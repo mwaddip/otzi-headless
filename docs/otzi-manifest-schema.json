@@ -1,0 +1,420 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mwaddip/otzi/otzi-manifest-v1.schema.json",
+  "title": "Ötzi Project Manifest",
+  "description": "Declarative JSON format for configuring Ötzi (PERMAFROST Vault) with custom OPNet contract operations, live state reads, conditional visibility, and theming.",
+  "type": "object",
+  "required": ["version", "name", "contracts", "operations"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Schema version. Must be 1."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Project name displayed in the UI header."
+    },
+    "description": {
+      "type": "string",
+      "description": "Short project description."
+    },
+    "icon": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL to project icon (displayed next to name)."
+    },
+    "theme": {
+      "$ref": "#/$defs/Theme"
+    },
+    "contracts": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/Contract"
+      },
+      "description": "Contract definitions keyed by logical name. Addresses are configured separately in Ötzi settings — NOT stored in the manifest."
+    },
+    "reads": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Read"
+      },
+      "description": "State values polled from contracts every 30 seconds. Results are available to conditions and the status panel."
+    },
+    "status": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/StatusEntry"
+      },
+      "description": "Dashboard status panel entries. Each references a key from reads."
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Operation"
+      },
+      "description": "Available operations rendered as cards with parameter inputs."
+    }
+  },
+  "$defs": {
+    "ThemeColors": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Color overrides for a specific theme mode.",
+      "properties": {
+        "accent": { "type": "string", "description": "Primary accent color (CSS color value). Also tints the Ötzi logo." },
+        "accentHover": { "type": "string", "description": "Accent hover color." },
+        "bg": { "type": "string", "description": "Background color." }
+      }
+    },
+    "Theme": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "CSS variable overrides. Provide dark/light objects for mode-specific colors, or flat fields as legacy (applied to dark mode only).",
+      "properties": {
+        "dark": { "$ref": "#/$defs/ThemeColors", "description": "Colors applied in dark mode." },
+        "light": { "$ref": "#/$defs/ThemeColors", "description": "Colors applied in light mode." },
+        "accent": { "type": "string", "description": "Legacy: accent color (dark mode only). Prefer dark.accent." },
+        "accentHover": { "type": "string", "description": "Legacy: accent hover (dark mode only). Prefer dark.accentHover." },
+        "bg": { "type": "string", "description": "Legacy: background (dark mode only). Prefer dark.bg." },
+        "radius": { "type": "string", "description": "Border radius (e.g. '0px', '8px'). Applied to both modes." }
+      }
+    },
+    "Contract": {
+      "type": "object",
+      "required": ["label", "abi"],
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string",
+          "description": "Human-readable contract name."
+        },
+        "abi": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": ["OP_20", "OP_20S", "OP_721"],
+              "description": "ABI shorthand. OP_20 = standard OP-20 token ABI. OP_20S = OP-20 + peg rate methods. OP_721 = standard OP-721 NFT ABI."
+            },
+            {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  { "type": "string", "enum": ["OP_20", "OP_20S", "OP_721"] },
+                  { "$ref": "#/$defs/AbiEntry" }
+                ]
+              },
+              "description": "Array of ABI entries. Can mix shorthand strings with custom AbiEntry objects."
+            }
+          ]
+        }
+      }
+    },
+    "AbiEntry": {
+      "type": "object",
+      "required": ["name", "type"],
+      "description": "A single ABI method/event entry in OPNet BitcoinInterfaceAbi format.",
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string", "enum": ["Function", "Event"] },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string", "enum": ["uint256", "uint8", "address", "bool", "bytes", "string"] }
+            }
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "Read": {
+      "type": "object",
+      "required": ["contract", "method", "returns"],
+      "additionalProperties": false,
+      "description": "A contract state value to poll periodically.",
+      "properties": {
+        "contract": {
+          "type": "string",
+          "description": "Contract key from the contracts object."
+        },
+        "method": {
+          "type": "string",
+          "description": "Method name to call (must exist in the contract's ABI)."
+        },
+        "params": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type", "source"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "type": "string", "enum": ["address", "uint256", "bool"] },
+              "source": {
+                "type": "string",
+                "pattern": "^(contract|setting):.+$",
+                "description": "Auto-fill source. 'contract:<key>' = address from settings. 'setting:<key>' = custom setting value."
+              }
+            }
+          },
+          "description": "Optional parameters for the read call (e.g., balanceOf(address)). Values are resolved from contract addresses or settings."
+        },
+        "returns": {
+          "type": "string",
+          "enum": ["uint8", "uint256", "address", "bool", "string"],
+          "description": "Expected return type."
+        },
+        "format": {
+          "type": "string",
+          "enum": ["raw", "token8", "btc8", "percent8", "price8", "address"],
+          "description": "Display format hint. raw = as-is. token8 = divide by 1e8. btc8 = divide by 1e8, suffix ' BTC'. percent8 = divide by 1e6, suffix '%'. price8 = divide by 1e8, prefix '$'. address = truncate hex."
+        }
+      }
+    },
+    "StatusEntry": {
+      "type": "object",
+      "required": ["label", "read"],
+      "additionalProperties": false,
+      "description": "A single entry in the status dashboard panel.",
+      "properties": {
+        "label": {
+          "type": "string",
+          "description": "Display label."
+        },
+        "read": {
+          "type": "string",
+          "description": "Key from the reads object whose value to display."
+        },
+        "map": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Optional mapping of raw values to display labels (e.g. {\"0\": \"SEEDING\", \"1\": \"LIVE\"})."
+        },
+        "condition": {
+          "$ref": "#/$defs/Condition",
+          "description": "When false, shows 'N/A' instead of the value. Useful for values that are meaningless in certain states (e.g. reserve ratio before initialization)."
+        }
+      }
+    },
+    "Operation": {
+      "type": "object",
+      "required": ["id", "label", "contract", "method", "params"],
+      "additionalProperties": false,
+      "description": "A single operation rendered as a card with parameter inputs and an execute button.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique operation identifier."
+        },
+        "label": {
+          "type": "string",
+          "description": "Button/card label."
+        },
+        "description": {
+          "type": "string",
+          "description": "What this operation does."
+        },
+        "contract": {
+          "type": "string",
+          "description": "Contract key from contracts, or \"$dynamic\" for user-selected contract."
+        },
+        "method": {
+          "type": "string",
+          "description": "Method name to call."
+        },
+        "condition": {
+          "$ref": "#/$defs/Condition",
+          "description": "When to show this operation. Omit to always show."
+        },
+        "ownerOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, only shown to admin users."
+        },
+        "confirm": {
+          "type": "string",
+          "description": "Confirmation message shown before execution. User must click twice."
+        },
+        "params": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Param"
+          },
+          "description": "Parameter definitions for this operation."
+        }
+      }
+    },
+    "Param": {
+      "type": "object",
+      "required": ["name", "type"],
+      "additionalProperties": false,
+      "description": "A single parameter input.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "ABI parameter name. Special value \"$contract\" selects which contract for $dynamic operations."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["uint256", "address", "bool", "bytes"],
+          "description": "Parameter type for encoding."
+        },
+        "label": {
+          "type": "string",
+          "description": "UI label for the input field."
+        },
+        "scale": {
+          "type": "number",
+          "description": "Multiply user input by this before encoding. E.g. 1e8 for 8-decimal tokens: user types '100', encoded as 10000000000."
+        },
+        "placeholder": {
+          "type": "string",
+          "description": "Input placeholder text."
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^(contract|setting|read):.+$",
+          "description": "Auto-fill source. 'contract:<key>' = address from settings. 'setting:<key>' = custom setting value. 'read:<key>' = value from reads. When set, the field is pre-filled and disabled."
+        },
+        "options": {
+          "type": "object",
+          "required": ["count", "item"],
+          "additionalProperties": false,
+          "description": "Dynamic dropdown populated from an indexed contract list. Renders a <select> instead of a text input.",
+          "properties": {
+            "count": {
+              "type": "object",
+              "required": ["contract", "method"],
+              "additionalProperties": false,
+              "description": "Read spec that returns the number of items (uint256).",
+              "properties": {
+                "contract": { "type": "string" },
+                "method": { "type": "string" }
+              }
+            },
+            "item": {
+              "type": "object",
+              "required": ["contract", "method"],
+              "additionalProperties": false,
+              "description": "Read spec that takes a uint256 index and returns one item.",
+              "properties": {
+                "contract": { "type": "string" },
+                "method": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["read", "eq"],
+          "additionalProperties": false,
+          "properties": {
+            "read": { "type": "string" },
+            "eq": { "oneOf": [{ "type": "number" }, { "type": "string" }, { "type": "boolean" }] }
+          },
+          "description": "Equality: reads[key] === value"
+        },
+        {
+          "type": "object",
+          "required": ["read", "neq"],
+          "additionalProperties": false,
+          "properties": {
+            "read": { "type": "string" },
+            "neq": { "oneOf": [{ "type": "number" }, { "type": "string" }, { "type": "boolean" }] }
+          },
+          "description": "Inequality: reads[key] !== value"
+        },
+        {
+          "type": "object",
+          "required": ["read", "gt"],
+          "additionalProperties": false,
+          "properties": {
+            "read": { "type": "string" },
+            "gt": { "type": "number" }
+          },
+          "description": "Greater than: reads[key] > value"
+        },
+        {
+          "type": "object",
+          "required": ["read", "lt"],
+          "additionalProperties": false,
+          "properties": {
+            "read": { "type": "string" },
+            "lt": { "type": "number" }
+          },
+          "description": "Less than: reads[key] < value"
+        },
+        {
+          "type": "object",
+          "required": ["blockWindow"],
+          "additionalProperties": false,
+          "properties": {
+            "blockWindow": {
+              "type": "object",
+              "required": ["read"],
+              "additionalProperties": false,
+              "properties": {
+                "read": { "type": "string", "description": "Reads key containing a block number." },
+                "minBlocks": { "type": "number", "description": "currentBlock >= reads[key] + minBlocks" },
+                "maxBlocks": { "type": "number", "description": "currentBlock < reads[key] + maxBlocks" }
+              }
+            }
+          },
+          "description": "Block window: operation visible only within a block range relative to a stored block number."
+        },
+        {
+          "type": "object",
+          "required": ["and"],
+          "additionalProperties": false,
+          "properties": {
+            "and": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/Condition" }
+            }
+          },
+          "description": "All conditions must be true."
+        },
+        {
+          "type": "object",
+          "required": ["or"],
+          "additionalProperties": false,
+          "properties": {
+            "or": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/Condition" }
+            }
+          },
+          "description": "At least one condition must be true."
+        },
+        {
+          "type": "object",
+          "required": ["not"],
+          "additionalProperties": false,
+          "properties": {
+            "not": { "$ref": "#/$defs/Condition" }
+          },
+          "description": "Condition must be false."
+        }
+      ]
+    }
+  }
+}

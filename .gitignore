@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+
+# Local-only handoff prompt — paste contents into the next Claude session
+HANDOFF.md
+
+# Local Claude Code state
+.claude/

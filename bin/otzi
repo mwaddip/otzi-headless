@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+# otzi CLI launcher — runs the TypeScript entrypoint via tsx.
+# Works when invoked directly (from a cloned repo) or via `npm install -g`
+# (tsx is pulled in as a runtime dep).
+set -eu
+DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$DIR/.." && pwd)"
+if [ -x "$ROOT/node_modules/.bin/tsx" ]; then
+  exec "$ROOT/node_modules/.bin/tsx" "$ROOT/src/daemon/entrypoint.ts" "$@"
+fi
+exec npx --yes tsx "$ROOT/src/daemon/entrypoint.ts" "$@"
