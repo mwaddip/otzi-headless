@@ -111,6 +111,7 @@ function makeIntegrationConfig(args: {
   return {
     share: { path: '/dev/null', passwordEnv: 'UNUSED' },
     node: { id: args.nodeId, partyId: args.partyId },
+    network: { name: 'testnet', opnetRpc: 'https://testnet.opnet.org' },
     transport: args.transport,
     peers: args.peerIds.map((p) => {
       const out: { id: string; partyId: PartyId; endpoint?: string } = {
@@ -385,6 +386,7 @@ describe('Daemon integration — DKG persistence + restart', () => {
         return {
           share: { path: sharePaths[i]!, passwordEnv: passwordEnvs[i]! },
           node: { id: `node-${i}`, partyId: i },
+          network: { name: 'testnet' as const, opnetRpc: 'https://testnet.opnet.org' },
           transport: {
             kind: 'peer-mesh' as const,
             listen: `127.0.0.1:${listenPorts[i]}`,

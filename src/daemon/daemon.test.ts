@@ -64,6 +64,7 @@ function makeConfig(overrides: {
   return {
     share: { path: '/dev/null', passwordEnv: 'UNUSED' },
     node: { id: overrides.nodeId, partyId: overrides.partyId },
+    network: { name: 'testnet', opnetRpc: 'https://testnet.opnet.org' },
     transport: { kind: 'peer-mesh' },
     peers: overrides.peerIds.map((p) => ({ id: p.id, partyId: p.partyId })),
     gate: { strategy: overrides.gateStrategy ?? 'auto' },

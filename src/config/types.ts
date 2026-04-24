@@ -17,6 +17,16 @@ export type GateStrategy = (typeof GATE_STRATEGIES)[number];
 export const TRIGGER_KINDS = ['http', 'cron'] as const;
 export type TriggerKind = (typeof TRIGGER_KINDS)[number];
 
+export const NETWORK_NAMES = ['mainnet', 'testnet', 'regtest'] as const;
+export type NetworkName = (typeof NETWORK_NAMES)[number];
+
+export interface NetworkConfig {
+  /** Bitcoin network the federation operates on. */
+  name: NetworkName;
+  /** OPNet RPC URL — operator-side broadcast paths default to this. */
+  opnetRpc: string;
+}
+
 export interface ShareConfig {
   /** Absolute path to the Ötzi-compatible share JSON file. */
   path: string;
@@ -73,6 +83,7 @@ export interface TriggerEntry {
 export interface DaemonConfig {
   share: ShareConfig;
   node: NodeConfig;
+  network: NetworkConfig;
   transport: TransportConfig;
   peers: PeerEntry[];
   gate: GateConfig;

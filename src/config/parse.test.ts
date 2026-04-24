@@ -14,6 +14,10 @@ password_env = "OTZI_SHARE_PASSWORD"
 id = "node-a"
 party_id = 1
 
+[network]
+name = "testnet"
+opnet_rpc = "https://testnet.opnet.org"
+
 [transport]
 kind = "peer-mesh"
 
@@ -37,6 +41,10 @@ describe('parseDaemonConfigToml — happy paths', () => {
       passwordEnv: 'OTZI_SHARE_PASSWORD',
     });
     expect(cfg.node).toEqual({ id: 'node-a', partyId: 1 });
+    expect(cfg.network).toEqual({
+      name: 'testnet',
+      opnetRpc: 'https://testnet.opnet.org',
+    });
     expect(cfg.transport).toEqual({ kind: 'peer-mesh' });
     expect(cfg.peers).toEqual([
       { id: 'node-b', partyId: 2, walletAddress: undefined, endpoint: undefined },
@@ -59,6 +67,10 @@ password_env = "OTZI_PWD"
 [node]
 id = "alpha"
 party_id = 2
+
+[network]
+name = "mainnet"
+opnet_rpc = "https://api.opnet.org"
 
 [transport]
 kind = "relay"
@@ -140,6 +152,10 @@ describe('parseDaemonConfigToml — missing required tables', () => {
     const toml = MINIMAL_TOML.replace(/\[gate\][\s\S]*$/, '');
     expect(() => parseDaemonConfigToml(toml)).toThrow(/gate.*missing required table/);
   });
+  it('rejects missing [network]', () => {
+    const toml = MINIMAL_TOML.replace(/\[network\][\s\S]*?(?=\n\[transport\])/, '');
+    expect(() => parseDaemonConfigToml(toml)).toThrow(/network.*missing required table/);
+  });
 });
 
 describe('parseDaemonConfigToml — type & enum validation', () => {
@@ -162,6 +178,13 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
     const toml = MINIMAL_TOML.replace('kind = "peer-mesh"', 'kind = "smoke-signal"');
     expect(() => parseDaemonConfigToml(toml)).toThrow(
       /transport\.kind.*must be one of peer-mesh \| relay/,
+    );
+  });
+
+  it('rejects unknown network.name', () => {
+    const toml = MINIMAL_TOML.replace('name = "testnet"', 'name = "moonnet"');
+    expect(() => parseDaemonConfigToml(toml)).toThrow(
+      /network\.name.*must be one of mainnet \| testnet \| regtest/,
     );
   });
 
@@ -207,6 +230,10 @@ password_env = "P"
 [node]
 id = "a"
 party_id = 1
+
+[network]
+name = "testnet"
+opnet_rpc = "https://testnet.opnet.org"
 
 [transport]
 kind = "peer-mesh"

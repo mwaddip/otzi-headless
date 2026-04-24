@@ -12,6 +12,8 @@ import {
   DeadlineConfig,
   GateConfig,
   GATE_STRATEGIES,
+  NetworkConfig,
+  NETWORK_NAMES,
   NodeConfig,
   PeerEntry,
   ShareConfig,
@@ -111,6 +113,14 @@ function parseNode(raw: unknown): NodeConfig {
   if (o.pubkey_book_file !== undefined)
     out.pubkeyBookFile = asString(o.pubkey_book_file, 'node.pubkey_book_file');
   return out;
+}
+
+function parseNetwork(raw: unknown): NetworkConfig {
+  const o = asObject(raw, 'network');
+  return {
+    name: asEnum(o.name, 'network.name', NETWORK_NAMES),
+    opnetRpc: asString(o.opnet_rpc, 'network.opnet_rpc'),
+  };
 }
 
 function parseTransport(raw: unknown): TransportConfig {
@@ -223,6 +233,7 @@ export function parseDaemonConfig(raw: unknown): DaemonConfig {
   const cfg: DaemonConfig = {
     share: parseShare(o.share),
     node: parseNode(o.node),
+    network: parseNetwork(o.network),
     transport: parseTransport(o.transport),
     peers: parsePeers(o.peers),
     gate: parseGate(o.gate),
