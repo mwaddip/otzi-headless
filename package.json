@@ -11,7 +11,8 @@
     "otzi": "tsx src/daemon/entrypoint.ts",
     "daemon": "tsx src/daemon/entrypoint.ts daemon",
     "setup:master": "tsx src/daemon/entrypoint.ts setup master",
-    "setup:member": "tsx src/daemon/entrypoint.ts setup member"
+    "setup:member": "tsx src/daemon/entrypoint.ts setup member",
+    "build:deb": "bash scripts/build-deb.sh"
   },
   "bin": {
     "otzi": "./bin/otzi"

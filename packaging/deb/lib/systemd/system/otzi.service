@@ -1,0 +1,30 @@
+[Unit]
+Description=Otzi-headless threshold-signing daemon
+After=network-online.target
+Wants=network-online.target
+# Skip start if config has not been generated yet (fresh install before bootstrap).
+ConditionPathExists=/etc/otzi/daemon.toml
+
+[Service]
+Type=simple
+User=otzi
+Group=otzi
+ExecStart=/usr/bin/otzi daemon /etc/otzi/daemon.toml
+Restart=on-failure
+RestartSec=5
+
+# Hardening — Node's V8 needs writable+executable memory, so don't set
+# MemoryDenyWriteExecute. Everything else below is safe for a Node service.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/otzi
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
