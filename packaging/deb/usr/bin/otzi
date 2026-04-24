@@ -1,0 +1,3 @@
+#!/bin/sh
+# otzi CLI launcher — exec's the bundled daemon entrypoint via Node.
+exec node /usr/lib/otzi/entrypoint.mjs "$@"

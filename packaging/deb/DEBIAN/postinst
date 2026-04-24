@@ -17,8 +17,6 @@ case "$1" in
     chown root:otzi /etc/otzi
     chmod 750 /etc/otzi
 
-    ln -sf /usr/lib/otzi/bin/otzi /usr/bin/otzi
-
     if [ -d /run/systemd/system ]; then
       deb-systemd-helper enable otzi.service >/dev/null || true
     fi
