@@ -2,7 +2,7 @@
 
 Snapshot for hand-off between sessions. `CLAUDE.md` is the spec; `PLAN.md` is the roadmap; this doc captures current state, session-made decisions, and gotchas.
 
-Last updated: 2026-04-24 (Per-node policy primitives landed. `/sign` API flipped from raw-unsigned-tx to **construction params** for BTC: each daemon (leader + participants) builds the tx locally from the same operator-supplied `{ to, amountSat, feeRate, utxos, frostP2tr, frostUntweakedPubKey }`, participants reject silently when their rebuilt sighashes don't match the leader's assertion. OPNet keeps raw-tx + advisory `hints`. `SigningSpec` now carries verified `outputs[]` / `amount` / `destination` / `method` (BTC = structural rebuild; OPNet = operator hints). `PolicyGate` extended with protocol-scoped rules: `max_btc_per_tx`, `allowed_btc_recipients`, `allowed_contracts`, `max_ceremonies_per_hour` (sliding-window, approvals-only). Operator-in-the-loop gates: built-in `exec` + `webhook` strategies (thin delegators); opinionated auth lives OUTSIDE the daemon — `examples/gate-web-opwallet/approver.mjs` is a standalone Node service that consumes the `webhook` interface and enforces OPWallet-signed ML-DSA-44 decisions. Gate-reject-mid-ceremony integration test proves participant silence → leader abort.)
+Last updated: 2026-04-24 (Phase 6 packaging shipped end-to-end. **553 KB .deb**: single esbuild bundle at `/usr/lib/otzi/entrypoint.mjs` (3.4 MB, `vendor/post-quantum` inlined, no `node_modules`, no `tsx` runtime); debconf-driven `daemon.toml` render with leader/leaf bootstrap-role prompt + per-network OPNet RPC defaults; container smoke test (`scripts/test-deb-container.sh`) validates install + bundle + parser on Ubuntu 24.04. Adds `[network]` config block (`mainnet`/`testnet`/`regtest` + `opnet_rpc`, required). Setup CLI renamed `master|member` → `leader|leaf` (user-facing only; internal `setupMaster`/`setupMember`/`runMasterBootstrap`/`runMemberRegister` function names unchanged). Chain-watcher trigger dropped from `TRIGGER_KINDS` — out of scope per the daemon-as-signing-backend principle.)
 
 ## Phase status
 
@@ -37,9 +37,13 @@ Last updated: 2026-04-24 (Per-node policy primitives landed. `/sign` API flipped
 | 3d | `PeerMeshTransport` — WebSocket per peer pair, lower-partyId dials. | ✅ Done. |
 | 3e | `RelayServer` + `RelayTransport` — opaque frame routing by ringId + partyId. | ✅ Done. |
 | 3f | Transport integration — `transport-factory.ts`; daemon-integration test over each transport. | ✅ Done. |
-| 6 | Packaging — Docker, systemd, `.deb` | ⏳ |
+| **6a** | **.deb build pipeline + skeleton** — `scripts/build-deb.sh` esbuild-bundles `src/daemon/entrypoint.ts` to `/usr/lib/otzi/entrypoint.mjs` (3.4 MB, vendor inlined). `DEBIAN/control` + minimal `postinst` + systemd unit. **553 KB compressed .deb** (down from 17.6 MB pre-esbuild — upstream packaging bugs in `@btc-vision/logger`/`bsi-common` leak `webpack`/`mongodb`/`typescript` as runtime deps; esbuild tree-shakes them out). | ✅ Done. |
+| **6b** | **`[network]` config block** — required `{ name: 'mainnet' \| 'testnet' \| 'regtest', opnet_rpc: string }`. No daemon code consumes it yet (advisory for operator tooling); debconf populates it. | ✅ Done. |
+| **6c** | **Setup CLI rename** `master\|member` → `leader\|leaf`. User-facing only — internal `setupMaster`/`setupMember`/`runMasterBootstrap`/`runMemberRegister` names unchanged (deliberate: confined-blast-radius rename). | ✅ Done. |
+| **6d** | **debconf templates + config script + postinst render** — leader/leaf bootstrap-role prompt, per-network `opnet_rpc` defaults, transport-conditional sub-prompts, peer-hostnames → commented `[[peers]]` stubs. Postinst does NOT auto-enable systemd (incomplete `[[peers]]` would crash-loop); install message walks operator through `setup` → edit toml → `generate` → `systemctl enable --now otzi`. | ✅ Done. |
+| **6e** | **`prerm`/`postrm` + container smoke test + `docs/install.md`** — postrm `purge` wipes `/etc/otzi`, `/var/lib/otzi`, otzi user/group, debconf answers (with explicit warning that this destroys the share). `scripts/test-deb-container.sh`: Ubuntu 24.04 + nodesource 22 + pre-seeded debconf, validates install layout, rendered toml, bundle invocation, and the expected "peers"-missing error from running the daemon against the incomplete config. | ✅ Done. |
 
-**Totals:** 299/299 tests, `tsc --noEmit` clean.
+**Totals:** 300/300 tests, `tsc --noEmit` clean. **553 KB .deb.**
 
 ## `src/` inventory
 
@@ -73,7 +77,7 @@ Last updated: 2026-04-24 (Per-node policy primitives landed. `/sign` API flipped
 
 | File | Purpose |
 |---|---|
-| `types.ts` | `DaemonConfig`, `NodeConfig`, `TransportConfig`, `GateConfig`, `TriggerEntry`, enum constants. `GATE_STRATEGIES = ['auto', 'policy', 'exec', 'webhook', 'cli', 'queue']`. |
+| `types.ts` | `DaemonConfig`, `NodeConfig`, `NetworkConfig`, `TransportConfig`, `GateConfig`, `TriggerEntry`, enum constants. `GATE_STRATEGIES = ['auto', 'policy', 'exec', 'webhook', 'cli', 'queue']`, `NETWORK_NAMES = ['mainnet', 'testnet', 'regtest']`, `TRIGGER_KINDS = ['http', 'cron']`. |
 | `parse.ts` | `parseDaemonConfigToml(text)` + `parseDaemonConfig(raw)`. `ConfigError` with `path` field. |
 | `load.ts` | `loadDaemonConfig(path)` — thin I/O wrapper. |
 
@@ -112,7 +116,7 @@ Last updated: 2026-04-24 (Per-node policy primitives landed. `/sign` API flipped
 | `leader.ts` | `LeaderDispatcher`. **Discriminated `LeaderSignRequest`:** `LeaderSignBtcRequest { btc: { to, amountSat, feeRate, network, frostP2tr, frostUntweakedPubKey, utxos } }` | `LeaderSignOpnetRequest { unsignedTx, inputs, hints? }` | `LeaderSignMldsaRequest { message }`. BTC: builds via `buildBtcTxFromParams`, populates spec with non-self outputs. OPNet: `extractBtcSighashes` + hint-populated spec. ML-DSA: opaque `message` bytes. `GateRejection` on reject/pending. |
 | `daemon.ts` | `Daemon` composition root. Wires blob infra + runner + gate + orchestrator + leader + triggers. `buildDefaultHttpHandler` parses discriminated `op:'sign'` body. Returns 403 on `GateRejection`. |
 | `transport-factory.ts` | Loads identity + pubkey book; derives `ringId = SHA-256(sorted raw pubkeys)`; builds peer-mesh or relay transport. |
-| `entrypoint.ts` | `main(argv)` CLI. Subcommands: `daemon` / `setup master|member` / `generate`. Does NOT call `initEccLib` (phase-4d trap). |
+| `entrypoint.ts` | `main(argv)` CLI. Subcommands: `daemon` / `setup leader\|leaf` / `generate`. Does NOT call `initEccLib` (phase-4d trap). |
 
 ### `src/bootstrap/` — pubkey exchange (phase 3c)
 
@@ -137,6 +141,8 @@ Last updated: 2026-04-24 (Per-node policy primitives landed. `/sign` API flipped
 | File | Purpose |
 |---|---|
 | `testnet-e2e.ts` | Live signet regression test for phase-4 broadcast pipeline. `source ~/projects/sharedenv/opnet-testnet.env && npx tsx scripts/testnet-e2e.ts`. `SKIP_TX=1` for offline portion. ~200k sats + ~15 min wait per full run. |
+| `build-deb.sh` | Hand-rolled `.deb` builder. esbuild-bundles `src/daemon/entrypoint.ts` → single `.mjs` with createRequire shim (so transitive CJS `require('node:crypto')` works under ESM); stages `packaging/deb/` + the bundle into a temp tree; `dpkg-deb --build`. Output: `dist/otzi-headless_<version>_<arch>.deb` (~553 KB). |
+| `test-deb-container.sh` | Ubuntu 24.04 container smoke test for the .deb. Pre-seeds debconf, installs nodesource 22 + the .deb, verifies install layout, rendered `daemon.toml`, bundle invocation, and the expected "peers"-missing error from running `otzi daemon` against the rendered (incomplete) config. Requires Docker. |
 
 ## `examples/`
 
@@ -152,6 +158,20 @@ Last updated: 2026-04-24 (Per-node policy primitives landed. `/sign` API flipped
 | File | Purpose |
 |---|---|
 | `gates.md` | Gate contract, `CeremonySpec` schema, all shipping strategies (`auto` / `policy` / `exec` / `webhook`), deadline table, "build your own" pointer at the OPWallet example. |
+| `install.md` | Operator install walkthrough — system requirements, debconf prompt reference, post-install bootstrap → DKG → enable flow, file layout (`/etc/otzi`, `/var/lib/otzi`), uninstall (with the explicit `purge` warning that destroys the share). |
+
+## `packaging/`
+
+| Path | Purpose |
+|---|---|
+| `deb/DEBIAN/control` | Package metadata. `Depends: nodejs (>= 22), adduser, debconf`. Version + arch are templated by `scripts/build-deb.sh`. |
+| `deb/DEBIAN/templates` | debconf prompt declarations. 9 prompts; HIGH priority for the must-decide ones (role, network, transport, relay-url-if-relay), MEDIUM for the rest (defaultable). |
+| `deb/DEBIAN/config` | debconf script. Pre-seeds `node-id` from hostname + `opnet-rpc` per-network. Asks transport-conditional sub-prompts. |
+| `deb/DEBIAN/postinst` | Creates `otzi:otzi` system user; renders `/etc/otzi/daemon.toml` from debconf answers (TOML quote-escaping via `toml_escape`); preserves the file across upgrades; does NOT auto-enable systemd; prints the operator next-steps. |
+| `deb/DEBIAN/prerm` | Stops the systemd unit on remove/upgrade/deconfigure. |
+| `deb/DEBIAN/postrm` | Cleans up systemd registration on remove. On `purge`: wipes `/etc/otzi`, `/var/lib/otzi`, otzi user/group, debconf answers. |
+| `deb/usr/bin/otzi` | One-line wrapper: `exec node /usr/lib/otzi/entrypoint.mjs "$@"`. |
+| `deb/lib/systemd/system/otzi.service` | systemd unit. `User=otzi`, hardening baseline that's V8-compatible (no `MemoryDenyWriteExecute`). `ConditionPathExists=/etc/otzi/daemon.toml` as a safety net. |
 
 ## Key decisions
 
@@ -215,6 +235,28 @@ Per-request retry: exp backoff 1s → 30s cap. Ceremony deadline scales with gat
 ### Config shape
 TOML for daemon runtime config. JSON for share files (Ötzi-compat). `DaemonConfig` separate from Ötzi's `VaultConfig`.
 
+### `[network]` config block (2026-04-24)
+- Required `{ name: 'mainnet' \| 'testnet' \| 'regtest', opnet_rpc: string }`. Lives on `DaemonConfig`.
+- No daemon code consumes the field at runtime — it's a documented home for operator network selection (debconf populates it; future operator CLI helpers can default to it).
+- Added because debconf needs a canonical place to land its `network` + `opnet-rpc` answers.
+
+### .deb packaging — esbuild bundle, not node_modules ship (2026-04-24)
+- `scripts/build-deb.sh` esbuilds `src/daemon/entrypoint.ts` → single `/usr/lib/otzi/entrypoint.mjs` (3.4 MB; vendor/post-quantum is pure JS and gets inlined).
+- Banner trick installs `createRequire` so transitive CJS deps that do `require('node:crypto')` (e.g. `@noble/hashes/cryptoNode` via bip39) keep working under ESM.
+- Without esbuild the .deb was 17.6 MB compressed (164 MB node_modules) — upstream packaging bugs in `@btc-vision/logger` (declares `webpack` + `ts-loader` + `typescript` as runtime deps) and `bsi-common` (pulls `mongodb`) leak ~80 MB of runtime-unused tooling. Tree-shaking strips it. **553 KB compressed; 32× shrink.**
+- No tsx runtime needed in the .deb. `/usr/bin/otzi` is `exec node /usr/lib/otzi/entrypoint.mjs "$@"`.
+- Dev parity (running unbundled via `bin/otzi`) is unchanged; tsx still ships as a regular dep for that path.
+
+### Setup CLI naming — leader/leaf, not master/member (2026-04-24)
+- User-facing: `otzi setup leader|leaf` + `--leader <url>` flag + npm scripts `setup:leader`/`setup:leaf` + README + debconf prompt.
+- Internal function/module names (`setupMaster`, `setupMember`, `runMasterBootstrap`, `runMemberRegister`, `src/bootstrap/master.ts`, `src/bootstrap/register.ts`) are unchanged — confined-blast-radius rename. Acceptable because they don't appear in any UX surface.
+- Reason: debconf prompts use leader/leaf (operator preference), and a "leader in debconf, master in CLI" mismatch would be a hedged leftover the no-stale-spec-hedging principle catches.
+
+### Chain-watcher trigger removed (2026-04-24)
+- `'chain-watcher'` was in `TRIGGER_KINDS` with a "not implemented yet" throw at construction.
+- Dropped entirely (schema, code, tests, docs). The daemon is a signing backend for critical-infrastructure keys, not an autonomous chain observer. If a ceremony should fire on a chain event, the operator's own watcher subscribes and POSTs `/sign`.
+- See `feedback_daemon_signing_backend_scope` memory.
+
 ## Open items / gotchas
 
 1. **Mandatory announce-frost wire fields.** `btcParams` (BTC path) + `unsignedTxHex` / `inputs` / `hints` (OPNet path) are currently optional at the wire level so ceremony-mechanics tests can use synthetic sighashes. Strict operator contract lives in `leader.sign()`. Making fields required tightens the protocol and guarantees participant verify always runs; needs updating ~6 test call sites to build real params (or a shared `makeDummyFrostExtras(sighashes)` helper).
@@ -269,4 +311,10 @@ OTZI_TEST_LOG=1 npx vitest run src/daemon/daemon-integration.test.ts
 # External OPWallet approver (consumes webhook gate):
 export APPROVER_PUBKEY_HEX="…"   # 2624 hex chars (ML-DSA-44 pubkey)
 node examples/gate-web-opwallet/approver.mjs
+
+# Build the .deb (output: dist/otzi-headless_<version>_<arch>.deb, ~553 KB):
+npm run build:deb
+
+# Container smoke test for the .deb (Ubuntu 24.04, requires Docker):
+bash scripts/test-deb-container.sh
 ```
