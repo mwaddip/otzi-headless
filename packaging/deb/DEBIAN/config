@@ -1,0 +1,48 @@
+#!/bin/sh
+set -e
+
+. /usr/share/debconf/confmodule
+
+# Default node-id to the system hostname if the operator hasn't already set it.
+db_get otzi-headless/node-id || true
+if [ -z "$RET" ]; then
+  db_set otzi-headless/node-id "$(hostname -s 2>/dev/null || hostname)"
+fi
+
+db_input high otzi-headless/role || true
+db_input high otzi-headless/network || true
+db_input medium otzi-headless/node-id || true
+db_go || true
+
+# Per-network default for opnet-rpc — only set when the operator hasn't
+# already supplied a value.
+db_get otzi-headless/network || true
+NETWORK="$RET"
+case "$NETWORK" in
+  mainnet)  DEFAULT_RPC="https://api.opnet.org" ;;
+  regtest)  DEFAULT_RPC="http://127.0.0.1:9001" ;;
+  *)        DEFAULT_RPC="https://testnet.opnet.org" ;;
+esac
+db_get otzi-headless/opnet-rpc || true
+if [ -z "$RET" ]; then
+  db_set otzi-headless/opnet-rpc "$DEFAULT_RPC"
+fi
+
+db_input medium otzi-headless/opnet-rpc || true
+db_input high otzi-headless/transport || true
+db_go || true
+
+db_get otzi-headless/transport || true
+TRANSPORT="$RET"
+case "$TRANSPORT" in
+  relay)
+    db_input high otzi-headless/relay-url || true
+    ;;
+  peer-mesh|*)
+    db_input medium otzi-headless/listen || true
+    ;;
+esac
+
+db_input medium otzi-headless/peer-hostnames || true
+db_input medium otzi-headless/operator-bind || true
+db_go || true
