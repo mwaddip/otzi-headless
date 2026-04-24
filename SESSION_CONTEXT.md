@@ -2,7 +2,7 @@
 
 Snapshot for hand-off between sessions. `CLAUDE.md` is the spec; `PLAN.md` is the roadmap; this doc captures current state, session-made decisions, and gotchas.
 
-Last updated: 2026-04-24 (Phase 6 packaging shipped end-to-end. **553 KB .deb**: single esbuild bundle at `/usr/lib/otzi/entrypoint.mjs` (3.4 MB, `vendor/post-quantum` inlined, no `node_modules`, no `tsx` runtime); debconf-driven `daemon.toml` render with leader/leaf bootstrap-role prompt + per-network OPNet RPC defaults; container smoke test (`scripts/test-deb-container.sh`) validates install + bundle + parser on Ubuntu 24.04. Adds `[network]` config block (`mainnet`/`testnet`/`regtest` + `opnet_rpc`, required). Setup CLI renamed `master|member` → `leader|leaf` (user-facing only; internal `setupMaster`/`setupMember`/`runMasterBootstrap`/`runMemberRegister` function names unchanged). Chain-watcher trigger dropped from `TRIGGER_KINDS` — out of scope per the daemon-as-signing-backend principle.)
+Last updated: 2026-04-25 (Phase 7 hardening shipped. **Release workflow** (tag-triggered CI that builds + container-smoketests + publishes the .deb as a GitHub Release, with size-regression + tag-vs-package.json guards). **Strict `announce-frost` wire** — `protocol` discriminator mandatory; three variants (`btc` / `opnet` / `keylink`); parser + `signFrostAsLeader` enforce. **Keylink FROST sign runs inline as the last phase of `runCombinedDkgProtocol`** when `DaemonConfig.network.name ∈ {mainnet, testnet}` — n-of-n symmetric aggregate, each peer exits with matching `frostLegacySig` which `persistCombinedDkgShare` writes onto the V3 envelope (regtest skips; signet e2e confirmed BHTT.transfer + BTC return still broadcast clean). **`docs/api.md` + `docs/config.md`** — full HTTP endpoint + TOML reference.)
 
 ## Phase status
 
@@ -42,8 +42,12 @@ Last updated: 2026-04-24 (Phase 6 packaging shipped end-to-end. **553 KB .deb**:
 | **6c** | **Setup CLI rename** `master\|member` → `leader\|leaf`. User-facing only — internal `setupMaster`/`setupMember`/`runMasterBootstrap`/`runMemberRegister` names unchanged (deliberate: confined-blast-radius rename). | ✅ Done. |
 | **6d** | **debconf templates + config script + postinst render** — leader/leaf bootstrap-role prompt, per-network `opnet_rpc` defaults, transport-conditional sub-prompts, peer-hostnames → commented `[[peers]]` stubs. Postinst does NOT auto-enable systemd (incomplete `[[peers]]` would crash-loop); install message walks operator through `setup` → edit toml → `generate` → `systemctl enable --now otzi`. | ✅ Done. |
 | **6e** | **`prerm`/`postrm` + container smoke test + `docs/install.md`** — postrm `purge` wipes `/etc/otzi`, `/var/lib/otzi`, otzi user/group, debconf answers (with explicit warning that this destroys the share). `scripts/test-deb-container.sh`: Ubuntu 24.04 + nodesource 22 + pre-seeded debconf, validates install layout, rendered toml, bundle invocation, and the expected "peers"-missing error from running the daemon against the incomplete config. | ✅ Done. |
+| **7a** | **GitHub release workflow (`.github/workflows/release.yml`)** — tag-push `v*.*.*` triggers: checkout → node 22 → verify tag matches `package.json` version → `npm ci` + `tsc --noEmit` + `vitest run` + `npm run build:deb` → size-regression guard (fail if >2 MB) → `bash scripts/test-deb-container.sh` → `gh release create --generate-notes` with the .deb attached. Single amd64 build (lean). | ✅ Done. |
+| **7b** | **Strict `announce-frost` wire + keylink variant** — `AnnounceFrostExtras` is a 3-variant discriminated union (`btc` / `opnet` / `keylink`); `CeremonyMessage`'s `announce-frost` arm uses it via `AnnounceFrostMessage = common & extras`; parser requires `protocol` + its corresponding fields (rejects as null otherwise); `announceFrostMessage` + `signFrostAsLeader` take required `extras`; orchestrator `verifyAndDecodeFrostAnnounce` switches on `announce.protocol` (`keylink` currently unverified — DKG-state threading is the plug-in point). Ships `makeDummyFrostKeylinkExtras` for ceremony-mechanics tests. | ✅ Done. |
+| **7c** | **Keylink FROST sign inline in combined DKG** — `CombinedDkgSpec.network?: NetworkName` opts in; `runCombinedDkgProtocol` runs DKG phases then `runKeylinkSignProtocol` (n-of-n FROST sign over `computeKeyLinkHash(mldsaPub, tweakedFrostPub, untweakedFrostPub, network)`, `tweaked: true`, ROUND_FROST_KEYLINK_R1/R2 blob keys so they don't collide with regular FROST rounds). Every peer aggregates locally → matching `frostLegacySig` on every `CombinedDkgResult`. `LeaderDeps.network` + `OrchestratorDeps.network` wire the value from config; `daemon.ts` maps `regtest` → undefined (skip keylink). `persistCombinedDkgShare` piggy-backs `frostLegacySig` as an extra top-level hex field on the V3 envelope. Signet e2e (`scripts/testnet-e2e.ts`) drops its manual keylink step and now reads `initResult.frostLegacySig` directly; live BHTT.transfer + BTC return confirmed end-to-end on 2026-04-25. | ✅ Done. |
+| **7d** | **`docs/api.md` + `docs/config.md`** — HTTP endpoint reference (per-op request/response shapes, auth model, 403-on-`GateRejection`, pubkey cheat sheet) + TOML reference (every table, per-strategy gate params, trigger kinds, cross-field validation rules, local-3-node sample). | ✅ Done. |
 
-**Totals:** 300/300 tests, `tsc --noEmit` clean. **553 KB .deb.**
+**Totals:** 301/301 tests, `tsc --noEmit` clean. **553 KB .deb.**
 
 ## `src/` inventory
 
@@ -57,8 +61,8 @@ Last updated: 2026-04-24 (Phase 6 packaging shipped end-to-end. **553 KB .deb**:
 | `blob-store.ts` | Keyed store. Idempotent put, throws on byte conflict. |
 | `blob-server.ts` | Long-lived bridge from `transport.servePulls` → `BlobStore`. Daemon-scoped. |
 | `blob-puller.ts` | Per-key worker pool. Exp backoff + `AbortController` deadline. |
-| `ceremony-messages.ts` | Announce / signoff message types. Encode/parse. **announce-frost carries discriminated `AnnounceFrostExtras`: BTC variant with `btcParams` (construction params) OR OPNet variant with `unsignedTxHex` + `inputs` + optional `hints`.** |
-| `ceremony-runner.ts` | All leader + participant methods for ML-DSA sign, FROST sign, ML-DSA DKG, FROST DKG, combined DKG. |
+| `ceremony-messages.ts` | Announce / signoff message types. Encode/parse. **`announce-frost` carries a required 3-variant `AnnounceFrostExtras`: `{ protocol: 'btc', btcParams }` (construction params) \| `{ protocol: 'opnet', unsignedTxHex, inputs, hints? }` (raw-tx + prevout + advisory) \| `{ protocol: 'keylink', network }` (OPNet V3-vault key-link sig).** Parser rejects as null on missing `protocol` or corresponding fields. Exports `makeDummyFrostKeylinkExtras()` for ceremony-mechanics tests. |
+| `ceremony-runner.ts` | All leader + participant methods for ML-DSA sign, FROST sign, ML-DSA DKG, FROST DKG, combined DKG. **`signFrostAsLeader`'s third arg `announceExtras` is required.** `CombinedDkgSpec.network?: NetworkName` opts into the key-link phase; `runCombinedDkgProtocol` runs `runKeylinkSignProtocol` at the end when set (n-of-n FROST sign over `computeKeyLinkHash(...)`, blob rounds `frost-keylink-r1`/`frost-keylink-r2`, all peers aggregate locally → matching `CombinedDkgResult.frostLegacySig`). Imports `computeKeyLinkHash` from `../node/frost-link` (one deliberate core→node coupling — hash format is OPNet-specific). |
 | `frost-sign-session.ts` | Session wrapper over `@mwaddip/frots`. N sighashes, mixed key-path/script-path. |
 | `dkg-session.ts` | ML-DSA DKG session wrapper. |
 | `frost-dkg-session.ts` | FROST DKG session wrapper. |
@@ -95,9 +99,9 @@ Last updated: 2026-04-24 (Phase 6 packaging shipped end-to-end. **553 KB .deb**:
 
 | File | Purpose |
 |---|---|
-| `types.ts` | `OrchestratorDeps`, `CeremonyOutcome`, `DkgPersistenceSink`, `Logger` + `NOOP_LOGGER`. |
+| `types.ts` | `OrchestratorDeps` (including `network?: NetworkName` for the key-link phase on combined DKG), `CeremonyOutcome`, `DkgPersistenceSink`, `Logger` + `NOOP_LOGGER`. |
 | `spec-builder.ts` | `buildSpecFromAnnounce(msg, ctx)` → `CeremonySpec`. Takes optional `btcOutputs` + `btcFrostP2tr` from the verify step; populates BTC spec with non-self outputs + amount + destination. OPNet spec populates from announce `hints`. |
-| `orchestrator.ts` | Long-lived listener. **Verify-before-gate:** `handleAnnounce` runs `verifyAndDecodeFrostAnnounce` on FROST announces before calling the gate. BTC: rebuilds tx via `buildBtcTxFromParams`, compares sighashes, emits decoded outputs. OPNet: re-extracts sighashes from unsigned-tx. Mismatch → silent drop before gate runs. Decoded outputs threaded through `evaluateGate` → spec-builder → gate. |
+| `orchestrator.ts` | Long-lived listener. **Verify-before-gate:** `handleAnnounce` runs `verifyAndDecodeFrostAnnounce` on FROST announces before calling the gate. The verify function switches on `announce.protocol`: BTC rebuilds tx via `buildBtcTxFromParams` + sighash match; OPNet re-extracts sighashes from unsigned-tx + match; keylink is unverified (DKG-state threading is the pluggable point). Mismatch → silent drop before gate runs. Decoded outputs threaded through `evaluateGate` → spec-builder → gate. `dispatchCombinedDkg` passes `deps.network` into the spec so the participant's combined-DKG run includes the key-link phase. |
 
 ### `src/triggers/` — trigger layer (phase 5d)
 
@@ -112,9 +116,9 @@ Last updated: 2026-04-24 (Phase 6 packaging shipped end-to-end. **553 KB .deb**:
 | File | Purpose |
 |---|---|
 | `config-merge.ts` | `loadAndValidate(configPath)` → `LoadedDaemonState`. Two modes: share present vs. DKG-only. Pure `buildStateFromShare` / `buildStateNoShare`. |
-| `share-persistence.ts` | `persistCombinedDkgShare` — encrypted V3 share envelope to disk with chmod 600 + parent mkdir. |
-| `leader.ts` | `LeaderDispatcher`. **Discriminated `LeaderSignRequest`:** `LeaderSignBtcRequest { btc: { to, amountSat, feeRate, network, frostP2tr, frostUntweakedPubKey, utxos } }` | `LeaderSignOpnetRequest { unsignedTx, inputs, hints? }` | `LeaderSignMldsaRequest { message }`. BTC: builds via `buildBtcTxFromParams`, populates spec with non-self outputs. OPNet: `extractBtcSighashes` + hint-populated spec. ML-DSA: opaque `message` bytes. `GateRejection` on reject/pending. |
-| `daemon.ts` | `Daemon` composition root. Wires blob infra + runner + gate + orchestrator + leader + triggers. `buildDefaultHttpHandler` parses discriminated `op:'sign'` body. Returns 403 on `GateRejection`. |
+| `share-persistence.ts` | `persistCombinedDkgShare` — encrypted V3 share envelope to disk with chmod 600 + parent mkdir. **Piggy-backs `frostLegacySig` as an extra top-level hex field on the V3 envelope when present** (outside `encryptShareV3`'s typed contract — it's a daemon-side add-on that Ötzi's decoder tolerates). |
+| `leader.ts` | `LeaderDispatcher`. **Discriminated `LeaderSignRequest`:** `LeaderSignBtcRequest { btc: { to, amountSat, feeRate, network, frostP2tr, frostUntweakedPubKey, utxos } }` \| `LeaderSignOpnetRequest { unsignedTx, inputs, hints? }` \| `LeaderSignMldsaRequest { message }`. BTC: builds via `buildBtcTxFromParams`, populates spec with non-self outputs. OPNet: `extractBtcSighashes` + hint-populated spec. ML-DSA: opaque `message` bytes. `GateRejection` on reject/pending. `LeaderDeps.network?: NetworkName` flows into combined-DKG spec to gate the key-link phase. |
+| `daemon.ts` | `Daemon` composition root. Wires blob infra + runner + gate + orchestrator + leader + triggers. `buildDefaultHttpHandler` parses discriminated `op:'sign'` body. Returns 403 on `GateRejection`. Maps `config.network.name` → `LeaderDeps.network` + `OrchestratorDeps.network` (`regtest` → undefined to skip key-link; `mainnet`/`testnet` → passthrough). |
 | `transport-factory.ts` | Loads identity + pubkey book; derives `ringId = SHA-256(sorted raw pubkeys)`; builds peer-mesh or relay transport. |
 | `entrypoint.ts` | `main(argv)` CLI. Subcommands: `daemon` / `setup leader\|leaf` / `generate`. Does NOT call `initEccLib` (phase-4d trap). |
 
@@ -157,6 +161,8 @@ Last updated: 2026-04-24 (Phase 6 packaging shipped end-to-end. **553 KB .deb**:
 
 | File | Purpose |
 |---|---|
+| `api.md` | HTTP endpoint reference — transport + auth, shared + error shapes, per-`op` bodies (`dkg-combined` / `dkg-mldsa` / `dkg-frost` / `sign` discriminated by `(scheme, protocol)`), response shapes, pubkey cheat sheet. |
+| `config.md` | TOML reference — every table + field with types/defaults, per-strategy gate params (policy / exec / webhook), trigger kinds (http / cron), cross-field validation rules, local-3-node sample. |
 | `gates.md` | Gate contract, `CeremonySpec` schema, all shipping strategies (`auto` / `policy` / `exec` / `webhook`), deadline table, "build your own" pointer at the OPWallet example. |
 | `install.md` | Operator install walkthrough — system requirements, debconf prompt reference, post-install bootstrap → DKG → enable flow, file layout (`/etc/otzi`, `/var/lib/otzi`), uninstall (with the explicit `purge` warning that destroys the share). |
 
@@ -257,27 +263,50 @@ TOML for daemon runtime config. JSON for share files (Ötzi-compat). `DaemonConf
 - Dropped entirely (schema, code, tests, docs). The daemon is a signing backend for critical-infrastructure keys, not an autonomous chain observer. If a ceremony should fire on a chain event, the operator's own watcher subscribes and POSTs `/sign`.
 - See `feedback_daemon_signing_backend_scope` memory.
 
+### Release workflow — tag-triggered .deb publish (2026-04-25)
+- `.github/workflows/release.yml` fires on tag push `v*.*.*`. Steps: checkout → node 22 (+ npm cache) → verify `${GITHUB_REF_NAME#v}` == `package.json`.version → `npm ci` + `npx tsc --noEmit` + `npx vitest run` + `npm run build:deb` → size-regression guard (fails if .deb > 2 MB; floor is 553 KB) → `bash scripts/test-deb-container.sh` as post-build gate → `gh release create <tag> --generate-notes <deb>` with `contents: write` perm.
+- Single amd64 build (lean). If arm64 ever becomes a target, matrix-build per arch.
+
+### Strict `announce-frost` wire + keylink variant (2026-04-25)
+- `protocol` discriminator is mandatory on every `announce-frost`. `AnnounceFrostExtras` is a 3-variant tagged union:
+  - `{ protocol: 'btc', btcParams }` — full BTC construction params; participants rebuild.
+  - `{ protocol: 'opnet', unsignedTxHex, inputs, hints? }` — raw-tx + prevout + advisory hints.
+  - `{ protocol: 'keylink', network }` — unverified at orchestrator today (DKG-state threading is the pluggable verify point); reserved for the OPNet V3-vault key-link FROST sig.
+- `CeremonyMessage` union's `announce-frost` arm becomes `AnnounceFrostMessage = common & AnnounceFrostExtras`. Parser requires `protocol` + its corresponding fields (returns null otherwise). `announceFrostMessage` + `signFrostAsLeader` take required `extras`.
+- `makeDummyFrostKeylinkExtras()` helper ships for ceremony-mechanics tests that don't care about tx specifics — the unverified `keylink` variant is the simplest satisfier.
+- Leader + orchestrator narrow on `announce.protocol` in `verifyAndDecodeFrostAnnounce`; the old fall-through `return {ok: true}` path is gone.
+
+### Keylink FROST sign inline in combined DKG (2026-04-25)
+- Closes the production gap: `scripts/testnet-e2e.ts` previously ran a manual follow-up keylink ceremony after DKG to produce `frostLegacySig`; the daemon's `runCombinedDkg` did **not** — shares shipped without the sig and OPNet contract calls against the vault failed at capture. Now:
+  - `CombinedDkgSpec.network?: NetworkName` gates the phase (opt-in; absent → legacy behavior).
+  - `runCombinedDkgProtocol` runs `runMldsaDkgProtocol` → `runFrostDkgProtocol` → `runKeylinkSignProtocol`. The key-link phase is an n-of-n FROST sign over `computeKeyLinkHash(mldsaPub, tweakedFrostPub, untweakedFrostPub, network)` (`tweaked: true`); every peer produces its R1/R2, pulls from the rest, aggregates locally. Output: `CombinedDkgResult.frostLegacySig` matching across all peers.
+  - Blob keys use new round names `frost-keylink-r1` / `frost-keylink-r2` to avoid collision with regular FROST-signing blobs under the same ceremonyId.
+  - `LeaderDeps.network` + `OrchestratorDeps.network` carry the config value; `daemon.ts` maps `config.network.name === 'regtest'` → undefined (skip keylink — the chain ID isn't fixed) and `mainnet`/`testnet` → passthrough. Regtest DKG still produces usable shares; OPNet contract calls against them will fail at capture (documented).
+- `persistCombinedDkgShare` piggy-backs `frostLegacySig` as an extra top-level hex field on the V3 envelope — outside `encryptShareV3`'s typed contract (the sig isn't part of Ötzi's V3 byte format) but tolerated by both Ötzi's decoder (ignores unknown fields) and our own load path (intersection type).
+- `src/core/ceremony-runner.ts` imports `computeKeyLinkHash` from `../node/frost-link` — one deliberate core→node coupling. Justified because the hash format is OPNet-specific and this is the one place the ceremony runner needs OPNet-awareness to close the V3 signing loop.
+- Signet e2e on 2026-04-25 confirmed BHTT.transfer + BTC return broadcast clean after the manual keylink step was dropped from `testnet-e2e.ts`.
+
 ## Open items / gotchas
 
-1. **Mandatory announce-frost wire fields.** `btcParams` (BTC path) + `unsignedTxHex` / `inputs` / `hints` (OPNet path) are currently optional at the wire level so ceremony-mechanics tests can use synthetic sighashes. Strict operator contract lives in `leader.sign()`. Making fields required tightens the protocol and guarantees participant verify always runs; needs updating ~6 test call sites to build real params (or a shared `makeDummyFrostExtras(sighashes)` helper).
+1. **OPNet construction-params.** Currently deferred. Needs SDK-level control of UTXO fetching — `captureOpnetSighashes` uses the higher-level `contract.<method>().sendTransaction()` path which internally queries the provider. Making OPNet deterministic requires monkey-patching `utxoManager.getUTXOs` similarly to how we monkey-patch `sendRawTransaction`.
 
-2. **OPNet construction-params.** Currently deferred. Needs SDK-level control of UTXO fetching — `captureOpnetSighashes` uses the higher-level `contract.<method>().sendTransaction()` path which internally queries the provider. Making OPNet deterministic requires monkey-patching `utxoManager.getUTXOs` similarly to how we monkey-patch `sendRawTransaction`.
+2. **Ring-rotation not implemented.** Once bootstrap is done, the ring is fixed. Adding/removing peers requires re-running bootstrap from scratch. Documented UX limitation; acceptable for stable federations.
 
-3. **Ring-rotation not implemented.** Once bootstrap is done, the ring is fixed. Adding/removing peers requires re-running bootstrap from scratch. Documented UX limitation; acceptable for stable federations.
+3. **Relay reconnect not implemented.** If the relay drops the WebSocket, daemons fail open — operator restart required.
 
-4. **Relay reconnect not implemented.** If the relay drops the WebSocket, daemons fail open — operator restart required.
+4. **ML-DSA DKG phase-3 expected-senders** — pull from every distinct generator (not just own bitmasks) else `dkgPhase4` throws. Handled in `phase3ExpectedSenders`.
 
-5. **ML-DSA DKG phase-3 expected-senders** — pull from every distinct generator (not just own bitmasks) else `dkgPhase4` throws. Handled in `phase3ExpectedSenders`.
+5. **`#N` retry suffix** requires `ceremonyId` to NOT contain `#`. Tighten with a check if ceremonyIds ever come from untrusted sources.
 
-6. **`#N` retry suffix** requires `ceremonyId` to NOT contain `#`. Tighten with a check if ceremonyIds ever come from untrusted sources.
+6. **Engine warnings on npm install.** `opnet@1.8.13` + some `@btc-vision/*` want Node 24+; we're on 22.19.
 
-7. **Engine warnings on npm install.** `opnet@1.8.13` + some `@btc-vision/*` want Node 24+; we're on 22.19.
+7. **Combine attempt cap.** `signAsLeader`'s `maxCombineAttempts` default is 50 (bumped from 5). Seat-of-pants.
 
-8. **Combine attempt cap.** `signAsLeader`'s `maxCombineAttempts` default is 50 (bumped from 5). Seat-of-pants.
+8. **FROST cheater identification disabled.** `buildFrostPublicKeyPackage` passes empty verifying-shares maps; on aggregation failure `signAggregate` returns an empty `culprits` list. Acceptable given transport's authenticated `from`.
 
-9. **FROST cheater identification disabled.** `buildFrostPublicKeyPackage` passes empty verifying-shares maps; on aggregation failure `signAggregate` returns an empty `culprits` list. Acceptable given transport's authenticated `from`.
+9. **ML-DSA only signs raw bytes.** `/sign scheme='mldsa'` requires `protocol='raw'`. No protocol-level decoding for ML-DSA-outer-auth-over-OPNet-tx.
 
-10. **ML-DSA only signs raw bytes.** `/sign scheme='mldsa'` requires `protocol='raw'`. No protocol-level decoding for ML-DSA-outer-auth-over-OPNet-tx.
+10. **Keylink verify unthreaded.** `verifyAndDecodeFrostAnnounce` currently returns `{ok: true}` for `protocol: 'keylink'` — the hash inputs are DKG-derived so participants could recompute locally, but that requires threading DKG state into the verify function. Matches federation-trust posture (rogue leader can sign wrong bytes → OPNet contract calls fail at SDK capture time; DoS, not theft). Pluggable upgrade when a real threat model demands it.
 
 ## Things NOT to do
 
@@ -293,6 +322,9 @@ TOML for daemon runtime config. JSON for share files (Ötzi-compat). `DaemonConf
 - **Don't force-close the bootstrap master** (`closeAllConnections`) after completion — graceful `server.close()` lets in-flight responses flush.
 - **Don't rewrite relative imports in `src/wire/`** to add `.js` extensions.
 - **Don't register per-ceremony `servePulls` handlers** — `BlobServer` owns it daemon-wide.
+- **Don't send `announce-frost` without extras.** The wire is strict — parser rejects as null, `signFrostAsLeader`'s third arg is required. Use `makeDummyFrostKeylinkExtras()` for ceremony-mechanics tests that don't care about tx specifics.
+- **Don't run combined DKG with `spec.network` unset in production.** Share persists without `frostLegacySig` → OPNet contract calls against the vault fail at capture. Daemon wires it automatically; only `regtest` daemons intentionally skip (documented carve-out).
+- **Don't bloat the .deb past 2 MB.** The release workflow's size-regression guard fails the build. Root cause is almost always an upstream dep dragging `webpack`/`mongodb`/`typescript` into the runtime import graph — check `npx esbuild ... --metafile` and tree-shake.
 
 ## Quick commands
 

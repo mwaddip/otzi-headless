@@ -40,8 +40,16 @@ export async function persistCombinedDkgShare(args: PersistDkgShareArgs): Promis
     L,
     args.password,
   );
+  // `frostLegacySig` is piggy-backed on the V3 envelope as an extra top-level
+  // field — Ötzi's share-file decoder tolerates unknown keys, and our own
+  // load path (`config-merge`) reads it back via an intersection type. Kept
+  // outside `encryptShareV3`'s typed contract because the sig isn't part of
+  // the byte-compat V3 serialization; it's a daemon-side add-on.
+  const completeFileObj = args.result.frostLegacySig
+    ? { ...fileObj, frostLegacySig: toHex(args.result.frostLegacySig) }
+    : fileObj;
   await mkdir(dirname(args.path), { recursive: true });
-  await writeFile(args.path, JSON.stringify(fileObj, null, 2), { mode: 0o600 });
+  await writeFile(args.path, JSON.stringify(completeFileObj, null, 2), { mode: 0o600 });
   // Explicit chmod after write: belt-and-suspenders against umask interference
   // and against the case where the file already existed with looser perms.
   await chmod(args.path, 0o600);

@@ -20,62 +20,19 @@ export type CeremonyMessage =
       messageHex: string;        // bytes to sign, hex-encoded
       signers: PartyId[];        // active signer set
     }
-  /** Leader announcement of a FROST signing ceremony. Single attempt — FROST combine is deterministic. */
-  | {
-      v: 1;
-      kind: 'announce-frost';
-      ceremonyId: string;
-      baseCeremonyId: string;
-      sighashes: Array<{ hashHex: string; tweaked: boolean }>;
-      signers: PartyId[];
-      /**
-       * Protocol tag. Populated whenever the leader supplies enough context
-       * for participants to rebuild or verify (BTC construction params, or
-       * OPNet raw tx + inputs). Absent on ceremony-mechanics tests that use
-       * synthetic sighashes.
-       */
-      protocol?: 'btc' | 'opnet';
-      /**
-       * BTC vault construction parameters. Present iff `protocol='btc'`.
-       * Participants rebuild the tx locally from these + compare computed
-       * sighashes to the leader's `sighashes` field. Mismatch → silent drop
-       * (catches honest-leader bugs AND any leader asserting inconsistent
-       * sighashes vs construction params).
-       */
-      btcParams?: {
-        to: string;
-        amountSat: string;          // decimal, u64-safe
-        feeRate: number;
-        network: 'mainnet' | 'testnet';
-        frostP2tr: string;
-        frostUntweakedPubKeyHex: string;
-        utxos: Array<{
-          transactionId: string;
-          outputIndex: number;
-          valueSat: string;
-        }>;
-      };
-      /**
-       * Full unsigned tx hex (OPNet path — construction-params for OPNet is
-       * deferred until the SDK-level UTXO fetcher can be deterministically
-       * controlled). Present iff `protocol='opnet'`.
-       */
-      unsignedTxHex?: string;
-      /** OPNet per-input prevout info. Present iff `protocol='opnet'`. */
-      inputs?: Array<{ scriptHex: string; valueSat: string; tweaked: boolean }>;
-      /**
-       * Advisory hints for gate policy matching (OPNet). Operator-supplied on
-       * `/sign`, propagated here; unverified. Matches Ötzi's trust posture:
-       * federation-insider lies are out-of-scope (threshold protects key
-       * material; DoS is the worst insider outcome). Used for
-       * `allowed_contracts` / `allowed_methods` / amount-cap rules.
-       */
-      hints?: {
-        contractAddress?: string;
-        method?: string;
-        amountTokenAtomic?: string;
-      };
-    }
+  /**
+   * Leader announcement of a FROST signing ceremony. Single attempt — FROST
+   * combine is deterministic. The `protocol` discriminant is mandatory and
+   * selects which construction data accompanies the announce:
+   *
+   * - `'btc'`: `btcParams` — participants rebuild the tx and verify sighashes.
+   * - `'opnet'`: `unsignedTxHex` + `inputs` — participants re-extract sighashes.
+   * - `'keylink'`: `network` — participants sign the SDK key-link hash the
+   *   daemon produces as part of DKG finalization (see `computeKeyLinkHash`).
+   *   Currently unverified at the orchestrator (the inputs to the hash are
+   *   DKG-derived, so recomputation is possible; wire it when needed).
+   */
+  | AnnounceFrostMessage
   /**
    * Initiator announcement of an ML-DSA DKG ceremony. Symmetric: no leader,
    * no retry. Carries the setup parameters every peer needs to create a
@@ -183,31 +140,17 @@ export function parseCeremonyMessage(bytes: Uint8Array): CeremonyMessage | null 
       if (typeof item.hashHex !== 'string' || typeof item.tweaked !== 'boolean') return null;
       sighashes.push({ hashHex: item.hashHex, tweaked: item.tweaked });
     }
-    const out: Extract<CeremonyMessage, { kind: 'announce-frost' }> = {
-      v: 1,
-      kind: 'announce-frost',
+    const base = {
+      v: 1 as const,
+      kind: 'announce-frost' as const,
       ceremonyId: m.ceremonyId,
       baseCeremonyId: m.baseCeremonyId,
       sighashes,
       signers: m.signers as PartyId[],
     };
-    if (typeof m.unsignedTxHex === 'string') out.unsignedTxHex = m.unsignedTxHex;
-    if (m.protocol === 'btc' || m.protocol === 'opnet') out.protocol = m.protocol;
-    if (Array.isArray(m.inputs)) {
-      const inputs: Array<{ scriptHex: string; valueSat: string; tweaked: boolean }> = [];
-      for (const inp of m.inputs) {
-        if (!inp || typeof inp !== 'object') return null;
-        const item = inp as Record<string, unknown>;
-        if (
-          typeof item.scriptHex !== 'string' ||
-          typeof item.valueSat !== 'string' ||
-          typeof item.tweaked !== 'boolean'
-        ) return null;
-        inputs.push({ scriptHex: item.scriptHex, valueSat: item.valueSat, tweaked: item.tweaked });
-      }
-      out.inputs = inputs;
-    }
-    if (m.btcParams && typeof m.btcParams === 'object') {
+
+    if (m.protocol === 'btc') {
+      if (!m.btcParams || typeof m.btcParams !== 'object') return null;
       const bp = m.btcParams as Record<string, unknown>;
       if (
         typeof bp.to !== 'string' ||
@@ -233,25 +176,61 @@ export function parseCeremonyMessage(bytes: Uint8Array): CeremonyMessage | null 
           valueSat: item.valueSat,
         });
       }
-      out.btcParams = {
-        to: bp.to,
-        amountSat: bp.amountSat,
-        feeRate: bp.feeRate,
-        network: bp.network,
-        frostP2tr: bp.frostP2tr,
-        frostUntweakedPubKeyHex: bp.frostUntweakedPubKeyHex,
-        utxos,
+      return {
+        ...base,
+        protocol: 'btc',
+        btcParams: {
+          to: bp.to,
+          amountSat: bp.amountSat,
+          feeRate: bp.feeRate,
+          network: bp.network,
+          frostP2tr: bp.frostP2tr,
+          frostUntweakedPubKeyHex: bp.frostUntweakedPubKeyHex,
+          utxos,
+        },
       };
     }
-    if (m.hints && typeof m.hints === 'object') {
-      const h = m.hints as Record<string, unknown>;
-      const hints: { contractAddress?: string; method?: string; amountTokenAtomic?: string } = {};
-      if (typeof h.contractAddress === 'string') hints.contractAddress = h.contractAddress;
-      if (typeof h.method === 'string') hints.method = h.method;
-      if (typeof h.amountTokenAtomic === 'string') hints.amountTokenAtomic = h.amountTokenAtomic;
-      out.hints = hints;
+
+    if (m.protocol === 'opnet') {
+      if (typeof m.unsignedTxHex !== 'string' || !Array.isArray(m.inputs)) return null;
+      const inputs: Array<{ scriptHex: string; valueSat: string; tweaked: boolean }> = [];
+      for (const inp of m.inputs) {
+        if (!inp || typeof inp !== 'object') return null;
+        const item = inp as Record<string, unknown>;
+        if (
+          typeof item.scriptHex !== 'string' ||
+          typeof item.valueSat !== 'string' ||
+          typeof item.tweaked !== 'boolean'
+        ) return null;
+        inputs.push({ scriptHex: item.scriptHex, valueSat: item.valueSat, tweaked: item.tweaked });
+      }
+      const out: AnnounceFrostMessage = {
+        ...base,
+        protocol: 'opnet',
+        unsignedTxHex: m.unsignedTxHex,
+        inputs,
+      };
+      if (m.hints && typeof m.hints === 'object') {
+        const h = m.hints as Record<string, unknown>;
+        const hints: AnnounceHints = {};
+        if (typeof h.contractAddress === 'string') hints.contractAddress = h.contractAddress;
+        if (typeof h.method === 'string') hints.method = h.method;
+        if (typeof h.amountTokenAtomic === 'string') hints.amountTokenAtomic = h.amountTokenAtomic;
+        out.hints = hints;
+      }
+      return out;
     }
-    return out;
+
+    if (m.protocol === 'keylink') {
+      if (m.network !== 'mainnet' && m.network !== 'testnet') return null;
+      return {
+        ...base,
+        protocol: 'keylink',
+        network: m.network,
+      };
+    }
+
+    return null;
   }
   if (m.kind === 'announce-dkg') {
     if (
@@ -382,27 +361,71 @@ export interface AnnounceFrostOpnetExtras {
   hints?: AnnounceHints;
 }
 
-export type AnnounceFrostExtras = AnnounceFrostBtcExtras | AnnounceFrostOpnetExtras;
+/**
+ * Key-link signing — the FROST Schnorr sig over `computeKeyLinkHash(...)`
+ * that OPNet's SDK replays via `withFrostLegacySig` during contract-call
+ * construction against a V3 vault. The hash inputs (mldsaPubKey + both
+ * FROST pubkeys) are DKG-derived, so participants already hold them; the
+ * wire carries only `network` (the remaining input). Unverified at the
+ * orchestrator today — threading DKG state into the verify function is
+ * the trivially-pluggable upgrade.
+ */
+export interface AnnounceFrostKeylinkExtras {
+  protocol: 'keylink';
+  network: 'mainnet' | 'testnet';
+}
+
+export type AnnounceFrostExtras =
+  | AnnounceFrostBtcExtras
+  | AnnounceFrostOpnetExtras
+  | AnnounceFrostKeylinkExtras;
+
+/**
+ * Wire shape of an `announce-frost` message — the common header intersected
+ * with one of the three `AnnounceFrostExtras` variants. The extras variant
+ * is MANDATORY: every production signing path carries construction data.
+ * Tests that only exercise ceremony mechanics use `makeDummyFrostKeylinkExtras`.
+ */
+export type AnnounceFrostMessage = {
+  v: 1;
+  kind: 'announce-frost';
+  ceremonyId: string;
+  baseCeremonyId: string;
+  sighashes: Array<{ hashHex: string; tweaked: boolean }>;
+  signers: PartyId[];
+} & AnnounceFrostExtras;
+
+/**
+ * Dummy extras for ceremony-mechanics tests that don't care about tx
+ * specifics — produces a `keylink` variant, which is unverified at the
+ * orchestrator. Production code never calls this.
+ */
+export function makeDummyFrostKeylinkExtras(
+  network: 'mainnet' | 'testnet' = 'testnet',
+): AnnounceFrostKeylinkExtras {
+  return { protocol: 'keylink', network };
+}
 
 export function announceFrostMessage(
   ceremonyId: string,
   baseCeremonyId: string,
   sighashes: ReadonlyArray<{ hash: Uint8Array; tweaked: boolean }>,
   signers: PartyId[],
-  extras?: AnnounceFrostExtras,
+  extras: AnnounceFrostExtras,
 ): CeremonyMessage {
-  const msg: Extract<CeremonyMessage, { kind: 'announce-frost' }> = {
-    v: 1,
-    kind: 'announce-frost',
+  const base = {
+    v: 1 as const,
+    kind: 'announce-frost' as const,
     ceremonyId,
     baseCeremonyId,
-    sighashes: sighashes.map(s => ({ hashHex: toHex(s.hash), tweaked: s.tweaked })),
-    signers,
+    sighashes: sighashes.map((s) => ({ hashHex: toHex(s.hash), tweaked: s.tweaked })),
+    signers: [...signers],
   };
-  if (extras) {
-    msg.protocol = extras.protocol;
-    if (extras.protocol === 'btc') {
-      msg.btcParams = {
+  if (extras.protocol === 'btc') {
+    return {
+      ...base,
+      protocol: 'btc',
+      btcParams: {
         to: extras.btcParams.to,
         amountSat: extras.btcParams.amountSat,
         feeRate: extras.btcParams.feeRate,
@@ -414,24 +437,34 @@ export function announceFrostMessage(
           outputIndex: u.outputIndex,
           valueSat: u.valueSat,
         })),
-      };
-    } else {
-      msg.unsignedTxHex = extras.unsignedTxHex;
-      msg.inputs = extras.inputs.map((inp) => ({
+      },
+    };
+  }
+  if (extras.protocol === 'opnet') {
+    const msg: AnnounceFrostMessage = {
+      ...base,
+      protocol: 'opnet',
+      unsignedTxHex: extras.unsignedTxHex,
+      inputs: extras.inputs.map((inp) => ({
         scriptHex: inp.scriptHex,
         valueSat: inp.valueSat,
         tweaked: inp.tweaked,
-      }));
-      if (extras.hints) {
-        const h: AnnounceHints = {};
-        if (extras.hints.contractAddress !== undefined) h.contractAddress = extras.hints.contractAddress;
-        if (extras.hints.method !== undefined) h.method = extras.hints.method;
-        if (extras.hints.amountTokenAtomic !== undefined) h.amountTokenAtomic = extras.hints.amountTokenAtomic;
-        msg.hints = h;
-      }
+      })),
+    };
+    if (extras.hints) {
+      const h: AnnounceHints = {};
+      if (extras.hints.contractAddress !== undefined) h.contractAddress = extras.hints.contractAddress;
+      if (extras.hints.method !== undefined) h.method = extras.hints.method;
+      if (extras.hints.amountTokenAtomic !== undefined) h.amountTokenAtomic = extras.hints.amountTokenAtomic;
+      msg.hints = h;
     }
+    return msg;
   }
-  return msg;
+  return {
+    ...base,
+    protocol: 'keylink',
+    network: extras.network,
+  };
 }
 
 export function announceDkgMessage(

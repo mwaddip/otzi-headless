@@ -25,6 +25,7 @@ import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
 import { createGate } from '../gate/factory';
 import type { ApprovalGate } from '../gate/types';
+import type { NetworkName as NodeNetworkName } from '../node/types';
 import { Orchestrator } from '../orchestrator/orchestrator';
 import {
   NOOP_LOGGER,
@@ -84,6 +85,15 @@ export class Daemon {
     const runner = new CeremonyRunner(deps.transport, this.store, puller);
     const gate: ApprovalGate = createGate(deps.state.config.gate);
 
+    // `node/types.NetworkName` is narrower than `config/types.NetworkName`:
+    // key-link only supports mainnet + testnet (chain-ID bound). Regtest
+    // daemons still do DKG but skip the key-link phase; operators can't
+    // use such vaults for OPNet contract calls, which matches regtest's
+    // dev-only posture.
+    const configNetwork = deps.state.config.network.name;
+    const keylinkNetwork: NodeNetworkName | undefined =
+      configNetwork === 'regtest' ? undefined : configNetwork;
+
     this.orchestrator = new Orchestrator({
       transport: deps.transport,
       runner,
@@ -96,6 +106,7 @@ export class Daemon {
       rng: deps.rng,
       pullOpts: deps.pullOpts,
       ceremonyDeadlines: deps.state.config.deadlines,
+      network: keylinkNetwork,
       persistDkgShare: deps.state.persistDkgShare,
       logger: this.log,
     });
@@ -110,6 +121,7 @@ export class Daemon {
       frostPublicKeyPackage: deps.frostPublicKeyPackage ?? deps.state.frostPublicKeyPackage,
       rng: deps.rng,
       pullOpts: deps.pullOpts,
+      network: keylinkNetwork,
       persistDkgShare: deps.state.persistDkgShare,
       logger: this.log,
     });

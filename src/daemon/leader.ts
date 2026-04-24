@@ -45,6 +45,13 @@ export interface LeaderDeps {
   rng: Rng;
   pullOpts: PullOpts;
   /**
+   * When set, combined DKG runs the key-link FROST sign phase (producing
+   * `frostLegacySig` on every peer) before persistence. Undefined (e.g.
+   * regtest daemons) skips key-link — OPNet contract calls then won't work
+   * against the resulting vault, but other ceremonies are unaffected.
+   */
+  network?: NetworkName;
+  /**
    * Persists this party's combined-DKG result after the protocol completes.
    * Errors propagate to the caller (HTTP 500) — leader stops short of
    * returning success when its own share didn't make it to disk.
@@ -171,6 +178,7 @@ export class LeaderDispatcher {
         parties: req.parties,
         level: req.level,
         rng: this.deps.rng,
+        ...(this.deps.network ? { network: this.deps.network } : {}),
       },
       this.deps.pullOpts,
     );

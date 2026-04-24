@@ -440,6 +440,7 @@ export class Orchestrator {
       parties: announce.parties,
       level: announce.level,
       rng: this.deps.rng,
+      ...(this.deps.network ? { network: this.deps.network } : {}),
     };
     const sessionId = sessionIdFromAnnounceCombinedDkg(announce);
     const task = this.deps.runner
@@ -618,7 +619,7 @@ function verifyAndDecodeFrostAnnounce(
 ): FrostVerifyOutcome {
   const { sighashes } = announce;
 
-  if (announce.btcParams) {
+  if (announce.protocol === 'btc') {
     const bp = announce.btcParams;
     let rebuilt;
     try {
@@ -657,7 +658,7 @@ function verifyAndDecodeFrostAnnounce(
     return { ok: true, btcOutputs: rebuilt.outputs, btcFrostP2tr: bp.frostP2tr };
   }
 
-  if (announce.unsignedTxHex !== undefined && announce.inputs !== undefined) {
+  if (announce.protocol === 'opnet') {
     const { unsignedTxHex, inputs } = announce;
     if (inputs.length !== sighashes.length) {
       return {
@@ -684,5 +685,10 @@ function verifyAndDecodeFrostAnnounce(
     return { ok: true };
   }
 
+  // keylink — unverified at the orchestrator. The hash inputs (mldsaPubKey,
+  // frostTweakedPubKey, frostUntweakedPubKey, network) are DKG-derived; a
+  // verify step would need DKG state threaded in. Matches OPNet hints: rogue
+  // insider's worst case is DoS (signs wrong bytes → future contract calls
+  // fail because the SDK recomputes the real hash).
   return { ok: true };
 }

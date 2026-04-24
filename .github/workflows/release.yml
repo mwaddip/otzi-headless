@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Verify tag matches package.json
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "error: tag ${GITHUB_REF_NAME} does not match package.json version ${PKG_VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npx vitest run
+
+      - name: Build .deb
+        run: npm run build:deb
+
+      - name: Regression guard — .deb size
+        run: |
+          DEB=$(ls -1 dist/otzi-headless_*.deb | head -1)
+          SIZE=$(stat -c%s "$DEB")
+          # 553 KB is the known floor; anything >2 MB means the esbuild bundle regressed
+          # (e.g. a new runtime dep started leaking webpack/mongodb/etc. again).
+          if [ "$SIZE" -gt 2097152 ]; then
+            echo "error: $DEB is ${SIZE} bytes (>2 MB); bundle regressed?" >&2
+            exit 1
+          fi
+          echo "OK: $DEB is ${SIZE} bytes"
+
+      - name: Container smoke test
+        run: bash scripts/test-deb-container.sh
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DEB=$(ls -1 dist/otzi-headless_*.deb | head -1)
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "otzi-headless ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "$DEB"

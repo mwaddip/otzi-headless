@@ -21,7 +21,7 @@ import { BlobStore } from './blob-store';
 import { BlobServer } from './blob-server';
 import { BlobPuller, type PullOpts } from './blob-puller';
 import { CeremonyRunner, type SigningSpec, type FrostSigningSpec, type MldsaDkgSpec, type FrostDkgSpec, type CombinedDkgSpec, type CombinedDkgResult } from './ceremony-runner';
-import { parseCeremonyMessage, sighashesFromAnnounceFrost, sessionIdFromAnnounceDkg, sessionIdFromAnnounceFrostDkg, sessionIdFromAnnounceCombinedDkg } from './ceremony-messages';
+import { parseCeremonyMessage, sighashesFromAnnounceFrost, sessionIdFromAnnounceDkg, sessionIdFromAnnounceFrostDkg, sessionIdFromAnnounceCombinedDkg, makeDummyFrostKeylinkExtras } from './ceremony-messages';
 import type { DKGResult } from '@btc-vision/post-quantum/threshold-ml-dsa.js';
 import { computeKeyLinkHash } from '../node/frost-link';
 import type { NetworkName } from '../node/types';
@@ -469,6 +469,7 @@ describe('CeremonyRunner — FROST signing (asymmetric: leader + participants)',
           rng: SYSTEM_RNG,
         },
         FAST_PULL_OPTS,
+        makeDummyFrostKeylinkExtras(),
       );
       expect(sigs).toHaveLength(2);
       for (const sig of sigs) expect(sig.length).toBe(64);
@@ -518,6 +519,7 @@ describe('CeremonyRunner — FROST signing (asymmetric: leader + participants)',
           rng: SYSTEM_RNG,
         },
         FAST_PULL_OPTS,
+        makeDummyFrostKeylinkExtras(),
       );
       expect(verifySignature(sigs[0]!, sighashes[0]!.hash, publicKeyPackage.verifyingKey)).toBe(true);
 
@@ -547,6 +549,7 @@ describe('CeremonyRunner — FROST signing (asymmetric: leader + participants)',
             rng: SYSTEM_RNG,
           },
           FAST_PULL_OPTS,
+          makeDummyFrostKeylinkExtras(),
         ),
       ).rejects.toThrow(/not in the active signer set/);
     } finally {
@@ -604,6 +607,7 @@ describe('CeremonyRunner — FROST signing (asymmetric: leader + participants)',
             rng: SYSTEM_RNG,
           },
           { maxAttempts: 3, initialDelayMs: 2, maxDelayMs: 5, deadlineMs: 30 },
+          makeDummyFrostKeylinkExtras(),
         ),
       ).rejects.toThrow(/FROST signing aborted/);
 
@@ -887,6 +891,7 @@ describe('CeremonyRunner — FROST DKG (symmetric)', () => {
           rng: SYSTEM_RNG,
         },
         FAST_PULL_OPTS,
+        makeDummyFrostKeylinkExtras(),
       );
       await ctx.get(0)!.runner.sendFrostSigningDoneSignoff(signBaseId, sigs);
       const signResult = await signingParticipant;
@@ -911,6 +916,7 @@ function orchestrateCombinedDkgParticipant(
   baseCeremonyId: string,
   opts: PullOpts,
   timeoutMs: number,
+  network?: NetworkName,
 ): Promise<{ status: 'done' | 'aborted' | 'timeout'; result?: CombinedDkgResult }> {
   return new Promise((resolve) => {
     let initiatorId: PartyId | null = null;
@@ -943,6 +949,7 @@ function orchestrateCombinedDkgParticipant(
           parties: msg.parties,
           level: msg.level,
           rng: SYSTEM_RNG,
+          ...(network ? { network } : {}),
         };
         inflight = ctx.runner.participateInCombinedDkg(spec, sessionId, opts).then(
           (r) => {
@@ -996,6 +1003,56 @@ describe('CeremonyRunner — Combined DKG (ML-DSA + FROST, one sessionId)', () =
           toHex(initResult.frost.publicKeyPackage.verifyingKey),
         );
       }
+
+      // No network supplied → key-link phase skipped; frostLegacySig stays undefined.
+      expect(initResult.frostLegacySig).toBeUndefined();
+      for (const pr of partResults) expect(pr.result!.frostLegacySig).toBeUndefined();
+    } finally {
+      close();
+    }
+  }, 240_000);
+
+  it('network=testnet: key-link phase produces matching frostLegacySig on every peer (BIP340 verifies under tweaked key)', async () => {
+    const { ctx, close } = buildRing([0, 1, 2]);
+    const baseId = 'combined-dkg-keylink-1';
+    const spec: CombinedDkgSpec = {
+      ceremonyId: baseId,
+      threshold: 2,
+      parties: 3,
+      level: 44,
+      rng: SYSTEM_RNG,
+      network: 'testnet',
+    };
+
+    try {
+      const participants = [1, 2].map(id =>
+        orchestrateCombinedDkgParticipant(ctx.get(id)!, baseId, DKG_PULL_OPTS, 180_000, 'testnet'),
+      );
+
+      const initResult = await ctx.get(0)!.runner.runCombinedDkg(spec, DKG_PULL_OPTS);
+      const partResults = await Promise.all(participants);
+
+      // Every peer exited with a sig and they all match (n-of-n → deterministic).
+      expect(initResult.frostLegacySig).toBeDefined();
+      const sigHex = toHex(initResult.frostLegacySig!);
+      for (const pr of partResults) {
+        expect(pr.status).toBe('done');
+        expect(pr.result!.frostLegacySig).toBeDefined();
+        expect(toHex(pr.result!.frostLegacySig!)).toBe(sigHex);
+      }
+
+      // The sig commits to `computeKeyLinkHash(mldsaPub, tweakedFrostPub, untweakedFrostPub, 'testnet')`
+      // and verifies under the tweaked group key — matches what the OPNet SDK
+      // expects when it replays via `withFrostLegacySig`.
+      const keyLinkHash = computeKeyLinkHash(
+        initResult.mldsa.publicKey,
+        initResult.frost.publicKeyPackage.verifyingKey,
+        initResult.frost.publicKeyPackage.untweakedVerifyingKey,
+        'testnet',
+      );
+      expect(
+        verifySignature(initResult.frostLegacySig!, keyLinkHash, initResult.frost.publicKeyPackage.verifyingKey),
+      ).toBe(true);
     } finally {
       close();
     }
@@ -1077,6 +1134,7 @@ describe('Integration — combined DKG → key-link FROST signing (2.5c)', () =>
           rng: SYSTEM_RNG,
         },
         FAST_PULL_OPTS,
+        { protocol: 'keylink', network: 'testnet' },
       );
       await ctx.get(0)!.runner.sendFrostSigningDoneSignoff(keylinkBaseId, sigs);
 

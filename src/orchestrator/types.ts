@@ -22,6 +22,7 @@ import type { CeremonyRunner, CombinedDkgResult } from '../core/ceremony-runner'
 import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
 import type { ApprovalGate } from '../gate/types';
+import type { NetworkName } from '../node/types';
 import type { DecryptedShare } from '../wire/share-crypto';
 
 export type OrchestratorCeremonyKind =
@@ -126,6 +127,13 @@ export interface OrchestratorDeps {
   pullOpts: PullOpts;
   /** Ceremony-wide safety-net deadlines (from `DaemonConfig.deadlines`). */
   ceremonyDeadlines: { signingMs: number; dkgMs: number };
+  /**
+   * Populated from `DaemonConfig.network.name` when the daemon is configured
+   * for mainnet or testnet. Participant-side combined DKG includes the
+   * key-link FROST sign phase iff this is set, mirroring the leader-side
+   * behavior and producing `frostLegacySig` locally.
+   */
+  network?: NetworkName;
   /**
    * Persists this party's combined-DKG result after participation settles.
    * Errors are logged but do NOT abort the ceremony — DKG itself succeeded

@@ -15,6 +15,12 @@ import type { BlobKey, PartyId } from './types';
 import type { Transport } from './transport';
 import type { BlobStore } from './blob-store';
 import type { BlobPuller, PullOpts } from './blob-puller';
+// Cross-module import (core → node) for the key-link hash computation. Lives
+// in `node/frost-link.ts` because the hash format is OPNet SDK-specific; this
+// is the one place where the ceremony runner needs OPNet-awareness to close
+// the V3-vault signing loop.
+import { computeKeyLinkHash } from '../node/frost-link';
+import type { NetworkName } from '../node/types';
 import {
   announceMessage,
   announceFrostMessage,
@@ -73,6 +79,9 @@ const ROUND_MLDSA_R3 = 'mldsa-r3';
 
 const ROUND_FROST_R1 = 'frost-sign-r1';
 const ROUND_FROST_R2 = 'frost-sign-r2';
+
+const ROUND_FROST_KEYLINK_R1 = 'frost-keylink-r1';
+const ROUND_FROST_KEYLINK_R2 = 'frost-keylink-r2';
 
 const ROUND_MLDSA_DKG_P1 = 'mldsa-dkg-p1';
 const ROUND_MLDSA_DKG_P2_PUB = 'mldsa-dkg-p2-pub';
@@ -154,11 +163,21 @@ export interface CombinedDkgSpec {
   level: number;
   /** Randomness source for FROST DKG. */
   rng: Rng;
+  /**
+   * When set, a final n-of-n FROST sign over `computeKeyLinkHash(...)` runs
+   * after the two DKG phases — produces the `frostLegacySig` that OPNet's
+   * SDK replays during contract calls against a V3 vault (via
+   * `withFrostLegacySig`). Omit (or leave undefined) to skip the key-link
+   * phase — e.g. for regtest daemons where the OPNet chain ID isn't fixed.
+   */
+  network?: NetworkName;
 }
 
 export interface CombinedDkgResult {
   mldsa: DKGResult;
   frost: { keyPackage: KeyPackage; publicKeyPackage: PublicKeyPackage };
+  /** BIP340 FROST sig over `computeKeyLinkHash(...)`. Present iff `spec.network` was set. */
+  frostLegacySig?: Uint8Array;
 }
 
 /**
@@ -276,7 +295,7 @@ export class CeremonyRunner {
   async signFrostAsLeader(
     spec: FrostSigningSpec,
     opts: PullOpts,
-    announceExtras?: AnnounceFrostExtras,
+    announceExtras: AnnounceFrostExtras,
   ): Promise<Uint8Array[]> {
     const me = this.transport.partyId;
     if (!spec.signers.includes(me)) {
@@ -850,6 +869,66 @@ export class CeremonyRunner {
       sessionId,
       opts,
     );
-    return { mldsa, frost };
+    const result: CombinedDkgResult = { mldsa, frost };
+    if (spec.network !== undefined) {
+      result.frostLegacySig = await this.runKeylinkSignProtocol(spec, result, opts, spec.network);
+    }
+    return result;
+  }
+
+  /**
+   * n-of-n FROST sign over `computeKeyLinkHash(...)` — runs after the two
+   * combined-DKG phases so every peer exits with `frostLegacySig` in hand
+   * (each party pulls R1/R2 from the rest and runs `aggregate` locally,
+   * same deterministic-output shape as DKG itself).
+   *
+   * The produced sig is what OPNet's SDK replays via `withFrostLegacySig`
+   * during V3-vault contract calls; without it, `opnet-capture` falls
+   * through to the wallet's wrong key and the tx is rejected on-chain.
+   */
+  private async runKeylinkSignProtocol(
+    spec: CombinedDkgSpec,
+    dkg: CombinedDkgResult,
+    opts: PullOpts,
+    network: NetworkName,
+  ): Promise<Uint8Array> {
+    const keyLinkHash = computeKeyLinkHash(
+      dkg.mldsa.publicKey,
+      dkg.frost.keyPackage.verifyingKey,
+      dkg.frost.keyPackage.untweakedVerifyingKey,
+      network,
+    );
+    const sighashes: FrostSighash[] = [{ hash: keyLinkHash, tweaked: true }];
+    const signers: PartyId[] = Array.from({ length: spec.parties }, (_, i) => i);
+    const frostSpec: FrostSigningSpec = {
+      ceremonyId: spec.ceremonyId,
+      sighashes,
+      signers,
+      keyPackage: dkg.frost.keyPackage,
+      publicKeyPackage: dkg.frost.publicKeyPackage,
+      rng: spec.rng,
+    };
+    const session = createFrostSession({
+      partyId: this.transport.partyId,
+      keyPackage: dkg.frost.keyPackage,
+      publicKeyPackage: dkg.frost.publicKeyPackage,
+      sighashes,
+      activeSigners: signers,
+      rng: spec.rng,
+      ceremonyId: spec.ceremonyId,
+    });
+    try {
+      this.produceOwnFrost(session, frostRound1, ROUND_FROST_KEYLINK_R1, frostSpec);
+      await this.pullAndAddFromOthersFrost(session, ROUND_FROST_KEYLINK_R1, frostSpec, opts, 1);
+      this.produceOwnFrost(session, frostRound2, ROUND_FROST_KEYLINK_R2, frostSpec);
+      await this.pullAndAddFromOthersFrost(session, ROUND_FROST_KEYLINK_R2, frostSpec, opts, 2);
+      const sigs = frostAggregate(session);
+      if (sigs.length !== 1) {
+        throw new Error(`keylink sign: expected 1 signature, got ${sigs.length}`);
+      }
+      return sigs[0]!;
+    } finally {
+      destroyFrostSession(session);
+    }
   }
 }

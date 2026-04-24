@@ -35,7 +35,6 @@ import { getContract, OP_20_ABI } from 'opnet';
 import { verifySignature, type Rng } from '@mwaddip/frots';
 import { schnorr } from '@noble/curves/secp256k1.js';
 import { getProvider, getNetwork, generateWallet } from '../src/node/opnet-client';
-import { computeKeyLinkHash } from '../src/node/frost-link';
 import { createInMemoryRing } from '../src/core/in-memory-transport';
 import { BlobStore } from '../src/core/blob-store';
 import { BlobServer } from '../src/core/blob-server';
@@ -45,6 +44,7 @@ import {
   parseCeremonyMessage,
   sessionIdFromAnnounceCombinedDkg,
   sighashesFromAnnounceFrost,
+  makeDummyFrostKeylinkExtras,
 } from '../src/core/ceremony-messages';
 import type { PartyId } from '../src/core/types';
 import type { Transport } from '../src/core/transport';
@@ -178,6 +178,7 @@ function orchestrateCombinedDkgParticipant(
           parties: msg.parties,
           level: msg.level,
           rng: SYSTEM_RNG,
+          network: 'testnet',
         };
         ctx.runner.participateInCombinedDkg(spec, sessionId, DKG_PULL_OPTS).then(
           (r) => {
@@ -215,7 +216,7 @@ interface DkgBundle {
 }
 
 async function phaseB(): Promise<DkgBundle> {
-  console.log('\n=== PHASE B — in-process combined DKG + key-link sign (3 peers, t=2) ===\n');
+  console.log('\n=== PHASE B — in-process combined DKG (3 peers, t=2, key-link inline) ===\n');
   const { ctx, close } = buildRing([0, 1, 2]);
   const baseId = 'testnet-e2e-dkg';
 
@@ -223,14 +224,14 @@ async function phaseB(): Promise<DkgBundle> {
   const p2 = orchestrateCombinedDkgParticipant(ctx.get(2)!, baseId);
   const t0 = Date.now();
   const initResult = await ctx.get(0)!.runner.runCombinedDkg(
-    { ceremonyId: baseId, threshold: 2, parties: 3, level: 44, rng: SYSTEM_RNG },
+    { ceremonyId: baseId, threshold: 2, parties: 3, level: 44, rng: SYSTEM_RNG, network: 'testnet' },
     DKG_PULL_OPTS,
   );
   const [r1, r2] = await Promise.all([p1, p2]);
   const elapsed = Date.now() - t0;
   const results = [initResult, r1, r2];
 
-  console.log(`DKG completed in ${elapsed}ms`);
+  console.log(`DKG (incl. key-link) completed in ${elapsed}ms`);
   console.log(`  ML-DSA pubkey (len ${initResult.mldsa.publicKey.length}): ${hex(initResult.mldsa.publicKey).slice(0, 32)}…`);
   console.log(`  FROST verifyingKey (tweaked):    ${hex(initResult.frost.publicKeyPackage.verifyingKey)}`);
   console.log(`  FROST untweakedVerifyingKey:     ${hex(initResult.frost.publicKeyPackage.untweakedVerifyingKey)}`);
@@ -251,30 +252,10 @@ async function phaseB(): Promise<DkgBundle> {
   const vaultAddress = Address.fromString(mldsaPubKeyHex, hex(tweakedSec1));
   console.log(`  Vault Address (OPNet):           ${vaultAddress}`);
 
-  // Key-link sign — produces the BIP340 sig that Ötzi V3 shares bundle as
-  // frostLegacySig. Signers=[0,1], tweaked=true.
-  const keylinkBaseId = 'testnet-e2e-keylink';
-  const keyLinkHash = computeKeyLinkHash(
-    initResult.mldsa.publicKey,
-    initResult.frost.publicKeyPackage.verifyingKey,
-    initResult.frost.publicKeyPackage.untweakedVerifyingKey,
-    'testnet',
-  );
-  const keylinkP1 = orchestrateFrostParticipant(ctx.get(1)!, keylinkBaseId, results, 1);
-  const keylinkSigs = await ctx.get(0)!.runner.signFrostAsLeader(
-    {
-      ceremonyId: keylinkBaseId,
-      sighashes: [{ hash: keyLinkHash, tweaked: true }],
-      signers: [0, 1],
-      keyPackage: initResult.frost.keyPackage,
-      publicKeyPackage: initResult.frost.publicKeyPackage,
-      rng: SYSTEM_RNG,
-    },
-    FAST_PULL_OPTS,
-  );
-  await ctx.get(0)!.runner.sendFrostSigningDoneSignoff(keylinkBaseId, keylinkSigs);
-  await keylinkP1;
-  const frostLegacySig = keylinkSigs[0]!;
+  // key-link FROST sig is produced inline as part of `runCombinedDkg` (all peers
+  // run the n-of-n aggregate locally). Just read it off the result.
+  if (!initResult.frostLegacySig) throw new Error('phaseB: expected frostLegacySig on combined DKG result');
+  const frostLegacySig = initResult.frostLegacySig;
   console.log(`  frostLegacySig: ${hex(frostLegacySig).slice(0, 32)}…`);
 
   // Wrap ML-DSA shares into DecryptedShare form for signAsLeader / participateInSigning.
@@ -366,6 +347,7 @@ async function phaseC(dkg: DkgBundle): Promise<void> {
         rng: SYSTEM_RNG,
       },
       FAST_PULL_OPTS,
+      makeDummyFrostKeylinkExtras(),
     );
     await ctx.get(0)!.runner.sendFrostSigningDoneSignoff(baseId, sigs);
     await participant;
@@ -525,6 +507,8 @@ async function runFrostCeremony(
 ): Promise<Uint8Array[]> {
   const baseId = `${ceremonyIdPrefix}-${Date.now()}`;
   const part1 = orchestrateFrostParticipant(dkg.ctx.get(1)!, baseId, dkg.results, 1);
+  // Participants here bypass the Orchestrator (direct `participateInFrostSigning`),
+  // so announce extras are parsed but not verified. Dummy keylink satisfies the wire.
   const sigs = await dkg.ctx.get(0)!.runner.signFrostAsLeader(
     {
       ceremonyId: baseId,
@@ -535,6 +519,7 @@ async function runFrostCeremony(
       rng: SYSTEM_RNG,
     },
     FAST_PULL_OPTS,
+    makeDummyFrostKeylinkExtras(),
   );
   await dkg.ctx.get(0)!.runner.sendFrostSigningDoneSignoff(baseId, sigs);
   await part1;

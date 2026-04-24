@@ -28,6 +28,7 @@ import { BlobStore } from '../core/blob-store';
 import {
   announceFrostMessage,
   encodeCeremonyMessage,
+  makeDummyFrostKeylinkExtras,
 } from '../core/ceremony-messages';
 import { CeremonyRunner } from '../core/ceremony-runner';
 import { createInMemoryRing } from '../core/in-memory-transport';
@@ -302,6 +303,7 @@ describe('Orchestrator — FROST signing', () => {
           rng: SYSTEM_RNG,
         },
         FAST_PULL_OPTS,
+        makeDummyFrostKeylinkExtras(),
       );
       await ctx.get(0)!.runner.sendFrostSigningDoneSignoff(baseId, sigs);
 
@@ -686,6 +688,7 @@ describe('Orchestrator — FROST signing', () => {
             rng: SYSTEM_RNG,
           },
           { maxAttempts: 2, initialDelayMs: 2, maxDelayMs: 5, deadlineMs: 30 },
+          makeDummyFrostKeylinkExtras(),
         ),
       ).rejects.toThrow();
     } finally {
