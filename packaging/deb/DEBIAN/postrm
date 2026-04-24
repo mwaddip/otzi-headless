@@ -1,0 +1,37 @@
+#!/bin/sh
+set -e
+
+. /usr/share/debconf/confmodule 2>/dev/null || true
+
+# Systemd cleanup runs on both remove and purge.
+if [ -d /run/systemd/system ]; then
+  case "$1" in
+    purge|remove)
+      deb-systemd-helper purge otzi.service >/dev/null 2>&1 || true
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+  esac
+fi
+
+case "$1" in
+  purge)
+    # Purge wipes the rendered config AND the threshold share. Operators
+    # who want to keep the share must back up /var/lib/otzi before purging
+    # (or use `dpkg -r` instead of `dpkg --purge`).
+    rm -rf /etc/otzi
+    rm -rf /var/lib/otzi
+
+    if getent passwd otzi >/dev/null 2>&1; then
+      deluser --quiet --system otzi >/dev/null 2>&1 || true
+    fi
+    if getent group otzi >/dev/null 2>&1; then
+      delgroup --quiet --system otzi >/dev/null 2>&1 || true
+    fi
+
+    if command -v db_purge >/dev/null 2>&1; then
+      db_purge || true
+    fi
+    ;;
+esac
+
+exit 0
