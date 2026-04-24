@@ -5,7 +5,10 @@
  * in response to external signals:
  *   - HTTP/IPC: operator POSTs JSON to a local endpoint.
  *   - Cron: wall-clock schedule fires a named job.
- *   - Chain-watcher (phase 6+): chain subscription fires on specific events.
+ *
+ * Chain-watching is intentionally out of scope — the daemon is a signing
+ * backend, not an autonomous chain observer. Operator infrastructure that
+ * needs an event-driven flow watches the chain itself and POSTs `/sign`.
  *
  * Triggers themselves do NOT know about ceremonies, shares, or the gate. They
  * deliver typed events to caller-supplied handlers. The daemon entrypoint

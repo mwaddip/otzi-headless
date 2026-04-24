@@ -22,7 +22,7 @@ Last updated: 2026-04-24 (Per-node policy primitives landed. `/sign` API flipped
 | 5a | `DaemonConfig` types + TOML parser. `[share]` / `[node]` / `[transport]` / `[[peers]]` / `[gate]` / `[deadlines]` / `[[triggers]]`. | ✅ Done. |
 | 5b | Approval gate — `ApprovalGate` interface + `AutoGate` + `PolicyGate` (strict-by-default). `createGate(config)` factory. | ✅ Done. |
 | 5c | Participant orchestrator — `Orchestrator` class. Leader-auth on announce + signoff. Gate decision cached across ML-DSA retries. Ceremony-deadline safety-net timeout. | ✅ Done. |
-| 5d | Triggers — `HttpTrigger` on `node:http` (host:port bind, Bearer auth) + `CronTrigger` on `croner`. Chain-watcher deferred. | ✅ Done. |
+| 5d | Triggers — `HttpTrigger` on `node:http` (host:port bind, Bearer auth) + `CronTrigger` on `croner`. (Chain watching is out of scope — daemon is a signing backend, not a watcher.) | ✅ Done. |
 | 5e | Daemon entrypoint — `Daemon` composition root; `LeaderDispatcher`; default HTTP handler; `config-merge.ts`; CLI `main(argv)` in `entrypoint.ts`. | ✅ Done. |
 | 5f | DKG persistence + no-share startup — `share-write.ts` (V3 byte-compat) + `share-persistence.ts` (chmod 600 + mkdir). `validateLoaded` handles `ENOENT` (DKG-only mode). CLI `otzi generate`. | ✅ Done. |
 | 5g | FROST `PublicKeyPackage` from persisted share — `frost-reconstruct.ts::buildFrostPublicKeyPackage(kp)` empty-maps PKG; integration test: no-share → DKG → restart → FROST sign + BIP340 verify. | ✅ Done. |
@@ -221,23 +221,21 @@ TOML for daemon runtime config. JSON for share files (Ötzi-compat). `DaemonConf
 
 2. **OPNet construction-params.** Currently deferred. Needs SDK-level control of UTXO fetching — `captureOpnetSighashes` uses the higher-level `contract.<method>().sendTransaction()` path which internally queries the provider. Making OPNet deterministic requires monkey-patching `utxoManager.getUTXOs` similarly to how we monkey-patch `sendRawTransaction`.
 
-3. **Chain-watcher trigger (phase 5d deferral).** `kind: "chain-watcher"` isn't implemented; `Daemon` constructor throws if config contains one. Needs OPNet subscription plumbing — unclear design space until there's a concrete use case.
+3. **Ring-rotation not implemented.** Once bootstrap is done, the ring is fixed. Adding/removing peers requires re-running bootstrap from scratch. Documented UX limitation; acceptable for stable federations.
 
-4. **Ring-rotation not implemented.** Once bootstrap is done, the ring is fixed. Adding/removing peers requires re-running bootstrap from scratch. Documented UX limitation; acceptable for stable federations.
+4. **Relay reconnect not implemented.** If the relay drops the WebSocket, daemons fail open — operator restart required.
 
-5. **Relay reconnect not implemented.** If the relay drops the WebSocket, daemons fail open — operator restart required.
+5. **ML-DSA DKG phase-3 expected-senders** — pull from every distinct generator (not just own bitmasks) else `dkgPhase4` throws. Handled in `phase3ExpectedSenders`.
 
-6. **ML-DSA DKG phase-3 expected-senders** — pull from every distinct generator (not just own bitmasks) else `dkgPhase4` throws. Handled in `phase3ExpectedSenders`.
+6. **`#N` retry suffix** requires `ceremonyId` to NOT contain `#`. Tighten with a check if ceremonyIds ever come from untrusted sources.
 
-7. **`#N` retry suffix** requires `ceremonyId` to NOT contain `#`. Tighten with a check if ceremonyIds ever come from untrusted sources.
+7. **Engine warnings on npm install.** `opnet@1.8.13` + some `@btc-vision/*` want Node 24+; we're on 22.19.
 
-8. **Engine warnings on npm install.** `opnet@1.8.13` + some `@btc-vision/*` want Node 24+; we're on 22.19.
+8. **Combine attempt cap.** `signAsLeader`'s `maxCombineAttempts` default is 50 (bumped from 5). Seat-of-pants.
 
-9. **Combine attempt cap.** `signAsLeader`'s `maxCombineAttempts` default is 50 (bumped from 5). Seat-of-pants.
+9. **FROST cheater identification disabled.** `buildFrostPublicKeyPackage` passes empty verifying-shares maps; on aggregation failure `signAggregate` returns an empty `culprits` list. Acceptable given transport's authenticated `from`.
 
-10. **FROST cheater identification disabled.** `buildFrostPublicKeyPackage` passes empty verifying-shares maps; on aggregation failure `signAggregate` returns an empty `culprits` list. Acceptable given transport's authenticated `from`.
-
-11. **ML-DSA only signs raw bytes.** `/sign scheme='mldsa'` requires `protocol='raw'`. No protocol-level decoding for ML-DSA-outer-auth-over-OPNet-tx.
+10. **ML-DSA only signs raw bytes.** `/sign scheme='mldsa'` requires `protocol='raw'`. No protocol-level decoding for ML-DSA-outer-auth-over-OPNet-tx.
 
 ## Things NOT to do
 

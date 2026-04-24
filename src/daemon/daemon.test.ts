@@ -385,17 +385,4 @@ describe('Daemon — lifecycle', () => {
     ).toThrow(/job_name='heartbeat' has no registered handler/);
   });
 
-  it('throws when transport kind is chain-watcher (not implemented)', async () => {
-    const ring = buildRing(3, '127.0.0.1:0');
-    const cfg = { ...ring.configs.get(0)! };
-    cfg.triggers = [{ kind: 'chain-watcher', params: {} }];
-    expect(() =>
-      new Daemon({
-        state: buildStateFromShare(cfg, ring.shares[0]!),
-        transport: ring.transports.get(0)!,
-        rng: SYSTEM_RNG,
-        pullOpts: FAST_PULL,
-      }),
-    ).toThrow(/chain-watcher.*not implemented/);
-  });
 });

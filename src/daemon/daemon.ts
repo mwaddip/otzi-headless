@@ -175,8 +175,6 @@ function buildTriggers(
         );
         break;
       }
-      case 'chain-watcher':
-        throw new Error(`daemon: ${path}.kind='chain-watcher' not implemented yet`);
     }
   }
   return out;

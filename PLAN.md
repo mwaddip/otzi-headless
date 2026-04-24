@@ -90,7 +90,6 @@ Implements CLAUDE.md § "Core Architecture: Pull-Based Blob Exchange" and § "Tr
 ```
 ┌─ triggers (new) ──────────────┐
 │  HTTP/IPC API                 │
-│  Chain watcher (OPNet)        │
 │  Cron                         │
 └──────────────┬────────────────┘
                │ ceremony spec
@@ -131,8 +130,9 @@ Implements CLAUDE.md § "Core Architecture: Pull-Based Blob Exchange" and § "Tr
 
 **Triggers (new):**
 - HTTP/IPC API — authorized POST endpoints that queue ceremonies.
-- Chain watcher — polls `opnet-client.ts` provider for events.
 - Cron scheduler — config-driven.
+
+(Chain watching is intentionally NOT a daemon responsibility — the daemon is a signing backend; operator infrastructure that needs event-driven flows watches the chain itself and POSTs `/sign`.)
 
 ---
 
@@ -159,7 +159,7 @@ Approval-gate design (added during bootstrap review) is specified in CLAUDE.md �
 | 2 | Ceremony core — `BlobStore`, `BlobPuller`, `CeremonyRunner` | `src/wire/dkg.ts`, `threshold.ts`, `frost-sign.ts`, `serialize.ts` |
 | 3 | Transport — PeerMesh (primary); relay port as follow-up | `ws`, `src/wire/relay-crypto.ts` |
 | 4 | Broadcast adapters — extract from `btc.ts`, `tx.ts` | `src/node/frost-psbt-signer.ts`, `threshold-signer.ts`, `frost-link.ts`, `opnet-client.ts` |
-| 5 | Triggers + daemon entrypoint — HTTP/IPC API, chain watcher, cron | new |
+| 5 | Triggers + daemon entrypoint — HTTP/IPC API, cron | new |
 | 6 | Packaging — Docker, systemd, .deb | new |
 
 Each phase ends with `tsc --noEmit` green + any new unit tests green before the next begins (OVERRIDES.md Rule 4 & 6).

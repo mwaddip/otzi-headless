@@ -20,7 +20,7 @@ The daemon runs pull-based instead:
 
 ### Role asymmetry — signing vs DKG
 
-**Signing is leader-driven.** The trigger (HTTP call / chain event / cron) fires on exactly one node — the initiator. That node is the leader for this ceremony:
+**Signing is leader-driven.** The trigger (HTTP call / cron) fires on exactly one node — the initiator. That node is the leader for this ceremony:
 - Drives all rounds, pulling co-signers' blobs into its session.
 - Runs `combine` locally (only the leader needs the signature — to broadcast the transaction).
 - Retries from round 1 with a `#N` ceremonyId suffix on rejection-sampling failure.
@@ -63,12 +63,13 @@ Both share the same E2E encrypted wire format.
 
 ## Triggers
 
-Ceremonies are initiated by machine inputs only:
-- HTTP/IPC API call from an authorized operator.
-- Watcher on chain events (e.g., bridge deposit detected → withdrawal ceremony).
+Ceremonies are initiated by machine inputs from operator infrastructure:
+- HTTP/IPC API call from an authorized operator backend.
 - Scheduled/cron.
 
-Config-driven. Ceremonies are always initiated by machine inputs; any interactive approval is layered on top via the per-node gate (see § Security Model), not at the trigger itself.
+The daemon does NOT watch chains, queues, or external state — it is a signing backend, not an autonomous actor. If a ceremony should fire on a chain event, the operator's own watcher subscribes to the event and POSTs `/sign`. Keeping the daemon's surface narrow keeps the audit footprint small.
+
+Config-driven. Any interactive approval is layered on top via the per-node gate (see § Security Model), not at the trigger itself.
 
 ## What to Share With Ötzi
 
