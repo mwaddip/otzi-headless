@@ -30,6 +30,7 @@ import {
   selectBtcUtxos,
   prepareBtcTx,
   broadcastBtcTx,
+  decodeBtcOutputs,
   type BtcCaptureContext,
   type BtcUtxo,
 } from './btc-vault';
@@ -355,5 +356,70 @@ describe('broadcastBtcTx', () => {
       network: 'mainnet',
     })).rejects.toThrow(/Broadcast failed.*rejected/);
     fetchSpy.mockRestore();
+  });
+});
+
+describe('decodeBtcOutputs', () => {
+  it('decodes a multi-output P2TR tx — addresses + amounts in order', () => {
+    const net = networks.opnetTestnet;
+    const p2tr = p2trAddressFor(net);
+    const script = btcAddress.toOutputScript(p2tr, net);
+
+    const tx = new Transaction();
+    tx.version = 2;
+    tx.addInput(Buffer.alloc(32, 0x11) as never, 0);
+    tx.addOutput(script as never, 70_000n as never);
+    tx.addOutput(script as never, 30_000n as never);
+
+    const outs = decodeBtcOutputs(tx.toHex(), 'testnet');
+    expect(outs.length).toBe(2);
+    expect(outs[0]!.address).toBe(p2tr);
+    expect(outs[0]!.amountSat).toBe(70_000n);
+    expect(outs[1]!.address).toBe(p2tr);
+    expect(outs[1]!.amountSat).toBe(30_000n);
+    expect(outs[0]!.scriptHex).toBe(Buffer.from(script).toString('hex'));
+  });
+
+  it('returns address=null for OP_RETURN outputs but preserves amountSat + scriptHex', () => {
+    const net = networks.opnetTestnet;
+    const p2tr = p2trAddressFor(net);
+    const p2trScript = btcAddress.toOutputScript(p2tr, net);
+    // OP_RETURN <4 bytes> — classic data carrier.
+    const opReturnScript = Buffer.from('6a04deadbeef', 'hex');
+
+    const tx = new Transaction();
+    tx.version = 2;
+    tx.addInput(Buffer.alloc(32, 0x22) as never, 0);
+    tx.addOutput(p2trScript as never, 50_000n as never);
+    tx.addOutput(opReturnScript as never, 0n as never);
+
+    const outs = decodeBtcOutputs(tx.toHex(), 'testnet');
+    expect(outs.length).toBe(2);
+    expect(outs[0]!.address).toBe(p2tr);
+    expect(outs[1]!.address).toBe(null);
+    expect(outs[1]!.amountSat).toBe(0n);
+    expect(outs[1]!.scriptHex).toBe('6a04deadbeef');
+  });
+
+  it('handles a tx with zero outputs', () => {
+    const tx = new Transaction();
+    tx.version = 2;
+    tx.addInput(Buffer.alloc(32, 0x33) as never, 0);
+    const outs = decodeBtcOutputs(tx.toHex(), 'testnet');
+    expect(outs).toEqual([]);
+  });
+
+  it('decodes mainnet P2WPKH output under mainnet network', () => {
+    // Canonical P2WPKH scriptPubKey: OP_0 <20 bytes>
+    const script = Buffer.from('0014' + '11'.repeat(20), 'hex');
+    const tx = new Transaction();
+    tx.version = 2;
+    tx.addInput(Buffer.alloc(32, 0x44) as never, 0);
+    tx.addOutput(script as never, 1_000n as never);
+
+    const outs = decodeBtcOutputs(tx.toHex(), 'mainnet');
+    expect(outs.length).toBe(1);
+    expect(outs[0]!.address).toMatch(/^bc1q/);
+    expect(outs[0]!.amountSat).toBe(1_000n);
   });
 });

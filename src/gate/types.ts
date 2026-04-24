@@ -32,14 +32,32 @@ export interface SigningSpec extends CeremonySpecBase {
   /** High-level operation the signing supports. */
   operation: 'btc-transfer' | 'opnet-call' | 'key-link' | 'generic';
   /**
-   * Amount in smallest units (sats for BTC, atomic for OPNet tokens).
-   * `undefined` when not applicable (e.g. raw-message signing).
+   * Total value committed, smallest units (sats for BTC = sum of non-self
+   * outputs; atomic for OPNet tokens = hint-supplied). `undefined` for
+   * operations where amount isn't applicable (raw-message signing).
    */
   amount?: bigint;
-  /** Destination address (BTC P2TR, OPNet contract, etc.). */
+  /**
+   * Primary destination (BTC: first non-self output address; OPNet:
+   * contract address from hints). `undefined` if not applicable.
+   */
   destination?: string;
-  /** OPNet method name ("transfer", "approve", ...) or BTC sighash tag. */
+  /** OPNet method name (hint-supplied) or BTC sighash tag. */
   method?: string;
+  /**
+   * Non-self (external) BTC tx outputs, decoded from the unsigned tx.
+   * Populated only for `operation === 'btc-transfer'` — derived
+   * structurally, verified by participant rebuild. The vault's own change
+   * output is excluded so policy rules like `allowed_btc_recipients`
+   * don't require every operator to add their own self-address to the
+   * allowlist.
+   */
+  outputs?: ReadonlyArray<{
+    /** Parsed address or `null` for non-standard (OP_RETURN, etc.). */
+    address: string | null;
+    /** Output value in satoshis. */
+    amountSat: bigint;
+  }>;
   /** Extra structured details for audit/logging. Gates ignore unless relevant. */
   details?: Record<string, unknown>;
 }

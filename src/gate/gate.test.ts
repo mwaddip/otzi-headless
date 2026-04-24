@@ -164,6 +164,160 @@ describe('PolicyGate — DKG', () => {
 });
 
 // ---------------------------------------------------------------------------
+// PolicyGate — protocol-scoped rules + rate limit
+// ---------------------------------------------------------------------------
+
+describe('PolicyGate — maxBtcPerTx', () => {
+  const btcSpec = (overrides: Partial<SigningSpec> = {}) =>
+    signingSpec({
+      operation: 'btc-transfer',
+      outputs: [{ address: 'bc1pA', amountSat: 40_000n }, { address: 'bc1pB', amountSat: 60_000n }],
+      amount: 100_000n,
+      destination: 'bc1pA',
+      method: undefined,
+      ...overrides,
+    });
+
+  it('approves when sum of outputs is at or below cap', async () => {
+    const gate = new PolicyGate({ maxBtcPerTx: 100_000n });
+    expect(await gate.approve(btcSpec())).toBe('approve');
+  });
+
+  it('rejects when sum of outputs exceeds cap', async () => {
+    const gate = new PolicyGate({ maxBtcPerTx: 99_999n });
+    expect(await gate.approve(btcSpec())).toBe('reject');
+  });
+
+  it('rejects when outputs missing on a btc-transfer spec', async () => {
+    const gate = new PolicyGate({ maxBtcPerTx: 1_000_000n });
+    expect(await gate.approve(btcSpec({ outputs: undefined }))).toBe('reject');
+  });
+
+  it('does NOT apply to opnet-call specs', async () => {
+    const gate = new PolicyGate({ maxBtcPerTx: 1n });
+    expect(
+      await gate.approve(signingSpec({ operation: 'opnet-call', outputs: undefined })),
+    ).toBe('approve');
+  });
+});
+
+describe('PolicyGate — allowedBtcRecipients', () => {
+  const btcSpec = (outputs: SigningSpec['outputs']) =>
+    signingSpec({ operation: 'btc-transfer', outputs, amount: 100n, destination: undefined, method: undefined });
+
+  it('approves when every non-self output is in allowlist', async () => {
+    const gate = new PolicyGate({ allowedBtcRecipients: ['bc1pA', 'bc1pB'] });
+    expect(
+      await gate.approve(btcSpec([{ address: 'bc1pA', amountSat: 50n }, { address: 'bc1pB', amountSat: 50n }])),
+    ).toBe('approve');
+  });
+
+  it('rejects when any output is not in allowlist', async () => {
+    const gate = new PolicyGate({ allowedBtcRecipients: ['bc1pA'] });
+    expect(
+      await gate.approve(btcSpec([{ address: 'bc1pA', amountSat: 50n }, { address: 'bc1pEvil', amountSat: 50n }])),
+    ).toBe('reject');
+  });
+
+  it('rejects any output with address=null (non-standard output)', async () => {
+    const gate = new PolicyGate({ allowedBtcRecipients: ['bc1pA'] });
+    expect(
+      await gate.approve(btcSpec([{ address: 'bc1pA', amountSat: 50n }, { address: null, amountSat: 0n }])),
+    ).toBe('reject');
+  });
+
+  it('rejects when outputs missing', async () => {
+    const gate = new PolicyGate({ allowedBtcRecipients: ['bc1pA'] });
+    expect(
+      await gate.approve(signingSpec({ operation: 'btc-transfer', outputs: undefined, amount: 0n, destination: undefined, method: undefined })),
+    ).toBe('reject');
+  });
+
+  it('ignores opnet-call specs', async () => {
+    const gate = new PolicyGate({ allowedBtcRecipients: ['bc1pA'] });
+    expect(await gate.approve(signingSpec({ operation: 'opnet-call', outputs: undefined }))).toBe('approve');
+  });
+});
+
+describe('PolicyGate — allowedContracts', () => {
+  it('approves when contract destination in allowlist', async () => {
+    const gate = new PolicyGate({ allowedContracts: ['0xabc'] });
+    expect(
+      await gate.approve(signingSpec({ operation: 'opnet-call', destination: '0xabc' })),
+    ).toBe('approve');
+  });
+
+  it('rejects when destination not in allowlist', async () => {
+    const gate = new PolicyGate({ allowedContracts: ['0xabc'] });
+    expect(
+      await gate.approve(signingSpec({ operation: 'opnet-call', destination: '0xdef' })),
+    ).toBe('reject');
+  });
+
+  it('rejects when destination missing', async () => {
+    const gate = new PolicyGate({ allowedContracts: ['0xabc'] });
+    expect(
+      await gate.approve(signingSpec({ operation: 'opnet-call', destination: undefined })),
+    ).toBe('reject');
+  });
+
+  it('ignores btc-transfer specs', async () => {
+    const gate = new PolicyGate({ allowedContracts: ['0xabc'] });
+    expect(await gate.approve(signingSpec({ operation: 'btc-transfer' }))).toBe('approve');
+  });
+});
+
+describe('PolicyGate — maxCeremoniesPerHour (sliding window)', () => {
+  it('approves up to the cap, rejects the N+1th within the hour', async () => {
+    let t = 1_700_000_000_000;
+    const gate = new PolicyGate({ maxCeremoniesPerHour: 3 }, () => t);
+    // All specs with distinct ceremonyIds so orchestrator-side cache is irrelevant here.
+    for (let i = 0; i < 3; i++) {
+      expect(await gate.approve(signingSpec({ ceremonyId: `c${i}` }))).toBe('approve');
+      t += 100;
+    }
+    expect(await gate.approve(signingSpec({ ceremonyId: 'c3' }))).toBe('reject');
+  });
+
+  it('evicts old approvals past the 1h cutoff', async () => {
+    let t = 1_700_000_000_000;
+    const gate = new PolicyGate({ maxCeremoniesPerHour: 2 }, () => t);
+    expect(await gate.approve(signingSpec({ ceremonyId: 'c0' }))).toBe('approve');
+    expect(await gate.approve(signingSpec({ ceremonyId: 'c1' }))).toBe('approve');
+    expect(await gate.approve(signingSpec({ ceremonyId: 'c2' }))).toBe('reject');
+    // Advance 1h + 1ms → first approval falls outside the window.
+    t += 60 * 60 * 1000 + 1;
+    expect(await gate.approve(signingSpec({ ceremonyId: 'c3' }))).toBe('approve');
+  });
+
+  it('does NOT count DKG towards the signing rate limit', async () => {
+    const gate = new PolicyGate({ maxCeremoniesPerHour: 1 });
+    expect(await gate.approve(dkgSpec({ ceremonyId: 'dkg-0' }))).toBe('approve');
+    expect(await gate.approve(dkgSpec({ ceremonyId: 'dkg-1' }))).toBe('approve');
+    expect(await gate.approve(signingSpec({ ceremonyId: 'sig-0' }))).toBe('approve');
+    expect(await gate.approve(signingSpec({ ceremonyId: 'sig-1' }))).toBe('reject');
+  });
+
+  it('does NOT record a timestamp on rejection (rate-limit slots only consumed by approvals)', async () => {
+    let t = 1_700_000_000_000;
+    // Rate-limit=2, but also destination_allowlist rejects.
+    const gate = new PolicyGate(
+      { maxCeremoniesPerHour: 2, destinationAllowlist: ['bc1pOK'] },
+      () => t,
+    );
+    // 10 rejected attempts.
+    for (let i = 0; i < 10; i++) {
+      expect(await gate.approve(signingSpec({ ceremonyId: `bad${i}`, destination: 'bc1pBAD' }))).toBe('reject');
+      t += 10;
+    }
+    // Slots still available.
+    expect(await gate.approve(signingSpec({ ceremonyId: 'ok0', destination: 'bc1pOK' }))).toBe('approve');
+    expect(await gate.approve(signingSpec({ ceremonyId: 'ok1', destination: 'bc1pOK' }))).toBe('approve');
+    expect(await gate.approve(signingSpec({ ceremonyId: 'ok2', destination: 'bc1pOK' }))).toBe('reject');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parsePolicyParams
 // ---------------------------------------------------------------------------
 
@@ -236,6 +390,37 @@ describe('parsePolicyParams', () => {
     );
   });
 
+  it('parses protocol-scoped rules + rate limit', () => {
+    expect(
+      parsePolicyParams({
+        max_btc_per_tx: 100_000_000,
+        allowed_btc_recipients: ['bc1p1'],
+        allowed_contracts: ['0xabc'],
+        max_ceremonies_per_hour: 10,
+      }),
+    ).toEqual({
+      maxBtcPerTx: 100_000_000n,
+      allowedBtcRecipients: ['bc1p1'],
+      allowedContracts: ['0xabc'],
+      maxCeremoniesPerHour: 10,
+    });
+  });
+
+  it('accepts max_btc_per_tx as a decimal string', () => {
+    expect(parsePolicyParams({ max_btc_per_tx: '2100000000000000' })).toEqual({
+      maxBtcPerTx: 2_100_000_000_000_000n,
+    });
+  });
+
+  it('rejects non-positive max_ceremonies_per_hour', () => {
+    expect(() => parsePolicyParams({ max_ceremonies_per_hour: 0 })).toThrow(
+      /gate\.max_ceremonies_per_hour.*>= 1/,
+    );
+    expect(() => parsePolicyParams({ max_ceremonies_per_hour: 1.5 })).toThrow(
+      /gate\.max_ceremonies_per_hour.*positive integer/,
+    );
+  });
+
   it('carries a path on ConfigError', () => {
     try {
       parsePolicyParams({ max_amount: 'oops' });
@@ -278,7 +463,7 @@ describe('createGate', () => {
   });
 
   it('throws for unimplemented strategies', () => {
-    for (const strategy of ['webhook', 'cli', 'queue'] as const) {
+    for (const strategy of ['cli', 'queue'] as const) {
       const cfg: GateConfig = { strategy };
       expect(() => createGate(cfg)).toThrow(/not implemented yet/);
     }
@@ -289,4 +474,79 @@ describe('createGate', () => {
       createGate({ strategy: 'policy', params: { max_amount: -1 } }),
     ).toThrow(/gate\.max_amount.*must be >= 0/);
   });
+
+  it('creates ExecGate for strategy="exec"', async () => {
+    // approve via `node -e "… approve …"`. Fast (no human in loop), deterministic.
+    const gate = createGate({
+      strategy: 'exec',
+      params: {
+        command: [process.execPath, '-e', 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{if(!d)process.exit(1);process.stdout.write("approve\\n");process.exit(0);});'],
+        timeout_sec: 10,
+      },
+    });
+    expect(await gate.approve(signingSpec())).toBe('approve');
+  });
+
+  it('ExecGate returns reject when command prints "reject"', async () => {
+    const gate = createGate({
+      strategy: 'exec',
+      params: {
+        command: [process.execPath, '-e', 'process.stdin.resume();process.stdin.on("end",()=>{console.log("reject");process.exit(0)});'],
+        timeout_sec: 10,
+      },
+    });
+    expect(await gate.approve(signingSpec())).toBe('reject');
+  });
+
+  it('ExecGate rejects invalid exec params at construction', () => {
+    expect(() => createGate({ strategy: 'exec', params: { command: [], timeout_sec: 10 } }))
+      .toThrow(/gate\.command/);
+    expect(() => createGate({ strategy: 'exec', params: { command: ['/bin/true'], timeout_sec: -1 } }))
+      .toThrow(/gate\.timeout_sec/);
+    expect(() => createGate({ strategy: 'exec', params: { command: ['/bin/true'], timeout_sec: 5, unknown: 1 } }))
+      .toThrow(/gate\.unknown/);
+  });
+
+  it('creates WebhookGate for strategy="webhook" and returns the approver decision', async () => {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ decision: 'approve' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    try {
+      const gate = createGate({
+        strategy: 'webhook',
+        params: { url: 'http://approver.test/decide', timeout_sec: 5 },
+      });
+      expect(await gate.approve(signingSpec())).toBe('approve');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('WebhookGate throws on non-200 response', async () => {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response('server down', { status: 503 });
+    try {
+      const gate = createGate({
+        strategy: 'webhook',
+        params: { url: 'http://approver.test/decide', timeout_sec: 5 },
+      });
+      await expect(gate.approve(signingSpec())).rejects.toThrow(/503/);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('WebhookGate rejects invalid params at construction', () => {
+    expect(() => createGate({ strategy: 'webhook', params: { timeout_sec: 5 } }))
+      .toThrow(/gate\.url/);
+    expect(() => createGate({ strategy: 'webhook', params: { url: 'http://x', timeout_sec: 0 } }))
+      .toThrow(/gate\.timeout_sec/);
+    expect(() => createGate({ strategy: 'webhook', params: { url: 'http://x', timeout_sec: 5, bogus: true } }))
+      .toThrow(/gate\.bogus/);
+  });
 });
+

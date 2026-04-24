@@ -62,9 +62,6 @@ async function runDaemonCommand(args: string[]): Promise<void> {
   const bundle = await buildTransportFromFiles(state);
   await bundle.start();
 
-  // FROST PublicKeyPackage reconstruction from V3 share is not yet wired —
-  // daemon runs without FROST signing until that gap is closed. DKG ceremonies
-  // work end-to-end regardless.
   const daemon = new Daemon({
     state,
     transport: bundle.transport,

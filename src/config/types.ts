@@ -11,7 +11,7 @@
 export const TRANSPORT_KINDS = ['peer-mesh', 'relay'] as const;
 export type TransportKind = (typeof TRANSPORT_KINDS)[number];
 
-export const GATE_STRATEGIES = ['auto', 'policy', 'webhook', 'cli', 'queue'] as const;
+export const GATE_STRATEGIES = ['auto', 'policy', 'exec', 'webhook', 'cli', 'queue'] as const;
 export type GateStrategy = (typeof GATE_STRATEGIES)[number];
 
 export const TRIGGER_KINDS = ['http', 'cron', 'chain-watcher'] as const;

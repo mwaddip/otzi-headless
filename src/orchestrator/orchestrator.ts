@@ -22,6 +22,11 @@
 
 import { EventEmitter } from 'node:events';
 import {
+  buildBtcTxFromParams,
+  extractBtcSighashes,
+  type DecodedBtcOutput,
+} from '../broadcast/btc-vault';
+import {
   messageFromAnnounce,
   parseCeremonyMessage,
   sessionIdFromAnnounceCombinedDkg,
@@ -30,6 +35,7 @@ import {
   sighashesFromAnnounceFrost,
   type CeremonyMessage,
 } from '../core/ceremony-messages';
+import { fromHex, toHex } from '../wire/hex';
 import type { PartyId, Unsubscribe } from '../core/types';
 import type { Decision } from '../gate/types';
 import { buildSpecFromAnnounce } from './spec-builder';
@@ -40,6 +46,17 @@ import {
   type OrchestratorCeremonyKind,
   type OrchestratorDeps,
 } from './types';
+
+interface FrostVerifyOk {
+  ok: true;
+  btcOutputs?: ReadonlyArray<DecodedBtcOutput>;
+  btcFrostP2tr?: string;
+}
+interface FrostVerifyError {
+  ok: false;
+  reason: string;
+}
+type FrostVerifyOutcome = FrostVerifyOk | FrostVerifyError;
 
 type AnnounceMessage = Extract<
   CeremonyMessage,
@@ -209,7 +226,24 @@ export class Orchestrator {
     }
     tracker.dispatchedCeremonyIds.add(msg.ceremonyId);
 
-    const decision = await this.evaluateGate(tracker, msg);
+    // Verify FROST-signing construction/sighashes before the gate sees the
+    // spec — so policy evaluation runs over VERIFIED fields. BTC rebuild from
+    // `btcParams`; OPNet re-extracts sighashes from the raw tx + inputs.
+    // Mismatch → silent drop (peer indistinguishable from offline). Verify
+    // outcome for BTC carries the decoded outputs that populate the spec.
+    let verify: FrostVerifyOutcome = { ok: true };
+    if (msg.kind === 'announce-frost') {
+      verify = verifyAndDecodeFrostAnnounce(msg);
+      if (!verify.ok) {
+        this.log.error(
+          `orchestrator: FROST announce sighash mismatch — silent drop (${verify.reason})`,
+          { baseId },
+        );
+        return;
+      }
+    }
+
+    const decision = await this.evaluateGate(tracker, msg, verify);
     if (decision !== 'approve') {
       this.log.info('orchestrator: gate non-approve; silent drop', { baseId, decision });
       return;
@@ -218,11 +252,18 @@ export class Orchestrator {
     this.dispatchParticipant(tracker, msg);
   }
 
-  private async evaluateGate(tracker: CeremonyTracker, msg: AnnounceMessage): Promise<Decision> {
+  private async evaluateGate(
+    tracker: CeremonyTracker,
+    msg: AnnounceMessage,
+    verify: FrostVerifyOutcome,
+  ): Promise<Decision> {
     if (!tracker.gateDecisionPromise) {
       const spec = buildSpecFromAnnounce(msg, {
         fromPartyId: tracker.leaderId,
         peersById: this.deps.peersById,
+        ...(verify.ok && verify.btcOutputs
+          ? { btcOutputs: verify.btcOutputs, btcFrostP2tr: verify.btcFrostP2tr }
+          : {}),
       });
       tracker.gateDecisionPromise = this.deps.gate.approve(spec).catch((err) => {
         this.log.warn('orchestrator: gate threw; treating as reject', {
@@ -303,6 +344,12 @@ export class Orchestrator {
       });
       return;
     }
+    // Sighash verification already happened upstream in handleAnnounce (BTC
+    // rebuild from btcParams or OPNet extract from unsignedTxHex+inputs) —
+    // a mismatching announce would have been silent-dropped before reaching
+    // dispatch. Signers here can trust `sighashes` are consistent with the
+    // construction data (or were absent, in which case participants sign
+    // the asserted sighashes directly — tests exercise this path).
     const spec = {
       ceremonyId: announce.ceremonyId,
       sighashes: sighashesFromAnnounceFrost(announce),
@@ -546,4 +593,96 @@ function errString(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+/**
+ * Verify the leader's asserted FROST-signing sighashes against what this
+ * node computes locally from the announce's construction data.
+ *
+ * BTC (`btcParams` present): rebuild the tx via `buildBtcTxFromParams`,
+ * compare sighashes. Produces decoded outputs that populate the `SigningSpec`
+ * — `allowed_btc_recipients` / `max_btc_per_tx` rules evaluate against these.
+ *
+ * OPNet (`unsignedTxHex` + `inputs` present): re-extract sighashes via
+ * `extractBtcSighashes`, compare. Decoded outputs aren't populated
+ * (daemon stays ABI-agnostic for OPNet); policy matches against
+ * operator-supplied `hints` instead (advisory; matches Ötzi's
+ * federation-trust posture).
+ *
+ * Legacy (no construction data — test harnesses with synthetic sighashes):
+ * returns `{ok: true}` with no outputs; participant signs whatever the
+ * leader asserts. Production paths always carry construction data.
+ */
+function verifyAndDecodeFrostAnnounce(
+  announce: Extract<CeremonyMessage, { kind: 'announce-frost' }>,
+): FrostVerifyOutcome {
+  const { sighashes } = announce;
+
+  if (announce.btcParams) {
+    const bp = announce.btcParams;
+    let rebuilt;
+    try {
+      rebuilt = buildBtcTxFromParams({
+        to: bp.to,
+        amountSat: BigInt(bp.amountSat),
+        feeRate: bp.feeRate,
+        network: bp.network,
+        frostP2tr: bp.frostP2tr,
+        frostUntweakedPubKey: fromHex(bp.frostUntweakedPubKeyHex),
+        utxos: bp.utxos.map((u) => ({
+          transactionId: u.transactionId,
+          outputIndex: u.outputIndex,
+          value: BigInt(u.valueSat),
+        })),
+      });
+    } catch (err) {
+      return { ok: false, reason: `btc rebuild failed: ${errString(err)}` };
+    }
+    if (rebuilt.sighashes.length !== sighashes.length) {
+      return {
+        ok: false,
+        reason: `btc rebuild produced ${rebuilt.sighashes.length} sighashes, announce has ${sighashes.length}`,
+      };
+    }
+    for (let i = 0; i < sighashes.length; i++) {
+      const leaderHex = sighashes[i]!.hashHex.toLowerCase();
+      const ourHex = toHex(rebuilt.sighashes[i]!.hash).toLowerCase();
+      if (leaderHex !== ourHex) {
+        return {
+          ok: false,
+          reason: `btc sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
+        };
+      }
+    }
+    return { ok: true, btcOutputs: rebuilt.outputs, btcFrostP2tr: bp.frostP2tr };
+  }
+
+  if (announce.unsignedTxHex !== undefined && announce.inputs !== undefined) {
+    const { unsignedTxHex, inputs } = announce;
+    if (inputs.length !== sighashes.length) {
+      return {
+        ok: false,
+        reason: `inputs.length=${inputs.length} != sighashes.length=${sighashes.length}`,
+      };
+    }
+    let recomputed: Array<{ index: number; hash: Uint8Array; tweaked: boolean }>;
+    try {
+      recomputed = extractBtcSighashes(unsignedTxHex, inputs);
+    } catch (err) {
+      return { ok: false, reason: `extract failed: ${errString(err)}` };
+    }
+    for (let i = 0; i < sighashes.length; i++) {
+      const leaderHex = sighashes[i]!.hashHex.toLowerCase();
+      const ourHex = toHex(recomputed[i]!.hash).toLowerCase();
+      if (leaderHex !== ourHex) {
+        return {
+          ok: false,
+          reason: `sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
+  return { ok: true };
 }

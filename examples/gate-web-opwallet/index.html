@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<!--
+  Reference operator UI for the `gate-web-opwallet` standalone approver.
+
+  Served by `approver.mjs` at GET /. The approver is an external service
+  that speaks the daemon's `webhook` gate interface — the daemon itself
+  does NOT verify ML-DSA signatures. That's deliberate: decision logic
+  lives outside the daemon.
+
+  Wire protocol (between browser and approver.mjs):
+    GET  /pending                   → [{ ceremonyId, spec, nonce }]
+    POST /decide                    → { ceremonyId, decision, nonce, signatureHex }
+
+  The signature covers:   SALT || ceremonyId || decision_byte || nonce
+    SALT           "otzi-headless:gate-decision:v1" (UTF-8)
+    decision_byte  0x01 (approve) | 0x00 (reject)
+    nonce          32 bytes from GET /pending
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ötzi Gate Approver</title>
+<style>
+  :root { --fg: #222; --bg: #fafafa; --card-bg: #fff; --border: #ddd;
+          --approve: #2e8b57; --reject: #c04040; }
+  body { font-family: system-ui, sans-serif; max-width: 820px; margin: 2rem auto;
+         padding: 0 1rem; color: var(--fg); background: var(--bg); }
+  h1 { margin-top: 0; }
+  #status { color: #666; font-size: 0.9em; margin: 0.5rem 0 1rem; }
+  .ceremony { border: 1px solid var(--border); border-radius: 6px; padding: 1rem;
+              margin: 1rem 0; background: var(--card-bg); }
+  .ceremony h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+  pre { background: #f0f0f0; padding: 0.75rem; overflow-x: auto;
+        font-size: 0.82em; border-radius: 4px; }
+  .buttons { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+  button { padding: 0.5rem 1rem; border: none; border-radius: 4px;
+           color: white; font-weight: 600; cursor: pointer; }
+  button.approve { background: var(--approve); }
+  button.reject  { background: var(--reject); }
+  button:disabled { opacity: 0.5; cursor: wait; }
+</style>
+</head>
+<body>
+  <h1>Ötzi Gate Approver</h1>
+  <div id="status">Initializing…</div>
+  <div id="pending"></div>
+<script>
+const SALT = "otzi-headless:gate-decision:v1";
+const BASE = "";  // same-origin (served by approver.mjs). Change if hosting separately.
+
+const statusEl = document.getElementById('status');
+const pendingEl = document.getElementById('pending');
+
+async function refresh() {
+  try {
+    const r = await fetch(`${BASE}/pending`);
+    if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+    render(await r.json());
+    statusEl.textContent = 'Connected (polled at ' + new Date().toLocaleTimeString() + ').';
+  } catch (e) {
+    statusEl.textContent = 'Failed to poll: ' + e.message;
+  }
+}
+
+function render(list) {
+  pendingEl.innerHTML = '';
+  if (!list.length) {
+    pendingEl.innerHTML = '<p><em>No pending ceremonies.</em></p>';
+    return;
+  }
+  for (const item of list) {
+    const card = document.createElement('div');
+    card.className = 'ceremony';
+    const h3 = document.createElement('h3');
+    h3.textContent = item.ceremonyId;
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(item.spec, null, 2);
+    const buttons = document.createElement('div');
+    buttons.className = 'buttons';
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'approve';
+    approveBtn.textContent = 'Approve';
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'reject';
+    rejectBtn.textContent = 'Reject';
+    approveBtn.onclick = () => decide(item, 'approve', [approveBtn, rejectBtn]);
+    rejectBtn.onclick  = () => decide(item, 'reject',  [approveBtn, rejectBtn]);
+    buttons.append(approveBtn, rejectBtn);
+    card.append(h3, pre, buttons);
+    pendingEl.appendChild(card);
+  }
+}
+
+async function decide(item, decision, buttons) {
+  for (const b of buttons) b.disabled = true;
+  try {
+    const wallet = window.opnet;
+    if (!wallet || typeof wallet.signMLDSA !== 'function')
+      throw new Error('OPWallet.signMLDSA not available — install/unlock OPWallet.');
+
+    const nonce = hexToBytes(item.nonce);
+    const ceremonyIdBytes = new TextEncoder().encode(item.ceremonyId);
+    const saltBytes = new TextEncoder().encode(SALT);
+    const payload = new Uint8Array(saltBytes.length + ceremonyIdBytes.length + 1 + nonce.length);
+    payload.set(saltBytes, 0);
+    payload.set(ceremonyIdBytes, saltBytes.length);
+    payload[saltBytes.length + ceremonyIdBytes.length] = decision === 'approve' ? 0x01 : 0x00;
+    payload.set(nonce, saltBytes.length + ceremonyIdBytes.length + 1);
+
+    // Request an ML-DSA-44 signature over `payload` from OPWallet.
+    // Exact API shape may evolve — check your wallet version.
+    const sigHex = await wallet.signMLDSA(bytesToHex(payload));
+
+    const resp = await fetch(`${BASE}/decide`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ceremonyId: item.ceremonyId,
+        decision,
+        nonce: item.nonce,
+        signatureHex: sigHex,
+      }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      alert('Approver rejected decision: ' + (err.error || resp.status));
+    }
+  } catch (e) {
+    alert('Failed: ' + e.message);
+  } finally {
+    await refresh();
+  }
+}
+
+function bytesToHex(bytes) {
+  let out = '';
+  for (const b of bytes) out += b.toString(16).padStart(2, '0');
+  return out;
+}
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) out[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  return out;
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

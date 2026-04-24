@@ -1,5 +1,14 @@
 import { ThresholdMLDSA } from '@btc-vision/post-quantum/threshold-ml-dsa.js';
 import {
+  Transaction,
+  networks,
+  payments,
+  toXOnly,
+  initEccLib,
+} from '@btc-vision/bitcoin';
+import { createNobleBackend } from '@btc-vision/ecpair';
+import { schnorr } from '@noble/curves/secp256k1.js';
+import {
   dkgFinalize,
   dkgRound1,
   dkgRound2,
@@ -12,21 +21,29 @@ import {
   type Round2SecretPackage,
 } from '@mwaddip/frots';
 import { describe, expect, it } from 'vitest';
+import { buildBtcTxFromParams } from '../broadcast/btc-vault';
 import { BlobPuller, type PullOpts } from '../core/blob-puller';
 import { BlobServer } from '../core/blob-server';
 import { BlobStore } from '../core/blob-store';
+import {
+  announceFrostMessage,
+  encodeCeremonyMessage,
+} from '../core/ceremony-messages';
 import { CeremonyRunner } from '../core/ceremony-runner';
 import { createInMemoryRing } from '../core/in-memory-transport';
 import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
 import { AutoGate } from '../gate/factory';
 import { PolicyGate } from '../gate/policy';
-import type { ApprovalGate } from '../gate/types';
+import type { ApprovalGate, CeremonySpec, Decision } from '../gate/types';
 import { getKL } from '../wire/dkg';
 import { toHex } from '../wire/hex';
 import type { DecryptedShare } from '../wire/share-crypto';
 import { Orchestrator } from './orchestrator';
-import type { CeremonyOutcome, OrchestratorDeps } from './types';
+import type { CeremonyOutcome, Logger, OrchestratorDeps } from './types';
+
+// Taproot address derivation uses secp256k1 ECC — init once (idempotent).
+initEccLib(createNobleBackend());
 
 // ─────────────────────────────────────────────────────────────────────────
 // Test fixtures
@@ -165,6 +182,7 @@ function buildOrchestrator(
     share?: DecryptedShare;
     frostKeyPackage?: KeyPackage;
     frostPublicKeyPackage?: PublicKeyPackage;
+    logger?: Logger;
   },
 ): Orchestrator {
   const gate = extras.gate ?? new AutoGate();
@@ -181,6 +199,7 @@ function buildOrchestrator(
     rng: SYSTEM_RNG,
     pullOpts: FAST_PULL_OPTS,
     ceremonyDeadlines: TEST_DEADLINES,
+    logger: extras.logger,
   };
   return new Orchestrator(deps);
 }
@@ -297,6 +316,353 @@ describe('Orchestrator — FROST signing', () => {
       close();
     }
   }, 60_000);
+
+  it('FROST signing refused when unsignedTx/sighash mismatch (byzantine leader)', async () => {
+    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
+    const { ctx, close, peersById } = buildRing([0, 1, 2]);
+    const baseId = 'frost-sig-mismatch';
+
+    const errLogs: string[] = [];
+    const logger: Logger = {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: (msg) => errLogs.push(msg),
+    };
+    const orch = buildOrchestrator(ctx.get(1)!, peersById, {
+      frostKeyPackage: keyPackages[1]!,
+      frostPublicKeyPackage: publicKeyPackage,
+      logger,
+    });
+    orch.start();
+
+    try {
+      // Build an unsigned tx spending the frost-tweaked key — makes the inputs
+      // look plausible. The assertion is that the leader's sighash does NOT
+      // match what extractBtcSighashes produces, so participant refuses.
+      const xOnly = publicKeyPackage.verifyingKey.slice(1);
+      const p2trScript = new Uint8Array(34);
+      p2trScript[0] = 0x51;
+      p2trScript[1] = 0x20;
+      p2trScript.set(xOnly, 2);
+
+      const tx = new Transaction();
+      tx.version = 2;
+      tx.addInput(Buffer.alloc(32, 0xaa) as never, 0);
+      tx.addOutput(Buffer.from(p2trScript) as never, 1000n as never);
+      const unsignedTxHex = tx.toHex();
+
+      // All-zero sighash — not what any real tx extraction produces.
+      const wrongSighash = new Uint8Array(32);
+
+      const announce = announceFrostMessage(
+        baseId,
+        baseId,
+        [{ hash: wrongSighash, tweaked: true }],
+        [0, 1],
+        {
+          protocol: 'opnet',
+          unsignedTxHex,
+          inputs: [
+            {
+              scriptHex: Buffer.from(p2trScript).toString('hex'),
+              valueSat: '1000',
+              tweaked: true,
+            },
+          ],
+        },
+      );
+      await ctx.get(0)!.transport.broadcast(encodeCeremonyMessage(announce));
+
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline) {
+        if (errLogs.some((m) => m.includes('sighash mismatch'))) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(errLogs.some((m) => m.includes('sighash mismatch'))).toBe(true);
+
+      // Belt-and-suspenders: participant produced no R1 blob.
+      const r1Blob = ctx.get(1)!.store.get({
+        ceremonyId: baseId,
+        round: 'frost-sign-r1',
+        from: 1,
+      });
+      expect(r1Blob).toBeUndefined();
+    } finally {
+      orch.stop();
+      close();
+    }
+  }, 10_000);
+
+  it('BTC construction-params: participant rebuilds, verifies, spec carries decoded outputs + amount + destination', async () => {
+    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
+    const { ctx, close, peersById } = buildRing([0, 1, 2]);
+    const baseId = 'frost-sig-btc-rebuild';
+
+    // Vault internal key = FROST untweaked aggregate pubkey. Its P2TR is the
+    // vault address — the source of UTXOs and change destination.
+    const frostUntweakedPubKey = publicKeyPackage.untweakedVerifyingKey;
+    const internalXOnly = toXOnly(Buffer.from(frostUntweakedPubKey) as never);
+    const frostP2tr = payments.p2tr({
+      internalPubkey: internalXOnly as never,
+      network: networks.opnetTestnet,
+    }).address!;
+
+    // Destination = a different P2TR. Use a real keypair so the x-only is
+    // a valid secp256k1 curve point.
+    const destSk = new Uint8Array(Array.from({ length: 32 }, (_, i) => i + 17));
+    const destXOnly = new Uint8Array(schnorr.getPublicKey(destSk));
+    const destP2tr = payments.p2tr({
+      internalPubkey: destXOnly as never,
+      network: networks.opnetTestnet,
+    }).address!;
+
+    const btcParamsLeader = {
+      to: destP2tr,
+      amountSat: 100_000n,
+      feeRate: 5,
+      network: 'testnet' as const,
+      frostP2tr,
+      frostUntweakedPubKey,
+      utxos: [
+        { transactionId: '11'.repeat(32), outputIndex: 0, value: 200_000n },
+      ],
+    };
+
+    // Leader builds locally to get the real sighashes that both sides will sign.
+    const built = buildBtcTxFromParams(btcParamsLeader);
+
+    // Capture the spec the gate sees (post-verify).
+    const specs: CeremonySpec[] = [];
+    const recordingGate: ApprovalGate = {
+      async approve(spec: CeremonySpec): Promise<Decision> {
+        specs.push(spec);
+        return 'approve';
+      },
+    };
+
+    const orch = buildOrchestrator(ctx.get(1)!, peersById, {
+      gate: recordingGate,
+      frostKeyPackage: keyPackages[1]!,
+      frostPublicKeyPackage: publicKeyPackage,
+    });
+    orch.start();
+
+    try {
+      const pending = orch.waitFor(baseId, 60_000);
+
+      const sigs = await ctx.get(0)!.runner.signFrostAsLeader(
+        {
+          ceremonyId: baseId,
+          sighashes: built.sighashes.map((s) => ({ hash: s.hash, tweaked: s.tweaked })),
+          signers: [0, 1],
+          keyPackage: keyPackages[0]!,
+          publicKeyPackage,
+          rng: SYSTEM_RNG,
+        },
+        FAST_PULL_OPTS,
+        {
+          protocol: 'btc',
+          btcParams: {
+            to: btcParamsLeader.to,
+            amountSat: btcParamsLeader.amountSat.toString(),
+            feeRate: btcParamsLeader.feeRate,
+            network: btcParamsLeader.network,
+            frostP2tr: btcParamsLeader.frostP2tr,
+            frostUntweakedPubKeyHex: toHex(btcParamsLeader.frostUntweakedPubKey),
+            utxos: btcParamsLeader.utxos.map((u) => ({
+              transactionId: u.transactionId,
+              outputIndex: u.outputIndex,
+              valueSat: u.value.toString(),
+            })),
+          },
+        },
+      );
+      await ctx.get(0)!.runner.sendFrostSigningDoneSignoff(baseId, sigs);
+
+      const outcome = await pending;
+      expect(outcome.kind).toBe('signing-frost');
+      expect(outcome.status).toBe('done');
+
+      expect(specs.length).toBe(1);
+      const spec = specs[0]!;
+      expect(spec.kind).toBe('signing');
+      if (spec.kind === 'signing') {
+        expect(spec.operation).toBe('btc-transfer');
+        expect(spec.destination).toBe(destP2tr);
+        expect(spec.amount).toBe(100_000n);
+        // outputs[] is non-self only — change output (vault P2TR) excluded.
+        expect(spec.outputs).toHaveLength(1);
+        expect(spec.outputs?.[0]?.address).toBe(destP2tr);
+        expect(spec.outputs?.[0]?.amountSat).toBe(100_000n);
+      }
+    } finally {
+      orch.stop();
+      close();
+    }
+  }, 60_000);
+
+  it('BTC construction-params: participant silent-drops when leader asserts sighashes inconsistent with btcParams (byzantine)', async () => {
+    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
+    const { ctx, close, peersById } = buildRing([0, 1, 2]);
+    const baseId = 'frost-sig-btc-byz';
+
+    const frostUntweakedPubKey = publicKeyPackage.untweakedVerifyingKey;
+    const internalXOnly = toXOnly(Buffer.from(frostUntweakedPubKey) as never);
+    const frostP2tr = payments.p2tr({
+      internalPubkey: internalXOnly as never,
+      network: networks.opnetTestnet,
+    }).address!;
+    const destSk = new Uint8Array(Array.from({ length: 32 }, (_, i) => i + 33));
+    const destXOnly = new Uint8Array(schnorr.getPublicKey(destSk));
+    const destP2tr = payments.p2tr({
+      internalPubkey: destXOnly as never,
+      network: networks.opnetTestnet,
+    }).address!;
+
+    const errLogs: string[] = [];
+    const logger: Logger = {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: (msg) => errLogs.push(msg),
+    };
+    const orch = buildOrchestrator(ctx.get(1)!, peersById, {
+      frostKeyPackage: keyPackages[1]!,
+      frostPublicKeyPackage: publicKeyPackage,
+      logger,
+    });
+    orch.start();
+
+    try {
+      // Announce real btcParams but assert a bogus (all-zero) sighash that
+      // won't match what participants rebuild.
+      const announce = announceFrostMessage(
+        baseId,
+        baseId,
+        [{ hash: new Uint8Array(32), tweaked: true }],
+        [0, 1],
+        {
+          protocol: 'btc',
+          btcParams: {
+            to: destP2tr,
+            amountSat: '100000',
+            feeRate: 5,
+            network: 'testnet',
+            frostP2tr,
+            frostUntweakedPubKeyHex: toHex(frostUntweakedPubKey),
+            utxos: [
+              { transactionId: '22'.repeat(32), outputIndex: 0, valueSat: '200000' },
+            ],
+          },
+        },
+      );
+      await ctx.get(0)!.transport.broadcast(encodeCeremonyMessage(announce));
+
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline) {
+        if (errLogs.some((m) => m.includes('btc sighash') && m.includes('mismatch'))) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(errLogs.some((m) => m.includes('btc sighash') && m.includes('mismatch'))).toBe(true);
+
+      const r1Blob = ctx.get(1)!.store.get({
+        ceremonyId: baseId,
+        round: 'frost-sign-r1',
+        from: 1,
+      });
+      expect(r1Blob).toBeUndefined();
+    } finally {
+      orch.stop();
+      close();
+    }
+  }, 10_000);
+
+  it('BTC ceremony aborts when a participant gate rejects (not enough signers → leader timeout)', async () => {
+    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
+    const { ctx, close, peersById } = buildRing([0, 1, 2]);
+    const baseId = 'frost-sig-policy-reject';
+
+    const frostUntweakedPubKey = publicKeyPackage.untweakedVerifyingKey;
+    const internalXOnly = toXOnly(Buffer.from(frostUntweakedPubKey) as never);
+    const frostP2tr = payments.p2tr({
+      internalPubkey: internalXOnly as never,
+      network: networks.opnetTestnet,
+    }).address!;
+
+    // Destination NOT on party-1's allowlist → their PolicyGate rejects.
+    const destSk = new Uint8Array(Array.from({ length: 32 }, (_, i) => i + 91));
+    const destXOnly = new Uint8Array(schnorr.getPublicKey(destSk));
+    const destP2tr = payments.p2tr({
+      internalPubkey: destXOnly as never,
+      network: networks.opnetTestnet,
+    }).address!;
+
+    // Party 1's gate only allows `bc1pOTHER`; the ceremony targets destP2tr → reject.
+    const rejectingGate = new PolicyGate({ allowedBtcRecipients: ['bc1pOTHER'] });
+    const orch1 = buildOrchestrator(ctx.get(1)!, peersById, {
+      gate: rejectingGate,
+      frostKeyPackage: keyPackages[1]!,
+      frostPublicKeyPackage: publicKeyPackage,
+    });
+    orch1.start();
+
+    try {
+      const btcParams = {
+        to: destP2tr,
+        amountSat: 50_000n,
+        feeRate: 5,
+        network: 'testnet' as const,
+        frostP2tr,
+        frostUntweakedPubKey,
+        utxos: [{ transactionId: '44'.repeat(32), outputIndex: 0, value: 200_000n }],
+      };
+      const built = buildBtcTxFromParams(btcParams);
+
+      // signers=[0, 1]; leader (0) depends on party 1's blobs to combine.
+      // Party 1 rejects → silent → leader's pull exhausts retries → throw.
+      await expect(
+        ctx.get(0)!.runner.signFrostAsLeader(
+          {
+            ceremonyId: baseId,
+            sighashes: built.sighashes.map((s) => ({ hash: s.hash, tweaked: s.tweaked })),
+            signers: [0, 1],
+            keyPackage: keyPackages[0]!,
+            publicKeyPackage,
+            rng: SYSTEM_RNG,
+          },
+          { maxAttempts: 3, initialDelayMs: 2, maxDelayMs: 10, deadlineMs: 300 },
+          {
+            protocol: 'btc',
+            btcParams: {
+              to: btcParams.to,
+              amountSat: btcParams.amountSat.toString(),
+              feeRate: btcParams.feeRate,
+              network: btcParams.network,
+              frostP2tr: btcParams.frostP2tr,
+              frostUntweakedPubKeyHex: toHex(btcParams.frostUntweakedPubKey),
+              utxos: btcParams.utxos.map((u) => ({
+                transactionId: u.transactionId,
+                outputIndex: u.outputIndex,
+                valueSat: u.value.toString(),
+              })),
+            },
+          },
+        ),
+      ).rejects.toThrow();
+
+      // Party 1 rejected → no R1 blob produced.
+      const r1Blob1 = ctx.get(1)!.store.get({
+        ceremonyId: baseId,
+        round: 'frost-sign-r1',
+        from: 1,
+      });
+      expect(r1Blob1).toBeUndefined();
+    } finally {
+      orch1.stop();
+      close();
+    }
+  }, 15_000);
 
   it('FROST signing rejected when no frostKeyPackage is loaded (misconfigured daemon)', async () => {
     const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);

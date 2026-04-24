@@ -28,6 +28,53 @@ export type CeremonyMessage =
       baseCeremonyId: string;
       sighashes: Array<{ hashHex: string; tweaked: boolean }>;
       signers: PartyId[];
+      /**
+       * Protocol tag. Populated whenever the leader supplies enough context
+       * for participants to rebuild or verify (BTC construction params, or
+       * OPNet raw tx + inputs). Absent on ceremony-mechanics tests that use
+       * synthetic sighashes.
+       */
+      protocol?: 'btc' | 'opnet';
+      /**
+       * BTC vault construction parameters. Present iff `protocol='btc'`.
+       * Participants rebuild the tx locally from these + compare computed
+       * sighashes to the leader's `sighashes` field. Mismatch → silent drop
+       * (catches honest-leader bugs AND any leader asserting inconsistent
+       * sighashes vs construction params).
+       */
+      btcParams?: {
+        to: string;
+        amountSat: string;          // decimal, u64-safe
+        feeRate: number;
+        network: 'mainnet' | 'testnet';
+        frostP2tr: string;
+        frostUntweakedPubKeyHex: string;
+        utxos: Array<{
+          transactionId: string;
+          outputIndex: number;
+          valueSat: string;
+        }>;
+      };
+      /**
+       * Full unsigned tx hex (OPNet path — construction-params for OPNet is
+       * deferred until the SDK-level UTXO fetcher can be deterministically
+       * controlled). Present iff `protocol='opnet'`.
+       */
+      unsignedTxHex?: string;
+      /** OPNet per-input prevout info. Present iff `protocol='opnet'`. */
+      inputs?: Array<{ scriptHex: string; valueSat: string; tweaked: boolean }>;
+      /**
+       * Advisory hints for gate policy matching (OPNet). Operator-supplied on
+       * `/sign`, propagated here; unverified. Matches Ötzi's trust posture:
+       * federation-insider lies are out-of-scope (threshold protects key
+       * material; DoS is the worst insider outcome). Used for
+       * `allowed_contracts` / `allowed_methods` / amount-cap rules.
+       */
+      hints?: {
+        contractAddress?: string;
+        method?: string;
+        amountTokenAtomic?: string;
+      };
     }
   /**
    * Initiator announcement of an ML-DSA DKG ceremony. Symmetric: no leader,
@@ -136,7 +183,7 @@ export function parseCeremonyMessage(bytes: Uint8Array): CeremonyMessage | null 
       if (typeof item.hashHex !== 'string' || typeof item.tweaked !== 'boolean') return null;
       sighashes.push({ hashHex: item.hashHex, tweaked: item.tweaked });
     }
-    return {
+    const out: Extract<CeremonyMessage, { kind: 'announce-frost' }> = {
       v: 1,
       kind: 'announce-frost',
       ceremonyId: m.ceremonyId,
@@ -144,6 +191,67 @@ export function parseCeremonyMessage(bytes: Uint8Array): CeremonyMessage | null 
       sighashes,
       signers: m.signers as PartyId[],
     };
+    if (typeof m.unsignedTxHex === 'string') out.unsignedTxHex = m.unsignedTxHex;
+    if (m.protocol === 'btc' || m.protocol === 'opnet') out.protocol = m.protocol;
+    if (Array.isArray(m.inputs)) {
+      const inputs: Array<{ scriptHex: string; valueSat: string; tweaked: boolean }> = [];
+      for (const inp of m.inputs) {
+        if (!inp || typeof inp !== 'object') return null;
+        const item = inp as Record<string, unknown>;
+        if (
+          typeof item.scriptHex !== 'string' ||
+          typeof item.valueSat !== 'string' ||
+          typeof item.tweaked !== 'boolean'
+        ) return null;
+        inputs.push({ scriptHex: item.scriptHex, valueSat: item.valueSat, tweaked: item.tweaked });
+      }
+      out.inputs = inputs;
+    }
+    if (m.btcParams && typeof m.btcParams === 'object') {
+      const bp = m.btcParams as Record<string, unknown>;
+      if (
+        typeof bp.to !== 'string' ||
+        typeof bp.amountSat !== 'string' ||
+        typeof bp.feeRate !== 'number' ||
+        (bp.network !== 'mainnet' && bp.network !== 'testnet') ||
+        typeof bp.frostP2tr !== 'string' ||
+        typeof bp.frostUntweakedPubKeyHex !== 'string' ||
+        !Array.isArray(bp.utxos)
+      ) return null;
+      const utxos: Array<{ transactionId: string; outputIndex: number; valueSat: string }> = [];
+      for (const u of bp.utxos) {
+        if (!u || typeof u !== 'object') return null;
+        const item = u as Record<string, unknown>;
+        if (
+          typeof item.transactionId !== 'string' ||
+          typeof item.outputIndex !== 'number' ||
+          typeof item.valueSat !== 'string'
+        ) return null;
+        utxos.push({
+          transactionId: item.transactionId,
+          outputIndex: item.outputIndex,
+          valueSat: item.valueSat,
+        });
+      }
+      out.btcParams = {
+        to: bp.to,
+        amountSat: bp.amountSat,
+        feeRate: bp.feeRate,
+        network: bp.network,
+        frostP2tr: bp.frostP2tr,
+        frostUntweakedPubKeyHex: bp.frostUntweakedPubKeyHex,
+        utxos,
+      };
+    }
+    if (m.hints && typeof m.hints === 'object') {
+      const h = m.hints as Record<string, unknown>;
+      const hints: { contractAddress?: string; method?: string; amountTokenAtomic?: string } = {};
+      if (typeof h.contractAddress === 'string') hints.contractAddress = h.contractAddress;
+      if (typeof h.method === 'string') hints.method = h.method;
+      if (typeof h.amountTokenAtomic === 'string') hints.amountTokenAtomic = h.amountTokenAtomic;
+      out.hints = hints;
+    }
+    return out;
   }
   if (m.kind === 'announce-dkg') {
     if (
@@ -244,13 +352,46 @@ export function announceMessage(
   };
 }
 
+export interface AnnounceHints {
+  contractAddress?: string;
+  method?: string;
+  amountTokenAtomic?: string;
+}
+
+export interface AnnounceBtcParams {
+  to: string;
+  amountSat: string;
+  feeRate: number;
+  network: 'mainnet' | 'testnet';
+  frostP2tr: string;
+  frostUntweakedPubKeyHex: string;
+  utxos: ReadonlyArray<{ transactionId: string; outputIndex: number; valueSat: string }>;
+}
+
+/** BTC construction-params variant — participants rebuild from `btcParams`. */
+export interface AnnounceFrostBtcExtras {
+  protocol: 'btc';
+  btcParams: AnnounceBtcParams;
+}
+
+/** OPNet raw-tx variant — participants re-extract sighashes from the tx + inputs. */
+export interface AnnounceFrostOpnetExtras {
+  protocol: 'opnet';
+  unsignedTxHex: string;
+  inputs: ReadonlyArray<{ scriptHex: string; valueSat: string; tweaked: boolean }>;
+  hints?: AnnounceHints;
+}
+
+export type AnnounceFrostExtras = AnnounceFrostBtcExtras | AnnounceFrostOpnetExtras;
+
 export function announceFrostMessage(
   ceremonyId: string,
   baseCeremonyId: string,
   sighashes: ReadonlyArray<{ hash: Uint8Array; tweaked: boolean }>,
   signers: PartyId[],
+  extras?: AnnounceFrostExtras,
 ): CeremonyMessage {
-  return {
+  const msg: Extract<CeremonyMessage, { kind: 'announce-frost' }> = {
     v: 1,
     kind: 'announce-frost',
     ceremonyId,
@@ -258,6 +399,39 @@ export function announceFrostMessage(
     sighashes: sighashes.map(s => ({ hashHex: toHex(s.hash), tweaked: s.tweaked })),
     signers,
   };
+  if (extras) {
+    msg.protocol = extras.protocol;
+    if (extras.protocol === 'btc') {
+      msg.btcParams = {
+        to: extras.btcParams.to,
+        amountSat: extras.btcParams.amountSat,
+        feeRate: extras.btcParams.feeRate,
+        network: extras.btcParams.network,
+        frostP2tr: extras.btcParams.frostP2tr,
+        frostUntweakedPubKeyHex: extras.btcParams.frostUntweakedPubKeyHex,
+        utxos: extras.btcParams.utxos.map((u) => ({
+          transactionId: u.transactionId,
+          outputIndex: u.outputIndex,
+          valueSat: u.valueSat,
+        })),
+      };
+    } else {
+      msg.unsignedTxHex = extras.unsignedTxHex;
+      msg.inputs = extras.inputs.map((inp) => ({
+        scriptHex: inp.scriptHex,
+        valueSat: inp.valueSat,
+        tweaked: inp.tweaked,
+      }));
+      if (extras.hints) {
+        const h: AnnounceHints = {};
+        if (extras.hints.contractAddress !== undefined) h.contractAddress = extras.hints.contractAddress;
+        if (extras.hints.method !== undefined) h.method = extras.hints.method;
+        if (extras.hints.amountTokenAtomic !== undefined) h.amountTokenAtomic = extras.hints.amountTokenAtomic;
+        msg.hints = h;
+      }
+    }
+  }
+  return msg;
 }
 
 export function announceDkgMessage(

@@ -1,5 +1,6 @@
 import { ThresholdMLDSA } from '@btc-vision/post-quantum/threshold-ml-dsa.js';
-import type { Rng } from '@mwaddip/frots';
+import { Transaction, toXOnly } from '@btc-vision/bitcoin';
+import { verifySignature, type Rng } from '@mwaddip/frots';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -12,7 +13,7 @@ import type { DkgPersistenceSink } from '../orchestrator/types';
 import { RelayServer } from '../transport/relay/server';
 import { generateIdentity, type IdentityKeyPair } from '../transport/identity';
 import { getKL } from '../wire/dkg';
-import { toHex } from '../wire/hex';
+import { fromHex, toHex } from '../wire/hex';
 import {
   decryptShareFile,
   type DecryptedShare,
@@ -546,17 +547,16 @@ describe('Daemon integration — DKG persistence + restart', () => {
 
       for (const b of round2Bundles) await waitUntilConnected(b, n - 1);
 
-      // Sign with the reloaded share. Sticks to ML-DSA because FROST
-      // PublicKeyPackage reconstruction from V3 is the next handoff item
-      // (#2) — the share has the FROST key material but the daemon doesn't
-      // assemble PublicKeyPackage from it yet.
+      // Sign with the reloaded share — ML-DSA first (scheme='mldsa'), then FROST.
       const message = new Uint8Array(32);
       crypto.getRandomValues(message);
       const signRes = await fetch(`http://127.0.0.1:${httpPorts[0]}/`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          op: 'sign-mldsa',
+          op: 'sign',
+          scheme: 'mldsa',
+          protocol: 'raw',
           ceremonyId: 'integration-persistence-sign',
           messageHex: toHex(message),
           signers: [0, 1],
@@ -564,15 +564,84 @@ describe('Daemon integration — DKG persistence + restart', () => {
       });
       const signBodyText = await signRes.text();
       if (signRes.status !== 200) {
-        throw new Error(`sign-mldsa returned ${signRes.status}: ${signBodyText}`);
+        throw new Error(`sign mldsa returned ${signRes.status}: ${signBodyText}`);
       }
       const signJson = JSON.parse(signBodyText) as {
         ceremonyId: string;
         status: string;
+        scheme: string;
         signatureHex: string;
       };
       expect(signJson.status).toBe('done');
+      expect(signJson.scheme).toBe('mldsa');
       expect(signJson.signatureHex.length).toBeGreaterThan(0);
+
+      // FROST key-path sign against a real unsigned Taproot tx. Operator POSTs
+      // tx bytes + prevout info; daemon extracts BIP-341 sighashes, runs the
+      // ceremony, returns sigs. BIP340 verify under the tweaked aggregate
+      // verifying key proves the reloaded share + derived PKG are consistent
+      // with the DKG's output.
+      const vkBytes = fromHex(dkgJson.frostVerifyingKeyHex);
+      const tweakedXOnly = toXOnly(Buffer.from(vkBytes) as never);
+      const p2trScript = Buffer.concat([
+        Buffer.from([0x51, 0x20]),
+        Buffer.from(tweakedXOnly),
+      ]);
+      const prevoutValue = 100_000n;
+      const unsignedTx = new Transaction();
+      unsignedTx.version = 2;
+      unsignedTx.addInput(Buffer.alloc(32, 0x42) as never, 0);
+      unsignedTx.addOutput(p2trScript as never, 50_000n as never);
+      const unsignedTxHex = unsignedTx.toHex();
+
+      // Use the OPNet raw-tx path here — structurally the same sighash math
+      // (BIP-341 key-path). Proper BTC construction-params rebuild path is
+      // exercised by the dedicated test added in phase B2.
+      const unifiedRes = await fetch(`http://127.0.0.1:${httpPorts[0]}/`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          op: 'sign',
+          ceremonyId: 'integration-persistence-sign-unified',
+          scheme: 'frost',
+          protocol: 'opnet',
+          unsignedTxHex,
+          signers: [0, 1],
+          inputs: [
+            {
+              scriptHex: p2trScript.toString('hex'),
+              valueSat: String(prevoutValue),
+              tweaked: true,
+            },
+          ],
+        }),
+      });
+      const unifiedBody = await unifiedRes.text();
+      if (unifiedRes.status !== 200) {
+        throw new Error(`sign (unified) returned ${unifiedRes.status}: ${unifiedBody}`);
+      }
+      const unifiedJson = JSON.parse(unifiedBody) as {
+        ceremonyId: string;
+        status: string;
+        scheme: string;
+        signaturesHex: string[];
+      };
+      expect(unifiedJson.status).toBe('done');
+      expect(unifiedJson.scheme).toBe('frost');
+      expect(unifiedJson.signaturesHex).toHaveLength(1);
+
+      // Recompute the expected sighash locally (same math the daemon runs
+      // via `extractBtcSighashes`) and BIP340-verify under the tweaked key.
+      const expectedSighash = unsignedTx.hashForWitnessV1(
+        0,
+        [p2trScript as never],
+        [prevoutValue as never],
+        0x00,
+      );
+      const unifiedSig = fromHex(unifiedJson.signaturesHex[0]!);
+      expect(
+        verifySignature(unifiedSig, new Uint8Array(expectedSighash), vkBytes),
+      ).toBe(true);
     },
     300_000,
   );

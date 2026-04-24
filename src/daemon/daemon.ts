@@ -91,8 +91,8 @@ export class Daemon {
       node: { id: deps.state.config.node.id, partyId: deps.state.config.node.partyId },
       peersById: deps.state.peersById,
       share: deps.state.share,
-      frostKeyPackage: deps.frostKeyPackage,
-      frostPublicKeyPackage: deps.frostPublicKeyPackage,
+      frostKeyPackage: deps.frostKeyPackage ?? deps.state.share?.frostKeyPackage,
+      frostPublicKeyPackage: deps.frostPublicKeyPackage ?? deps.state.frostPublicKeyPackage,
       rng: deps.rng,
       pullOpts: deps.pullOpts,
       ceremonyDeadlines: deps.state.config.deadlines,
@@ -106,8 +106,8 @@ export class Daemon {
       node: { id: deps.state.config.node.id, partyId: deps.state.config.node.partyId },
       peersById: deps.state.peersById,
       share: deps.state.share,
-      frostKeyPackage: deps.frostKeyPackage,
-      frostPublicKeyPackage: deps.frostPublicKeyPackage,
+      frostKeyPackage: deps.frostKeyPackage ?? deps.state.share?.frostKeyPackage,
+      frostPublicKeyPackage: deps.frostPublicKeyPackage ?? deps.state.frostPublicKeyPackage,
       rng: deps.rng,
       pullOpts: deps.pullOpts,
       persistDkgShare: deps.state.persistDkgShare,
@@ -271,40 +271,119 @@ export function buildDefaultHttpHandler(
             },
           };
         }
-        case 'sign-mldsa': {
-          const sig = await leader.signMldsa({
-            ceremonyId,
-            operation: 'generic',
-            message: fromHex(requireString(b, 'messageHex')),
-            signers: requireNumberArray(b, 'signers'),
-          });
-          return { status: 200, body: { ceremonyId, status: 'done', signatureHex: toHex(sig) } };
-        }
-        case 'sign-frost': {
-          const rawSighashes = b.sighashes;
-          if (!Array.isArray(rawSighashes))
-            return { status: 400, body: { error: "'sighashes' must be an array" } };
-          const sighashes = rawSighashes.map((s, i) => {
-            if (!s || typeof s !== 'object')
-              throw new Error(`sighashes[${i}] must be { hashHex, tweaked }`);
-            const item = s as Record<string, unknown>;
+        case 'sign': {
+          const scheme = requireString(b, 'scheme');
+          if (scheme !== 'frost' && scheme !== 'mldsa')
+            return { status: 400, body: { error: "'scheme' must be 'frost' or 'mldsa'" } };
+          const protocol = requireString(b, 'protocol');
+          const signers = requireNumberArray(b, 'signers');
+
+          let result: Awaited<ReturnType<typeof leader.sign>>;
+          if (scheme === 'mldsa') {
+            if (protocol !== 'raw')
+              return { status: 400, body: { error: "scheme='mldsa' requires protocol='raw'" } };
+            result = await leader.sign({
+              ceremonyId,
+              scheme: 'mldsa',
+              protocol: 'raw',
+              message: fromHex(requireString(b, 'messageHex')),
+              signers,
+            });
+          } else if (protocol === 'btc') {
+            const btc = requireObject(b, 'btc');
+            const network = requireString(btc, 'network');
+            if (network !== 'mainnet' && network !== 'testnet')
+              return { status: 400, body: { error: "btc.network must be 'mainnet' or 'testnet'" } };
+            const utxosRaw = btc.utxos;
+            if (!Array.isArray(utxosRaw))
+              return { status: 400, body: { error: "btc.utxos must be an array" } };
+            const utxos = utxosRaw.map((u, i) => {
+              if (!u || typeof u !== 'object')
+                throw new Error(`btc.utxos[${i}] must be { transactionId, outputIndex, valueSat }`);
+              const item = u as Record<string, unknown>;
+              return {
+                transactionId: requireString(item, 'transactionId'),
+                outputIndex: requireNumber(item, 'outputIndex'),
+                value: BigInt(requireString(item, 'valueSat')),
+              };
+            });
+            result = await leader.sign({
+              ceremonyId,
+              scheme: 'frost',
+              protocol: 'btc',
+              signers,
+              btc: {
+                to: requireString(btc, 'to'),
+                amountSat: BigInt(requireString(btc, 'amountSat')),
+                feeRate: requireNumber(btc, 'feeRate'),
+                network,
+                frostP2tr: requireString(btc, 'frostP2tr'),
+                frostUntweakedPubKey: fromHex(requireString(btc, 'frostUntweakedPubKeyHex')),
+                utxos,
+              },
+            });
+          } else if (protocol === 'opnet') {
+            const rawInputs = b.inputs;
+            if (!Array.isArray(rawInputs))
+              return { status: 400, body: { error: "'inputs' must be an array for protocol='opnet'" } };
+            const inputs = rawInputs.map((inp, i) => {
+              if (!inp || typeof inp !== 'object')
+                throw new Error(`inputs[${i}] must be { scriptHex, valueSat, tweaked }`);
+              const item = inp as Record<string, unknown>;
+              const rawValue = item.valueSat;
+              const valueSat =
+                typeof rawValue === 'string'
+                  ? rawValue
+                  : typeof rawValue === 'number'
+                    ? String(Math.trunc(rawValue))
+                    : null;
+              if (valueSat === null)
+                throw new Error(`inputs[${i}].valueSat must be a string or integer`);
+              return {
+                scriptHex: requireString(item, 'scriptHex'),
+                valueSat,
+                tweaked: typeof item.tweaked === 'boolean' ? item.tweaked : true,
+              };
+            });
+            const hintsRaw = b.hints;
+            let hints: { contractAddress?: string; method?: string; amountTokenAtomic?: string } | undefined;
+            if (hintsRaw && typeof hintsRaw === 'object') {
+              const h = hintsRaw as Record<string, unknown>;
+              hints = {};
+              if (typeof h.contractAddress === 'string') hints.contractAddress = h.contractAddress;
+              if (typeof h.method === 'string') hints.method = h.method;
+              if (typeof h.amountTokenAtomic === 'string') hints.amountTokenAtomic = h.amountTokenAtomic;
+            }
+            result = await leader.sign({
+              ceremonyId,
+              scheme: 'frost',
+              protocol: 'opnet',
+              signers,
+              unsignedTx: fromHex(requireString(b, 'unsignedTxHex')),
+              inputs,
+              ...(hints ? { hints } : {}),
+            });
+          } else {
+            return { status: 400, body: { error: "'protocol' must be 'raw', 'btc', or 'opnet'" } };
+          }
+          if (result.scheme === 'mldsa') {
             return {
-              hash: fromHex(requireString(item, 'hashHex')),
-              tweaked: typeof item.tweaked === 'boolean' ? item.tweaked : true,
+              status: 200,
+              body: {
+                ceremonyId,
+                status: 'done',
+                scheme: 'mldsa',
+                signatureHex: toHex(result.signature),
+              },
             };
-          });
-          const sigs = await leader.signFrost({
-            ceremonyId,
-            operation: 'generic',
-            sighashes,
-            signers: requireNumberArray(b, 'signers'),
-          });
+          }
           return {
             status: 200,
             body: {
               ceremonyId,
               status: 'done',
-              signaturesHex: sigs.map((s) => toHex(s)),
+              scheme: 'frost',
+              signaturesHex: result.signatures.map((s) => toHex(s)),
             },
           };
         }
@@ -331,6 +410,12 @@ function requireString(obj: Record<string, unknown>, key: string): string {
   const v = obj[key];
   if (typeof v !== 'string') throw new Error(`'${key}' must be a string`);
   return v;
+}
+function requireObject(obj: Record<string, unknown>, key: string): Record<string, unknown> {
+  const v = obj[key];
+  if (!v || typeof v !== 'object' || Array.isArray(v))
+    throw new Error(`'${key}' must be an object`);
+  return v as Record<string, unknown>;
 }
 function requireNumber(obj: Record<string, unknown>, key: string): number {
   const v = obj[key];

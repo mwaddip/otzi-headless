@@ -25,6 +25,7 @@ import {
   signoffAbortedMessage,
   signoffDoneMessage,
   signoffFrostDoneMessage,
+  type AnnounceFrostExtras,
 } from './ceremony-messages';
 import {
   createSession as createFrostSession,
@@ -275,6 +276,7 @@ export class CeremonyRunner {
   async signFrostAsLeader(
     spec: FrostSigningSpec,
     opts: PullOpts,
+    announceExtras?: AnnounceFrostExtras,
   ): Promise<Uint8Array[]> {
     const me = this.transport.partyId;
     if (!spec.signers.includes(me)) {
@@ -285,7 +287,13 @@ export class CeremonyRunner {
     try {
       await this.transport.broadcast(
         encodeCeremonyMessage(
-          announceFrostMessage(spec.ceremonyId, spec.ceremonyId, spec.sighashes, spec.signers),
+          announceFrostMessage(
+            spec.ceremonyId,
+            spec.ceremonyId,
+            spec.sighashes,
+            spec.signers,
+            announceExtras,
+          ),
         ),
       );
 

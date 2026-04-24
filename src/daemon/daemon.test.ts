@@ -228,7 +228,7 @@ describe('Daemon — HTTP-driven DKG end-to-end', () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('Daemon — HTTP-driven ML-DSA signing', () => {
-  it('sign-mldsa: leader produces a signature; participants contribute blobs', async () => {
+  it('op=sign scheme=mldsa: leader produces a signature; participants contribute blobs', async () => {
     const ring = buildRing(3, '127.0.0.1:0');
     const daemons: Daemon[] = [];
     for (const pid of [0, 1, 2] as PartyId[]) {
@@ -251,15 +251,18 @@ describe('Daemon — HTTP-driven ML-DSA signing', () => {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          op: 'sign-mldsa',
+          op: 'sign',
+          scheme: 'mldsa',
+          protocol: 'raw',
           ceremonyId: 'sig-integration-1',
           messageHex: msgHex,
           signers: [0, 1],
         }),
       });
       expect(res.status).toBe(200);
-      const json = (await res.json()) as { status: string; signatureHex: string };
+      const json = (await res.json()) as { status: string; scheme: string; signatureHex: string };
       expect(json.status).toBe('done');
+      expect(json.scheme).toBe('mldsa');
       expect(json.signatureHex.length).toBeGreaterThan(0);
     } finally {
       for (const d of daemons) await d.stop();
@@ -335,7 +338,9 @@ describe('Daemon — HTTP error paths', () => {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          op: 'sign-mldsa',
+          op: 'sign',
+          scheme: 'mldsa',
+          protocol: 'raw',
           messageHex: toHex(new TextEncoder().encode('x')),
           signers: [0, 1],
         }),

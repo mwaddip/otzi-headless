@@ -15,11 +15,13 @@
  * decrypt an existing share *or* encrypt a freshly-DKG'd one.
  */
 
+import type { PublicKeyPackage } from '@mwaddip/frots';
 import { readFile } from 'node:fs/promises';
 import { loadDaemonConfig } from '../config/load';
 import type { DaemonConfig } from '../config/types';
 import type { PartyId } from '../core/types';
 import type { DkgPersistenceSink } from '../orchestrator/types';
+import { buildFrostPublicKeyPackage } from '../wire/frost-reconstruct';
 import { decryptShareFile, type DecryptedShare, type ShareFile } from '../wire/share-crypto';
 import { persistCombinedDkgShare } from './share-persistence';
 
@@ -29,6 +31,8 @@ export interface LoadedDaemonState {
   config: DaemonConfig;
   /** Decrypted share. Undefined when the daemon is in DKG-only mode (no share file at startup). */
   share?: DecryptedShare;
+  /** Derived from `share.frostKeyPackage` when present (see `buildFrostPublicKeyPackage`). */
+  frostPublicKeyPackage?: PublicKeyPackage;
   /** Includes self. Orchestrator + leader consume this directly. */
   peersById: ReadonlyMap<PartyId, string>;
   /** Pre-bound persistence sink. Present after `validateLoaded`; absent for `buildStateFromShare` / `buildStateNoShare`. */
@@ -104,7 +108,10 @@ export function buildStateFromShare(
 ): LoadedDaemonState {
   validateAlignment(config, share);
   const peersById = buildPeersById(config);
-  return { config, share, peersById };
+  const frostPublicKeyPackage = share.frostKeyPackage
+    ? buildFrostPublicKeyPackage(share.frostKeyPackage)
+    : undefined;
+  return { config, share, frostPublicKeyPackage, peersById };
 }
 
 /**

@@ -139,6 +139,189 @@ export function selectBtcUtxos(
   return { selected, fee, change };
 }
 
+/**
+ * Per-input prevout info needed to recompute BIP-341 sighashes from a
+ * pre-built unsigned transaction. Operator supplies this on the `/sign`
+ * API; participants re-derive the same sighashes from it.
+ */
+export interface BtcSighashInput {
+  /** Hex of the scriptPubKey for this input's prevout. */
+  scriptHex: string;
+  /** Satoshi value of the prevout, as a decimal string for bigint safety. */
+  valueSat: string;
+  /** true = key-path (BIP341 tap-tweak); false = script-path. */
+  tweaked: boolean;
+}
+
+export interface BtcBuildParams {
+  /** Destination bech32 address (must be valid for `network`). */
+  to: string;
+  /** Positive satoshi amount. */
+  amountSat: bigint;
+  /** Fee rate sat/vB. */
+  feeRate: number;
+  network: NetworkName;
+  /** FROST vault P2TR — source of UTXOs and change destination. */
+  frostP2tr: string;
+  /** 33B SEC1 compressed untweaked FROST aggregate pubkey. */
+  frostUntweakedPubKey: Uint8Array;
+  /** UTXOs the caller asserts the vault holds. See `buildBtcTxFromParams` doc for trust model. */
+  utxos: readonly BtcUtxo[];
+}
+
+export interface BtcBuildResult {
+  /** Full unsigned tx hex. */
+  txHex: string;
+  /** BIP-341 key-path sighashes, one per input. All `tweaked: true` (vault is P2TR key-path). */
+  sighashes: Array<{ index: number; hash: Uint8Array; tweaked: boolean }>;
+  /** Per-input prevout info (scriptHex + valueSat). */
+  inputs: BtcSighashInput[];
+  /** Decoded outputs. Populates `SigningSpec.outputs` for gate rules. */
+  outputs: DecodedBtcOutput[];
+  estimatedFeeSat: bigint;
+  changeSat: bigint;
+}
+
+/**
+ * Build an unsigned BTC vault transfer tx + sighashes from construction params.
+ *
+ * Deterministic: two nodes running this with identical params produce
+ * identical tx bytes. Called by the leader on `/sign` and re-run by
+ * participants on announce receipt to verify sighashes match.
+ *
+ * Trust model for UTXOs: the leader asserts a UTXO snapshot; participants
+ * rebuild from the same assertion. If the leader lies, BIP-341 sighashes
+ * commit to prevout scripts + values, so Bitcoin consensus rejects at
+ * broadcast time — worst case is a wasted ceremony (DoS), never theft.
+ * See `feedback_match_otzi_trust_model`: insider DoS is in-scope.
+ */
+export function buildBtcTxFromParams(params: BtcBuildParams): BtcBuildResult {
+  const { to, amountSat, feeRate, network: networkName, frostP2tr, frostUntweakedPubKey, utxos } = params;
+
+  if (typeof amountSat !== 'bigint' || amountSat <= 0n) {
+    throw new Error(`buildBtcTxFromParams: amountSat must be a positive bigint (got ${String(amountSat)})`);
+  }
+  if (typeof feeRate !== 'number' || feeRate <= 0) {
+    throw new Error('buildBtcTxFromParams: feeRate must be a positive number (sat/vB)');
+  }
+
+  const network = getNetwork(networkName);
+  const internalXOnly = toXOnly(Buffer.from(frostUntweakedPubKey) as never);
+
+  // Throws if `to` isn't valid for the selected network — surface directly.
+  btcAddress.toOutputScript(to, network);
+
+  const { selected, fee, change } = selectBtcUtxos(utxos, amountSat, feeRate);
+
+  const p2trOutput = payments.p2tr({ internalPubkey: internalXOnly as never, network }).output!;
+
+  const tx = new Transaction();
+  tx.version = 2;
+  for (const utxo of selected) {
+    const txidBuf = Buffer.from(utxo.transactionId.replace(/^0x/, ''), 'hex').reverse();
+    tx.addInput(txidBuf as never, utxo.outputIndex);
+  }
+
+  tx.addOutput(btcAddress.toOutputScript(to, network) as never, amountSat as never);
+  if (change > 0n) {
+    tx.addOutput(btcAddress.toOutputScript(frostP2tr, network) as never, change as never);
+  }
+
+  const prevoutScripts = selected.map(() => p2trOutput);
+  const prevoutValues = selected.map((u) => u.value as never);
+
+  const sighashes: Array<{ index: number; hash: Uint8Array; tweaked: boolean }> = [];
+  for (let i = 0; i < selected.length; i++) {
+    const hash = tx.hashForWitnessV1(i, prevoutScripts, prevoutValues, 0x00);
+    sighashes.push({ index: i, hash: new Uint8Array(hash), tweaked: true });
+  }
+
+  const p2trOutputHex = Buffer.from(p2trOutput).toString('hex');
+  const inputs: BtcSighashInput[] = selected.map((u) => ({
+    scriptHex: p2trOutputHex,
+    valueSat: u.value.toString(),
+    tweaked: true,
+  }));
+
+  const txHex = tx.toHex();
+  const outputs = decodeBtcOutputs(txHex, networkName);
+
+  return {
+    txHex,
+    sighashes,
+    inputs,
+    outputs,
+    estimatedFeeSat: fee,
+    changeSat: change,
+  };
+}
+
+export interface DecodedBtcOutput {
+  /**
+   * Parsed output address. `null` for outputs whose script doesn't resolve
+   * to a known address type (OP_RETURN data carriers, non-standard scripts).
+   */
+  address: string | null;
+  /** Output value in satoshis. */
+  amountSat: bigint;
+  /** Raw scriptPubKey, hex. */
+  scriptHex: string;
+}
+
+/**
+ * Decode outputs of a pre-built unsigned transaction. Structural BTC decode
+ * only — no ABI, no OPNet awareness. Consumed by the gate layer to populate
+ * `SigningSpec` fields (amount cap, recipient allowlist rules). Callers that
+ * gate on recipients should treat `address: null` as non-matching.
+ */
+export function decodeBtcOutputs(
+  unsignedTxHex: string,
+  networkName: NetworkName,
+): DecodedBtcOutput[] {
+  const tx = Transaction.fromHex(unsignedTxHex);
+  const network = getNetwork(networkName);
+  return tx.outs.map((out) => {
+    let address: string | null = null;
+    try {
+      address = btcAddress.fromOutputScript(out.script, network);
+    } catch {
+      address = null;
+    }
+    return {
+      address,
+      amountSat: BigInt(out.value as unknown as bigint),
+      scriptHex: Buffer.from(out.script).toString('hex'),
+    };
+  });
+}
+
+/**
+ * Extract per-input BIP-341 sighashes from a pre-built unsigned tx.
+ * Protocol-level only: no ABI decoding, no contract awareness. Used by the
+ * `/sign` leader path and by participants (on verify). Sighash type is
+ * SIGHASH_DEFAULT (0x00) for every input — key-path and script-path both
+ * commit to all inputs + outputs in the default BIP-341 form.
+ */
+export function extractBtcSighashes(
+  unsignedTxHex: string,
+  inputs: readonly BtcSighashInput[],
+): Array<{ index: number; hash: Uint8Array; tweaked: boolean }> {
+  const tx = Transaction.fromHex(unsignedTxHex);
+  if (inputs.length !== tx.ins.length) {
+    throw new Error(
+      `extractBtcSighashes: ${inputs.length} prevouts provided for ${tx.ins.length} tx inputs`,
+    );
+  }
+  const scripts = inputs.map((inp) => Buffer.from(inp.scriptHex, 'hex') as never);
+  const values = inputs.map((inp) => BigInt(inp.valueSat) as never);
+  const out: Array<{ index: number; hash: Uint8Array; tweaked: boolean }> = [];
+  for (let i = 0; i < inputs.length; i++) {
+    const hash = tx.hashForWitnessV1(i, scripts, values, 0x00);
+    out.push({ index: i, hash: new Uint8Array(hash), tweaked: inputs[i]!.tweaked });
+  }
+  return out;
+}
+
 export async function prepareBtcTx(inputs: PrepareBtcInputs): Promise<PrepareBtcResult> {
   const { to, amount, feeRate, network: networkName, frostP2tr, frostUntweakedPubKey } = inputs;
 
