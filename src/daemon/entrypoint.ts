@@ -2,8 +2,8 @@
  * CLI entrypoint — dispatches to subcommands:
  *
  *   otzi daemon <config.toml>                              — run the daemon
- *   otzi setup master <config.toml> --bind <host:port>     — run bootstrap (master side)
- *   otzi setup member <config.toml> --master <url>         — run bootstrap (member side)
+ *   otzi setup leader <config.toml> --bind <host:port>     — run bootstrap (leader side)
+ *   otzi setup leaf <config.toml> --leader <url>           — run bootstrap (leaf side)
  *   otzi generate <config.toml> [flags]                    — trigger DKG against local daemon
  *
  * The `daemon` subcommand loads config + share + identity + pubkey book and
@@ -44,8 +44,8 @@ function usage(): string {
   return [
     'usage:',
     '  otzi daemon <path/to/daemon.toml>',
-    '  otzi setup master <path/to/daemon.toml> --bind <host:port>',
-    '  otzi setup member <path/to/daemon.toml> --master <url>',
+    '  otzi setup leader <path/to/daemon.toml> --bind <host:port>',
+    '  otzi setup leaf <path/to/daemon.toml> --leader <url>',
     '  otzi generate <path/to/daemon.toml> [--threshold N] [--level 44] [--ceremony-id <id>]',
   ].join('\n');
 }
@@ -98,7 +98,7 @@ async function runDaemonCommand(args: string[]): Promise<void> {
   );
   if (!state.share) {
     console.error(
-      `otzi daemon: signing requests will be rejected until DKG runs. From another shell on the master node:`,
+      `otzi daemon: signing requests will be rejected until DKG runs. From another shell on the leader node:`,
     );
     console.error(`  otzi generate ${state.config.share.path === '/dev/null' ? '<config.toml>' : '<your config.toml>'}`);
     console.error('Then SIGINT this daemon and restart to load the persisted share.');
@@ -114,16 +114,16 @@ async function runSetupCommand(args: string[]): Promise<void> {
   if (!subcmd || !configPath) throw new Error(usage());
 
   const flagMap = parseFlags(flags);
-  if (subcmd === 'master') {
+  if (subcmd === 'leader') {
     const bind = flagMap.get('bind');
-    if (!bind) throw new Error('otzi setup master: --bind <host:port> is required');
+    if (!bind) throw new Error('otzi setup leader: --bind <host:port> is required');
     await setupMaster(configPath, bind);
     return;
   }
-  if (subcmd === 'member') {
-    const masterUrl = flagMap.get('master');
-    if (!masterUrl) throw new Error('otzi setup member: --master <url> is required');
-    await setupMember(configPath, masterUrl);
+  if (subcmd === 'leaf') {
+    const leaderUrl = flagMap.get('leader');
+    if (!leaderUrl) throw new Error('otzi setup leaf: --leader <url> is required');
+    await setupMember(configPath, leaderUrl);
     return;
   }
   throw new Error(`unknown setup subcommand '${subcmd}'\n${usage()}`);

@@ -111,11 +111,11 @@ The daemon runs as TypeScript via [`tsx`](https://github.com/privatenumber/tsx)
 ```bash
 ./bin/otzi                                                    # prints usage
 ./bin/otzi daemon config.toml                                 # run daemon
-./bin/otzi setup master config.toml --bind 0.0.0.0:7090       # bootstrap master
-./bin/otzi setup member config.toml --master http://<master>:7090  # bootstrap member
+./bin/otzi setup leader config.toml --bind 0.0.0.0:7090       # bootstrap leader
+./bin/otzi setup leaf config.toml --leader http://<leader>:7090  # bootstrap leaf
 ```
 
-Or from inside the repo: `npm run daemon -- config.toml`, `npm run setup:master -- config.toml --bind …`, etc.
+Or from inside the repo: `npm run daemon -- config.toml`, `npm run setup:leader -- config.toml --bind …`, etc.
 
 ## Setting up a federation
 
@@ -170,27 +170,27 @@ For `kind = "relay"`, drop `transport.listen` and add `transport.url = "ws://rel
 ### 2. Bootstrap identity + pubkey book
 
 The bootstrap exchanges each daemon's long-term ECDH public key. Designate
-one node as the **master** for setup; others `register` against it.
-Run the daemons **sequentially** — master first, then each member.
+one node as the **leader** for setup; others `register` against it.
+Run the daemons **sequentially** — leader first, then each leaf.
 
-**On the master (`node-a`):**
+**On the leader (`node-a`):**
 
 ```bash
-./bin/otzi setup master /etc/otzi/daemon.toml --bind 0.0.0.0:7090
+./bin/otzi setup leader /etc/otzi/daemon.toml --bind 0.0.0.0:7090
 ```
 
-Master generates an identity keypair (if one doesn't already exist), starts
+Leader generates an identity keypair (if one doesn't already exist), starts
 a one-shot HTTP server, and waits for every expected peer to register. On
 completion, it writes `pubkey_book_file` and prints the fingerprint.
 
-**On each member (`node-b`, `node-c`):**
+**On each leaf (`node-b`, `node-c`):**
 
 ```bash
-./bin/otzi setup member /etc/otzi/daemon.toml --master http://node-a.example:7090
+./bin/otzi setup leaf /etc/otzi/daemon.toml --leader http://node-a.example:7090
 ```
 
-Each member generates its own identity, POSTs it to master, and long-polls
-until master returns the full pubkey book. It writes the same book locally
+Each leaf generates its own identity, POSTs it to leader, and long-polls
+until leader returns the full pubkey book. It writes the same book locally
 and prints the fingerprint.
 
 ### 3. Verify fingerprints
