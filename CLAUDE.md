@@ -8,6 +8,17 @@ Headless daemon variant of Ötzi, for automated and federated threshold-signing 
 
 Reference implementation: `~/projects/otzi/` (React + Express + Go relay, interactive operators). This repo is a **separate-repo sibling**, not a workspace member — drift risk is minimal because the protocol is solidified (DKG + FROST + ML-DSA, standards-based); any changes are bug fixes, not new features.
 
+## Interface Contracts
+
+`INTERFACES.md` (entry point) + `facts/<subsystem>.md` (per-subsystem) hold the authoritative preconditions, postconditions, and invariants for every component in this repo.
+
+**Before any code change:**
+1. Read the relevant `facts/<subsystem>.md` first. The `INTERFACES.md` index maps subsystems to files.
+2. If the change crosses a contract boundary, update the contract there before writing code.
+3. Cite affected contracts in commit messages and PR descriptions.
+
+If a contract doesn't match current behavior, the contract is stale — investigate, fix the divergence, then resume work. Never silently route around a stale contract.
+
 ## Core Architecture: Pull-Based Blob Exchange
 
 Ötzi's React UI uses leader-driven state-sync: 500ms STATE broadcasts, barrier synchronization, COMPLETE-gated transitions. **DO NOT PORT THIS.** That complexity is browser tax (tabs close, timers drift, users refresh); it's a coordination primitive forced by fragile endpoints, not a protocol property.
