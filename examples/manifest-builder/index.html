@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ötzi Manifest Builder</title>
+<style>
+  :root {
+    --fg: #222; --bg: #fafafa; --panel-bg: #fff; --border: #ddd;
+    --accent: #2e6fdb; --error: #c04040; --warning: #b07c00; --ok: #2e8b57;
+    --disabled: #aaa;
+  }
+  body { margin: 0; font-family: system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  .layout { display: grid; grid-template-columns: 220px 1fr 220px; min-height: 100vh; }
+  .sidebar, .export-panel { background: var(--panel-bg); border-right: 1px solid var(--border); padding: 1rem; }
+  .export-panel { border-left: 1px solid var(--border); border-right: 0; }
+  main { padding: 1.5rem; overflow-y: auto; }
+  .mode { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+  .nav-item { display: block; width: 100%; text-align: left; padding: 0.5rem 0.75rem;
+    background: transparent; border: 0; cursor: pointer; border-radius: 4px;
+    color: var(--fg); font: inherit; }
+  .nav-item.active { background: var(--accent); color: #fff; }
+  .nav-item.disabled, .nav-item:disabled { color: var(--disabled); cursor: not-allowed; }
+  .err-badge { background: var(--error); color: #fff; border-radius: 10px; padding: 0 0.4rem;
+    font-size: 0.75em; margin-left: 0.4rem; }
+  .load-btn { display: block; margin: 0.5rem 0 1rem; padding: 0.5rem; border: 1px dashed var(--border);
+    border-radius: 4px; cursor: pointer; text-align: center; }
+  .load-btn input { display: none; }
+  .export-btn { width: 100%; padding: 0.7rem; background: var(--accent); color: #fff;
+    border: 0; border-radius: 4px; font: inherit; cursor: pointer; }
+  .export-btn:disabled { background: var(--disabled); cursor: not-allowed; }
+  .card, .param-card { background: var(--panel-bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+  .param-card { background: #f5f5f5; }
+  .card header { font-size: 1.05em; margin-bottom: 0.6rem; }
+  label { display: block; margin: 0.4rem 0; }
+  label input, label select, label textarea { display: block; width: 100%; margin-top: 0.2rem;
+    padding: 0.4rem; border: 1px solid var(--border); border-radius: 3px; font: inherit;
+    box-sizing: border-box; }
+  label textarea { font-family: monospace; font-size: 0.9em; }
+  .abi-tabs { margin: 0.5rem 0; }
+  .abi-tabs label { display: inline-block; margin-right: 1rem; }
+  .delete { background: var(--error); color: #fff; border: 0; padding: 0.3rem 0.7rem;
+    border-radius: 4px; cursor: pointer; }
+  .field-errors { margin: 0.2rem 0; padding-left: 1.2rem; color: var(--error); font-size: 0.9em; }
+  .banner { padding: 0.7rem 1rem; border-radius: 4px; margin-bottom: 1rem; display: flex;
+    justify-content: space-between; align-items: center; }
+  .banner.error { background: #ffe5e5; color: var(--error); border: 1px solid var(--error); }
+  .banner.ok { background: #e5f5ea; color: var(--ok); border: 1px solid var(--ok); }
+  .banner button { background: transparent; border: 0; cursor: pointer; font-size: 1.1em; }
+  .hint { color: #666; font-size: 0.9em; }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 0.8rem 0; }
+  h2 { margin-top: 0; }
+  button { font: inherit; }
+</style>
+</head>
+<body>
+<script type="importmap">
+{
+  "imports": {
+    "preact": "./vendor/preact.js",
+    "preact/hooks": "./vendor/preact-hooks.js",
+    "@preact/signals": "./vendor/signals.js",
+    "htm": "./vendor/htm.js",
+    "ajv/dist/2020.js": "./vendor/ajv.js"
+  }
+}
+</script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
