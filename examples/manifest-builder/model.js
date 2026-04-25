@@ -54,8 +54,8 @@ function stripOperation(op, mode) {
     params: (op.params ?? []).map((p) => stripParam(p, mode)),
   };
   if (op.description) out.description = op.description;
-  if (op.confirm) out.confirm = op.confirm;
   if (mode === 'full') {
+    if (op.confirm) out.confirm = op.confirm;
     if (op.condition !== undefined) out.condition = op.condition;
     if (op.ownerOnly) out.ownerOnly = op.ownerOnly;
   }
@@ -64,17 +64,19 @@ function stripOperation(op, mode) {
 
 function stripParam(p, mode) {
   const out = { name: p.name, type: p.type };
-  if (p.label) out.label = p.label;
   if (typeof p.scale === 'number') out.scale = p.scale;
-  if (p.placeholder) out.placeholder = p.placeholder;
+  if (mode === 'full') {
+    if (p.label) out.label = p.label;
+    if (p.placeholder) out.placeholder = p.placeholder;
+    if (p.options) out.options = p.options;
+  }
   if (p.source) {
     if (mode === 'headless' && p.source.startsWith('read:')) {
-      // omit
+      // omit — read: requires reads polling, not supported in headless.
     } else {
       out.source = p.source;
     }
   }
-  if (p.options) out.options = p.options;
   return out;
 }
 
@@ -86,11 +88,11 @@ export function exportManifest(manifest, mode) {
     operations: (manifest.operations ?? []).map((op) => stripOperation(op, mode)),
   };
   if (manifest.description) out.description = manifest.description;
-  if (manifest.icon) out.icon = manifest.icon;
   for (const [k, v] of Object.entries(manifest.contracts ?? {})) {
     out.contracts[k] = { label: v.label, abi: v.abi, address: v.address };
   }
   if (mode === 'full') {
+    if (manifest.icon) out.icon = manifest.icon;
     if (manifest.theme) out.theme = manifest.theme;
     if (manifest.reads && Object.keys(manifest.reads).length > 0) out.reads = manifest.reads;
     if (Array.isArray(manifest.status) && manifest.status.length > 0) out.status = manifest.status;

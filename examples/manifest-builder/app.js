@@ -1,6 +1,7 @@
 import { h, render } from 'preact';
 import { signal, computed } from '@preact/signals';
 import htm from 'htm';
+import schemaData from './schema.js';
 import { emptyManifest, renameContractKey, exportManifest, resolveAbiMethods } from './model.js';
 import { validateManifest } from './validation.js';
 import { slugify } from './slugify.js';
@@ -10,10 +11,8 @@ const html = htm.bind(h);
 const state = signal(emptyManifest());
 const mode = signal('headless'); // 'headless' | 'full'
 const activeSection = signal('meta');
-const schema = signal(null);
+const schema = signal(schemaData);
 const banner = signal(null);
-
-fetch('./schema.json').then((r) => r.json()).then((s) => { schema.value = s; });
 
 const validation = computed(() => {
   if (!schema.value) return { errors: [], warnings: [] };
@@ -124,6 +123,7 @@ function FieldErrors({ path }) {
 }
 
 function MetaSection() {
+  const isFull = mode.value === 'full';
   return html`
     <section>
       <h2>Project metadata</h2>
@@ -131,8 +131,10 @@ function MetaSection() {
         onInput=${(e) => update((s) => ({ ...s, name: e.target.value }))}/></label>
       <label>Description <input value=${state.value.description ?? ''}
         onInput=${(e) => update((s) => ({ ...s, description: e.target.value }))}/></label>
-      <label>Icon URL <input value=${state.value.icon ?? ''}
-        onInput=${(e) => update((s) => ({ ...s, icon: e.target.value }))}/></label>
+      ${isFull ? html`
+        <label>Icon URL <input value=${state.value.icon ?? ''}
+          onInput=${(e) => update((s) => ({ ...s, icon: e.target.value }))}/></label>
+      ` : null}
     </section>`;
 }
 
@@ -196,14 +198,17 @@ function ParamCard({ opIndex, paramIndex, param }) {
     ops[opIndex] = op;
     return { ...s, operations: ops };
   });
+  const isFull = mode.value === 'full';
   return html`
     <div class="param-card">
       <label>Name <input value=${param.name} onInput=${(e) => setParam((p) => ({ ...p, name: e.target.value }))}/></label>
       <label>Type <select value=${param.type} onChange=${(e) => setParam((p) => ({ ...p, type: e.target.value }))}>
         <option>uint256</option><option>address</option><option>bool</option><option>bytes</option>
       </select></label>
-      <label>Label <input value=${param.label ?? ''} onInput=${(e) => setParam((p) => ({ ...p, label: e.target.value }))}/></label>
-      <label>Placeholder <input value=${param.placeholder ?? ''} onInput=${(e) => setParam((p) => ({ ...p, placeholder: e.target.value }))}/></label>
+      ${isFull ? html`
+        <label>Label <input value=${param.label ?? ''} onInput=${(e) => setParam((p) => ({ ...p, label: e.target.value }))}/></label>
+        <label>Placeholder <input value=${param.placeholder ?? ''} onInput=${(e) => setParam((p) => ({ ...p, placeholder: e.target.value }))}/></label>
+      ` : null}
       <label>Scale <input type="number" value=${param.scale ?? ''} onInput=${(e) => setParam((p) => ({ ...p, scale: e.target.value === '' ? undefined : Number(e.target.value) }))}/></label>
       <label>Source <input value=${param.source ?? ''} placeholder="contract:foo or setting:bar"
         onInput=${(e) => setParam((p) => ({ ...p, source: e.target.value || undefined }))}/></label>
@@ -221,13 +226,16 @@ function OperationCard({ index, op }) {
   const methods = op.contract && op.contract !== '$dynamic' && state.value.contracts[op.contract]
     ? resolveAbiMethods(state.value.contracts[op.contract].abi)
     : [];
+  const isFull = mode.value === 'full';
   return html`
     <div class="card">
       <header><strong>${op.id || '(unnamed)'}</strong> — ${op.label || ''}</header>
       <label>ID <input value=${op.id} onInput=${(e) => setOp((o) => ({ ...o, id: e.target.value }))}/></label>
       <label>Label <input value=${op.label} onInput=${(e) => setOp((o) => ({ ...o, label: e.target.value }))}/></label>
       <label>Description <input value=${op.description ?? ''} onInput=${(e) => setOp((o) => ({ ...o, description: e.target.value }))}/></label>
-      <label>Confirm prompt <input value=${op.confirm ?? ''} onInput=${(e) => setOp((o) => ({ ...o, confirm: e.target.value }))}/></label>
+      ${isFull ? html`
+        <label>Confirm prompt <input value=${op.confirm ?? ''} onInput=${(e) => setOp((o) => ({ ...o, confirm: e.target.value }))}/></label>
+      ` : null}
       <label>Contract <select value=${op.contract} onChange=${(e) => setOp((o) => ({ ...o, contract: e.target.value }))}>
         <option value="">(pick)</option>
         ${contractKeys.map((k) => html`<option>${k}</option>`)}
