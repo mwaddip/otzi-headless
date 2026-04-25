@@ -2,7 +2,7 @@
 
 Snapshot for hand-off between sessions. `CLAUDE.md` is the spec; `PLAN.md` is the roadmap; this doc captures current state, session-made decisions, and gotchas.
 
-Last updated: 2026-04-25 (Phase 8 — OPNet construction-params landed. **Deterministic capture** — `OpnetCaptureInputs` accepts asserted `utxos` / `challenge` / `rndBytesSeed`; `BitcoinUtils.rndBytes` is monkey-patched with HMAC-SHA-512 counter DRBG during the capture (only way to plumb determinism since OPNet's `CallResult.sendTransaction` doesn't forward `randomBytes` to the factory); module-level `captureMutex` serializes captures so concurrent ones don't interleave. **`opnet-params` wire variant** — fourth `AnnounceFrostExtras` arm (`opnet-params`) carrying full construction params + on-wire ML-DSA threshold sig; `serializeChallengeForWire` overrides `legacyPublicKey` with the 33-byte SEC1 original because `ChallengeSolution.toRaw()` is lossy (returns post-tweak 32-byte; SDK's `originalPublicKeyBuffer()` then throws on reconstruction). **Leader + participant integration** — `LeaderSignOpnetParamsRequest` runs full flow (fetch UTXOs/challenge → seed → capture → announce → FROST → broadcast → return txid); orchestrator's `verifyFrostAnnounce` re-runs identical capture + matches sighashes; `refundAddress` derived locally per-peer via `deriveVaultP2tr` (operator can't override — change-theft vector). **Signet e2e** confirmed bit-identical sighashes across peers using DIFFERENT mnemonics. Phase 7 hardening still in place (release workflow, strict wire, inline keylink, api/config docs).)
+Last updated: 2026-04-25 (Phase 8 + manifest-builder UI landed; **CLI consumer gap surfaced**. The manifest builder under `examples/manifest-builder/` is the authoring side of the manifest workflow — it produces v2 `.otzi.json` files. The consumer side (`otzi install/list/sign/uninstall` CLI subcommands) was supposed to ship from the start as **THE primary operator-facing entry point** but was never built — the daemon's localhost-only binding was specifically intended to enforce CLI-only access. This is the next phase. See `feedback_cli_is_primary_entrypoint` memory.)
 
 ## Phase status
 
@@ -51,8 +51,10 @@ Last updated: 2026-04-25 (Phase 8 — OPNet construction-params landed. **Determ
 | **8c** | **Leader + participant integration** — `LeaderSignOpnetParamsRequest` request type; `signOpnetParams` runs full flow (fetch UTXOs + challenge from provider → generate 32B seed → capture → announce → FROST → broadcast → return txid). Orchestrator's `verifyAndDecodeFrostAnnounce` lifted to private async `verifyFrostAnnounce` method with `opnet-params` branch: derives expected `refundAddress` via `deriveVaultP2tr` and matches against announce (change-theft prevention), reconstructs capture inputs via `buildCaptureInputsFromParams`, re-runs `captureOpnetSighashes`, compares sighashes. SpecBuilder populates STRUCTURALLY-verified `destination` (contractAddress) + `method` (policy rules evaluate trusted data, unlike legacy `opnet`'s advisory hints). `LeaderDeps` + `OrchestratorDeps` gain `frostLegacySig` / `sdkWalletMnemonic` / `opnetProvider` / `opnetSeedFill`. `config-merge` extracts top-level `frostLegacySig` from V3 share-file JSON. `daemon.ts` generates default `sdkWalletMnemonic` + binds `getProvider(keylinkNetwork)`. | ✅ Done. |
 | **8d** | **HTTP handler + `docs/api.md`** — `/sign { scheme:'frost', protocol:'opnet-params', ... }` body parser; response includes `transactionId` when present (daemon-internal broadcast). `docs/api.md` adds the new variant. | ✅ Done. |
 | **8e** | **Testnet-e2e migration** — `phaseF` instantiates a real `LeaderDispatcher` on peer 0 (production sign path) and orchestrates peer 1 via `orchestrateOpnetParamsParticipant` which uses a DIFFERENT mnemonic to prove the SDK's signer slot doesn't affect captured bytes. Participant verifies sighashes match leader's before signing — throws on mismatch. Signet run on 2026-04-25 confirmed bit-identical sighashes; OPNet broadcast `ea1050…4923` + BTC return `a88f73…0ae03` clean end-to-end. | ✅ Done. |
+| **MB** | **Manifest builder UI** — `examples/manifest-builder/` ships as a static HTML + Preact tool that produces v2 `.otzi.json` files. Schema bumped to v2 in `docs/otzi-manifest-schema.json` (adds required `Contract.address`, `Param.source: contract:<key>` resolves from manifest). All deps (preact, @preact/signals, htm, ajv) vendored as committed esbuild bundles under `vendor/` (no runtime CDN). Pure logic split into testable modules (`model.js`, `validation.js`, `slugify.js`); UI in `app.js`; entry `index.html` uses an import map → `vendor/*.js`. Operator runs `bash serve.sh` to start a localhost HTTP server (modern browsers block `<script type="module">` from `file://`). Headless mode (default) emits ONLY fields a future headless CLI consumer would use — Meta name/description, contracts, operations, params with name/type/scale/source. Full mode (UI placeholder for forward-port to Ötzi React UI) adds icon, confirm, label/placeholder, options, condition, ownerOnly, theme/reads/status. Spec at `docs/manifest-builder-spec.md`, plan at `docs/manifest-builder-plan.md`. **No consumer for the produced manifests exists in this repo yet.** | ✅ Done. |
+| **9** | **CLI manifest consumer — NOT YET IMPLEMENTED.** `otzi install/list/sign/uninstall` was always supposed to be the primary operator-facing entry point — the thing every project that integrates otzi-headless scripts against. The daemon's localhost-only binding was specifically intended to enforce CLI-only access. Eight phases of "operator tooling deferred" left this gap open; the manifest builder above produces files for which no consumer exists in this repo. Next session's priority. See `feedback_cli_is_primary_entrypoint` memory. | ❌ TODO. |
 
-**Totals:** 336/336 tests, `tsc --noEmit` clean. **553 KB .deb.**
+**Totals:** 373/373 tests (336 + 33 manifest-builder + 4 unaccounted from header diff), `tsc --noEmit` clean. **553 KB .deb** (.deb size unchanged — manifest builder is pure operator-side under `examples/`, not bundled).
 
 ## `src/` inventory
 
@@ -162,6 +164,16 @@ Last updated: 2026-04-25 (Phase 8 — OPNet construction-params landed. **Determ
 | `gate-web-opwallet/approver.mjs` | Standalone Node service that speaks the daemon's `webhook` contract and enforces ML-DSA-44 wallet-signed decisions. Daemon has no ML-DSA verification code for gates — it lives here. |
 | `gate-web-opwallet/index.html` | Operator UI served by `approver.mjs`. OPWallet's `signMLDSA` signs `salt ‖ ceremonyId ‖ decision_byte ‖ nonce`. |
 | `gate-web-opwallet/README.md` | Architecture diagram + run instructions + security properties + customization guide. |
+| `manifest-builder/index.html` | Static HTML entry point with import map → `vendor/*.js`. Operator runs `bash serve.sh` (Python stdlib HTTP server) and opens `http://localhost:8765/index.html`. |
+| `manifest-builder/app.js` | Preact UI components — sidebar with mode radio (Headless/Full), section nav (Meta/Contracts/Operations + greyed Reads/Status/Theme), card-based editors, load/export. |
+| `manifest-builder/model.js` | Pure state shape + mutations + key-rename propagation + `exportManifest(state, mode)` shape stripping. Headless mode strips UI-only fields (icon, confirm, label, placeholder, options, condition, ownerOnly, theme/reads/status). |
+| `manifest-builder/validation.js` | ajv-based JSON Schema validation + cross-field rules (contract refs, ABI methods, duplicate ids, `Param.source` resolution). Errors keyed by JSON path. |
+| `manifest-builder/slugify.js` | Filename helper (project name → URL-safe slug). |
+| `manifest-builder/schema.json` + `schema.js` | Vendored v2 schema (byte-equal mirror of `docs/otzi-manifest-schema.json`); `schema.js` is a JS-module wrapper auto-generated to avoid `fetch()` CORS issues even on localhost. |
+| `manifest-builder/vendor/{preact,signals,htm,ajv,preact-hooks}.js` | Committed esbuild bundles; total ~302 KB. preact-hooks/signals externalize preact so all share one runtime instance. |
+| `manifest-builder/build-vendor.sh` | Maintenance script — regenerates `vendor/*.js` from npm devDependencies via esbuild. Run when bumping preact/signals/htm/ajv versions. |
+| `manifest-builder/serve.sh` | Python `http.server` wrapper — modern browsers reject `<script type="module">` from `file://` URLs because each path becomes a unique origin and CORS blocks cross-file imports. |
+| `manifest-builder/README.md` + tests | Usage doc + vitest suites covering pure modules (33 tests). |
 
 ## `docs/`
 
@@ -171,6 +183,9 @@ Last updated: 2026-04-25 (Phase 8 — OPNet construction-params landed. **Determ
 | `config.md` | TOML reference — every table + field with types/defaults, per-strategy gate params (policy / exec / webhook), trigger kinds (http / cron), cross-field validation rules, local-3-node sample. |
 | `gates.md` | Gate contract, `CeremonySpec` schema, all shipping strategies (`auto` / `policy` / `exec` / `webhook`), deadline table, "build your own" pointer at the OPWallet example. |
 | `install.md` | Operator install walkthrough — system requirements, debconf prompt reference, post-install bootstrap → DKG → enable flow, file layout (`/etc/otzi`, `/var/lib/otzi`), uninstall (with the explicit `purge` warning that destroys the share). |
+| `manifest-builder-spec.md` | Design spec for `examples/manifest-builder/` — goals, schema-v2 changes, architecture (vendored deps), UI structure, mode contract (Headless vs Full), validation. |
+| `manifest-builder-plan.md` | Implementation plan — 10 tasks, executed in this session (2026-04-25). Each task has full code, test code, exact commands, and commit messages. |
+| `otzi-manifest-schema.json` | Canonical v2 manifest schema. Bumped from v1 in this session: `Contract.address` is required (flat string, no network keying); `Param.source: contract:<key>` resolves from manifest's own `contracts[key].address` (was: from Ötzi settings). Mirrored byte-equal at `examples/manifest-builder/schema.json`. |
 
 ## `packaging/`
 
@@ -290,6 +305,19 @@ TOML for daemon runtime config. JSON for share files (Ötzi-compat). `DaemonConf
 - **ML-DSA threshold sig pre-computed by operator.** Same as the existing raw-tx `opnet` flow: operator runs `/sign scheme='mldsa' protocol='raw'` over `sha256(calldata)` first, passes the resulting sig as `mldsaThresholdSignatureHex` on the `opnet-params` request. Avoids bundling two ceremonies into one HTTP call.
 - **Mnemonic doesn't affect capture output.** Each daemon generates a fresh `sdkWalletMnemonic` at startup; the SDK only uses `signer.publicKey` (overridden to untweaked FROST key) and `signer.multiSignPsbt` (monkey-patched). Private key never reached. Confirmed by signet e2e where leader and participant ran with different mnemonics and produced bit-identical sighashes.
 
+### CLI is the primary operator entry point (2026-04-25, surfaced)
+- `otzi install/list/sign/uninstall` is THE operator-facing surface for otzi-headless. Every project that integrates otzi-headless scripts against the CLI, NOT the daemon's HTTP API directly.
+- The daemon's HTTP API (`/sign`, `/dkg-*`) is an **internal implementation detail** that should be bound to localhost / UDS only. The localhost binding is **load-bearing**: it's specifically what enforces "the CLI is the only realistic way to submit transactions". An exposed daemon API on a leaf node would let an external attacker forge `/install`, push hostile manifests, or submit arbitrary signing requests — bypassing the CLI's intent layer.
+- This was supposed to ship from the start. Eight phases of "operator tooling deferred" left the gap open. The manifest builder UI shipped this session is the **authoring** half of the manifest workflow; the **consumer** half (the CLI) is the unbuilt other half. Without the CLI, operators have no operator-facing path to call the daemon — the .deb is functionally a black box.
+- See `feedback_cli_is_primary_entrypoint` memory.
+
+### Manifest builder UI (2026-04-25)
+- `examples/manifest-builder/` ships as a static HTML + Preact tool that produces v2 `.otzi.json` files. Schema bumped to v2 (adds required `Contract.address`; `Param.source: contract:<key>` resolves from manifest, not Ötzi settings).
+- Vendored deps (preact, @preact/signals, htm, ajv) as committed esbuild bundles in `vendor/`. No runtime CDN. `build-vendor.sh` regenerates from npm-installed devDependencies.
+- ES modules can't load from `file://` in modern browsers (each path is a unique origin → CORS blocks). Operator runs `bash serve.sh` to start a localhost HTTP server.
+- Headless mode (default) is the otzi-headless target — strips UI-only fields (icon, confirm, label, placeholder, options, condition, ownerOnly, theme/reads/status). Full mode is a forward-looking export path for when the same builder is adopted by Ötzi's React UI.
+- Spec: `docs/manifest-builder-spec.md`. Plan: `docs/manifest-builder-plan.md`. README at `examples/manifest-builder/README.md`.
+
 ### Keylink FROST sign inline in combined DKG (2026-04-25)
 - Closes the production gap: `scripts/testnet-e2e.ts` previously ran a manual follow-up keylink ceremony after DKG to produce `frostLegacySig`; the daemon's `runCombinedDkg` did **not** — shares shipped without the sig and OPNet contract calls against the vault failed at capture. Now:
   - `CombinedDkgSpec.network?: NetworkName` gates the phase (opt-in; absent → legacy behavior).
@@ -302,7 +330,9 @@ TOML for daemon runtime config. JSON for share files (Ötzi-compat). `DaemonConf
 
 ## Open items / gotchas
 
-1. **OPNet construction-params.** Currently deferred. Needs SDK-level control of UTXO fetching — `captureOpnetSighashes` uses the higher-level `contract.<method>().sendTransaction()` path which internally queries the provider. Making OPNet deterministic requires monkey-patching `utxoManager.getUTXOs` similarly to how we monkey-patch `sendRawTransaction`.
+0. **NO CLI MANIFEST CONSUMER.** `otzi install/list/sign/uninstall` doesn't exist. The manifest builder UI produces `.otzi.json` files for which no consumer exists in this repo. Daemon's `/sign` takes raw construction params; nothing reads manifests. Next session's priority — see `feedback_cli_is_primary_entrypoint` memory + the next handoff.
+
+1. **OPNet construction-params (item resolved).** Phase 8 shipped this — see § OPNet construction-params (Phase 8). Listed here in earlier handoffs as deferred; now done.
 
 2. **Ring-rotation not implemented.** Once bootstrap is done, the ring is fixed. Adding/removing peers requires re-running bootstrap from scratch. Documented UX limitation; acceptable for stable federations.
 
