@@ -25,6 +25,7 @@ import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
 import { createGate } from '../gate/factory';
 import type { ApprovalGate } from '../gate/types';
+import { generateMnemonic, getProvider } from '../node/opnet-client';
 import type { NetworkName as NodeNetworkName } from '../node/types';
 import { Orchestrator } from '../orchestrator/orchestrator';
 import {
@@ -65,6 +66,23 @@ export interface DaemonDeps {
   cronHandlers?: ReadonlyMap<string, CronHandler>;
   /** Optional env override for HTTP auth token lookup. Defaults to `process.env`. */
   env?: Readonly<Record<string, string | undefined>>;
+  /**
+   * Throwaway mnemonic for the SDK's wallet-keypair slot during OPNet
+   * capture. Defaults to a freshly-generated one at startup. Tests inject a
+   * fixed value for reproducibility.
+   */
+  sdkWalletMnemonic?: string;
+  /**
+   * OPNet provider — exposes `utxoManager.getUTXOs` + `getChallenge` for the
+   * `opnet-params` leader flow. Defaults to a live `JSONRpcProvider` bound
+   * to `config.network.name`; tests inject a stub.
+   */
+  opnetProvider?: {
+    utxoManager: { getUTXOs: (args: { address: string }) => Promise<unknown[]> };
+    getChallenge: () => Promise<unknown>;
+  };
+  /** Seed fill for the 32B opnet-params random seed. Defaults to WebCrypto. */
+  opnetSeedFill?: (buf: Uint8Array) => void;
 }
 
 export class Daemon {
@@ -94,6 +112,15 @@ export class Daemon {
     const keylinkNetwork: NodeNetworkName | undefined =
       configNetwork === 'regtest' ? undefined : configNetwork;
 
+    // `sdkWalletMnemonic` + `opnetProvider` are shared between orchestrator and
+    // leader for the `opnet-params` flow. Generate once at startup; the
+    // mnemonic never signs anything reaching chain (multiSignPsbt is
+    // monkey-patched during capture). `opnetProvider` is only used when
+    // keylinkNetwork is set — regtest skips it.
+    const sdkWalletMnemonic = deps.sdkWalletMnemonic ?? generateMnemonic();
+    const opnetProvider = deps.opnetProvider
+      ?? (keylinkNetwork ? getProvider(keylinkNetwork) : undefined);
+
     this.orchestrator = new Orchestrator({
       transport: deps.transport,
       runner,
@@ -107,6 +134,8 @@ export class Daemon {
       pullOpts: deps.pullOpts,
       ceremonyDeadlines: deps.state.config.deadlines,
       network: keylinkNetwork,
+      ...(deps.state.frostLegacySig ? { frostLegacySig: deps.state.frostLegacySig } : {}),
+      sdkWalletMnemonic,
       persistDkgShare: deps.state.persistDkgShare,
       logger: this.log,
     });
@@ -122,6 +151,10 @@ export class Daemon {
       rng: deps.rng,
       pullOpts: deps.pullOpts,
       network: keylinkNetwork,
+      ...(deps.state.frostLegacySig ? { frostLegacySig: deps.state.frostLegacySig } : {}),
+      sdkWalletMnemonic,
+      ...(opnetProvider ? { opnetProvider } : {}),
+      ...(deps.opnetSeedFill ? { opnetSeedFill: deps.opnetSeedFill } : {}),
       persistDkgShare: deps.state.persistDkgShare,
       logger: this.log,
     });
@@ -373,8 +406,46 @@ export function buildDefaultHttpHandler(
               inputs,
               ...(hints ? { hints } : {}),
             });
+          } else if (protocol === 'opnet-params') {
+            const rawParams = b.params;
+            if (!Array.isArray(rawParams))
+              return { status: 400, body: { error: "'params' must be an array for protocol='opnet-params'" } };
+            let paramTypes: readonly ('address' | 'u256' | 'bytes')[] | undefined;
+            if (b.paramTypes !== undefined) {
+              if (!Array.isArray(b.paramTypes))
+                return { status: 400, body: { error: "'paramTypes' must be an array" } };
+              const out: Array<'address' | 'u256' | 'bytes'> = [];
+              for (const t of b.paramTypes) {
+                if (t !== 'address' && t !== 'u256' && t !== 'bytes')
+                  return { status: 400, body: { error: `paramTypes entries must be 'address' | 'u256' | 'bytes' (got '${String(t)}')` } };
+                out.push(t);
+              }
+              paramTypes = out;
+            }
+            const hintsRaw = b.hints;
+            let hints: { amountTokenAtomic?: string } | undefined;
+            if (hintsRaw && typeof hintsRaw === 'object') {
+              const h = hintsRaw as Record<string, unknown>;
+              hints = {};
+              if (typeof h.amountTokenAtomic === 'string') hints.amountTokenAtomic = h.amountTokenAtomic;
+            }
+            result = await leader.sign({
+              ceremonyId,
+              scheme: 'frost',
+              protocol: 'opnet-params',
+              signers,
+              contractAddress: requireString(b, 'contractAddress'),
+              method: requireString(b, 'method'),
+              params: [...rawParams],
+              ...(paramTypes ? { paramTypes } : {}),
+              mldsaThresholdSignature: fromHex(requireString(b, 'mldsaThresholdSignatureHex')),
+              ...(typeof b.feeRate === 'number' ? { feeRate: b.feeRate } : {}),
+              ...(typeof b.priorityFeeSat === 'string' ? { priorityFee: BigInt(b.priorityFeeSat) } : {}),
+              ...(typeof b.maxSatToSpendSat === 'string' ? { maximumAllowedSatToSpend: BigInt(b.maxSatToSpendSat) } : {}),
+              ...(hints ? { hints } : {}),
+            });
           } else {
-            return { status: 400, body: { error: "'protocol' must be 'raw', 'btc', or 'opnet'" } };
+            return { status: 400, body: { error: "'protocol' must be 'raw', 'btc', 'opnet', or 'opnet-params'" } };
           }
           if (result.scheme === 'mldsa') {
             return {
@@ -394,6 +465,10 @@ export function buildDefaultHttpHandler(
               status: 'done',
               scheme: 'frost',
               signaturesHex: result.signatures.map((s) => toHex(s)),
+              // Present only when the daemon broadcast the tx internally
+              // (opnet-params flow); absent for btc/opnet where the operator
+              // broadcasts externally.
+              ...(result.transactionId !== undefined ? { transactionId: result.transactionId } : {}),
             },
           };
         }

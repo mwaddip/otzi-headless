@@ -135,7 +135,7 @@ Common fields for every `sign` variant:
 | Field | Type | Notes |
 |---|---|---|
 | `scheme` | `"frost"` \| `"mldsa"` | Required. |
-| `protocol` | `"btc"` \| `"opnet"` \| `"raw"` | See variant-specific rules below. |
+| `protocol` | `"btc"` \| `"opnet"` \| `"opnet-params"` \| `"raw"` | See variant-specific rules below. |
 | `signers` | `number[]` | Active signer partyIds. Must include this daemon's own `partyId` (it's the leader). |
 
 ### `scheme: "frost", protocol: "btc"`
@@ -236,6 +236,74 @@ Response:
   "status": "done",
   "scheme": "frost",
   "signaturesHex": ["…", "…"]           // one per input, in ceremony order
+}
+```
+
+### `scheme: "frost", protocol: "opnet-params"`
+
+OPNet construction parameters — the construction-params equivalent of the
+`btc` protocol for OPNet contract calls. The leader fetches UTXOs + challenge
+from the OPNet provider, generates a 32-byte random seed, runs the full
+deterministic capture (see SESSION_CONTEXT § Deterministic OPNet capture) to
+produce the template txs + sighashes, asserts all three on-wire. Participants
+re-run the identical capture from asserted inputs and verify the sighashes
+match before signing — policy rules evaluate **structurally verified**
+`contractAddress` + `method`, not advisory hints. The daemon owns the OPNet
+`captureContext` and broadcasts the tx internally after the FROST ceremony —
+the operator does not broadcast externally.
+
+Operator pre-computes `mldsaThresholdSignatureHex` via a prior
+`op: "sign", scheme: "mldsa", protocol: "raw"` ceremony over
+`sha256(calldata)` (calldata is produced by the OP-20 encoder in
+`opnet-calldata.ts`). The daemon knows only OP-20 ABI — custom-ABI contracts
+stay on the `protocol: "opnet"` (raw-tx) path.
+
+Request:
+
+```jsonc
+{
+  "op": "sign",
+  "scheme": "frost",
+  "protocol": "opnet-params",
+  "signers": [0, 1],
+  "contractAddress": "opt1…",              // OP-20 contract (bech32 or 0x hex)
+  "method": "transfer",
+  "params": ["0x…32-byte address hex…", "1000000"],   // positional args, JSON-safe
+  "paramTypes": ["address", "u256"],        // optional; defaults OP-20 ABI inference
+  "mldsaThresholdSignatureHex": "…",        // outer ML-DSA sig over sha256(calldata)
+  "feeRate": 10,                            // sat/vB; optional, default 10
+  "priorityFeeSat": "1000",                 // decimal string; optional, default "1000"
+  "maxSatToSpendSat": "100000",             // decimal string; optional, default "100000"
+  "hints": {                                // optional; advisory — amount stays unverified
+    "amountTokenAtomic": "1000000"
+  }
+}
+```
+
+Notes:
+
+- `contractAddress` and `method` land on the `CeremonySpec` as
+  structurally-verified fields — use `allowed_contracts` + `method_allowlist`
+  gate policy rules against trusted data. `amountTokenAtomic` remains
+  advisory (daemon stays ABI-agnostic for amounts).
+- The daemon derives the vault refund address (P2TR of the untweaked FROST
+  aggregate key) locally per-peer. Operator cannot override — a bogus refund
+  would be change-theft, not DoS.
+- If the leader lies about UTXOs / challenge / random seed, participants'
+  rebuilt sighashes differ → silent drop → ceremony aborts (DoS, not theft).
+  Matches federation-trust.
+- Requires a V3 share (combined DKG with `[network]` set to mainnet/testnet
+  → `frostLegacySig` persisted). Regtest daemons cannot run `opnet-params`.
+
+Response:
+
+```jsonc
+{
+  "ceremonyId": "…",
+  "status": "done",
+  "scheme": "frost",
+  "signaturesHex": ["…", "…"],              // one per captured sighash
+  "transactionId": "…"                      // daemon-broadcasted OPNet txid
 }
 ```
 

@@ -99,14 +99,17 @@ function buildFrostSigningSpec(
   ctx: SpecBuilderCtx,
   leader: string,
 ): SigningSpec {
+  const operation =
+    msg.protocol === 'btc' ? 'btc-transfer' :
+    msg.protocol === 'opnet' ? 'opnet-call' :
+    msg.protocol === 'opnet-params' ? 'opnet-call' :
+    'generic';
   const base: SigningSpec = {
     kind: 'signing',
     ceremonyId: msg.baseCeremonyId,
     leader,
     role: 'participant',
-    operation: msg.protocol === 'btc' ? 'btc-transfer'
-      : msg.protocol === 'opnet' ? 'opnet-call'
-      : 'generic',
+    operation,
   };
 
   // BTC: populate outputs from verified rebuild, filtering the vault's own
@@ -125,7 +128,7 @@ function buildFrostSigningSpec(
     };
   }
 
-  // OPNet: populate from operator-supplied hints (advisory).
+  // OPNet raw-tx: populate from operator-supplied hints (advisory).
   if (msg.protocol === 'opnet' && msg.hints) {
     const { contractAddress, method, amountTokenAtomic } = msg.hints;
     return {
@@ -133,6 +136,23 @@ function buildFrostSigningSpec(
       ...(contractAddress !== undefined ? { destination: contractAddress } : {}),
       ...(method !== undefined ? { method } : {}),
       ...(amountTokenAtomic !== undefined ? { amount: BigInt(amountTokenAtomic) } : {}),
+    };
+  }
+
+  // OPNet construction-params: destination + method are STRUCTURALLY verified
+  // (participant re-ran the capture locally and matched sighashes). Policy
+  // rules (`allowed_contracts`, `method_allowlist`) evaluate trusted data.
+  // `amountTokenAtomic` is still advisory (ABI-agnostic daemon — value isn't
+  // structurally decoded).
+  if (msg.protocol === 'opnet-params') {
+    const { contractAddress, method, hints } = msg.opnetParams;
+    return {
+      ...base,
+      destination: contractAddress,
+      method,
+      ...(hints?.amountTokenAtomic !== undefined
+        ? { amount: BigInt(hints.amountTokenAtomic) }
+        : {}),
     };
   }
 

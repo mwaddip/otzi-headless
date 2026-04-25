@@ -24,9 +24,10 @@
  * FROST ceremony produces real per-sighash signatures.
  */
 
-import { Address } from '@btc-vision/transaction';
+import { createHmac } from 'node:crypto';
+import { Address, BitcoinUtils, ChallengeSolution } from '@btc-vision/transaction';
 import { toXOnly } from '@btc-vision/bitcoin';
-import { getContract } from 'opnet';
+import { getContract, UTXO as OpnetUtxo } from 'opnet';
 import type { NetworkName } from '../node/types.js';
 import { getProvider, getNetwork, generateWallet } from '../node/opnet-client.js';
 import { ThresholdMLDSASigner } from '../node/threshold-signer.js';
@@ -94,6 +95,39 @@ export interface OpnetCaptureInputs {
   feeRate?: number;
   priorityFee?: bigint;
   maximumAllowedSatToSpend?: bigint;
+
+  /**
+   * UTXO snapshot the operator asserts the vault holds. When set, skips the
+   * SDK's implicit provider fetch (`provider.utxoManager.getUTXOs`) — required
+   * for cross-peer determinism on construction-params (`protocol: 'opnet-params'`).
+   * When unset, SDK falls back to its default UTXO fetcher (legacy `protocol: 'opnet'`
+   * raw-tx path only — the leader builds once, participants verify against the bytes).
+   */
+  utxos?: OpnetUtxo[];
+
+  /**
+   * Network challenge solution. When set, skips the SDK's implicit
+   * `provider.getChallenge()` RPC fetch (which is network-derived and
+   * non-deterministic across peers). Leader fetches once and asserts on-wire;
+   * participants use the same. If the leader lies, broadcast fails at OPNet
+   * consensus — wasted ceremony, no theft.
+   */
+  challenge?: ChallengeSolution;
+
+  /**
+   * 32-byte seed enabling deterministic `BitcoinUtils.rndBytes()` during
+   * capture. The OPNet CallResult layer does NOT forward `params.randomBytes`
+   * through to the tx factory (it accepts `utxos` and `challenge` as
+   * first-class construction inputs but silently drops `randomBytes`), so the
+   * only way to make the full `sendTransaction` path deterministic is to
+   * monkey-patch the global RNG source for the duration of the capture.
+   * Each `rndBytes()` call returns `HMAC-SHA-512(seed, BE32(counter))` with
+   * a counter that increments per call — same seed → same sequence across
+   * peers. Restores the original `BitcoinUtils.rndBytes` in `finally`. A
+   * module-level mutex (`captureMutex`) serializes captures so concurrent
+   * ones don't interleave counter sequences.
+   */
+  rndBytesSeed?: Uint8Array;
 }
 
 export interface CapturedSighash {
@@ -110,6 +144,61 @@ export interface OpnetCaptureContext {
 export interface OpnetCaptureResult {
   sighashes: CapturedSighash[];
   captureContext: OpnetCaptureContext;
+}
+
+/**
+ * HMAC-SHA-512(seed, BE32(counter)) → 64 bytes. Exported for testability and
+ * for producers that want to pre-generate a deterministic sequence offline.
+ * Counter is 0-indexed: `deriveCaptureRndBytes(seed, 0)` is the first chunk.
+ */
+export function deriveCaptureRndBytes(seed: Uint8Array, counter: number): Uint8Array {
+  if (!Number.isInteger(counter) || counter < 0) {
+    throw new Error(`deriveCaptureRndBytes: counter must be a non-negative integer (got ${counter})`);
+  }
+  const counterBuf = Buffer.alloc(4);
+  counterBuf.writeUInt32BE(counter, 0);
+  return new Uint8Array(createHmac('sha512', seed).update(counterBuf).digest());
+}
+
+interface RndBytesPatchHandle {
+  restore: () => void;
+  /** Number of times the patched rndBytes was called. Useful for test assertions. */
+  getCallCount: () => number;
+}
+
+/**
+ * Install a deterministic stand-in for `BitcoinUtils.rndBytes` derived from
+ * `seed`. Returns a handle whose `restore()` reinstates the original. Idempotent
+ * across concurrent captures only when serialized by `captureMutex` — calling
+ * this twice without restoring between leaves the inner call stomping the
+ * outer's counter.
+ */
+export function installRndBytesPatch(seed: Uint8Array): RndBytesPatchHandle {
+  const original = BitcoinUtils.rndBytes;
+  let counter = 0;
+  BitcoinUtils.rndBytes = () => deriveCaptureRndBytes(seed, counter++);
+  return {
+    restore: () => { BitcoinUtils.rndBytes = original; },
+    getCallCount: () => counter,
+  };
+}
+
+// Module-level mutex — serializes captures process-wide so the rndBytes patch
+// and the sendRawTransaction monkey-patches don't interleave. Leader runs
+// captures one-at-a-time; participants do too, but multiple ceremonies
+// overlapping is possible. Lock is trivial and always engaged (even when no
+// determinism knobs are set) since the sendRawTransaction patches are
+// process-global regardless.
+let captureMutex: Promise<void> = Promise.resolve();
+
+async function acquireCaptureLock(): Promise<() => void> {
+  const prev = captureMutex;
+  let release!: () => void;
+  captureMutex = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await prev;
+  return release;
 }
 
 export async function captureOpnetSighashes(
@@ -132,9 +221,15 @@ export async function captureOpnetSighashes(
     feeRate = DEFAULT_FEE_RATE,
     priorityFee = DEFAULT_PRIORITY_FEE,
     maximumAllowedSatToSpend = DEFAULT_MAX_SAT_SPEND,
+    utxos: assertedUtxos,
+    challenge: assertedChallenge,
+    rndBytesSeed,
   } = inputs;
 
   const params = convertOpnetParams(rawParams ?? [], paramTypes);
+
+  const releaseLock = await acquireCaptureLock();
+  const rndBytesPatch = rndBytesSeed ? installRndBytesPatch(rndBytesSeed) : null;
 
   const provider = getProvider(networkName);
   const network = getNetwork(networkName);
@@ -204,8 +299,12 @@ export async function captureOpnetSighashes(
       feeRate,
       priorityFee,
       maximumAllowedSatToSpend,
+      // When operator-asserted, skips the SDK's provider fetch.
+      ...(assertedUtxos !== undefined ? { utxos: assertedUtxos } : {}),
+      ...(assertedChallenge !== undefined ? { challenge: assertedChallenge } : {}),
     };
 
+    let sdkError: unknown;
     try {
       if (frostLegacySig) {
         const keyLinkHash = computeKeyLinkHash(mldsaPubKey, frostTweakedPubKey, frostUntweakedPubKey, networkName);
@@ -216,17 +315,24 @@ export async function captureOpnetSighashes(
       } else {
         await callResult.sendTransaction(sendTxParams);
       }
-    } catch {
-      // Expected: __capture_only__ from the monkey-patched provider aborts
-      // the SDK after templates are finalized. A real error leaves
-      // capturedTemplateTxs empty and is surfaced by the check below.
+    } catch (err) {
+      // `__capture_only__` is the expected sentinel — the monkey-patched
+      // provider throws it after templates are finalized to abort broadcast.
+      // Other errors are real and need to surface for diagnosis.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('__capture_only__')) sdkError = err;
     } finally {
       (provider as unknown as Record<string, unknown>).sendRawTransactionPackage = origSendRawPkg;
       (provider as unknown as Record<string, unknown>).sendRawTransaction = origSendRaw;
     }
 
     if (capturedTemplateTxs.length === 0 || capturedCalls.length < capturedTemplateTxs.length) {
-      throw new Error('Capture failed — no template transactions or insufficient signing rounds');
+      const detail = sdkError instanceof Error ? `: ${sdkError.message}` : sdkError !== undefined ? `: ${String(sdkError)}` : '';
+      const out = new Error(`Capture failed — no template transactions or insufficient signing rounds${detail}`);
+      if (sdkError instanceof Error && sdkError.stack) {
+        (out as Error & { cause?: unknown }).cause = sdkError;
+      }
+      throw out;
     }
 
     // signInteraction invokes multiSignPsbt multiple times (fee estimation
@@ -255,5 +361,7 @@ export async function captureOpnetSighashes(
   } finally {
     mnemonic.zeroize();
     wallet.zeroize();
+    rndBytesPatch?.restore();
+    releaseLock();
   }
 }

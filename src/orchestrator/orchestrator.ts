@@ -26,6 +26,12 @@ import {
   extractBtcSighashes,
   type DecodedBtcOutput,
 } from '../broadcast/btc-vault';
+import { captureOpnetSighashes } from '../broadcast/opnet-capture';
+import {
+  buildCaptureInputsFromParams,
+  deriveVaultP2tr,
+  type OpnetParamsKeyMat,
+} from '../broadcast/opnet-params-reconstruct';
 import {
   messageFromAnnounce,
   parseCeremonyMessage,
@@ -228,12 +234,13 @@ export class Orchestrator {
 
     // Verify FROST-signing construction/sighashes before the gate sees the
     // spec — so policy evaluation runs over VERIFIED fields. BTC rebuild from
-    // `btcParams`; OPNet re-extracts sighashes from the raw tx + inputs.
-    // Mismatch → silent drop (peer indistinguishable from offline). Verify
-    // outcome for BTC carries the decoded outputs that populate the spec.
+    // `btcParams`; OPNet re-extracts sighashes from raw tx + inputs;
+    // `opnet-params` re-runs the deterministic capture. Mismatch → silent
+    // drop (peer indistinguishable from offline). Verify outcome for BTC
+    // carries the decoded outputs that populate the spec.
     let verify: FrostVerifyOutcome = { ok: true };
     if (msg.kind === 'announce-frost') {
-      verify = verifyAndDecodeFrostAnnounce(msg);
+      verify = await this.verifyFrostAnnounce(msg);
       if (!verify.ok) {
         this.log.error(
           `orchestrator: FROST announce sighash mismatch — silent drop (${verify.reason})`,
@@ -585,6 +592,167 @@ export class Orchestrator {
   private timeoutOutcome(tracker: CeremonyTracker): CeremonyOutcome {
     return { baseCeremonyId: tracker.baseCeremonyId, kind: tracker.kind, status: 'timeout' } as CeremonyOutcome;
   }
+
+  /**
+   * Verify the leader's asserted FROST-signing sighashes against what this
+   * node computes locally from the announce's construction data.
+   *
+   * - `btc` (`btcParams` present): rebuild via `buildBtcTxFromParams` +
+   *   compare. Produces decoded outputs for `SigningSpec.outputs`.
+   * - `opnet` (`unsignedTxHex` + `inputs`): re-extract sighashes via
+   *   `extractBtcSighashes` + compare. ABI-agnostic; policy uses hints.
+   * - `opnet-params` (`opnetParams`): re-run the deterministic capture via
+   *   `captureOpnetSighashes` with asserted UTXOs / challenge / rnd-bytes
+   *   seed + local key material + compare. Silent-drop if any key material
+   *   or deps are missing (capture needs share + frost + mnemonic).
+   * - `keylink`: unverified (DKG-state threading is the plug-in point).
+   */
+  private async verifyFrostAnnounce(
+    announce: Extract<CeremonyMessage, { kind: 'announce-frost' }>,
+  ): Promise<FrostVerifyOutcome> {
+    const { sighashes } = announce;
+
+    if (announce.protocol === 'btc') {
+      const bp = announce.btcParams;
+      let rebuilt;
+      try {
+        rebuilt = buildBtcTxFromParams({
+          to: bp.to,
+          amountSat: BigInt(bp.amountSat),
+          feeRate: bp.feeRate,
+          network: bp.network,
+          frostP2tr: bp.frostP2tr,
+          frostUntweakedPubKey: fromHex(bp.frostUntweakedPubKeyHex),
+          utxos: bp.utxos.map((u) => ({
+            transactionId: u.transactionId,
+            outputIndex: u.outputIndex,
+            value: BigInt(u.valueSat),
+          })),
+        });
+      } catch (err) {
+        return { ok: false, reason: `btc rebuild failed: ${errString(err)}` };
+      }
+      if (rebuilt.sighashes.length !== sighashes.length) {
+        return {
+          ok: false,
+          reason: `btc rebuild produced ${rebuilt.sighashes.length} sighashes, announce has ${sighashes.length}`,
+        };
+      }
+      for (let i = 0; i < sighashes.length; i++) {
+        const leaderHex = sighashes[i]!.hashHex.toLowerCase();
+        const ourHex = toHex(rebuilt.sighashes[i]!.hash).toLowerCase();
+        if (leaderHex !== ourHex) {
+          return {
+            ok: false,
+            reason: `btc sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
+          };
+        }
+      }
+      return { ok: true, btcOutputs: rebuilt.outputs, btcFrostP2tr: bp.frostP2tr };
+    }
+
+    if (announce.protocol === 'opnet') {
+      const { unsignedTxHex, inputs } = announce;
+      if (inputs.length !== sighashes.length) {
+        return {
+          ok: false,
+          reason: `inputs.length=${inputs.length} != sighashes.length=${sighashes.length}`,
+        };
+      }
+      let recomputed: Array<{ index: number; hash: Uint8Array; tweaked: boolean }>;
+      try {
+        recomputed = extractBtcSighashes(unsignedTxHex, inputs);
+      } catch (err) {
+        return { ok: false, reason: `extract failed: ${errString(err)}` };
+      }
+      for (let i = 0; i < sighashes.length; i++) {
+        const leaderHex = sighashes[i]!.hashHex.toLowerCase();
+        const ourHex = toHex(recomputed[i]!.hash).toLowerCase();
+        if (leaderHex !== ourHex) {
+          return {
+            ok: false,
+            reason: `sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
+          };
+        }
+      }
+      return { ok: true };
+    }
+
+    if (announce.protocol === 'opnet-params') {
+      const keyMat = this.buildOpnetParamsKeyMat();
+      if (!keyMat) {
+        return {
+          ok: false,
+          reason: 'opnet-params: missing share / frost pkg / frostLegacySig / mnemonic / network',
+        };
+      }
+      // Refund address controls where the SDK sends change — a bogus value
+      // would be theft, not DoS. Verify it matches our locally-derived P2TR
+      // before trusting the rest of the announce.
+      let expectedRefund: string;
+      try {
+        expectedRefund = deriveVaultP2tr(keyMat.frostUntweakedPubKey, keyMat.network);
+      } catch (err) {
+        return { ok: false, reason: `refund derive failed: ${errString(err)}` };
+      }
+      if (announce.opnetParams.refundAddress !== expectedRefund) {
+        return {
+          ok: false,
+          reason: `refundAddress mismatch: announce=${announce.opnetParams.refundAddress} expected=${expectedRefund}`,
+        };
+      }
+      let captured;
+      try {
+        const inputs = buildCaptureInputsFromParams(announce.opnetParams, keyMat);
+        captured = await captureOpnetSighashes(inputs);
+      } catch (err) {
+        return { ok: false, reason: `opnet-params capture failed: ${errString(err)}` };
+      }
+      if (captured.sighashes.length !== sighashes.length) {
+        return {
+          ok: false,
+          reason: `opnet-params rebuild produced ${captured.sighashes.length} sighashes, announce has ${sighashes.length}`,
+        };
+      }
+      for (let i = 0; i < sighashes.length; i++) {
+        const leaderHex = sighashes[i]!.hashHex.toLowerCase();
+        const ourHex = captured.sighashes[i]!.hash.toLowerCase();
+        if (leaderHex !== ourHex) {
+          return {
+            ok: false,
+            reason: `opnet-params sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
+          };
+        }
+      }
+      return { ok: true };
+    }
+
+    // keylink — unverified at the orchestrator. The hash inputs (mldsaPubKey,
+    // frostTweakedPubKey, frostUntweakedPubKey, network) are DKG-derived; a
+    // verify step would need DKG state threaded in.
+    return { ok: true };
+  }
+
+  /**
+   * Assemble the per-daemon key material for opnet-params capture. Returns
+   * undefined if any required piece is missing (share, frost publicKeyPackage,
+   * frostLegacySig, network, sdkWalletMnemonic). Callers silent-drop the
+   * announce when this returns undefined.
+   */
+  private buildOpnetParamsKeyMat(): OpnetParamsKeyMat | undefined {
+    const { share, frostPublicKeyPackage, frostLegacySig, network, sdkWalletMnemonic } = this.deps;
+    if (!share || !frostPublicKeyPackage || !frostLegacySig || !network || !sdkWalletMnemonic) {
+      return undefined;
+    }
+    return {
+      mldsaPubKey: fromHex(share.publicKey),
+      frostTweakedPubKey: frostPublicKeyPackage.verifyingKey,
+      frostUntweakedPubKey: frostPublicKeyPackage.untweakedVerifyingKey,
+      frostLegacySig,
+      network,
+      sdkWalletMnemonic,
+    };
+  }
 }
 
 function errString(err: unknown): string {
@@ -596,99 +764,3 @@ function errString(err: unknown): string {
   }
 }
 
-/**
- * Verify the leader's asserted FROST-signing sighashes against what this
- * node computes locally from the announce's construction data.
- *
- * BTC (`btcParams` present): rebuild the tx via `buildBtcTxFromParams`,
- * compare sighashes. Produces decoded outputs that populate the `SigningSpec`
- * — `allowed_btc_recipients` / `max_btc_per_tx` rules evaluate against these.
- *
- * OPNet (`unsignedTxHex` + `inputs` present): re-extract sighashes via
- * `extractBtcSighashes`, compare. Decoded outputs aren't populated
- * (daemon stays ABI-agnostic for OPNet); policy matches against
- * operator-supplied `hints` instead (advisory; matches Ötzi's
- * federation-trust posture).
- *
- * Legacy (no construction data — test harnesses with synthetic sighashes):
- * returns `{ok: true}` with no outputs; participant signs whatever the
- * leader asserts. Production paths always carry construction data.
- */
-function verifyAndDecodeFrostAnnounce(
-  announce: Extract<CeremonyMessage, { kind: 'announce-frost' }>,
-): FrostVerifyOutcome {
-  const { sighashes } = announce;
-
-  if (announce.protocol === 'btc') {
-    const bp = announce.btcParams;
-    let rebuilt;
-    try {
-      rebuilt = buildBtcTxFromParams({
-        to: bp.to,
-        amountSat: BigInt(bp.amountSat),
-        feeRate: bp.feeRate,
-        network: bp.network,
-        frostP2tr: bp.frostP2tr,
-        frostUntweakedPubKey: fromHex(bp.frostUntweakedPubKeyHex),
-        utxos: bp.utxos.map((u) => ({
-          transactionId: u.transactionId,
-          outputIndex: u.outputIndex,
-          value: BigInt(u.valueSat),
-        })),
-      });
-    } catch (err) {
-      return { ok: false, reason: `btc rebuild failed: ${errString(err)}` };
-    }
-    if (rebuilt.sighashes.length !== sighashes.length) {
-      return {
-        ok: false,
-        reason: `btc rebuild produced ${rebuilt.sighashes.length} sighashes, announce has ${sighashes.length}`,
-      };
-    }
-    for (let i = 0; i < sighashes.length; i++) {
-      const leaderHex = sighashes[i]!.hashHex.toLowerCase();
-      const ourHex = toHex(rebuilt.sighashes[i]!.hash).toLowerCase();
-      if (leaderHex !== ourHex) {
-        return {
-          ok: false,
-          reason: `btc sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
-        };
-      }
-    }
-    return { ok: true, btcOutputs: rebuilt.outputs, btcFrostP2tr: bp.frostP2tr };
-  }
-
-  if (announce.protocol === 'opnet') {
-    const { unsignedTxHex, inputs } = announce;
-    if (inputs.length !== sighashes.length) {
-      return {
-        ok: false,
-        reason: `inputs.length=${inputs.length} != sighashes.length=${sighashes.length}`,
-      };
-    }
-    let recomputed: Array<{ index: number; hash: Uint8Array; tweaked: boolean }>;
-    try {
-      recomputed = extractBtcSighashes(unsignedTxHex, inputs);
-    } catch (err) {
-      return { ok: false, reason: `extract failed: ${errString(err)}` };
-    }
-    for (let i = 0; i < sighashes.length; i++) {
-      const leaderHex = sighashes[i]!.hashHex.toLowerCase();
-      const ourHex = toHex(recomputed[i]!.hash).toLowerCase();
-      if (leaderHex !== ourHex) {
-        return {
-          ok: false,
-          reason: `sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
-        };
-      }
-    }
-    return { ok: true };
-  }
-
-  // keylink — unverified at the orchestrator. The hash inputs (mldsaPubKey,
-  // frostTweakedPubKey, frostUntweakedPubKey, network) are DKG-derived; a
-  // verify step would need DKG state threaded in. Matches OPNet hints: rogue
-  // insider's worst case is DoS (signs wrong bytes → future contract calls
-  // fail because the SDK recomputes the real hash).
-  return { ok: true };
-}

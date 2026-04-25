@@ -135,6 +135,21 @@ export interface OrchestratorDeps {
    */
   network?: NetworkName;
   /**
+   * V3 key-link FROST sig produced during combined DKG — OPNet's SDK replays
+   * it during contract-call construction (see `withFrostLegacySig`). Needed
+   * by the participant-side capture when verifying an `opnet-params` announce;
+   * without it, opnet-params announces silent-drop. Undefined on regtest
+   * daemons (key-link phase skipped there).
+   */
+  frostLegacySig?: Uint8Array;
+  /**
+   * Throwaway mnemonic for the SDK's wallet-keypair slot during capture.
+   * Never signs anything that reaches the chain (multiSignPsbt is
+   * monkey-patched during capture). The daemon generates one at startup.
+   * Without it, `opnet-params` announces silent-drop.
+   */
+  sdkWalletMnemonic?: string;
+  /**
    * Persists this party's combined-DKG result after participation settles.
    * Errors are logged but do NOT abort the ceremony — DKG itself succeeded
    * in memory; persistence is best-effort on the participant side. Operator

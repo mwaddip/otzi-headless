@@ -20,6 +20,14 @@ import {
   type BtcUtxo,
   type DecodedBtcOutput,
 } from '../broadcast/btc-vault';
+import { captureOpnetSighashes, type OpnetCaptureContext } from '../broadcast/opnet-capture';
+import {
+  deriveVaultP2tr,
+  serializeOpnetParams,
+} from '../broadcast/opnet-params-reconstruct';
+import { broadcastOpnetTx } from '../broadcast/opnet-broadcast';
+import type { ChallengeSolution } from '@btc-vision/transaction';
+import type { UTXO as OpnetUtxo } from 'opnet';
 import type { PullOpts } from '../core/blob-puller';
 import type { CeremonyRunner, CombinedDkgResult } from '../core/ceremony-runner';
 import type { NetworkName } from '../node/types';
@@ -51,6 +59,36 @@ export interface LeaderDeps {
    * against the resulting vault, but other ceremonies are unaffected.
    */
   network?: NetworkName;
+  /**
+   * V3 key-link FROST sig for `opnet-params` capture — replayed by the
+   * OPNet SDK during contract-call construction against a V3 vault. Read
+   * from the share envelope by `config-merge`. Required when the leader
+   * handles `LeaderSignOpnetParamsRequest`; absence produces a clear error.
+   */
+  frostLegacySig?: Uint8Array;
+  /**
+   * Throwaway mnemonic for the SDK's wallet-keypair slot during capture
+   * (never signs; multiSignPsbt is monkey-patched). Daemon generates one at
+   * startup and reuses. Required for `opnet-params` leader flow.
+   */
+  sdkWalletMnemonic?: string;
+  /**
+   * OPNet JSON-RPC provider for UTXO + challenge fetches during the
+   * `opnet-params` flow. Tests inject a stub; production wires the real
+   * `JSONRpcProvider` via `daemon.ts`. The type is intentionally loose —
+   * the SDK's full `JSONRpcProvider` type leaks many internal fields we
+   * don't need here.
+   */
+  opnetProvider?: {
+    utxoManager: { getUTXOs: (args: { address: string }) => Promise<unknown[]> };
+    getChallenge: () => Promise<unknown>;
+  };
+  /**
+   * CSPRNG used to fill the 32B rnd-bytes seed the leader asserts on-wire
+   * for the deterministic `opnet-params` capture. Defaults to WebCrypto when
+   * not supplied. Tests inject a deterministic fill for reproducibility.
+   */
+  opnetSeedFill?: (buf: Uint8Array) => void;
   /**
    * Persists this party's combined-DKG result after the protocol completes.
    * Errors propagate to the caller (HTTP 500) — leader stops short of
@@ -127,6 +165,32 @@ export interface LeaderSignOpnetRequest extends LeaderSignRequestBase {
   };
 }
 
+/**
+ * OPNet construction-params flow. Operator POSTs contract + method + params
+ * + pre-computed ML-DSA threshold sig. Daemon fetches UTXOs + challenge,
+ * generates the rnd-bytes seed, runs capture, asserts everything on-wire,
+ * runs FROST ceremony, broadcasts. Participants rebuild the exact capture
+ * and verify sighashes match — gate policy then evaluates structurally-
+ * verified `contractAddress` + `method`.
+ */
+export interface LeaderSignOpnetParamsRequest extends LeaderSignRequestBase {
+  scheme: 'frost';
+  protocol: 'opnet-params';
+  contractAddress: string;
+  method: string;
+  params: readonly unknown[];
+  paramTypes?: readonly ('address' | 'u256' | 'bytes')[];
+  /** ML-DSA threshold sig over `sha256(calldata)`. Operator pre-computes. */
+  mldsaThresholdSignature: Uint8Array;
+  feeRate?: number;
+  priorityFee?: bigint;
+  maximumAllowedSatToSpend?: bigint;
+  /** Advisory hints for policy gate (amountTokenAtomic remains advisory). */
+  hints?: {
+    amountTokenAtomic?: string;
+  };
+}
+
 export interface LeaderSignMldsaRequest extends LeaderSignRequestBase {
   scheme: 'mldsa';
   protocol: 'raw';
@@ -137,11 +201,17 @@ export interface LeaderSignMldsaRequest extends LeaderSignRequestBase {
 export type LeaderSignRequest =
   | LeaderSignBtcRequest
   | LeaderSignOpnetRequest
+  | LeaderSignOpnetParamsRequest
   | LeaderSignMldsaRequest;
 
 export type LeaderSignResult =
   | { scheme: 'mldsa'; signature: Uint8Array }
-  | { scheme: 'frost'; signatures: Uint8Array[] };
+  | {
+      scheme: 'frost';
+      signatures: Uint8Array[];
+      /** Populated iff the daemon broadcast the tx internally (OPNet construction-params flow). */
+      transactionId?: string;
+    };
 
 type SigningOperation = 'btc-transfer' | 'opnet-call' | 'generic';
 
@@ -149,6 +219,7 @@ function operationFromSignReq(req: LeaderSignRequest): SigningOperation {
   if (req.scheme === 'mldsa') return 'generic';
   if (req.protocol === 'btc') return 'btc-transfer';
   if (req.protocol === 'opnet') return 'opnet-call';
+  if (req.protocol === 'opnet-params') return 'opnet-call';
   return 'generic';
 }
 
@@ -293,6 +364,10 @@ export class LeaderDispatcher {
       return { scheme: 'frost', signatures: sigs };
     }
 
+    if (req.protocol === 'opnet-params') {
+      return this.signOpnetParams(req);
+    }
+
     // protocol === 'opnet'
     if (req.inputs.length === 0)
       throw new Error(`leader: scheme='frost' protocol='opnet' requires non-empty 'inputs' array`);
@@ -321,6 +396,118 @@ export class LeaderDispatcher {
     );
     await this.deps.runner.sendFrostSigningDoneSignoff(req.ceremonyId, sigs);
     return { scheme: 'frost', signatures: sigs };
+  }
+
+  /**
+   * OPNet construction-params leader flow: fetches UTXOs + challenge from
+   * provider, generates the rnd-bytes seed, runs capture, announces with
+   * the full wire blob, runs the FROST ceremony, then broadcasts the tx.
+   * Returns the txid alongside signatures because the daemon owns the
+   * captureContext — operator has no way to broadcast externally.
+   */
+  private async signOpnetParams(req: LeaderSignOpnetParamsRequest): Promise<LeaderSignResult> {
+    const { share, frostKeyPackage, frostPublicKeyPackage, frostLegacySig, sdkWalletMnemonic, network, opnetProvider } = this.deps;
+    if (!share) throw new Error("leader: protocol='opnet-params' requires share");
+    if (!frostKeyPackage || !frostPublicKeyPackage) throw new Error("leader: protocol='opnet-params' requires FROST key material");
+    if (!frostLegacySig) throw new Error("leader: protocol='opnet-params' requires frostLegacySig (V3 share)");
+    if (!sdkWalletMnemonic) throw new Error("leader: protocol='opnet-params' requires sdkWalletMnemonic");
+    if (!network) throw new Error("leader: protocol='opnet-params' requires network");
+    if (!opnetProvider) throw new Error("leader: protocol='opnet-params' requires opnetProvider");
+
+    const mldsaPubKey = new Uint8Array(Buffer.from(share.publicKey, 'hex'));
+    const frostTweakedPubKey = frostPublicKeyPackage.verifyingKey;
+    const frostUntweakedPubKey = frostPublicKeyPackage.untweakedVerifyingKey;
+    const refundAddress = deriveVaultP2tr(frostUntweakedPubKey, network);
+
+    // Fetch UTXOs + challenge before seed generation so the async I/O fault
+    // lane runs first; seed + subsequent capture are local-only.
+    const rawUtxos = await opnetProvider.utxoManager.getUTXOs({ address: refundAddress });
+    const utxos = rawUtxos as OpnetUtxo[];
+    const challenge = (await opnetProvider.getChallenge()) as ChallengeSolution;
+
+    const rndBytesSeed = new Uint8Array(32);
+    const fill = this.deps.opnetSeedFill ?? ((buf: Uint8Array) => {
+      if (typeof globalThis.crypto?.getRandomValues !== 'function') {
+        throw new Error('leader: no globalThis.crypto.getRandomValues — provide opnetSeedFill');
+      }
+      globalThis.crypto.getRandomValues(buf);
+    });
+    fill(rndBytesSeed);
+
+    const feeRate = req.feeRate ?? 10;
+    const priorityFee = req.priorityFee ?? 1000n;
+    const maximumAllowedSatToSpend = req.maximumAllowedSatToSpend ?? 100000n;
+
+    const captured = await captureOpnetSighashes({
+      contractAddress: req.contractAddress,
+      method: req.method,
+      params: [...req.params],
+      ...(req.paramTypes ? { paramTypes: [...req.paramTypes] } : {}),
+      network,
+      mldsaThresholdSignature: req.mldsaThresholdSignature,
+      mldsaPubKey,
+      frostTweakedPubKey,
+      frostUntweakedPubKey,
+      frostLegacySig,
+      refundAddress,
+      sdkWalletMnemonic,
+      feeRate,
+      priorityFee,
+      maximumAllowedSatToSpend,
+      utxos,
+      challenge,
+      rndBytesSeed,
+    });
+
+    await this.requireApprove(this.signingSpecOpnetParams(req));
+
+    const announceExtras = {
+      protocol: 'opnet-params' as const,
+      opnetParams: serializeOpnetParams({
+        contractAddress: req.contractAddress,
+        method: req.method,
+        params: req.params,
+        ...(req.paramTypes ? { paramTypes: req.paramTypes } : {}),
+        refundAddress,
+        feeRate,
+        priorityFee,
+        maximumAllowedSatToSpend,
+        randomBytesSeed: rndBytesSeed,
+        mldsaThresholdSignature: req.mldsaThresholdSignature,
+        utxos,
+        challenge,
+        ...(req.hints ? { hints: { ...req.hints } } : {}),
+      }),
+    };
+
+    const sigs = await this.deps.runner.signFrostAsLeader(
+      {
+        ceremonyId: req.ceremonyId,
+        sighashes: captured.sighashes.map((s) => ({
+          hash: new Uint8Array(Buffer.from(s.hash, 'hex')),
+          tweaked: s.type === 'key-path',
+        })),
+        signers: req.signers,
+        keyPackage: frostKeyPackage,
+        publicKeyPackage: frostPublicKeyPackage,
+        rng: this.deps.rng,
+      },
+      this.deps.pullOpts,
+      announceExtras,
+    );
+    await this.deps.runner.sendFrostSigningDoneSignoff(req.ceremonyId, sigs);
+
+    const broadcast = await broadcastOpnetTx({
+      captureContext: captured.captureContext,
+      frostSignatures: captured.sighashes.map((s, i) => ({
+        hash: s.hash,
+        signature: toHex(sigs[i]!),
+      })),
+      frostTweakedPubKey,
+      frostUntweakedPubKey,
+      network,
+    });
+    return { scheme: 'frost', signatures: sigs, transactionId: broadcast.transactionId };
   }
 
   private signingSpecMldsa(
@@ -371,6 +558,26 @@ export class LeaderDispatcher {
       operation: 'opnet-call',
       ...(hints.contractAddress !== undefined ? { destination: hints.contractAddress } : {}),
       ...(hints.method !== undefined ? { method: hints.method } : {}),
+      ...(amount !== undefined ? { amount } : {}),
+    };
+  }
+
+  private signingSpecOpnetParams(
+    req: LeaderSignOpnetParamsRequest,
+  ): CeremonySpec {
+    const amount = req.hints?.amountTokenAtomic !== undefined
+      ? BigInt(req.hints.amountTokenAtomic) : undefined;
+    return {
+      kind: 'signing',
+      ceremonyId: req.ceremonyId,
+      leader: this.deps.node.id,
+      role: 'leader',
+      operation: 'opnet-call',
+      // Verified structurally: leader runs capture from these exact inputs,
+      // participants rebuild + match. Policy rules `allowed_contracts` +
+      // `method_allowlist` evaluate trusted data.
+      destination: req.contractAddress,
+      method: req.method,
       ...(amount !== undefined ? { amount } : {}),
     };
   }

@@ -33,6 +33,14 @@ export interface LoadedDaemonState {
   share?: DecryptedShare;
   /** Derived from `share.frostKeyPackage` when present (see `buildFrostPublicKeyPackage`). */
   frostPublicKeyPackage?: PublicKeyPackage;
+  /**
+   * V3 share envelope carries `frostLegacySig` as an extra top-level hex
+   * field (piggy-backed by `share-persistence.ts` — outside Ötzi's canonical
+   * V3 byte format but tolerated). Extracted here from the raw share-file
+   * JSON (not via `decryptShareFile`, which is one of the lifted Ötzi
+   * byte-compat files). Consumed by `opnet-params` capture verification.
+   */
+  frostLegacySig?: Uint8Array;
   /** Includes self. Orchestrator + leader consume this directly. */
   peersById: ReadonlyMap<PartyId, string>;
   /** Pre-bound persistence sink. Present after `validateLoaded`; absent for `buildStateFromShare` / `buildStateNoShare`. */
@@ -92,8 +100,22 @@ export async function validateLoaded(
   const decryptor = options.shareDecryptor ?? decryptShareFile;
   const share = await decryptor(shareFile, password);
   const base = buildStateFromShare(config, share);
+  const frostLegacySig = extractFrostLegacySig(shareFile, config.share.path);
   const persistDkgShare = makePersistSink(config, password);
-  return { ...base, persistDkgShare };
+  return {
+    ...base,
+    ...(frostLegacySig ? { frostLegacySig } : {}),
+    persistDkgShare,
+  };
+}
+
+function extractFrostLegacySig(shareFile: ShareFile, path: string): Uint8Array | undefined {
+  const raw = (shareFile as ShareFile & { frostLegacySig?: unknown }).frostLegacySig;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string' || !/^[0-9a-fA-F]+$/.test(raw) || raw.length === 0) {
+    throw new Error(`daemon: share file at '${path}' has invalid frostLegacySig (must be hex)`);
+  }
+  return new Uint8Array(Buffer.from(raw, 'hex'));
 }
 
 /**

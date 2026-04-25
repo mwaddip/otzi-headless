@@ -34,7 +34,7 @@ import { Address } from '@btc-vision/transaction';
 import { getContract, OP_20_ABI } from 'opnet';
 import { verifySignature, type Rng } from '@mwaddip/frots';
 import { schnorr } from '@noble/curves/secp256k1.js';
-import { getProvider, getNetwork, generateWallet } from '../src/node/opnet-client';
+import { getProvider, getNetwork, generateWallet, generateMnemonic } from '../src/node/opnet-client';
 import { createInMemoryRing } from '../src/core/in-memory-transport';
 import { BlobStore } from '../src/core/blob-store';
 import { BlobServer } from '../src/core/blob-server';
@@ -56,6 +56,12 @@ import {
 import { encodeCalldata } from '../src/broadcast/opnet-calldata';
 import { captureOpnetSighashes } from '../src/broadcast/opnet-capture';
 import { broadcastOpnetTx } from '../src/broadcast/opnet-broadcast';
+import {
+  buildCaptureInputsFromParams,
+  type OpnetParamsKeyMat,
+} from '../src/broadcast/opnet-params-reconstruct';
+import { LeaderDispatcher } from '../src/daemon/leader';
+import { AutoGate } from '../src/gate/factory';
 
 const SYSTEM_RNG: Rng = { fillBytes(dest) { crypto.getRandomValues(dest); } };
 
@@ -625,8 +631,77 @@ async function runMldsaThresholdSign(
   return sig;
 }
 
+/**
+ * Participant-side verify for `opnet-params`: listens for the leader's
+ * announce, reconstructs identical capture inputs from the wire + local
+ * key material, re-runs the capture, and compares sighashes. Throws on
+ * any mismatch — that's the determinism invariant. On match, calls
+ * `participateInFrostSigning`.
+ *
+ * Deliberately uses a DIFFERENT `sdkWalletMnemonic` than the leader to
+ * exercise the invariant that capture output depends only on the shared
+ * inputs (mnemonic only seeds a wallet slot the SDK never signs with
+ * — publicKey is overridden, multiSignPsbt is monkey-patched).
+ */
+async function orchestrateOpnetParamsParticipant(
+  ctx: NodeCtx,
+  baseCeremonyId: string,
+  partyId: PartyId,
+  dkg: DkgBundle,
+): Promise<void> {
+  const keyMat: OpnetParamsKeyMat = {
+    mldsaPubKey: dkg.results[partyId]!.mldsa.publicKey,
+    frostTweakedPubKey: dkg.tweakedSec1,
+    frostUntweakedPubKey: dkg.untweakedSec1,
+    frostLegacySig: dkg.frostLegacySig,
+    network: 'testnet',
+    // Fresh mnemonic — different from the leader's. Capture must still be deterministic.
+    sdkWalletMnemonic: generateMnemonic(),
+  };
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const off = ctx.transport.onBroadcast((from, bytes) => {
+      void from;
+      const msg = parseCeremonyMessage(bytes);
+      if (!msg || msg.baseCeremonyId !== baseCeremonyId) return;
+      if (msg.kind !== 'announce-frost' || msg.protocol !== 'opnet-params') return;
+
+      console.log(`  participant ${partyId}: announce received, re-running capture to verify...`);
+      const cT = Date.now();
+      const inputs = buildCaptureInputsFromParams(msg.opnetParams, keyMat);
+      captureOpnetSighashes(inputs).then((captured) => {
+        if (settled) return;
+        console.log(`  participant ${partyId}: capture completed in ${Date.now() - cT}ms — ${captured.sighashes.length} sighash(es)`);
+        if (captured.sighashes.length !== msg.sighashes.length) {
+          throw new Error(`participant ${partyId}: sighash count mismatch (ours=${captured.sighashes.length}, leader=${msg.sighashes.length})`);
+        }
+        for (let i = 0; i < captured.sighashes.length; i++) {
+          const ours = captured.sighashes[i]!.hash.toLowerCase();
+          const leader = msg.sighashes[i]!.hashHex.toLowerCase();
+          if (ours !== leader) {
+            throw new Error(`participant ${partyId}: sighash[${i}] MISMATCH (determinism broken)\n  leader=${leader}\n  ours=  ${ours}`);
+          }
+        }
+        console.log(`  participant ${partyId}: all sighashes matched leader ✓ — signing`);
+        const sighashes = sighashesFromAnnounceFrost(msg);
+        return ctx.runner.participateInFrostSigning({
+          ceremonyId: msg.ceremonyId,
+          sighashes,
+          signers: msg.signers,
+          keyPackage: dkg.results[partyId]!.frost.keyPackage,
+          publicKeyPackage: dkg.results[partyId]!.frost.publicKeyPackage,
+          rng: SYSTEM_RNG,
+        }, FAST_PULL_OPTS);
+      }).then(
+        () => { if (!settled) { settled = true; off(); resolve(); } },
+        (err) => { if (!settled) { settled = true; off(); reject(err); } },
+      );
+    });
+  });
+}
+
 async function phaseF(env: Env, dkg: DkgBundle): Promise<void> {
-  console.log('\n=== PHASE F — OPNet ceremony (BHTT.transfer back) ===\n');
+  console.log('\n=== PHASE F — OPNet ceremony via /sign protocol=opnet-params ===\n');
   const AMOUNT = 500_000n;
   const deployerAddressHex = (() => {
     const { wallet, mnemonic } = generateWallet(env.deployerMnemonic, 'testnet');
@@ -634,63 +709,63 @@ async function phaseF(env: Env, dkg: DkgBundle): Promise<void> {
   })();
   console.log(`Transfer spec: ${AMOUNT} BHTT → ${deployerAddressHex}`);
 
-  // Encode calldata + messageHash.
+  // Operator-side: encode calldata + messageHash, run ML-DSA threshold.
   const { messageHash } = encodeCalldata(
     'transfer',
     [deployerAddressHex, AMOUNT.toString()],
     ['address', 'u256'],
   );
   console.log(`  messageHash: ${hex(messageHash)}`);
-
-  // Run ML-DSA threshold sign over messageHash.
-  console.log('Running ML-DSA threshold ceremony...');
+  console.log('Running ML-DSA threshold ceremony (pre-computed by operator)...');
   const t0 = Date.now();
   const mldsaSig = await runMldsaThresholdSign(dkg, messageHash);
   console.log(`  ML-DSA sig (${mldsaSig.length}B) in ${Date.now() - t0}ms`);
 
-  // Capture template txs + sighashes from the SDK.
-  console.log('Capturing OPNet tx template...');
-  const captured = await captureOpnetSighashes({
+  // Build LeaderDispatcher on peer 0 — the production sign path.
+  const leader = new LeaderDispatcher({
+    runner: dkg.ctx.get(0)!.runner,
+    gate: new AutoGate(),
+    node: { id: 'peer-0', partyId: 0 },
+    peersById: new Map([[0, 'peer-0'], [1, 'peer-1'], [2, 'peer-2']]),
+    share: dkg.mldsaShares[0]!,
+    frostKeyPackage: dkg.results[0]!.frost.keyPackage,
+    frostPublicKeyPackage: dkg.results[0]!.frost.publicKeyPackage,
+    rng: SYSTEM_RNG,
+    pullOpts: FAST_PULL_OPTS,
+    network: 'testnet',
+    frostLegacySig: dkg.frostLegacySig,
+    sdkWalletMnemonic: generateMnemonic(),
+    opnetProvider: getProvider('testnet'),
+    logger: {
+      debug: () => {},
+      info: (m, x) => console.log(`  leader: ${m}`, x ?? ''),
+      warn: (m, x) => console.warn(`  leader WARN: ${m}`, x ?? ''),
+      error: (m, x) => console.error(`  leader ERR: ${m}`, x ?? ''),
+    },
+  });
+
+  const baseId = `opnet-params-${Date.now()}`;
+  const part1 = orchestrateOpnetParamsParticipant(dkg.ctx.get(1)!, baseId, 1, dkg);
+
+  console.log('Invoking leader.sign (protocol=opnet-params)...');
+  const result = await leader.sign({
+    ceremonyId: baseId,
+    scheme: 'frost',
+    protocol: 'opnet-params',
+    signers: [0, 1],
     contractAddress: env.bhttContractBech32,
     method: 'transfer',
     params: [deployerAddressHex, AMOUNT.toString()],
     paramTypes: ['address', 'u256'],
-    abi: OP_20_ABI,
-    network: 'testnet',
     mldsaThresholdSignature: mldsaSig,
-    mldsaPubKey: dkg.results[0]!.mldsa.publicKey,
-    frostTweakedPubKey: dkg.tweakedSec1,
-    frostUntweakedPubKey: dkg.untweakedSec1,
-    frostLegacySig: dkg.frostLegacySig,
-    refundAddress: dkg.vaultP2tr,
-    sdkWalletMnemonic: env.deployerMnemonic,
+    hints: { amountTokenAtomic: AMOUNT.toString() },
   });
-  console.log(`  captured ${captured.sighashes.length} sighash(es), ${captured.captureContext.templateTxs.length} template tx(s)`);
-  for (const sh of captured.sighashes) {
-    console.log(`    [${sh.index}] type=${sh.type} hash=${sh.hash.slice(0, 32)}…`);
+  await part1;
+
+  if (result.scheme !== 'frost' || !result.transactionId) {
+    throw new Error(`phaseF: unexpected leader result shape: ${JSON.stringify({ scheme: result.scheme, hasTxid: 'transactionId' in result })}`);
   }
-
-  // Run FROST ceremony over each sighash with the correct tweaked flag.
-  console.log('Running FROST ceremony over captured sighashes...');
-  const frostSpec = captured.sighashes.map(s => ({
-    hash: Buffer.from(s.hash, 'hex'),
-    tweaked: s.type === 'key-path',
-  }));
-  const frostSigs = await runFrostCeremony(dkg, 'opnet-ceremony', frostSpec);
-
-  const frostSignatures = captured.sighashes.map((s, i) => ({
-    hash: s.hash,
-    signature: hex(frostSigs[i]!),
-  }));
-  console.log('Broadcasting OPNet tx...');
-  const result = await broadcastOpnetTx({
-    captureContext: captured.captureContext,
-    frostSignatures,
-    frostTweakedPubKey: dkg.tweakedSec1,
-    frostUntweakedPubKey: dkg.untweakedSec1,
-    network: 'testnet',
-  });
-  console.log(`✓ OPNet ceremony broadcast: txid=${result.transactionId}`);
+  console.log(`✓ OPNet ceremony broadcast via opnet-params: txid=${result.transactionId}`);
 }
 
 async function main(): Promise<void> {

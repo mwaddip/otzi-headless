@@ -26,7 +26,12 @@ export type CeremonyMessage =
    * selects which construction data accompanies the announce:
    *
    * - `'btc'`: `btcParams` — participants rebuild the tx and verify sighashes.
-   * - `'opnet'`: `unsignedTxHex` + `inputs` — participants re-extract sighashes.
+   * - `'opnet'`: `unsignedTxHex` + `inputs` — participants re-extract sighashes
+   *   from leader-supplied raw bytes. Advisory `hints` populate the spec.
+   * - `'opnet-params'`: `opnetParams` — participants re-run `captureOpnetSighashes`
+   *   with the same asserted UTXOs / challenge / random-bytes seed and verify
+   *   the resulting sighashes match. `contractAddress` + `method` land on the
+   *   spec as STRUCTURALLY-verified fields (policy rules gate on them).
    * - `'keylink'`: `network` — participants sign the SDK key-link hash the
    *   daemon produces as part of DKG finalization (see `computeKeyLinkHash`).
    *   Currently unverified at the orchestrator (the inputs to the hash are
@@ -221,6 +226,16 @@ export function parseCeremonyMessage(bytes: Uint8Array): CeremonyMessage | null 
       return out;
     }
 
+    if (m.protocol === 'opnet-params') {
+      const parsed = parseOpnetParams(m.opnetParams);
+      if (!parsed) return null;
+      return {
+        ...base,
+        protocol: 'opnet-params',
+        opnetParams: parsed,
+      };
+    }
+
     if (m.protocol === 'keylink') {
       if (m.network !== 'mainnet' && m.network !== 'testnet') return null;
       return {
@@ -362,6 +377,75 @@ export interface AnnounceFrostOpnetExtras {
 }
 
 /**
+ * UTXO in on-wire raw form. Mirrors OPNet's `IUTXO` / `RawUTXOResponse` shape
+ * so participants can do `new UTXO(raw, raw.isCSV)` during rebuild. The
+ * `value` field is a decimal string (bigint-safe over JSON). `scriptPubKey`
+ * is a pass-through structure — the SDK consumes it verbatim during
+ * `signInteraction` (no daemon-side parsing).
+ */
+export interface AnnounceOpnetUtxoRaw {
+  transactionId: string;
+  outputIndex: number;
+  value: string;
+  scriptPubKey: unknown;
+  raw?: string;
+  witnessScript?: string;
+  redeemScript?: string;
+  isCSV?: boolean;
+}
+
+/**
+ * Full OPNet construction-params payload. The leader fetches UTXOs +
+ * challenge from the provider, generates a 32B random seed, and asserts all
+ * three on-wire. Participants run `captureOpnetSighashes` with identical
+ * inputs and verify the resulting sighashes match. Same deterministic-rebuild
+ * trust model as BTC's `btcParams`: if the leader lies about prevout state,
+ * broadcast fails at OPNet consensus — DoS at worst, never theft
+ * (federation-trust posture).
+ */
+export interface AnnounceOpnetParams {
+  contractAddress: string;
+  method: string;
+  /** Pre-conversion, JSON-safe — strings / numbers / booleans. */
+  params: ReadonlyArray<unknown>;
+  paramTypes?: ReadonlyArray<'address' | 'u256' | 'bytes'>;
+  refundAddress: string;
+  feeRate: number;
+  priorityFeeSat: string;
+  maxSatToSpendSat: string;
+  /** 32-byte random seed for deterministic `BitcoinUtils.rndBytes()` during capture. */
+  randomBytesSeedHex: string;
+  utxos: ReadonlyArray<AnnounceOpnetUtxoRaw>;
+  /** `ChallengeSolution.toRaw()` form — participant does `new ChallengeSolution(raw)`. */
+  challenge: Record<string, unknown>;
+  /**
+   * ML-DSA threshold signature over `sha256(calldata)` — the outer OPNet
+   * tx-level auth. Operator computes via a prior `/sign scheme='mldsa'`
+   * ceremony and hands it to the daemon as a `LeaderSignOpnetParamsRequest`
+   * field; leader asserts on-wire; participants use the asserted bytes
+   * during capture. Cryptographic verify is omitted in the participant verify
+   * step — a forged sig produces sighashes that also verify (since they
+   * commit to the tx bytes including the bad sig) and the tx fails at OPNet
+   * broadcast consensus → DoS, not theft. Matches federation-trust posture.
+   */
+  mldsaThresholdSignatureHex: string;
+  hints?: AnnounceHints;
+}
+
+/**
+ * OPNet construction-params variant — participants re-run the capture with
+ * asserted UTXOs + challenge + random-bytes seed and verify the resulting
+ * sighashes match the leader's assertion. The `contractAddress` + 4-byte
+ * method selector end up as STRUCTURALLY-verified fields on the `SigningSpec`,
+ * so policy rules (`allowed_contracts`, `method_allowlist`) evaluate against
+ * trusted data — unlike the legacy `opnet` variant whose `hints` are advisory.
+ */
+export interface AnnounceFrostOpnetParamsExtras {
+  protocol: 'opnet-params';
+  opnetParams: AnnounceOpnetParams;
+}
+
+/**
  * Key-link signing — the FROST Schnorr sig over `computeKeyLinkHash(...)`
  * that OPNet's SDK replays via `withFrostLegacySig` during contract-call
  * construction against a V3 vault. The hash inputs (mldsaPubKey + both
@@ -378,6 +462,7 @@ export interface AnnounceFrostKeylinkExtras {
 export type AnnounceFrostExtras =
   | AnnounceFrostBtcExtras
   | AnnounceFrostOpnetExtras
+  | AnnounceFrostOpnetParamsExtras
   | AnnounceFrostKeylinkExtras;
 
 /**
@@ -460,11 +545,147 @@ export function announceFrostMessage(
     }
     return msg;
   }
+  if (extras.protocol === 'opnet-params') {
+    return {
+      ...base,
+      protocol: 'opnet-params',
+      opnetParams: encodeOpnetParams(extras.opnetParams),
+    };
+  }
   return {
     ...base,
     protocol: 'keylink',
     network: extras.network,
   };
+}
+
+function encodeOpnetParams(p: AnnounceOpnetParams): AnnounceOpnetParams {
+  const out: AnnounceOpnetParams = {
+    contractAddress: p.contractAddress,
+    method: p.method,
+    params: [...p.params],
+    refundAddress: p.refundAddress,
+    feeRate: p.feeRate,
+    priorityFeeSat: p.priorityFeeSat,
+    maxSatToSpendSat: p.maxSatToSpendSat,
+    randomBytesSeedHex: p.randomBytesSeedHex,
+    mldsaThresholdSignatureHex: p.mldsaThresholdSignatureHex,
+    utxos: p.utxos.map((u) => {
+      const clone: AnnounceOpnetUtxoRaw = {
+        transactionId: u.transactionId,
+        outputIndex: u.outputIndex,
+        value: u.value,
+        scriptPubKey: u.scriptPubKey,
+      };
+      if (u.raw !== undefined) clone.raw = u.raw;
+      if (u.witnessScript !== undefined) clone.witnessScript = u.witnessScript;
+      if (u.redeemScript !== undefined) clone.redeemScript = u.redeemScript;
+      if (u.isCSV !== undefined) clone.isCSV = u.isCSV;
+      return clone;
+    }),
+    challenge: p.challenge,
+  };
+  if (p.paramTypes) out.paramTypes = [...p.paramTypes];
+  if (p.hints) {
+    const h: AnnounceHints = {};
+    if (p.hints.contractAddress !== undefined) h.contractAddress = p.hints.contractAddress;
+    if (p.hints.method !== undefined) h.method = p.hints.method;
+    if (p.hints.amountTokenAtomic !== undefined) h.amountTokenAtomic = p.hints.amountTokenAtomic;
+    out.hints = h;
+  }
+  return out;
+}
+
+/**
+ * Parse the raw-JSON `opnetParams` blob off an announce. Structural validation
+ * only (top-level fields + utxo shape); the `challenge` pass-through is checked
+ * at reconstruction time (`new ChallengeSolution(raw)` throws on malformed
+ * data, which silent-drops the announce — matches federation-trust posture).
+ */
+function parseOpnetParams(raw: unknown): AnnounceOpnetParams | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const p = raw as Record<string, unknown>;
+  if (
+    typeof p.contractAddress !== 'string' ||
+    typeof p.method !== 'string' ||
+    !Array.isArray(p.params) ||
+    typeof p.refundAddress !== 'string' ||
+    typeof p.feeRate !== 'number' ||
+    typeof p.priorityFeeSat !== 'string' ||
+    typeof p.maxSatToSpendSat !== 'string' ||
+    typeof p.randomBytesSeedHex !== 'string' ||
+    typeof p.mldsaThresholdSignatureHex !== 'string' ||
+    !Array.isArray(p.utxos) ||
+    !p.challenge ||
+    typeof p.challenge !== 'object'
+  ) return null;
+
+  if (!/^[0-9a-fA-F]+$/.test(p.randomBytesSeedHex) || p.randomBytesSeedHex.length !== 64) return null;
+  if (!/^[0-9a-fA-F]+$/.test(p.mldsaThresholdSignatureHex) || p.mldsaThresholdSignatureHex.length === 0) return null;
+  if (!/^\d+$/.test(p.priorityFeeSat)) return null;
+  if (!/^\d+$/.test(p.maxSatToSpendSat)) return null;
+
+  let paramTypes: ReadonlyArray<'address' | 'u256' | 'bytes'> | undefined;
+  if (p.paramTypes !== undefined) {
+    if (!Array.isArray(p.paramTypes)) return null;
+    const out: Array<'address' | 'u256' | 'bytes'> = [];
+    for (const t of p.paramTypes) {
+      if (t !== 'address' && t !== 'u256' && t !== 'bytes') return null;
+      out.push(t);
+    }
+    paramTypes = out;
+  }
+
+  const utxos: AnnounceOpnetUtxoRaw[] = [];
+  for (const u of p.utxos) {
+    if (!u || typeof u !== 'object') return null;
+    const item = u as Record<string, unknown>;
+    if (
+      typeof item.transactionId !== 'string' ||
+      typeof item.outputIndex !== 'number' ||
+      typeof item.value !== 'string' ||
+      !item.scriptPubKey ||
+      typeof item.scriptPubKey !== 'object'
+    ) return null;
+    if (!/^\d+$/.test(item.value)) return null;
+    const clone: AnnounceOpnetUtxoRaw = {
+      transactionId: item.transactionId,
+      outputIndex: item.outputIndex,
+      value: item.value,
+      scriptPubKey: item.scriptPubKey,
+    };
+    if (typeof item.raw === 'string') clone.raw = item.raw;
+    if (typeof item.witnessScript === 'string') clone.witnessScript = item.witnessScript;
+    if (typeof item.redeemScript === 'string') clone.redeemScript = item.redeemScript;
+    if (typeof item.isCSV === 'boolean') clone.isCSV = item.isCSV;
+    utxos.push(clone);
+  }
+
+  let hints: AnnounceHints | undefined;
+  if (p.hints && typeof p.hints === 'object') {
+    const h = p.hints as Record<string, unknown>;
+    hints = {};
+    if (typeof h.contractAddress === 'string') hints.contractAddress = h.contractAddress;
+    if (typeof h.method === 'string') hints.method = h.method;
+    if (typeof h.amountTokenAtomic === 'string') hints.amountTokenAtomic = h.amountTokenAtomic;
+  }
+
+  const out: AnnounceOpnetParams = {
+    contractAddress: p.contractAddress,
+    method: p.method,
+    params: [...p.params],
+    refundAddress: p.refundAddress,
+    feeRate: p.feeRate,
+    priorityFeeSat: p.priorityFeeSat,
+    maxSatToSpendSat: p.maxSatToSpendSat,
+    randomBytesSeedHex: p.randomBytesSeedHex,
+    utxos,
+    challenge: p.challenge as Record<string, unknown>,
+    mldsaThresholdSignatureHex: p.mldsaThresholdSignatureHex,
+  };
+  if (paramTypes) out.paramTypes = paramTypes;
+  if (hints) out.hints = hints;
+  return out;
 }
 
 export function announceDkgMessage(
