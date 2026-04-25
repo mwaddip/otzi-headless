@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mwaddip/otzi/otzi-manifest-v1.schema.json",
+  "$id": "https://github.com/mwaddip/otzi/otzi-manifest-v2.schema.json",
   "title": "Ötzi Project Manifest",
   "description": "Declarative JSON format for configuring Ötzi (PERMAFROST Vault) with custom OPNet contract operations, live state reads, conditional visibility, and theming.",
   "type": "object",
@@ -8,8 +8,8 @@
   "additionalProperties": false,
   "properties": {
     "version": {
-      "const": 1,
-      "description": "Schema version. Must be 1."
+      "const": 2,
+      "description": "Schema version. Must be 2."
     },
     "name": {
       "type": "string",
@@ -34,7 +34,7 @@
       "additionalProperties": {
         "$ref": "#/$defs/Contract"
       },
-      "description": "Contract definitions keyed by logical name. Addresses are configured separately in Ötzi settings — NOT stored in the manifest."
+      "description": "Contract definitions keyed by logical name. Each contract carries its address inline."
     },
     "reads": {
       "type": "object",
@@ -84,7 +84,7 @@
     },
     "Contract": {
       "type": "object",
-      "required": ["label", "abi"],
+      "required": ["label", "abi", "address"],
       "additionalProperties": false,
       "properties": {
         "label": {
@@ -109,6 +109,11 @@
               "description": "Array of ABI entries. Can mix shorthand strings with custom AbiEntry objects."
             }
           ]
+        },
+        "address": {
+          "type": "string",
+          "minLength": 1,
+          "description": "On-chain contract address. Manifests are network-agnostic — publish a separate manifest per deployment."
         }
       }
     },
@@ -168,7 +173,7 @@
               "source": {
                 "type": "string",
                 "pattern": "^(contract|setting):.+$",
-                "description": "Auto-fill source. 'contract:<key>' = address from settings. 'setting:<key>' = custom setting value."
+                "description": "Auto-fill source. 'contract:<key>' = address from contracts[key].address. 'setting:<key>' = custom setting value."
               }
             }
           },
@@ -289,7 +294,7 @@
         "source": {
           "type": "string",
           "pattern": "^(contract|setting|read):.+$",
-          "description": "Auto-fill source. 'contract:<key>' = address from settings. 'setting:<key>' = custom setting value. 'read:<key>' = value from reads. When set, the field is pre-filled and disabled."
+          "description": "Auto-fill source. 'contract:<key>' = address from contracts[key].address. 'setting:<key>' = custom setting value. 'read:<key>' = value from reads. When set, the field is pre-filled and disabled."
         },
         "options": {
           "type": "object",
