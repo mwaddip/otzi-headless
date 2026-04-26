@@ -3,46 +3,47 @@ set -e
 
 . /usr/share/debconf/confmodule
 
-# Default node-id to the system hostname if the operator hasn't already set it.
-db_get otzi-headless/node-id || true
-if [ -z "$RET" ]; then
-  db_set otzi-headless/node-id "$(hostname -s 2>/dev/null || hostname)"
-fi
-
-db_input high otzi-headless/role || true
-db_input high otzi-headless/network || true
-db_input medium otzi-headless/node-id || true
-db_go || true
-
-# Per-network default for opnet-rpc — only set when the operator hasn't
-# already supplied a value.
+# Pre-seed defaults conditionally
 db_get otzi-headless/network || true
-NETWORK="$RET"
-case "$NETWORK" in
-  mainnet)  DEFAULT_RPC="https://api.opnet.org" ;;
-  regtest)  DEFAULT_RPC="http://127.0.0.1:9001" ;;
-  *)        DEFAULT_RPC="https://testnet.opnet.org" ;;
+case "$RET" in
+  mainnet) db_set otzi-headless/opnet-rpc "https://api.opnet.org" ;;
+  testnet) db_set otzi-headless/opnet-rpc "https://testnet.opnet.org" ;;
+  regtest) db_set otzi-headless/opnet-rpc "http://127.0.0.1:9001" ;;
 esac
-db_get otzi-headless/opnet-rpc || true
-if [ -z "$RET" ]; then
-  db_set otzi-headless/opnet-rpc "$DEFAULT_RPC"
-fi
 
-db_input medium otzi-headless/opnet-rpc || true
+db_get otzi-headless/node-id || true
+[ -z "$RET" ] && db_set otzi-headless/node-id "$(hostname -s 2>/dev/null || hostname)"
+
+# Ask high-priority prompts in order.
+db_input high otzi-headless/role || true
+db_input high otzi-headless/operators || true
+db_input high otzi-headless/bootstrap-secret || true
+db_input high otzi-headless/network || true
 db_input high otzi-headless/transport || true
+
 db_go || true
 
+# Conditional sub-prompts based on transport choice.
 db_get otzi-headless/transport || true
 TRANSPORT="$RET"
-case "$TRANSPORT" in
-  relay)
-    db_input high otzi-headless/relay-url || true
-    ;;
-  peer-mesh|*)
-    db_input medium otzi-headless/listen || true
-    ;;
-esac
+if [ "$TRANSPORT" = "relay" ]; then
+  db_input high otzi-headless/relay-url || true
+else
+  db_input medium otzi-headless/listen || true
+fi
 
+# Conditional sub-prompts based on role choice.
+db_get otzi-headless/role || true
+ROLE="$RET"
+if [ "$ROLE" = "leader" ]; then
+  db_input medium otzi-headless/bootstrap-bind || true
+else
+  db_input high otzi-headless/bootstrap-leader-url || true
+fi
+
+# Other medium-priority prompts.
+db_input medium otzi-headless/opnet-rpc || true
 db_input medium otzi-headless/peer-hostnames || true
-db_input medium otzi-headless/operator-bind || true
+db_input medium otzi-headless/node-id || true
+
 db_go || true
