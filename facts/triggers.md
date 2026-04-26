@@ -173,3 +173,49 @@
 
 ---
 
+### `uds.ts`
+**Purpose:** Small UDS server (node:net + node:http; zero deps) that listens on a Unix domain socket path and forwards HTTP-shaped requests to a caller-supplied handler. Filesystem permissions on the socket path are the auth model — no Bearer token, no host:port concept.
+
+**Public surface:**
+- `UdsTrigger` (class)
+  - **Constructor(config: UdsTriggerConfig)**
+    - **Pre:** `config.path` is an absolute path within an existing directory; the parent directory must exist before `start()`.
+    - **Post:** Initializes server state; does NOT bind yet.
+    - **Throws:** none at construction.
+
+  - **async start(): Promise<void>**
+    - **Pre:** Server not already started; `config.path` parent exists; daemon process has write permission to the parent dir.
+    - **Post:** Creates the socket file at `config.path` (chmod via process umask + parent setgid). On graceful prior shutdown the file is gone; on hard exit a stale file may exist — `start()` `unlink()`s any preexisting file at the path before bind.
+    - **Throws:** `Error` on bind failure (parent dir missing, permission denied, etc.).
+    - **Invariant:** Reentrant (returns early if already started).
+
+  - **async stop(): Promise<void>**
+    - **Pre:** Called after start (or redundantly).
+    - **Post:** Closes server, removes the socket file. Idempotent.
+    - **Invariant:** Reentrant.
+
+  - **address(): { path: string } | null**
+    - **Pre:** Called any time.
+    - **Post:** `{ path }` after start; `null` before/after.
+
+- **Request handling**
+  - **Pre:** UDS HTTP request arrives.
+  - **Post:** Same body parsing + handler invocation rules as `HttpTrigger` (1 MB cap, JSON parse on `application/json`).
+  - **Auth:** None at the application layer. Filesystem perms gate access.
+  - **Handler:** Same `HttpHandler` type as HTTP trigger. Request shape is identical (`HttpRequest`); `headers.host` will be `localhost` since UDS has no concept of host.
+
+**Invariants:**
+- The socket is the auth boundary; daemon does NOT inspect peer credentials.
+- A stale socket file from a previous unclean shutdown is removed by `start()`.
+- Same 1 MB body cap as HTTP trigger.
+
+**Cross-component contracts:**
+- Depends on: `node:net`, `node:http` (for HTTP-shaped parsing only — UDS carries HTTP/1.1 over the socket), `node:fs/promises` for unlink, NOOP_LOGGER.
+- Used by: `Daemon` (via `buildTriggers`).
+
+**Notes / gotchas:**
+- The CLI talks HTTP over UDS via Node's built-in `http.request({ socketPath })` — same wire shape as TCP HTTP, just different transport.
+- File mode of the socket is determined by `umask` at `listen()` time; daemon should set `umask(0o007)` so the socket lands at 0660 with parent setgid making the group `otzi`.
+
+---
+
