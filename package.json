@@ -16,6 +16,9 @@
   "bin": {
     "otzi": "./bin/otzi"
   },
+  "engines": {
+    "node": ">=22.0.0 <25.0.0"
+  },
   "files": [
     "src",
     "bin",
