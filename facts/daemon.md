@@ -103,6 +103,41 @@
 
 ---
 
+### `vault-pubkey.ts`
+**Purpose:** Writes the operator-facing vault metadata cache `/var/lib/otzi/vault-pubkey.json`. Cache exists so the CLI (`otzi vault` / `otzi btc balance` / `otzi op20 balance` / `otzi btc send`) can answer "what's our vault address?" without ever decrypting the share file.
+
+**Public surface:**
+- `writeVaultPubkeyFile(input): Promise<void>`
+  - **Pre:** `input.network` is a valid `NetworkName`; `input.frostUntweakedPubKey` is the 33B SEC1 untweaked aggregate FROST pubkey; `input.frostTweakedPubKey` is the 32B x-only post-tweak (or 33B SEC1, both accepted as raw bytes for hex-encoding); `input.mldsaPubKey` is the raw ML-DSA public key bytes.
+  - **Post:** Creates parent dir (recursive); writes JSON with mode 0o644. Schema:
+    ```json
+    {
+      "network": "mainnet" | "testnet" | "regtest",
+      "btcAddress": "<bech32m P2TR>",
+      "opnetAddress": "0x<64 hex>",
+      "frostUntweakedPubKey": "<hex>",
+      "frostTweakedPubKey": "<hex>",
+      "mldsaPubKeyHex": "<hex>"
+    }
+    ```
+  - **Trigger:** Written (overwriting) on every `loadAndValidate` (daemon startup post share decrypt) AND post-DKG via `share-persistence.persistCombinedDkgShare`.
+  - **Permissions:** chmod 0o644 (world-readable) — values are public (BTC address, OPNet address, ML-DSA pubkey, FROST aggregate pubkeys). The CLI reads the file as the operator user; group + world readability avoids needing operator-group elevation for read-only commands.
+  - **Output path override:** Callers may pass `outputPath` (defaults to `/var/lib/otzi/vault-pubkey.json`); production paths use the default.
+
+**Invariants:**
+- Address derivation matches `deriveVaultP2tr` (broadcast subsystem) — both compute the same bech32m for the same untweaked FROST aggregate + network.
+- OPNet address is `0x` + hex(SHA256(mldsaPubKey)) — same identity model the rest of the codebase uses.
+- File is overwritten (no append); writes are NOT atomic (write failure mid-flight could leave a truncated file). Acceptable: the file is rewritten on every daemon startup, and the schema is small (KB-scale), so partial-write corruption is rare and self-healing on restart.
+
+**Failure mode:** ENOENT before first DKG completes. CLI commands that need the vault address print a clean error pointing the operator to `otzi generate`.
+
+**Cross-component contracts:**
+- Depends on: `deriveVaultP2tr` from `src/broadcast/opnet-params-reconstruct.ts`; sha256 from `@noble/hashes`; hex helpers.
+- Called by: `config-merge.loadAndValidate` (startup), `share-persistence.persistCombinedDkgShare` (post-DKG).
+- Consumed by: CLI commands `otzi vault`, `otzi btc balance`, `otzi btc send`, `otzi op20 balance` (read-only).
+
+---
+
 ### `leader.ts`
 **Purpose:** Leader-side ceremony dispatcher. Evaluates gate, invokes runner, broadcasts signoff, surfaces result. Discriminated DKG + signing requests.
 

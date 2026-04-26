@@ -286,6 +286,11 @@
   - **Concurrency:** Safe; pure function.
   - **Determinism:** Deterministic; two peers with same key and network derive the same address.
 
+**Canonical helper.** Called by:
+  - Phase 8 OPNet construction-params (refundAddress derivation — leader + participant both invoke).
+  - Phase 9b vault-pubkey cache writer (`src/daemon/vault-pubkey.ts`).
+  - Phase 9b CLI read commands (indirectly — they read the cache, which holds the result of this derivation).
+
 **Invariants:**
 - Address is used as refundAddress for OPNet change outputs (never operator-supplied).
 - Locally derived on every peer to prevent refund-address theft.
