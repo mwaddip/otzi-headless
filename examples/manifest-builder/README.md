@@ -4,16 +4,30 @@ Standalone in-browser tool that produces v1 `headless-manifest` `.otzi.json` fil
 
 ## Usage
 
-Run the bundled helper script to serve the directory over HTTP:
+The repo ships **two equivalent forms** of the same UI; pick whichever matches how you're running it:
+
+### Bundled (single file, opens from `file://`)
+
+[`bundled.html`](./bundled.html) is a self-contained 154 KB file with all JS and deps inlined. Just open it from your file manager — no server needed.
+
+```bash
+xdg-open examples/manifest-builder/bundled.html   # or double-click in your file manager
+```
+
+Operators distributing the builder to others typically share `bundled.html`.
+
+### Source (modules + importmap, requires localhost)
+
+For development, edit the source modules and serve them over HTTP:
 
 ```bash
 bash examples/manifest-builder/serve.sh
 # → http://localhost:8765/index.html
 ```
 
-Then open the printed URL. Modern browsers (Firefox + Chromium) refuse to load `<script type="module">` from `file://` URLs — every `file://` path is a unique origin and CORS blocks cross-file imports. A localhost server sidesteps that. The script uses Python's stdlib `http.server`; any other static-file server works (`npx serve`, nginx, etc.).
+Modern browsers (Firefox + Chromium) refuse to load `<script type="module">` from `file://` URLs — every `file://` path is a unique origin and CORS blocks cross-file imports. A localhost server sidesteps that. The script uses Python's stdlib `http.server`; any other static-file server works (`npx serve`, nginx, etc.).
 
-The page loads with no network calls beyond `localhost`. All dependencies (preact, signals, htm, ajv) ship as committed esbuild bundles under [`vendor/`](./vendor/) and are wired in via the import map in `index.html`.
+Both forms load with no network calls beyond `localhost`. Source-form deps (preact, signals, htm, ajv) ship as committed esbuild bundles under [`vendor/`](./vendor/) and are wired via the import map in `index.html`. The bundled form inlines everything into one `<script>`.
 
 ## Workflow
 
@@ -44,6 +58,17 @@ npx vitest run examples/manifest-builder/
 ```
 
 UI changes (`app.js`, `index.html`) are validated by manual smoke testing.
+
+### Regenerating `bundled.html`
+
+After editing any of `app.js` / `model.js` / `validation.js` / `slugify.js` / `schema.js` / `index.html`, regenerate the single-file bundle:
+
+```bash
+bash examples/manifest-builder/build.sh
+git add examples/manifest-builder/bundled.html
+```
+
+The script esbuilds `app.js` (with all relative + npm imports resolved) into one minified IIFE, then inlines it into `index.html` (replacing the importmap + module script). Output: `bundled.html`, ~154 KB.
 
 ### Upgrading vendored dependencies
 
