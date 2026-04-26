@@ -13,6 +13,8 @@
  *   otzi btc send <addr> <amount>[unit]         — send BTC from the vault
  *   otzi btc balance [--unit ...]               — read vault BTC balance
  *   otzi op20 balance <ticker|ID>               — read vault OP20 balance
+ *   otzi backup                                 — write password-protected archive of daemon state
+ *   otzi restore <path> [--password-stdin]      — recover daemon state from an archive
  *
  * The `daemon` subcommand loads config + share + identity + pubkey book and
  * starts the transport + Daemon. SIGINT/SIGTERM trigger graceful shutdown.
@@ -73,6 +75,12 @@ export async function main(argv: readonly string[]): Promise<void> {
     case 'op20':
       await runOp20Command(rest);
       return;
+    case 'backup':
+      await runBackupCommand(rest);
+      return;
+    case 'restore':
+      await runRestoreCommand(rest);
+      return;
     default:
       throw new Error(usage());
   }
@@ -93,6 +101,8 @@ function usage(): string {
     '  otzi btc send <address> <amount>[unit] [--config <path>] [--fee-rate <sat/vB>]',
     '  otzi btc balance [--unit sats|btc|mbtc|ubtc]',
     '  otzi op20 balance <ticker|ID>',
+    '  otzi backup',
+    '  otzi restore <archive-path> [--password-stdin]',
   ].join('\n');
 }
 
@@ -435,6 +445,43 @@ async function runOp20Command(args: string[]): Promise<void> {
     return;
   }
   throw new Error('usage: otzi op20 balance <ticker|ID>');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi backup`
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runBackupCommand(_args: string[]): Promise<void> {
+  const { runBackup } = await import('../cli/cmd/backup');
+  const result = await runBackup();
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(`  Backup written: ${result.path}`);
+  console.log(`  Password:       ${result.password}`);
+  console.log('');
+  console.log('  WRITE THIS DOWN. There is no recovery path if you lose this password.');
+  console.log('  Store the backup file and password in physically separate locations.');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi restore <archive-path> [--password-stdin]`
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runRestoreCommand(args: string[]): Promise<void> {
+  const { positional, flags } = parsePositionalAndFlags(args);
+  const archivePath = positional[0];
+  if (!archivePath)
+    throw new Error('usage: otzi restore <archive-path> [--password-stdin]');
+  const { runRestore } = await import('../cli/cmd/restore');
+  const result = await runRestore({
+    archivePath,
+    ...(flags.has('password-stdin') ? { passwordStdin: true } : {}),
+  });
+  console.log('Restored files:');
+  for (const f of result.restoredFiles) {
+    console.log(`  ${f.path} (mode 0${f.mode.toString(8).padStart(3, '0')})`);
+  }
+  console.log('Run `systemctl start otzi` to bring up the daemon.');
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
