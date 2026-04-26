@@ -66,8 +66,10 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 - **Don't use `once('message')`** as the sole handshake consumer; use `HandshakeQueue`-style persistent listener.
 - **Don't force-close (`closeAllConnections`)** the bootstrap master after completion; graceful `server.close()` lets in-flight responses flush.
 
-### Localhost-binding (load-bearing)
-- The daemon's HTTP listener should be bound to loopback or UDS. The localhost binding is the security justification for not requiring mTLS — and is the precondition for the future CLI consumer (`feedback_cli_is_primary_entrypoint`). Currently NOT enforced at parse-time; should be promoted in the CLI phase.
+### Operator API surface (load-bearing)
+- The daemon's operator API binds to a UDS socket by default (`[[triggers]] kind="uds" path="/var/run/otzi/otzi.sock"`). Filesystem permissions (chmod 660 root:otzi) are the auth model.
+- An optional `kind="http"` trigger is supported for the future remote-CLI case, but the parser ENFORCES that the bind host is loopback (`127.0.0.1`, `::1`, `localhost`) or a UDS path. External binds are rejected at parse time.
+- Group-membership-based access is the precondition for `feedback_cli_is_primary_entrypoint` — the CLI is THE operator surface, and any user in the `otzi` group can run it without sudo.
 
 ### `#N` retry suffix (ML-DSA signing)
 - Leader appends `#N` to `ceremonyId` on combine retry. `baseCeremonyId` is stable across retries. **`ceremonyId` MUST NOT contain `#`** ; tighten with a check if ceremonyIds ever come from untrusted sources.
@@ -105,6 +107,7 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 - Don't accept operator-supplied `refundAddress` on `opnet-params`.
 - Don't run two `captureOpnetSighashes` concurrently in the same process — `captureMutex` serializes them.
 - Don't send `announce-frost` without `extras` — the wire is strict; parser rejects as null.
+- Don't accept `protocol: 'opnet'` requests. The HTTP body parser returns 400; legacy code paths stay in `src/broadcast/` for the `opnet-params` flow's internal use only.
 
 ---
 
