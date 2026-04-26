@@ -9,9 +9,17 @@ ConditionPathExists=/etc/otzi/daemon.toml
 Type=simple
 User=otzi
 Group=otzi
+# UMask 0007 → files daemon creates land at 0660 (group-readable). Combined
+# with parent-dir setgid (root:otzi 2770), new files inherit group otzi.
+UMask=0007
 ExecStart=/usr/bin/otzi daemon /etc/otzi/daemon.toml
 Restart=on-failure
 RestartSec=5
+
+# /var/run/otzi must exist before bind; RuntimeDirectory creates it on unit
+# start with the unit's User/Group + RuntimeDirectoryMode.
+RuntimeDirectory=otzi
+RuntimeDirectoryMode=2770
 
 # Hardening — Node's V8 needs writable+executable memory, so don't set
 # MemoryDenyWriteExecute. Everything else below is safe for a Node service.
