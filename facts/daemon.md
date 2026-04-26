@@ -348,15 +348,21 @@
 ### `setup.ts`
 **Purpose:** Bootstrap CLI wrappers. Drives setupMaster (leader) + setupMember (member) with identity key generation + pubkey book persistence.
 
+**CLI surface (`entrypoint.ts`)**
+  - `otzi setup <config.toml>` — zero-arg. Reads `[bootstrap].role` from config to dispatch:
+    - `role = "leader"` → calls `setupMaster(configPath, config.bootstrap.bind)`.
+    - `role = "leaf"` → calls `setupMember(configPath, config.bootstrap.leaderUrl)`.
+  - Throws `Error` if `[bootstrap]` is missing, role is unknown, or the role-specific field is absent. The legacy `setup leader|leaf` CLI form is REMOVED — config-driven dispatch is the only path.
+
 **Public surface:**
-- **setupMaster(configPath, bind): Promise<void>**
+- **setupMaster(configPath, bind): Promise<void>** — internal helper, unchanged signature.
   - **Pre:** Config path + bind address (host:port) provided.
   - **Post:** Loads config; loads/generates identity key; runs bootstrap master; writes pubkey book.
   - **Idempotent:** If pubkey book already exists, re-emits fingerprint without re-bootstrapping.
-  - **Identity:** Reused if file exists; generated if missing (mode 0600).
+  - **Identity:** Reused if file exists; generated if missing (mode 0660).
   - **Logs:** Announcement of setup complete + fingerprint + verification warning.
 
-- **setupMember(configPath, masterUrl): Promise<void>**
+- **setupMember(configPath, masterUrl): Promise<void>** — internal helper, unchanged signature.
   - **Pre:** Config path + master URL provided.
   - **Post:** Loads config; loads/generates identity key; registers with master; writes pubkey book.
   - **Idempotent:** If pubkey book already exists, re-emits fingerprint.
@@ -367,7 +373,7 @@
   - **Errors:** Missing paths cause immediate failure.
 
 - **File I/O**
-  - **Identity:** Mode 0600 (owner read/write).
+  - **Identity:** Mode 0660 (group read/write — Phase 9a.3). Daemon-user (otzi) reads via group membership when an operator-user (in `otzi` group) ran `setup`.
   - **Pubkey book:** Mode 0644 (world-readable).
   - **Parent directories:** Created recursively.
 
