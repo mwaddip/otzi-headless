@@ -7,6 +7,9 @@ dist/
 # Local-only handoff prompt — paste contents into the next Claude session
 HANDOFF.md
 
+# Local AI bookkeeping snapshot — not shippable documentation
+SESSION_CONTEXT.md
+
 # Local Claude Code state
 .claude/
 .superpowers/
