@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import * as net from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
@@ -124,6 +125,100 @@ describe('PeerMeshTransport — IP allowlist', () => {
     const droppedIp = String(dropLines[0]!.extra!.ip);
     expect(droppedIp.endsWith('127.0.0.1')).toBe(true);
   }, 10_000);
+
+  it('writes zero bytes to the wire when verifyClient rejects (no 401 leak)', async () => {
+    // The previous test asserts the WS *client* never sees `open`, but a
+    // destroyed-pre-write socket and a destroyed-after-401-write socket both
+    // manifest the same way to a `WebSocket` client. The information-leak claim
+    // — that scanners see nothing — only holds if `verifyClient` truly aborts
+    // before any HTTP response bytes hit the kernel buffer. Verify that
+    // directly with a raw TCP socket and assert zero bytes received.
+    //
+    // Regression scenario this guards: if someone makes `verifyClient` async
+    // (returning Promise<boolean>), ws's handshake path would write the 401
+    // response *before* our destroy() runs — bytes leak, this test fails.
+    const me = await generateIdentity();
+    const peer = await generateIdentity();
+    const myPort = await freePort();
+    const peerPort = await freePort();
+
+    const { logger, lines } = makeLogger();
+
+    const transport = new PeerMeshTransport({
+      self: { partyId: 2, identity: me },
+      listen: `127.0.0.1:${myPort}`,
+      peers: [
+        { partyId: 1, publicKey: peer.publicKeyRaw, endpoint: `ws://127.0.0.1:${peerPort}` },
+      ],
+      logger,
+    });
+
+    await transport.start();
+    stopFns.push(() => transport.stop());
+
+    // Same monkey-patch as the silent-drop test: force the allowlist to reject
+    // loopback so any inbound from 127.0.0.1 is treated as "non-peer".
+    const allowlist = (transport as unknown as { allowlist: PeerAllowlist }).allowlist;
+    (allowlist as unknown as { has: (ip: string) => boolean }).has = () => false;
+
+    // Build the byte-for-byte minimum HTTP upgrade request to trigger ws's
+    // verifyClient path. ws validates `Connection: Upgrade`, `Upgrade: websocket`,
+    // `Sec-WebSocket-Version: 13`, and a base64-16-byte `Sec-WebSocket-Key`
+    // before invoking verifyClient — these are the required headers for the
+    // handshake to even reach our reject path.
+    const wsKey = randomBytes(16).toString('base64');
+    const upgradeRequest =
+      `GET / HTTP/1.1\r\n` +
+      `Host: 127.0.0.1:${myPort}\r\n` +
+      `Connection: Upgrade\r\n` +
+      `Upgrade: websocket\r\n` +
+      `Sec-WebSocket-Key: ${wsKey}\r\n` +
+      `Sec-WebSocket-Version: 13\r\n` +
+      `\r\n`;
+
+    // Open a raw TCP connection — bypasses ws-client framing entirely so we
+    // observe the exact bytes the server emits.
+    const sock = net.connect({ host: '127.0.0.1', port: myPort });
+
+    const received = await new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const timer = setTimeout(() => {
+        sock.destroy();
+        reject(new Error('socket did not close within 2s — destroy() may not have run'));
+      }, 2_000);
+
+      sock.on('connect', () => {
+        sock.write(upgradeRequest);
+      });
+      sock.on('data', (chunk) => {
+        chunks.push(chunk);
+      });
+      sock.on('close', () => {
+        clearTimeout(timer);
+        resolve(Buffer.concat(chunks));
+      });
+      sock.on('error', () => {
+        // ECONNRESET is expected when the server destroys the socket;
+        // fall through to `close` for the assertion.
+      });
+    });
+
+    // Core assertion: the server emitted ZERO bytes before closing. If
+    // ws-server ever wrote the 401 response (e.g. async verifyClient
+    // regression, race against destroy), `received.length` would be > 0 and
+    // the buffer would start with `HTTP/1.1 401 ...`.
+    expect(received.length).toBe(0);
+    expect(received.toString('utf8').startsWith('HTTP/1.1')).toBe(false);
+    expect(received.toString('utf8')).not.toContain('401');
+
+    // The warn log line was emitted exactly once — confirms verifyClient ran
+    // and rejected (the test isn't passing trivially because the connection
+    // failed before reaching verifyClient).
+    const dropLines = lines.filter(
+      (l) => l.level === 'warn' && l.msg.startsWith('peer-allowlist:'),
+    );
+    expect(dropLines).toHaveLength(1);
+  }, 5_000);
 
   it('refuses to start when a peer endpoint cannot be DNS-resolved', async () => {
     const me = await generateIdentity();

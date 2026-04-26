@@ -120,6 +120,11 @@ async function runDaemonCommand(args: string[]): Promise<void> {
   // logger to both the transport (for peer-mesh allowlist warns picked up by
   // fail2ban via journald) and to the Daemon (for orchestrator/leader/triggers
   // info+error context). stderr only — stdout is reserved for CLI machine output.
+  // CLI subcommands (sign/vault/btc/op20/...) deliberately keep `NOOP_LOGGER`
+  // and MUST stay that way: their stdout is consumed by shell scripts piping tx
+  // IDs, vault metadata, balances into `xargs`/`opnet broadcast`/etc., so any
+  // log line on stdout would corrupt the downstream parser. Wire log output to
+  // stderr if a future CLI verb genuinely needs it; never to stdout.
   const logger = createConsoleLogger();
 
   const state = await loadAndValidate(configPath);
