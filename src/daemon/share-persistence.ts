@@ -10,12 +10,14 @@
  * `/etc/otzi/share.json` on a fresh box.
  */
 
-import { chmod, mkdir, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { CombinedDkgResult } from '../core/ceremony-runner';
 import { getKL } from '../wire/dkg';
 import { toHex } from '../wire/hex';
 import { encryptShareV3 } from '../wire/share-write';
+
+const BOOTSTRAP_SECRET_PATH = '/var/lib/otzi/bootstrap-secret';
 
 export interface PersistDkgShareArgs {
   result: CombinedDkgResult;
@@ -53,4 +55,21 @@ export async function persistCombinedDkgShare(args: PersistDkgShareArgs): Promis
   // Explicit chmod after write: belt-and-suspenders against umask interference
   // and against the case where the file already existed with looser perms.
   await chmod(args.path, 0o600);
+
+  // Wipe the bootstrap secret now that the share is durably written. Phase 9c
+  // control-plane verifies operator HMAC against this file; once DKG is done
+  // the federation switches to share-based auth and the secret is no longer
+  // needed. ENOENT on unlink is silently ignored (idempotent on retries /
+  // repeat DKG); other errors are logged but don't fail persistence (share is
+  // already on disk; secret-wipe failure is a soft error operators can clean
+  // up out-of-band).
+  try {
+    await unlink(BOOTSTRAP_SECRET_PATH);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.error(
+        `share-persistence: failed to unlink bootstrap-secret: ${(err as Error).message}`,
+      );
+    }
+  }
 }
