@@ -1,189 +1,124 @@
 import { describe, it, expect } from 'vitest';
 import {
   emptyManifest,
-  renameContractKey,
   exportManifest,
-  resolveAbiMethods,
+  contractTypeRequiresDecimals,
+  contractTypeRequiresAbi,
 } from './model.js';
 
 describe('emptyManifest', () => {
-  it('returns a valid v2 skeleton', () => {
+  it('returns a valid v1 skeleton', () => {
     const m = emptyManifest();
-    expect(m.version).toBe(2);
+    expect(m.version).toBe(1);
     expect(m.name).toBe('');
-    expect(m.contracts).toEqual({});
-    expect(m.operations).toEqual([]);
+    expect(m.description).toBe('');
+    expect(m.contracts).toEqual([]);
   });
 });
 
-describe('renameContractKey', () => {
-  it('updates contracts object key', () => {
-    const m = {
-      version: 2, name: 'x', contracts: { old: { label: 'L', abi: 'OP_20', address: 'a' } },
-      operations: [],
-    };
-    const next = renameContractKey(m, 'old', 'new');
-    expect(next.contracts.new).toBeDefined();
-    expect(next.contracts.old).toBeUndefined();
+describe('contractTypeRequiresDecimals', () => {
+  it('is true for OP20 + OP20S', () => {
+    expect(contractTypeRequiresDecimals('OP20')).toBe(true);
+    expect(contractTypeRequiresDecimals('OP20S')).toBe(true);
   });
-
-  it('updates Operation.contract references', () => {
-    const m = {
-      version: 2, name: 'x', contracts: { tok: { label: 'L', abi: 'OP_20', address: 'a' } },
-      operations: [{ id: 'op1', label: 'Op', contract: 'tok', method: 'transfer', params: [] }],
-    };
-    const next = renameContractKey(m, 'tok', 'token');
-    expect(next.operations[0].contract).toBe('token');
+  it('is false for OP721 + Custom', () => {
+    expect(contractTypeRequiresDecimals('OP721')).toBe(false);
+    expect(contractTypeRequiresDecimals('Custom')).toBe(false);
   });
+});
 
-  it('updates Param.source contract references', () => {
-    const m = {
-      version: 2, name: 'x', contracts: { tok: { label: 'L', abi: 'OP_20', address: 'a' } },
-      operations: [{
-        id: 'op1', label: 'Op', contract: 'tok', method: 'transfer',
-        params: [{ name: 'to', type: 'address', source: 'contract:tok' }],
-      }],
-    };
-    const next = renameContractKey(m, 'tok', 'token');
-    expect(next.operations[0].params[0].source).toBe('contract:token');
-  });
-
-  it('updates dynamic dropdown references in Param.options', () => {
-    const m = {
-      version: 2, name: 'x',
-      contracts: { src: { label: 'L', abi: 'OP_20', address: 'a' } },
-      operations: [{
-        id: 'op1', label: 'Op', contract: 'src', method: 'm',
-        params: [{
-          name: 'idx', type: 'uint256',
-          options: { count: { contract: 'src', method: 'count' }, item: { contract: 'src', method: 'at' } },
-        }],
-      }],
-    };
-    const next = renameContractKey(m, 'src', 'list');
-    expect(next.operations[0].params[0].options.count.contract).toBe('list');
-    expect(next.operations[0].params[0].options.item.contract).toBe('list');
-  });
-
-  it('returns the input unchanged when source key does not exist', () => {
-    const m = { version: 2, name: 'x', contracts: {}, operations: [] };
-    expect(renameContractKey(m, 'nope', 'new')).toEqual(m);
-  });
-
-  it('refuses to rename onto an existing key', () => {
-    const m = {
-      version: 2, name: 'x',
-      contracts: { a: { label: 'A', abi: 'OP_20', address: '0x1' }, b: { label: 'B', abi: 'OP_20', address: '0x2' } },
-      operations: [],
-    };
-    expect(() => renameContractKey(m, 'a', 'b')).toThrow(/already exists/);
+describe('contractTypeRequiresAbi', () => {
+  it('is true only for Custom', () => {
+    expect(contractTypeRequiresAbi('Custom')).toBe(true);
+    expect(contractTypeRequiresAbi('OP20')).toBe(false);
+    expect(contractTypeRequiresAbi('OP20S')).toBe(false);
+    expect(contractTypeRequiresAbi('OP721')).toBe(false);
   });
 });
 
 describe('exportManifest', () => {
-  it('strips empty optional fields', () => {
+  it('emits version + name + contracts always', () => {
     const m = {
-      version: 2, name: 'x', description: '', icon: '',
-      contracts: {}, operations: [], reads: {}, status: [],
+      version: 1, name: 'X', description: '',
+      contracts: [{ name: 'tok', address: '0xabc', type: 'OP20', decimals: 8 }],
     };
     const out = exportManifest(m);
-    expect(out).not.toHaveProperty('description');
-    expect(out).not.toHaveProperty('icon');
-    expect(out).not.toHaveProperty('reads');
-    expect(out).not.toHaveProperty('status');
+    expect(out.version).toBe(1);
+    expect(out.name).toBe('X');
+    expect(Array.isArray(out.contracts)).toBe(true);
   });
 
-  it('preserves populated optional fields', () => {
-    const m = {
-      version: 2, name: 'x', description: 'desc',
-      contracts: {}, operations: [],
-    };
+  it('omits empty description', () => {
+    const m = { version: 1, name: 'X', description: '', contracts: [] };
+    const out = exportManifest(m);
+    expect(out).not.toHaveProperty('description');
+  });
+
+  it('preserves non-empty description', () => {
+    const m = { version: 1, name: 'X', description: 'desc', contracts: [] };
     const out = exportManifest(m);
     expect(out.description).toBe('desc');
   });
 
-  it('omits Operation.confirm, condition, ownerOnly', () => {
+  it('OP20 contract: emits decimals, omits abi', () => {
     const m = {
-      version: 2, name: 'x',
-      contracts: {},
-      operations: [{
-        id: 'op1', label: 'Op', contract: 'c', method: 'm', params: [],
-        confirm: 'Sure?', condition: { read: 'x', eq: 1 }, ownerOnly: true,
+      version: 1, name: 'X', contracts: [{
+        name: 'tok', address: '0xabc', type: 'OP20', decimals: 8,
+        abi: [{ name: 'lingering', params: [] }], // should be stripped
       }],
     };
     const out = exportManifest(m);
-    expect(out.operations[0]).not.toHaveProperty('confirm');
-    expect(out.operations[0]).not.toHaveProperty('condition');
-    expect(out.operations[0]).not.toHaveProperty('ownerOnly');
+    expect(out.contracts[0].decimals).toBe(8);
+    expect(out.contracts[0]).not.toHaveProperty('abi');
   });
 
-  it('omits Param.label, placeholder, options', () => {
+  it('OP20S contract: emits decimals, omits abi', () => {
     const m = {
-      version: 2, name: 'x', contracts: {},
-      operations: [{
-        id: 'op1', label: 'Op', contract: 'c', method: 'm',
-        params: [{
-          name: 'p', type: 'uint256',
-          label: 'Amount', placeholder: 'e.g. 100',
-          options: { count: { contract: 'c', method: 'count' }, item: { contract: 'c', method: 'at' } },
-        }],
+      version: 1, name: 'X', contracts: [{
+        name: 'pegged', address: '0xabc', type: 'OP20S', decimals: 18,
       }],
     };
     const out = exportManifest(m);
-    expect(out.operations[0].params[0]).not.toHaveProperty('label');
-    expect(out.operations[0].params[0]).not.toHaveProperty('placeholder');
-    expect(out.operations[0].params[0]).not.toHaveProperty('options');
+    expect(out.contracts[0].decimals).toBe(18);
+    expect(out.contracts[0]).not.toHaveProperty('abi');
   });
 
-  it('omits Meta.icon', () => {
+  it('OP721 contract: omits both decimals and abi', () => {
     const m = {
-      version: 2, name: 'x', icon: 'https://example.com/icon.png',
-      contracts: {}, operations: [],
-    };
-    const out = exportManifest(m);
-    expect(out).not.toHaveProperty('icon');
-  });
-
-  it('omits Param.source: read:', () => {
-    const m = {
-      version: 2, name: 'x', contracts: {},
-      operations: [{
-        id: 'op1', label: 'Op', contract: 'c', method: 'm',
-        params: [{ name: 'p', type: 'uint256', source: 'read:foo' }],
+      version: 1, name: 'X', contracts: [{
+        name: 'nft', address: '0xabc', type: 'OP721',
+        decimals: 99, abi: [{ name: 'x', params: [] }], // both should be stripped
       }],
     };
     const out = exportManifest(m);
-    expect(out.operations[0].params[0]).not.toHaveProperty('source');
-  });
-});
-
-describe('resolveAbiMethods', () => {
-  it('returns OP_20 standard method names for shorthand', () => {
-    const methods = resolveAbiMethods('OP_20');
-    expect(methods).toContain('transfer');
-    expect(methods).toContain('balanceOf');
-    expect(methods).toContain('approve');
+    expect(out.contracts[0]).not.toHaveProperty('decimals');
+    expect(out.contracts[0]).not.toHaveProperty('abi');
   });
 
-  it('extracts names from a custom AbiEntry array', () => {
-    const abi = [
-      { name: 'foo', type: 'Function', inputs: [], outputs: [] },
-      { name: 'Bar', type: 'Event', inputs: [] },
-    ];
-    expect(resolveAbiMethods(abi)).toEqual(['foo']);
+  it('Custom contract: emits abi, omits decimals', () => {
+    const m = {
+      version: 1, name: 'X', contracts: [{
+        name: 'cm', address: '0xabc', type: 'Custom',
+        decimals: 99, // should be stripped
+        abi: [{ name: 'doThing', params: [{ name: 'x', type: 'uint256' }] }],
+      }],
+    };
+    const out = exportManifest(m);
+    expect(out.contracts[0]).not.toHaveProperty('decimals');
+    expect(out.contracts[0].abi).toEqual([
+      { name: 'doThing', params: [{ name: 'x', type: 'uint256' }] },
+    ]);
   });
 
-  it('handles a mixed array', () => {
-    const abi = [
-      'OP_20',
-      { name: 'customMethod', type: 'Function', inputs: [], outputs: [] },
-    ];
-    const methods = resolveAbiMethods(abi);
-    expect(methods).toContain('transfer');
-    expect(methods).toContain('customMethod');
-  });
-
-  it('returns empty array for unknown shorthand', () => {
-    expect(resolveAbiMethods('UNKNOWN')).toEqual([]);
+  it('preserves contract order from state array', () => {
+    const m = {
+      version: 1, name: 'X', contracts: [
+        { name: 'a', address: '0x1', type: 'OP20', decimals: 1 },
+        { name: 'b', address: '0x2', type: 'OP721' },
+        { name: 'c', address: '0x3', type: 'Custom', abi: [] },
+      ],
+    };
+    const out = exportManifest(m);
+    expect(out.contracts.map((c) => c.name)).toEqual(['a', 'b', 'c']);
   });
 });

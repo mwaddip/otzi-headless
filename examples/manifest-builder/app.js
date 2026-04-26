@@ -2,7 +2,12 @@ import { h, render } from 'preact';
 import { signal, computed } from '@preact/signals';
 import htm from 'htm';
 import schemaData from './schema.js';
-import { emptyManifest, renameContractKey, exportManifest, resolveAbiMethods } from './model.js';
+import {
+  emptyManifest,
+  exportManifest,
+  contractTypeRequiresDecimals,
+  contractTypeRequiresAbi,
+} from './model.js';
 import { validateManifest } from './validation.js';
 import { slugify } from './slugify.js';
 
@@ -19,10 +24,9 @@ const validation = computed(() => {
 });
 
 const errorsBySection = computed(() => {
-  const map = { meta: 0, contracts: 0, operations: 0 };
+  const map = { meta: 0, contracts: 0 };
   for (const e of validation.value.errors) {
     if (e.path.startsWith('contracts')) map.contracts++;
-    else if (e.path.startsWith('operations')) map.operations++;
     else map.meta++;
   }
   return map;
@@ -43,7 +47,10 @@ function loadFile(file) {
       }
       const r = validateManifest(parsed, schema.value);
       if (r.errors.length > 0) {
-        banner.value = { kind: 'error', text: `Invalid manifest: ${r.errors[0].message} at ${r.errors[0].path || '<root>'}` };
+        banner.value = {
+          kind: 'error',
+          text: `Invalid manifest: ${r.errors[0].message} at ${r.errors[0].path || '<root>'}`,
+        };
         return;
       }
       state.value = parsed;
@@ -71,8 +78,7 @@ function exportFile() {
 function Sidebar() {
   const errs = errorsBySection.value;
   const counts = {
-    contracts: Object.keys(state.value.contracts).length,
-    operations: state.value.operations.length,
+    contracts: state.value.contracts.length,
   };
   const sectionItem = (key, label, count, errCount) => html`
     <button
@@ -89,7 +95,6 @@ function Sidebar() {
       <hr/>
       ${sectionItem('meta', 'Meta', null, errs.meta)}
       ${sectionItem('contracts', 'Contracts', counts.contracts, errs.contracts)}
-      ${sectionItem('operations', 'Operations', counts.operations, errs.operations)}
     </aside>`;
 }
 
@@ -116,45 +121,75 @@ function MetaSection() {
       <h2>Project metadata</h2>
       <label>Project name <input value=${state.value.name}
         onInput=${(e) => update((s) => ({ ...s, name: e.target.value }))}/></label>
+      <${FieldErrors} path="name"/>
       <label>Description <input value=${state.value.description ?? ''}
         onInput=${(e) => update((s) => ({ ...s, description: e.target.value }))}/></label>
+      <${FieldErrors} path="description"/>
     </section>`;
 }
 
-function ContractCard({ key, contract }) {
-  const abiMode = typeof contract.abi === 'string' ? 'shorthand' : Array.isArray(contract.abi) ? 'mixed' : 'custom';
+function ContractCard({ index, contract }) {
+  const setContract = (mut) => update((s) => {
+    const contracts = [...s.contracts];
+    contracts[index] = mut(contracts[index]);
+    return { ...s, contracts };
+  });
+  const onTypeChange = (newType) => setContract((c) => {
+    const next = { ...c, type: newType };
+    // Drop fields that are invalid for the new type. Pre-release: no
+    // UX subtlety needed — user re-enters if they switch back.
+    if (!contractTypeRequiresDecimals(newType)) delete next.decimals;
+    if (!contractTypeRequiresAbi(newType)) delete next.abi;
+    if (contractTypeRequiresDecimals(newType) && typeof next.decimals !== 'number') {
+      next.decimals = 18;
+    }
+    if (contractTypeRequiresAbi(newType) && !Array.isArray(next.abi)) {
+      next.abi = [];
+    }
+    return next;
+  });
   return html`
     <div class="card">
-      <header><strong>${key || '(unnamed)'}</strong> — ${contract.label || ''}</header>
-      <label>Key <input value=${key} onChange=${(e) => {
-        try { update((s) => renameContractKey(s, key, e.target.value)); }
-        catch (err) { banner.value = { kind: 'error', text: err.message }; }
-      }}/></label>
-      <label>Label <input value=${contract.label}
-        onInput=${(e) => update((s) => ({ ...s, contracts: { ...s.contracts, [key]: { ...s.contracts[key], label: e.target.value } } }))}/></label>
+      <header><strong>${contract.name || '(unnamed)'}</strong> — ${contract.type}</header>
+      <label>Name <input value=${contract.name}
+        placeholder="identifier (max 64 chars)"
+        onInput=${(e) => setContract((c) => ({ ...c, name: e.target.value }))}/></label>
+      <${FieldErrors} path=${`contracts.${index}.name`}/>
       <label>Address <input value=${contract.address}
-        onInput=${(e) => update((s) => ({ ...s, contracts: { ...s.contracts, [key]: { ...s.contracts[key], address: e.target.value } } }))}/></label>
-      <div class="abi-tabs">
-        <label><input type="radio" name=${`abi-${key}`} checked=${abiMode === 'shorthand'}
-          onChange=${() => update((s) => ({ ...s, contracts: { ...s.contracts, [key]: { ...s.contracts[key], abi: 'OP_20' } } }))}/> Shorthand</label>
-        <label><input type="radio" name=${`abi-${key}`} checked=${abiMode === 'custom'}
-          onChange=${() => update((s) => ({ ...s, contracts: { ...s.contracts, [key]: { ...s.contracts[key], abi: [] } } }))}/> Custom</label>
-      </div>
-      ${abiMode === 'shorthand' ? html`
-        <select value=${contract.abi}
-          onChange=${(e) => update((s) => ({ ...s, contracts: { ...s.contracts, [key]: { ...s.contracts[key], abi: e.target.value } } }))}>
-          <option>OP_20</option><option>OP_20S</option><option>OP_721</option>
-        </select>` : html`
-        <textarea rows="6" value=${JSON.stringify(contract.abi, null, 2)}
-          onChange=${(e) => {
-            try { const v = JSON.parse(e.target.value); update((s) => ({ ...s, contracts: { ...s.contracts, [key]: { ...s.contracts[key], abi: v } } })); }
-            catch (err) { banner.value = { kind: 'error', text: `ABI JSON: ${err.message}` }; }
-          }}></textarea>`}
-      <button class="delete" onClick=${() => update((s) => {
-        const next = { ...s, contracts: { ...s.contracts } };
-        delete next.contracts[key];
-        return next;
-      })}>Delete</button>
+        placeholder="0x + 64 hex"
+        onInput=${(e) => setContract((c) => ({ ...c, address: e.target.value }))}/></label>
+      <${FieldErrors} path=${`contracts.${index}.address`}/>
+      <label>Type <select value=${contract.type}
+        onChange=${(e) => onTypeChange(e.target.value)}>
+        <option>OP20</option><option>OP20S</option><option>OP721</option><option>Custom</option>
+      </select></label>
+      <${FieldErrors} path=${`contracts.${index}.type`}/>
+      ${contractTypeRequiresDecimals(contract.type) ? html`
+        <label>Decimals <input type="number" min="0" max="38"
+          value=${contract.decimals ?? ''}
+          onInput=${(e) => setContract((c) => ({
+            ...c,
+            decimals: e.target.value === '' ? undefined : Number(e.target.value),
+          }))}/></label>
+        <${FieldErrors} path=${`contracts.${index}.decimals`}/>
+      ` : null}
+      ${contractTypeRequiresAbi(contract.type) ? html`
+        <label>ABI (JSON array of <code>{ name, params: [{ name, type }] }</code>)
+          <textarea rows="8" value=${JSON.stringify(contract.abi ?? [], null, 2)}
+            onChange=${(e) => {
+              try {
+                const v = JSON.parse(e.target.value);
+                setContract((c) => ({ ...c, abi: v }));
+              } catch (err) {
+                banner.value = { kind: 'error', text: `ABI JSON: ${err.message}` };
+              }
+            }}></textarea></label>
+        <${FieldErrors} path=${`contracts.${index}.abi`}/>
+      ` : null}
+      <button class="delete" onClick=${() => update((s) => ({
+        ...s,
+        contracts: s.contracts.filter((_, i) => i !== index),
+      }))}>Delete</button>
     </div>`;
 }
 
@@ -162,86 +197,13 @@ function ContractsSection() {
   return html`
     <section>
       <h2>Contracts</h2>
-      ${Object.entries(state.value.contracts).map(([key, contract]) => html`<${ContractCard} key=${key} contract=${contract}/>`)}
-      <button onClick=${() => {
-        let i = 1;
-        while (`contract${i}` in state.value.contracts) i++;
-        update((s) => ({ ...s, contracts: { ...s.contracts, [`contract${i}`]: { label: '', abi: 'OP_20', address: '' } } }));
-      }}>+ Add Contract</button>
-    </section>`;
-}
-
-function ParamCard({ opIndex, paramIndex, param }) {
-  const setParam = (mut) => update((s) => {
-    const ops = [...s.operations];
-    const op = { ...ops[opIndex] };
-    const params = [...op.params];
-    params[paramIndex] = mut(params[paramIndex]);
-    op.params = params;
-    ops[opIndex] = op;
-    return { ...s, operations: ops };
-  });
-  return html`
-    <div class="param-card">
-      <label>Name <input value=${param.name} onInput=${(e) => setParam((p) => ({ ...p, name: e.target.value }))}/></label>
-      <label>Type <select value=${param.type} onChange=${(e) => setParam((p) => ({ ...p, type: e.target.value }))}>
-        <option>uint256</option><option>address</option><option>bool</option><option>bytes</option>
-      </select></label>
-      <label>Scale <input type="number" value=${param.scale ?? ''} onInput=${(e) => setParam((p) => ({ ...p, scale: e.target.value === '' ? undefined : Number(e.target.value) }))}/></label>
-      <label>Source <input value=${param.source ?? ''} placeholder="contract:foo or setting:bar"
-        onInput=${(e) => setParam((p) => ({ ...p, source: e.target.value || undefined }))}/></label>
-      <${FieldErrors} path=${`operations.${opIndex}.params.${paramIndex}.source`}/>
-    </div>`;
-}
-
-function OperationCard({ index, op }) {
-  const setOp = (mut) => update((s) => {
-    const ops = [...s.operations];
-    ops[index] = mut(ops[index]);
-    return { ...s, operations: ops };
-  });
-  const contractKeys = Object.keys(state.value.contracts);
-  const methods = op.contract && op.contract !== '$dynamic' && state.value.contracts[op.contract]
-    ? resolveAbiMethods(state.value.contracts[op.contract].abi)
-    : [];
-  return html`
-    <div class="card">
-      <header><strong>${op.id || '(unnamed)'}</strong> — ${op.label || ''}</header>
-      <label>ID <input value=${op.id} onInput=${(e) => setOp((o) => ({ ...o, id: e.target.value }))}/></label>
-      <label>Label <input value=${op.label} onInput=${(e) => setOp((o) => ({ ...o, label: e.target.value }))}/></label>
-      <label>Description <input value=${op.description ?? ''} onInput=${(e) => setOp((o) => ({ ...o, description: e.target.value }))}/></label>
-      <label>Contract <select value=${op.contract} onChange=${(e) => setOp((o) => ({ ...o, contract: e.target.value }))}>
-        <option value="">(pick)</option>
-        ${contractKeys.map((k) => html`<option>${k}</option>`)}
-        <option value="$dynamic">$dynamic</option>
-      </select></label>
-      <${FieldErrors} path=${`operations.${index}.contract`}/>
-      <label>Method ${op.contract === '$dynamic' || methods.length === 0
-        ? html`<input value=${op.method} onInput=${(e) => setOp((o) => ({ ...o, method: e.target.value }))}/>`
-        : html`<select value=${op.method} onChange=${(e) => setOp((o) => ({ ...o, method: e.target.value }))}>
-            <option value="">(pick)</option>
-            ${methods.map((m) => html`<option>${m}</option>`)}
-          </select>`}
-      </label>
-      <${FieldErrors} path=${`operations.${index}.method`}/>
-      <h4>Params</h4>
-      ${(op.params ?? []).map((p, j) => html`<${ParamCard} opIndex=${index} paramIndex=${j} param=${p}/>`)}
-      <button onClick=${() => setOp((o) => ({ ...o, params: [...(o.params ?? []), { name: '', type: 'uint256' }] }))}>+ Add Param</button>
-      <button class="delete" onClick=${() => update((s) => ({ ...s, operations: s.operations.filter((_, i) => i !== index) }))}>Delete Operation</button>
-    </div>`;
-}
-
-function OperationsSection() {
-  return html`
-    <section>
-      <h2>Operations</h2>
-      ${state.value.operations.map((op, i) => html`<${OperationCard} index=${i} op=${op}/>`)}
-      <button onClick=${() => update((s) => {
-        let i = 1;
-        const ids = new Set(s.operations.map((o) => o.id));
-        while (ids.has(`op${i}`)) i++;
-        return { ...s, operations: [...s.operations, { id: `op${i}`, label: '', contract: '', method: '', params: [] }] };
-      })}>+ Add Operation</button>
+      ${state.value.contracts.map((contract, i) => html`
+        <${ContractCard} index=${i} contract=${contract}/>
+      `)}
+      <button onClick=${() => update((s) => ({
+        ...s,
+        contracts: [...s.contracts, { name: '', address: '', type: 'OP20', decimals: 18 }],
+      }))}>+ Add Contract</button>
     </section>`;
 }
 
@@ -250,7 +212,6 @@ function App() {
   switch (activeSection.value) {
     case 'meta': body = html`<${MetaSection}/>`; break;
     case 'contracts': body = html`<${ContractsSection}/>`; break;
-    case 'operations': body = html`<${OperationsSection}/>`; break;
   }
   return html`
     <div class="layout">

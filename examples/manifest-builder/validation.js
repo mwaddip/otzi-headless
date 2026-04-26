@@ -1,5 +1,4 @@
 import Ajv from 'ajv/dist/2020.js';
-import { resolveAbiMethods } from './model.js';
 
 let cachedSchema = null;
 let cachedValidator = null;
@@ -7,6 +6,10 @@ let cachedValidator = null;
 function getValidator(schema) {
   if (cachedSchema !== schema) {
     cachedSchema = schema;
+    // strict: false because the if/then conditional in the schema references
+    // `type` in nested `properties` clauses; ajv-strict flags those as
+    // ambiguous even though the meaning is unambiguous (the `if` is gated
+    // by `required`). Mirrors src/cli/manifest-validate.ts.
     const ajv = new Ajv({ allErrors: true, strict: false });
     cachedValidator = ajv.compile(schema);
   }
@@ -28,64 +31,49 @@ function schemaErrors(manifest, schema) {
   }));
 }
 
+/**
+ * Cross-field rules NOT expressible in JSON Schema. Mirrors
+ * src/cli/manifest-validate.ts exactly:
+ * - Duplicate contract names within `contracts[]` are rejected.
+ * - Duplicate method names within a Custom contract's `abi[]` are rejected.
+ */
 function crossFieldErrors(manifest) {
   const errors = [];
-  const warnings = [];
-  const contracts = manifest.contracts ?? {};
-  const operations = manifest.operations ?? [];
+  const contracts = Array.isArray(manifest.contracts) ? manifest.contracts : [];
 
-  const idCounts = new Map();
-  for (const op of operations) {
-    if (op?.id) idCounts.set(op.id, (idCounts.get(op.id) ?? 0) + 1);
-  }
-  for (const [id, count] of idCounts) {
-    if (count > 1) errors.push({ path: `operations`, message: `duplicate operation id '${id}'` });
-  }
-
-  operations.forEach((op, i) => {
-    if (!op || typeof op !== 'object') return;
-    if (op.contract && op.contract !== '$dynamic' && !(op.contract in contracts)) {
-      errors.push({
-        path: `operations.${i}.contract`,
-        message: `undefined contract key '${op.contract}'`,
-      });
-    }
-    if (op.contract && op.contract !== '$dynamic' && op.method && contracts[op.contract]) {
-      const methods = resolveAbiMethods(contracts[op.contract].abi);
-      if (methods.length > 0 && !methods.includes(op.method)) {
+  const contractNames = new Set();
+  for (const [i, c] of contracts.entries()) {
+    if (!c || typeof c !== 'object') continue;
+    if (typeof c.name === 'string') {
+      if (contractNames.has(c.name)) {
         errors.push({
-          path: `operations.${i}.method`,
-          message: `method '${op.method}' not found in ABI for contract '${op.contract}'`,
+          path: `contracts.${i}.name`,
+          message: `duplicate contract name '${c.name}'`,
         });
       }
+      contractNames.add(c.name);
     }
-    (op.params ?? []).forEach((p, j) => {
-      if (typeof p?.source !== 'string') return;
-      const m = p.source.match(/^(contract|setting|read):(.+)$/);
-      if (!m) return;
-      const [, kind, key] = m;
-      if (kind === 'contract' && !(key in contracts)) {
-        errors.push({
-          path: `operations.${i}.params.${j}.source`,
-          message: `undefined contract key '${key}' in source`,
-        });
-      } else if (kind === 'setting') {
-        warnings.push({
-          path: `operations.${i}.params.${j}.source`,
-          message: `setting key '${key}' is operator-supplied — verify it exists in your environment`,
-        });
-      }
-    });
-  });
 
-  return { errors, warnings };
+    if (c.type === 'Custom' && Array.isArray(c.abi)) {
+      const methodNames = new Set();
+      for (const [j, method] of c.abi.entries()) {
+        if (!method || typeof method !== 'object') continue;
+        if (typeof method.name !== 'string') continue;
+        if (methodNames.has(method.name)) {
+          errors.push({
+            path: `contracts.${i}.abi.${j}.name`,
+            message: `duplicate method name '${method.name}' in contract '${c.name}'`,
+          });
+        }
+        methodNames.add(method.name);
+      }
+    }
+  }
+
+  return errors;
 }
 
 export function validateManifest(manifest, schema) {
-  const errors = schemaErrors(manifest, schema);
-  const cross = crossFieldErrors(manifest);
-  return {
-    errors: [...errors, ...cross.errors],
-    warnings: cross.warnings,
-  };
+  const errors = [...schemaErrors(manifest, schema), ...crossFieldErrors(manifest)];
+  return { errors, warnings: [] };
 }

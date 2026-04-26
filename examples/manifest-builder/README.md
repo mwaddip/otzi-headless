@@ -1,6 +1,6 @@
-# Ötzi Manifest Builder
+# Headless Manifest Builder
 
-Standalone in-browser tool that produces v2 `.otzi.json` manifests for OPNet contracts.
+Standalone in-browser tool that produces v1 `headless-manifest` `.otzi.json` files for the Ötzi headless daemon.
 
 ## Usage
 
@@ -17,19 +17,23 @@ The page loads with no network calls beyond `localhost`. All dependencies (preac
 
 ## Workflow
 
-1. Fill in **Meta** (project name, description).
-2. Add **Contracts** — pick a key, label, address, and either a shorthand ABI (`OP_20` / `OP_20S` / `OP_721`) or paste a custom `AbiEntry[]` array.
-3. Add **Operations** — pick a contract + method, then add params with types, scaling, sources.
-4. Click **Download .otzi.json**. The button is disabled while validation errors exist.
+1. Fill in **Meta** (project name, optional description).
+2. Add **Contracts** — for each contract: a name (identifier), `0x`-prefixed 64-hex address, and a contract **type**:
+   - **OP20** / **OP20S** — built-in token ABIs. Requires `decimals` (0..38). No `abi` field.
+   - **OP721** — built-in NFT ABI. No `decimals`, no `abi`.
+   - **Custom** — paste an `abi` array of `{ name, params: [{ name, type }] }`. No `decimals`.
+3. Click **Download .otzi.json**. The button stays disabled while validation errors exist.
 
 To edit an existing manifest: click **Load .otzi.json** at the top of the sidebar.
 
-## What changed in v2
+## Schema
 
-- `Contract.address` is now a **required** field (flat string, not a per-network map). Manifests are network-agnostic — publish a separate file per deployment.
-- `Param.source: contract:<key>` resolves from `contracts[key].address` in the manifest itself, not from a separate Ötzi settings store.
+The v1 schema is at [`schema.json`](./schema.json), mirrored byte-equal from the canonical [`docs/headless-manifest-schema.json`](../../docs/headless-manifest-schema.json). The builder validates against the vendored copy; the daemon validates against the canonical one (`src/cli/manifest-validate.ts`). A round-trip test in `round-trip.test.js` confirms both validators agree.
 
-The full v2 schema is at [`schema.json`](./schema.json), mirrored byte-equal from [`docs/otzi-manifest-schema.json`](../../docs/otzi-manifest-schema.json).
+The builder reproduces the daemon's two cross-field rules locally:
+
+1. Duplicate contract names within `contracts[]` are rejected.
+2. Duplicate method names within a Custom contract's `abi[]` are rejected.
 
 ## Development
 
