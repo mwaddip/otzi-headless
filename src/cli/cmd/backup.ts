@@ -278,6 +278,10 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
   }
 }
 
-function stripLeadingSlash(p: string): string {
+/**
+ * Convert an absolute path to a tar-relative path. Exported so `restore.ts`
+ * can reverse the mapping without duplicating the helper.
+ */
+export function stripLeadingSlash(p: string): string {
   return p.startsWith('/') ? p.slice(1) : p;
 }
