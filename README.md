@@ -104,6 +104,15 @@ Three nodes, all online, signing all together. Replace `node-a / node-b /
 node-c` with your real hostnames. Steps run **on every node** unless marked
 otherwise.
 
+The walkthrough uses **testnet** so you can complete it with disposable
+funds. For mainnet, swap `testnet` → `mainnet` in the debconf prompt
+(default OPNet RPC becomes `https://api.opnet.org`); everything else —
+ceremony, CLI flow, file layout — is identical. The vault addresses
+printed by `otzi generate` will use the network's address prefix
+(`tb1p…` on testnet, `bc1p…` on mainnet). `regtest` also works but
+skips the OPNet keylink phase, so OPNet contract calls against the
+resulting share will fail at capture (BTC vault transfers still work).
+
 ### 1. Install the .deb
 
 Download `otzi-headless_0.1.0_amd64.deb` from
