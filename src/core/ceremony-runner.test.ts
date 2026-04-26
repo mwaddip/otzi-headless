@@ -109,7 +109,7 @@ function orchestrateParticipant(
 
     const off = ctx.transport.onBroadcast((from, bytes) => {
       const msg = parseCeremonyMessage(bytes);
-      if (!msg || msg.baseCeremonyId !== baseCeremonyId) return;
+      if (!msg || !('baseCeremonyId' in msg) || msg.baseCeremonyId !== baseCeremonyId) return;
 
       if (msg.kind === 'announce') {
         if (leaderId === null) leaderId = from;
@@ -399,7 +399,7 @@ function orchestrateFrostParticipant(
 
     const off = ctx.transport.onBroadcast((from, bytes) => {
       const msg = parseCeremonyMessage(bytes);
-      if (!msg || msg.baseCeremonyId !== baseCeremonyId) return;
+      if (!msg || !('baseCeremonyId' in msg) || msg.baseCeremonyId !== baseCeremonyId) return;
 
       if (msg.kind === 'announce-frost') {
         if (leaderId === null) leaderId = from;
@@ -647,7 +647,7 @@ function orchestrateDkgParticipant(
 
     const off = ctx.transport.onBroadcast((from, bytes) => {
       const msg = parseCeremonyMessage(bytes);
-      if (!msg || msg.baseCeremonyId !== baseCeremonyId) return;
+      if (!msg || !('baseCeremonyId' in msg) || msg.baseCeremonyId !== baseCeremonyId) return;
 
       if (msg.kind === 'announce-dkg') {
         if (initiatorId === null) initiatorId = from;
@@ -792,7 +792,7 @@ function orchestrateFrostDkgParticipant(
 
     const off = ctx.transport.onBroadcast((from, bytes) => {
       const msg = parseCeremonyMessage(bytes);
-      if (!msg || msg.baseCeremonyId !== baseCeremonyId) return;
+      if (!msg || !('baseCeremonyId' in msg) || msg.baseCeremonyId !== baseCeremonyId) return;
 
       if (msg.kind === 'announce-frost-dkg') {
         if (initiatorId === null) initiatorId = from;
@@ -936,7 +936,7 @@ function orchestrateCombinedDkgParticipant(
 
     const off = ctx.transport.onBroadcast((from, bytes) => {
       const msg = parseCeremonyMessage(bytes);
-      if (!msg || msg.baseCeremonyId !== baseCeremonyId) return;
+      if (!msg || !('baseCeremonyId' in msg) || msg.baseCeremonyId !== baseCeremonyId) return;
 
       if (msg.kind === 'announce-combined-dkg') {
         if (initiatorId === null) initiatorId = from;

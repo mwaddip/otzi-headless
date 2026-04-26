@@ -99,6 +99,19 @@ export type CeremonyMessage =
       kind: 'signoff-aborted';
       baseCeremonyId: string;
       reason?: string;
+    }
+  /**
+   * Control-plane: distribute a `.otzi.json` manifest to every peer during
+   * the bootstrap window. Authenticated by HMAC-SHA-256 over the operator-typed
+   * shared `bootstrap-secret`. Receivers drop with `ControlPlaneClosed` once
+   * `share-persistence` has unlinked the secret post-DKG. Carries the verbatim
+   * manifest text (no canonicalization — HMAC is over the exact bytes).
+   */
+  | {
+      v: 1;
+      kind: 'manifest-push';
+      manifest: string;
+      hmac: string;
     };
 
 export function encodeCeremonyMessage(msg: CeremonyMessage): Uint8Array {
@@ -327,8 +340,20 @@ export function parseCeremonyMessage(bytes: Uint8Array): CeremonyMessage | null 
       reason: typeof m.reason === 'string' ? m.reason : undefined,
     };
   }
+  if (m.kind === 'manifest-push') {
+    if (typeof m.manifest !== 'string') return null;
+    if (typeof m.hmac !== 'string' || m.hmac.length === 0 || !MANIFEST_PUSH_HEX_RE.test(m.hmac)) return null;
+    return {
+      v: 1,
+      kind: 'manifest-push',
+      manifest: m.manifest,
+      hmac: m.hmac.toLowerCase(),
+    };
+  }
   return null;
 }
+
+const MANIFEST_PUSH_HEX_RE = /^[0-9a-fA-F]+$/;
 
 export function announceMessage(
   ceremonyId: string,
@@ -782,6 +807,10 @@ export function signoffFrostDoneMessage(
 
 export function signoffAbortedMessage(baseCeremonyId: string, reason?: string): CeremonyMessage {
   return { v: 1, kind: 'signoff-aborted', baseCeremonyId, reason };
+}
+
+export function manifestPushMessage(opts: { manifest: string; hmac: string }): CeremonyMessage {
+  return { v: 1, kind: 'manifest-push', manifest: opts.manifest, hmac: opts.hmac.toLowerCase() };
 }
 
 export function messageFromAnnounce(msg: Extract<CeremonyMessage, { kind: 'announce' }>): Uint8Array {

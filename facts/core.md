@@ -282,6 +282,7 @@
     - `announce-dkg`, `announce-frost-dkg`, `announce-combined-dkg` — symmetric DKG initiations.
     - `signoff-done`, `signoff-frost-done` — leader success signoffs.
     - `signoff-aborted` — leader abort.
+    - `manifest-push` — control-plane manifest distribution (Phase 9c). Bootstrap-window-only.
 
 - `function encodeCeremonyMessage(msg: CeremonyMessage) → Uint8Array`
   - **Pre:** Message is well-formed CeremonyMessage.
@@ -332,6 +333,14 @@
     - **Pre:** `baseCeremonyId` identifies the ceremony; optional `reason` is human-readable cause.
     - **Post:** Leader broadcasts on exhausted retries or unrecoverable error; participants release state.
     - **Factory:** `signoffAbortedMessage(baseCeremonyId, reason?)`
+
+  - `manifest-push` (control-plane — Phase 9c)
+    - **Pre:** Sender has the operator-typed shared `bootstrap-secret` and computed `HMAC-SHA-256(secret, manifestText)`.
+    - **Post:** Carries `{ manifest: string (UTF-8 .otzi.json contents), hmac: string (hex HMAC-SHA-256) }`.
+    - **Factory:** `manifestPushMessage({ manifest, hmac })`
+    - **Lifecycle:** Bootstrap-window-only. Receiver drops at the daemon's control-plane layer if `/var/lib/otzi/bootstrap-secret` is absent. `share-persistence.persistCombinedDkgShare` `unlink()`s the secret on first DKG completion (Phase 9a.5); subsequent `manifest-push` messages are dropped with a `ControlPlaneClosed` log.
+    - **Authentication layering:** The transport's `from` field already authenticates the sender as a peer in the ring. The HMAC is additive — it proves the sender knows the *operator-typed* shared secret, not just any peer in the ring (so a rogue daemon can't push without cooperating with an operator who holds the secret).
+    - **Validation:** Receiver re-computes HMAC + validates manifest against `headless-manifest-v1` schema; mismatch / schema failure → silent drop (logged warn).
 
 - **OPNet params (AnnounceOpnetParams):**
   - **Fields:**
