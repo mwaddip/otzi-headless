@@ -13,19 +13,17 @@ configuration (bind address, auth, gate strategy) is documented in
 
 ## Transport + auth
 
+The operator API listens on a Unix domain socket by default:
+
+- **UDS path:** `/var/run/otzi/otzi.sock` (configurable via `[[triggers]] kind="uds" path=...`).
+- **Auth:** filesystem permissions. The socket is `chmod 660 root:otzi`. Any user in the `otzi` group can connect; nobody else.
+- **Wire shape:** HTTP/1.1 over the UDS, identical to TCP HTTP. Use Node's `http.request({ socketPath })` or `curl --unix-socket`.
 - **Method:** `POST`. Anything else → `405`.
 - **Content-Type:** JSON body, max 1 MB.
-- **Bind:** operator-configured via `[[triggers]].params.bind` as `host:port`
-  (default suggestion `127.0.0.1:7080`). The daemon does not enforce a
-  loopback constraint yet — prefer loopback or a Unix socket fronting
-  (operator responsibility until the binding-constraint work lands). An
-  exposed operator API on a leaf is equivalent to an attacker owning it —
-  the gate is the only thing between forged triggers and a co-signed
-  transaction.
-- **Bearer auth:** when `[[triggers]].params.auth_token_env` is set, the
-  daemon reads the token from that env var at startup and requires matching
-  `Authorization: Bearer <token>` on every request. Missing/mismatched →
-  `401` with `{ "error": "unauthorized" }`.
+
+Optionally, `[[triggers]] kind="http"` can be opted into for a TCP listener — but the parser enforces loopback (`127.0.0.1`, `::1`, `localhost`) only. External binds are rejected at startup with a `ConfigError`. This is load-bearing for the security posture: the daemon is reachable only via the local CLI.
+
+When `[[triggers]] kind="http" auth_token_env="…"` is set, the daemon reads the token from that env var at startup and requires matching `Authorization: Bearer <token>` on every request. Missing/mismatched → `401` with `{ "error": "unauthorized" }`. UDS triggers do NOT use Bearer auth (filesystem permissions are the auth model).
 
 ## Common fields
 
@@ -191,53 +189,24 @@ One sig per input; the caller broadcasts the tx. `btc.ts`'s `broadcastBtcTx`
 is the standard path — it injects the sigs as witness elements and does a
 BIP340 verify under the tweaked aggregate key before submitting.
 
-### `scheme: "frost", protocol: "opnet"`
+### `scheme: "frost", protocol: "opnet"` — DEPRECATED (returns 400)
 
-OPNet raw-tx + per-input prevout info + optional advisory hints. The operator
-built the tx using the OPNet SDK (via `captureOpnetSighashes`). The daemon
-extracts BIP-341 sighashes from the raw bytes; participants re-extract and
-compare. Construction-params for OPNet is deferred (needs SDK-level UTXO
-fetcher determinism — tracked).
+The raw unsigned-tx path has been deprecated as of phase 9a. Participants
+cannot independently verify the announced contract/method/amount against
+the operator-supplied bytes (`hints` are advisory only); gate policy
+evaluates untrusted fields. A rogue leader can sign something other than
+what the operator intended.
 
-Request:
+Use `protocol: 'opnet-params'` (Phase 8) instead — every node rebuilds the
+tx independently from construction params and sighash-checks before
+signing.
 
-```jsonc
-{
-  "op": "sign",
-  "scheme": "frost",
-  "protocol": "opnet",
-  "signers": [0, 1],
-  "unsignedTxHex": "…full unsigned tx hex…",
-  "inputs": [
-    {
-      "scriptHex": "…prevout scriptPubKey hex…",
-      "valueSat": "200000",
-      "tweaked": true                  // true = key-path, false = script-path
-    }
-  ],
-  "hints": {                            // optional — advisory only
-    "contractAddress": "0x…",
-    "method": "transfer",
-    "amountTokenAtomic": "1000000"
-  }
-}
-```
-
-Hints are unverified — they populate `CeremonySpec` for policy-gate matching
-(e.g. `allowed_contracts`, `allowed_methods`). The daemon never decodes ABI.
-Matches federation-trust: a rogue insider can lie in hints, but the worst
-case is DoS (gate-based refusal or a failed OPNet call).
-
-Response:
-
-```jsonc
-{
-  "ceremonyId": "…",
-  "status": "done",
-  "scheme": "frost",
-  "signaturesHex": ["…", "…"]           // one per input, in ceremony order
-}
-```
+The underlying broadcast helpers in `src/broadcast/opnet-capture.ts` and
+`opnet-broadcast.ts` are still in the binary (still imported by the
+`opnet-params` flow internally); only the public HTTP entry point is
+gated off. Re-enable in `src/daemon/daemon.ts::buildDefaultHttpHandler`
+only if you accept the unverifiability and have a use case the SDK
+can't reach via construction params.
 
 ### `scheme: "frost", protocol: "opnet-params"`
 
