@@ -54,25 +54,21 @@ Edit `/etc/fail2ban/jail.d/otzi.local`:
   redirected the daemon's stderr to a file, comment out the systemd lines and
   uncomment `backend = polling` + `logpath = /var/log/otzi/daemon.log`.
 
-## Logger gotcha
+## Sanity check: are warn lines reaching journald?
 
-> **The daemon must have a logger wired for this filter to match anything.**
-
-The peer-mesh allowlist warn line is emitted via the `Logger` interface in
-`src/orchestrator/types.ts`. If the daemon was started without a logger
-(`NOOP_LOGGER` default), the warn call drops on the floor and journald sees
-nothing — fail2ban will then never trigger.
-
-Quick sanity check from the host running the daemon:
+The .deb-installed daemon ships with a stderr `Logger` wired into
+`runDaemonCommand` (see `src/daemon/console-logger.ts`), so warn lines from
+the peer-mesh allowlist land in journald automatically under the `otzi.service`
+unit. Confirm with:
 
 ```bash
 sudo journalctl -u otzi.service --since '1 hour ago' | grep -F 'peer-allowlist:'
 ```
 
 If you see lines, the filter will work. If you see nothing despite known
-non-peer connection attempts, the daemon is running with `NOOP_LOGGER`. The
-fix lives in the daemon entrypoint (out of scope for this example) — wire a
-console-style logger that writes to stderr so journald can pick it up.
+non-peer connection attempts, you're either running a custom-launched daemon
+that didn't construct a `createConsoleLogger()` (only the `daemon` subcommand
+does), or no scanners have hit the listen port yet.
 
 ## Test the filter against real journal entries
 
