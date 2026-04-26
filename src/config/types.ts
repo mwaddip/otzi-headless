@@ -17,6 +17,17 @@ export type GateStrategy = (typeof GATE_STRATEGIES)[number];
 export const TRIGGER_KINDS = ['http', 'uds', 'cron'] as const;
 export type TriggerKind = (typeof TRIGGER_KINDS)[number];
 
+export const BOOTSTRAP_ROLES = ['leader', 'leaf'] as const;
+export type BootstrapRole = (typeof BOOTSTRAP_ROLES)[number];
+
+export interface BootstrapConfig {
+  role: BootstrapRole;
+  /** Required when role === 'leader'. host:port the bootstrap server binds. */
+  bind?: string;
+  /** Required when role === 'leaf'. Full URL of the leader's bootstrap endpoint. */
+  leaderUrl?: string;
+}
+
 export const NETWORK_NAMES = ['mainnet', 'testnet', 'regtest'] as const;
 export type NetworkName = (typeof NETWORK_NAMES)[number];
 
@@ -89,6 +100,8 @@ export interface DaemonConfig {
   gate: GateConfig;
   deadlines: DeadlineConfig;
   triggers: TriggerEntry[];
+  /** Optional. Populated by debconf-rendered daemon.toml; absent in test fixtures. */
+  bootstrap?: BootstrapConfig;
 }
 
 export const DEFAULT_SIGNING_DEADLINE_MS = 300_000;
