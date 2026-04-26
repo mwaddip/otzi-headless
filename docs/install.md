@@ -108,6 +108,47 @@ sudo dpkg-reconfigure otzi-headless
 | `/var/lib/otzi/bootstrap-secret` | shared passphrase, wiped after DKG | root:otzi 660 |
 | `/var/run/otzi/otzi.sock` | UDS socket for operator CLI | otzi:otzi 660 |
 
+## Operations
+
+### Logs
+
+The daemon writes structured info / warn / error lines to stderr; systemd
+captures them in journald. There is no daemon-level log file to manage.
+
+```
+journalctl -u otzi -f             # live tail
+journalctl -u otzi --since today  # windowed
+journalctl -u otzi -p warning     # filter by priority
+```
+
+### Disk + retention
+
+Logs are subject to journald's defaults (typically a 4 GB rolling cap;
+persistence is configurable). For long-term retention, either raise the
+cap in `/etc/systemd/journald.conf`:
+
+```
+SystemMaxUse=20G
+```
+
+or ship logs to an external collector (rsyslog, Loki, Vector, etc.).
+
+### Restart
+
+`systemctl restart otzi` is safe to run at any time:
+
+- Orchestrator state is in-memory; restart drops it cleanly.
+- In-flight ceremonies will NOT resume. The trigger source (operator HTTP
+  call, cron) re-fires them.
+- Persistent state (share, identity, pubkey book) is reloaded from disk
+  on startup.
+
+### Backup + recovery
+
+See `otzi backup` (TBD — ships in a follow-up workstream). For now, manual
+backup of `/var/lib/otzi/` (share + identity + pubkey book) plus
+`/etc/otzi/daemon.toml` covers everything a node needs to come back online.
+
 ## Uninstall
 
 ```bash
