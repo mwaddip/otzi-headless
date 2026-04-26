@@ -164,7 +164,7 @@ export class Daemon {
 
     const httpHandler =
       deps.httpHandler
-      ?? buildDefaultHttpHandler(this.leader, configNetwork, this.log);
+      ?? buildDefaultHttpHandler(this.leader, configNetwork, deps.state, this.log);
     this.triggers = buildTriggers(deps.state.config.triggers, httpHandler, deps.cronHandlers, this.log);
   }
 
@@ -265,6 +265,7 @@ function optionalStringParam(
 export function buildDefaultHttpHandler(
   leader: LeaderDispatcher,
   network: NetworkName,
+  state: LoadedDaemonState,
   logger: Logger = NOOP_LOGGER,
 ): HttpHandler {
   return async (req: HttpRequest): Promise<HttpResponse> => {
@@ -281,6 +282,34 @@ export function buildDefaultHttpHandler(
 
     try {
       switch (op) {
+        case 'vault-info': {
+          // Read-only metadata: peer set + threshold + cached vault
+          // addresses. Used by the CLI to discover the signer set + verify
+          // the vault's identity before signing.
+          if (!state.share || !state.share.frostKeyPackage) {
+            return {
+              status: 409,
+              body: { error: 'vault-info: no share loaded (run `otzi generate` first)' },
+            };
+          }
+          const partyIds = [...state.peersById.keys()].sort((a, b) => a - b);
+          const { btcAddress, opnetAddress } = deriveVaultAddresses(
+            network,
+            state.share.frostKeyPackage.untweakedVerifyingKey,
+            fromHex(state.share.publicKey),
+          );
+          return {
+            status: 200,
+            body: {
+              partyIds,
+              threshold: state.share.threshold,
+              parties: state.share.parties,
+              network,
+              btcAddress,
+              opnetAddress,
+            },
+          };
+        }
         case 'dkg-combined': {
           const result = await leader.runCombinedDkg({
             ceremonyId,

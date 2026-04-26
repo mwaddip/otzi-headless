@@ -21,6 +21,15 @@ export class DaemonClientError extends Error {
   }
 }
 
+export interface VaultInfo {
+  partyIds: number[];
+  threshold: number;
+  parties: number;
+  network: 'mainnet' | 'testnet' | 'regtest';
+  btcAddress: string;
+  opnetAddress: string;
+}
+
 interface TransportOpts {
   socketPath?: string;
   host?: string;
@@ -60,6 +69,10 @@ export class DaemonClient {
       return new DaemonClient({ host: m[1]!, port: Number(m[2]) });
     }
     throw new Error('daemon-client: no uds or http trigger in daemon.toml');
+  }
+
+  async vaultInfo(): Promise<VaultInfo> {
+    return this.request<VaultInfo>({ op: 'vault-info' });
   }
 
   /** Send a JSON request; throw on non-200; return the parsed body. */
