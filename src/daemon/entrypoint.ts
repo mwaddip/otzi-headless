@@ -4,6 +4,14 @@
  *   otzi daemon <config.toml>                   — run the daemon
  *   otzi setup <config.toml>                    — run bootstrap (reads [bootstrap].role from config)
  *   otzi generate <config.toml> [flags]         — trigger DKG against local daemon
+ *   otzi install <path>                         — install a manifest
+ *   otzi list                                   — show the installed manifest
+ *   otzi uninstall                              — remove the installed manifest
+ *   otzi sign <contract> <method> <args...>     — sign + broadcast OPNet contract call
+ *   otzi vault [--json]                         — print vault metadata
+ *   otzi btc send <addr> <amount>[unit]         — send BTC from the vault
+ *   otzi btc balance [--unit ...]               — read vault BTC balance
+ *   otzi op20 balance <ticker|ID>               — read vault OP20 balance
  *
  * The `daemon` subcommand loads config + share + identity + pubkey book and
  * starts the transport + Daemon. SIGINT/SIGTERM trigger graceful shutdown.
@@ -11,7 +19,9 @@
  * mode (signing rejected; DKG works) — operator runs `otzi generate` against
  * it from another shell, then restarts to load the persisted share.
  *
- * (Phase 9b/9c add: install / list / sign / uninstall / vault / btc / op20 / sync.)
+ * Operator-facing commands (install/list/sign/...) talk to the local daemon
+ * over a Unix domain socket (typically /var/run/otzi/otzi.sock). The default
+ * config path /etc/otzi/daemon.toml matches the .deb install layout.
  *
  * Explicitly does NOT call `initEccLib` — phase-4d trap: double-init would
  * silently misroute the FROST legacy-sig monkey-patch when BTC broadcast
@@ -23,6 +33,8 @@ import { loadAndValidate } from './config-merge';
 import { Daemon } from './daemon';
 import { setupMaster, setupMember } from './setup';
 import { buildTransportFromFiles } from './transport-factory';
+
+const DEFAULT_DAEMON_CONFIG_PATH = '/etc/otzi/daemon.toml';
 
 export async function main(argv: readonly string[]): Promise<void> {
   const [, , cmd, ...rest] = argv;
@@ -36,6 +48,27 @@ export async function main(argv: readonly string[]): Promise<void> {
     case 'generate':
       await runGenerateCommand(rest);
       return;
+    case 'install':
+      await runInstallCommand(rest);
+      return;
+    case 'list':
+      await runListCommand(rest);
+      return;
+    case 'uninstall':
+      await runUninstallCommand(rest);
+      return;
+    case 'sign':
+      await runSignCommand(rest);
+      return;
+    case 'vault':
+      await runVaultCommand(rest);
+      return;
+    case 'btc':
+      await runBtcCommand(rest);
+      return;
+    case 'op20':
+      await runOp20Command(rest);
+      return;
     default:
       throw new Error(usage());
   }
@@ -47,6 +80,14 @@ function usage(): string {
     '  otzi daemon <path/to/daemon.toml>',
     '  otzi setup <path/to/daemon.toml>',
     '  otzi generate <path/to/daemon.toml> [--threshold N] [--level 44] [--ceremony-id <id>]',
+    '  otzi install <path>',
+    '  otzi list',
+    '  otzi uninstall',
+    '  otzi sign <contract> <method> [args...] [--config <path>] [--fee-rate <sat/vB>]',
+    '  otzi vault [--json]',
+    '  otzi btc send <address> <amount>[unit] [--config <path>] [--fee-rate <sat/vB>]',
+    '  otzi btc balance [--unit sats|btc|mbtc|ubtc]',
+    '  otzi op20 balance <ticker|ID>',
   ].join('\n');
 }
 
@@ -227,6 +268,152 @@ function parseFlags(args: string[]): Map<string, string> {
     i += 1;
   }
   return out;
+}
+
+/**
+ * Parse mixed positional + --flag args. Boolean flags (`--json` with no
+ * following value) are also allowed and surface in the flags map with an
+ * empty string value.
+ */
+function parsePositionalAndFlags(args: string[]): {
+  positional: string[];
+  flags: Map<string, string>;
+} {
+  const positional: string[] = [];
+  const flags = new Map<string, string>();
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (!arg.startsWith('--')) {
+      positional.push(arg);
+      continue;
+    }
+    const key = arg.slice(2);
+    const next = args[i + 1];
+    if (next === undefined || next.startsWith('--')) {
+      flags.set(key, '');
+      continue;
+    }
+    flags.set(key, next);
+    i += 1;
+  }
+  return { positional, flags };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi install <path>`
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runInstallCommand(args: string[]): Promise<void> {
+  const source = args[0];
+  if (!source || source.startsWith('--')) throw new Error('usage: otzi install <path>');
+  const { install } = await import('../cli/cmd/install');
+  await install({ source });
+  console.error(`otzi: installed manifest from ${source}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi list`
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runListCommand(_args: string[]): Promise<void> {
+  const { list } = await import('../cli/cmd/list');
+  const out = await list();
+  console.log(out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi uninstall`
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runUninstallCommand(_args: string[]): Promise<void> {
+  const { uninstall } = await import('../cli/cmd/uninstall');
+  const result = await uninstall();
+  console.error(result.removed ? 'otzi: manifest removed' : 'otzi: no manifest installed');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi sign <contract> <method> <args...>`
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runSignCommand(args: string[]): Promise<void> {
+  const { positional, flags } = parsePositionalAndFlags(args);
+  if (positional.length < 2)
+    throw new Error('usage: otzi sign <contract> <method> [args...]');
+  const [contractIdent, methodIdent, ...rest] = positional;
+  const { sign } = await import('../cli/cmd/sign');
+  const configPath = flags.get('config') || DEFAULT_DAEMON_CONFIG_PATH;
+  const result = await sign({
+    configPath,
+    contractIdent: contractIdent!,
+    methodIdent: methodIdent!,
+    args: rest,
+    ...(flags.has('fee-rate') ? { feeRate: Number(flags.get('fee-rate')) } : {}),
+  });
+  console.log(result.transactionId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi vault [--json]`
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runVaultCommand(args: string[]): Promise<void> {
+  const { flags } = parsePositionalAndFlags(args);
+  const { vault } = await import('../cli/cmd/vault');
+  const out = await vault({ json: flags.has('json') });
+  console.log(out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi btc {send|balance} ...`
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runBtcCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  if (sub === 'send') {
+    const { positional, flags } = parsePositionalAndFlags(args.slice(1));
+    if (positional.length !== 2)
+      throw new Error('usage: otzi btc send <address> <amount>[unit]');
+    const [toAddress, amount] = positional;
+    const { btcSend } = await import('../cli/cmd/btc');
+    const result = await btcSend({
+      configPath: flags.get('config') || DEFAULT_DAEMON_CONFIG_PATH,
+      toAddress: toAddress!,
+      amount: amount!,
+      ...(flags.has('fee-rate') ? { feeRate: Number(flags.get('fee-rate')) } : {}),
+    });
+    console.log(result.transactionId);
+    return;
+  }
+  if (sub === 'balance') {
+    const { flags } = parsePositionalAndFlags(args.slice(1));
+    const { btcBalance } = await import('../cli/cmd/btc');
+    const out = await btcBalance({
+      ...(flags.has('unit')
+        ? { unit: flags.get('unit') as 'sats' | 'btc' | 'mbtc' | 'ubtc' }
+        : {}),
+    });
+    console.log(out);
+    return;
+  }
+  throw new Error('usage: otzi btc {send <address> <amount>[unit] | balance [--unit ...]}');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi op20 balance <ticker|ID>`
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runOp20Command(args: string[]): Promise<void> {
+  const sub = args[0];
+  if (sub === 'balance') {
+    const identifier = args[1];
+    if (!identifier || identifier.startsWith('--'))
+      throw new Error('usage: otzi op20 balance <ticker|ID>');
+    const { op20Balance } = await import('../cli/cmd/op20');
+    const out = await op20Balance({ identifier });
+    console.log(out);
+    return;
+  }
+  throw new Error('usage: otzi op20 balance <ticker|ID>');
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
