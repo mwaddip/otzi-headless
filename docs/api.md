@@ -31,7 +31,7 @@ Every request body is a JSON object. All ceremony requests accept:
 
 | Field | Type | Notes |
 |---|---|---|
-| `op` | string, required | One of `dkg-combined`, `dkg-mldsa`, `dkg-frost`, `sign`, `vault-info`. |
+| `op` | string, required | One of `dkg-combined`, `dkg-mldsa`, `dkg-frost`, `sign`, `vault-info`, `sync`. |
 | `ceremonyId` | string, optional | Operator-supplied. When omitted, the daemon generates `"<op>-<uuid>"`. Must not contain `#` (reserved for ML-DSA retry suffixes). |
 
 Every successful response body includes:
@@ -343,6 +343,71 @@ Response:
 No protocol-level decoding or policy-gate field population beyond the
 generic `operation: 'generic'` marker — gate rules targeting `allowed_btc_recipients`
 or `allowed_contracts` don't apply.
+
+## `op: "sync"`
+
+Distribute a manifest to all peers in the federation. Bootstrap-window-only
+— returns `410` once the local daemon has wiped its `bootstrap-secret`
+post-DKG.
+
+The local daemon installs the manifest first (atomic write to
+`/etc/otzi/manifest.otzi.json`), then broadcasts a `manifest-push` wire
+message to every peer. Each peer's daemon re-verifies the HMAC, validates
+the manifest against `headless-manifest-v1`, and atomically installs to
+its own `/etc/otzi/manifest.otzi.json`. Per-peer success/failure is NOT
+exposed in the response (the underlying transport surface is broadcast,
+not unicast); operators verify peer state via `otzi list` on each node or
+via daemon logs.
+
+Request:
+
+```jsonc
+{
+  "op": "sync",
+  "manifest": "<.otzi.json contents as a UTF-8 string — verbatim, no canonicalization>",
+  "hmac": "<hex HMAC-SHA-256(bootstrap_secret, manifest_text)>"
+}
+```
+
+Response (`200`):
+
+```jsonc
+{
+  "ceremonyId": "sync-…",
+  "status": "done",
+  "peersNotified": 2
+}
+```
+
+Error responses:
+
+| Status | Cause |
+|---|---|
+| `400` | HMAC mismatch, schema validation failure, JSON parse error, or a different manifest already installed locally (run `otzi uninstall` first). |
+| `410` | `/var/lib/otzi/bootstrap-secret` is absent on this daemon (post-DKG, control plane closed). Use `otzi install` on each node instead. |
+| `502` | Manifest installed locally, but transport.broadcast to peers failed. |
+
+### Wire opcodes (peer-to-peer)
+
+#### `manifest-push`
+
+The wire message broadcast by the local daemon on `op:'sync'`. Carries the
+operator's manifest text + HMAC to every peer in the ring. Bootstrap-window-only;
+receivers drop with a logged warning post-DKG (their bootstrap-secret has
+been wiped).
+
+```jsonc
+{
+  "v": 1,
+  "kind": "manifest-push",
+  "manifest": "<.otzi.json contents>",
+  "hmac": "<hex HMAC-SHA-256>"
+}
+```
+
+The transport's `from` field already authenticates the sender as a peer in
+the ring; the HMAC is additive — it proves the sender knows the
+*operator-typed* shared secret, not just any peer.
 
 ## Identity of fields that look similar
 

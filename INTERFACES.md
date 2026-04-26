@@ -72,6 +72,13 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 - Group-membership-based access is the precondition for `feedback_cli_is_primary_entrypoint` — the CLI is THE operator surface, and any user in the `otzi` group can run it without sudo.
 - **`otzi <subcommand>` is THE operator-facing surface.** Direct `curl` calls to the daemon UDS are not a supported workflow. If a flow exists in production, it should be reachable via `otzi <subcommand>`. New ops added to the daemon HTTP handler should land alongside a CLI verb that wraps them; raw HTTP usage is reserved for tests + debugging.
 
+### Control plane (Phase 9c)
+- The daemon's "control plane" is the set of bootstrap-window-only operations — currently just `manifest-push`. All control-plane wire messages are authenticated by HMAC-SHA-256 over the operator-typed shared `bootstrap-secret`.
+- The `bootstrap-secret` lives at `/var/lib/otzi/bootstrap-secret` chmod 660 root:otzi (set up by 9a's debconf prompt at install time, distributed out-of-band between operators). It is wiped automatically by `share-persistence.persistCombinedDkgShare` on first successful DKG completion.
+- Post-DKG, all control-plane operations are rejected with `ControlPlaneClosed` errors. Manifest changes after DKG are operator-local: each operator runs `otzi install` on their own node.
+- The `manifest-push` opcode rides the existing Noise-KK transport. The transport's authenticated `from` field is independent from the HMAC; the HMAC is additive (it proves the sender knows the operator-typed secret, not just any peer in the ring).
+- `op:'sync'` distribution semantics are best-effort broadcast: the local daemon installs first (so a local refusal short-circuits the broadcast), then fans out via `transport.broadcast`. There is NO per-peer ack channel — operators verify with `otzi list` on each peer or via daemon logs if they need confirmation.
+
 ### `#N` retry suffix (ML-DSA signing)
 - Leader appends `#N` to `ceremonyId` on combine retry. `baseCeremonyId` is stable across retries. **`ceremonyId` MUST NOT contain `#`** ; tighten with a check if ceremonyIds ever come from untrusted sources.
 

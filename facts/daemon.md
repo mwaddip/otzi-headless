@@ -103,6 +103,40 @@
 
 ---
 
+### `control-plane.ts`
+**Purpose:** Bootstrap-window-only control-plane handlers. Currently: `manifest-push` (Phase 9c). Verifies HMAC, validates schema, atomically installs the pushed manifest.
+
+**Public surface:**
+- `ControlPlane` (class)
+  - **Constructor(opts: ControlPlaneOpts = {})**
+    - `secretPath` defaults to `/var/lib/otzi/bootstrap-secret`; tests override.
+    - `manifestPath` defaults to `/etc/otzi/manifest.otzi.json`; tests override.
+    - `logger` defaults to `NOOP_LOGGER`.
+- `installPushedManifest(input: { manifest: string; hmacHex: string }): Promise<void>`
+  - **Pre:** Caller has decoded the wire message; `manifest` is verbatim text, `hmacHex` is the asserted HMAC.
+  - **Post:** On success, manifest is at `manifestPath` (chmod 0o660, atomic write via `.tmp` + rename). Idempotent on byte-identical existing manifest (no-op write, info log).
+  - **Throws:**
+    - `ControlPlaneClosed` — `bootstrap-secret` file missing or empty (post-DKG).
+    - `HmacMismatch` — HMAC verify failed (constant-time compare via `timingSafeEqual`).
+    - `ManifestRejected` — JSON parse or schema validation failure.
+    - `ManifestExists` — a different manifest already installed at `manifestPath` (operator must `otzi uninstall` locally first).
+
+**Invariants:**
+- HMAC compare is constant-time. HMAC computed as `HMAC-SHA-256(secret, manifestText)` with the secret read fresh from disk per request (so the post-DKG wipe takes effect immediately, no daemon-restart needed).
+- Manifest is written verbatim — no canonicalization. The HMAC is over the exact bytes the operator sent.
+- Trailing-whitespace tolerance on `existing.trim() !== input.manifest.trim()` so an existing file with a trailing newline is still considered identical.
+
+**Cross-component contracts:**
+- Depends on: `validateManifest` from `src/cli/manifest-validate.ts` (reuses the same schema check as `otzi install`); `node:crypto` for HMAC + constant-time compare.
+- Used by: `Daemon`'s `op:'sync'` HTTP handler (local install path) and `Orchestrator.handleManifestPush` (remote-receive path).
+
+**Lifecycle:**
+- The `bootstrap-secret` is created by 9a's debconf flow at install time; persisted at `/var/lib/otzi/bootstrap-secret` chmod 660 root:otzi.
+- `share-persistence.persistCombinedDkgShare` `unlink()`s the file on first successful DKG completion (Phase 9a.5).
+- After the unlink, every `installPushedManifest` call throws `ControlPlaneClosed` — the control plane is permanently closed for that federation.
+
+---
+
 ### `vault-pubkey.ts`
 **Purpose:** Writes the operator-facing vault metadata cache `/var/lib/otzi/vault-pubkey.json`. Cache exists so the CLI (`otzi vault` / `otzi btc balance` / `otzi op20 balance` / `otzi btc send`) can answer "what's our vault address?" without ever decrypting the share file.
 
@@ -247,12 +281,19 @@
   - **Throws:** `Error` on missing required params or missing cron handler.
 
 - **Default HTTP handler** (buildDefaultHttpHandler)
-  - **Pre:** POST requests to handler. Constructed with `(leader, network: NetworkName, state: LoadedDaemonState, logger)`.
-  - **Post:** Discriminated dispatch on `req.body.op` field: 'vault-info', 'dkg-combined', 'dkg-mldsa', 'dkg-frost', 'sign'.
+  - **Pre:** POST requests to handler. Constructed with `(leader, network: NetworkName, state: LoadedDaemonState, controlPlane: ControlPlane, transport: Transport, logger)`.
+  - **Post:** Discriminated dispatch on `req.body.op` field: 'vault-info', 'dkg-combined', 'dkg-mldsa', 'dkg-frost', 'sign', 'sync'.
   - **vault-info (read):** Returns `{ partyIds, threshold, parties, network, btcAddress, opnetAddress }` from in-memory state. 409 if no share is loaded yet (`vault-info: no share loaded (run 'otzi generate' first)`).
   - **dkg-combined:** Runs combined DKG; response carries `mldsaPublicKeyHex`, `frostVerifyingKeyHex`, plus operator-facing `btcAddress` + `opnetAddress` + `network` (computed via `deriveVaultAddresses`). The address triple matches what `vault-pubkey.json` will hold post-restart.
   - **DKG ops (mldsa, frost):** Extract threshold, parties, level; invoke leader; return ceremony result + public keys.
   - **sign op:** Discriminate on scheme + protocol; parse BTC/OPNet/opnet-params/raw-mldsa request; invoke leader.sign; return signatures + optional txid.
+  - **sync op (Phase 9c):** Operator-facing manifest distribution endpoint.
+    - **Pre:** Local `bootstrap-secret` exists; `manifest` is valid headless-manifest-v1 JSON; `hmac` matches HMAC-SHA-256(secret, manifest).
+    - **Post:** Local manifest atomically installed via `controlPlane.installPushedManifest`; `manifest-push` wire message broadcast to every peer via `transport.broadcast`; response carries `{ ceremonyId, status, peersNotified }`.
+    - **Status 410:** `{ error: 'control plane closed' }` when `bootstrap-secret` is missing (post-DKG).
+    - **Status 400:** HMAC mismatch / schema failure / existing-non-identical-manifest (carries `kind` for the error class name).
+    - **Status 502:** Manifest installed locally, but `transport.broadcast` failed.
+    - **Invariant:** Local install runs first — failure short-circuits the broadcast.
   - **Status 403 on gate reject:** `{ error: 'gate rejected', decision, ceremonyId }`.
   - **Status 500 on other errors:** `{ error: <message>, ceremonyId }`.
   - **Status 400 on malformed input.**

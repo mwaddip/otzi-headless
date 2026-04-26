@@ -15,6 +15,7 @@ The default config path is `/etc/otzi/daemon.toml` — operators can override pe
 ### Manifest
 
 - `otzi install <path>` — install a `.otzi.json` manifest at `/etc/otzi/manifest.otzi.json`. Validates against `headless-manifest-v1` (see `docs/headless-manifest-schema.json`). Refuses if a manifest is already installed; run `otzi uninstall` first.
+- `otzi sync <path>` — distribute a manifest to ALL peers in the federation. Validates locally, computes HMAC-SHA-256 over the verbatim text using `/var/lib/otzi/bootstrap-secret`, and broadcasts via the daemon's control plane. Bootstrap-window-only: after DKG completes, this command exits with `control plane closed` — operators must run `otzi install <new file>` locally on each node from then on. Prints the per-call `ceremonyId` and the count of peers notified; check each peer's `otzi list` to confirm install.
 - `otzi list` — show the installed manifest as a numbered/lettered tree.
 - `otzi uninstall` — remove the installed manifest (idempotent).
 
