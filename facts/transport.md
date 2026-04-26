@@ -406,7 +406,7 @@
 - Offline peers are silently skipped (broadcast) or return null (pull); no error.
 - All peer connections are closed gracefully on stop(); pending pulls are rejected.
 - `partyId` is immutable; peers list is derived from options and cannot change post-construction.
-- Inbound connections from non-peer source IPs are silently destroyed (no WS upgrade response) before the handshake. The allowlist resolves at startup only; relay-only peers without an `endpoint` are skipped. The cryptographic layer (Noise-KK + ML-DSA pubkey book) is the security boundary; the allowlist is defense-in-depth against random scanners.
+- Inbound connections from non-peer source IPs are silently destroyed before the WS upgrade completes. The check runs in `WebSocketServer`'s synchronous `verifyClient` hook; on miss, the handler calls `info.req.socket.destroy()` and returns `false` so `ws` never writes the HTTP 401 response that returning `false` alone would produce. **Do NOT move this check to a `connection`-event handler** — by then the 101 upgrade is already on the wire and the silent-drop property is lost. The allowlist resolves at startup only; relay-only peers without an `endpoint` are skipped. The cryptographic layer (Noise-KK + ML-DSA pubkey book) is the security boundary; the allowlist is defense-in-depth against random scanners.
 
 **Cross-component contracts:**
 - Depends on: WebSocket (ws library), PeerConnection (handshake + record layer), wire format (broadcast, pull-req, pull-resp).
@@ -502,6 +502,7 @@
 - Frame to self is rejected (400 error).
 - Peer joined/left events broadcast to all other members in the ring (excluding self).
 - Relay sees only opaque hex payloads; never validates or decrypts (Noise KK at peer layer provides auth).
+- **No L4 source-IP filter.** Multiplexing is by `partyId` from the client `hello`, not by remote address; any host that can reach the relay can attempt to claim a partyId. Cryptographic auth (Noise-KK + ML-DSA pubkey book at the peer layer) is the only gate on relay'd traffic. This is the deliberate counterpart to peer-mesh's `verifyClient` allowlist — the relay path trades the L4 pre-filter for routability through NAT / shared infrastructure.
 - WebSocket errors and closes both trigger cleanup.
 - Graceful shutdown closes all peer sockets; no forced close.
 
@@ -512,7 +513,7 @@
 
 **Notes / gotchas:**
 - No authentication at relay layer; first-come-first-served partyId. Noise KK protects the ceremony — squatter can't handshake with legitimate peers.
-- Operator responsible for network isolation (loopback + TLS, or VPN).
+- Operator responsible for network isolation (loopback + TLS, or VPN). The relay does not implement an IP allowlist analogous to peer-mesh's; if scanner-noise mitigation is needed in front of the relay, it must come from the operator's firewall.
 - Silent frame drop (target offline) is intentional; sender learns via peer-joined notifications.
 - Rings are ephemeral; auto-deleted when empty.
 
