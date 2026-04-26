@@ -15,38 +15,75 @@ case "$1" in
               --home /var/lib/otzi --shell /usr/sbin/nologin otzi
     fi
 
-    [ -d /var/lib/otzi ] || mkdir -p /var/lib/otzi
-    chown otzi:otzi /var/lib/otzi
-    chmod 750 /var/lib/otzi
-
+    # /etc/otzi: 2770 root:otzi (setgid) so group-otzi members can edit/install
+    # manifests; new files inherit group otzi via setgid.
     [ -d /etc/otzi ] || mkdir -p /etc/otzi
     chown root:otzi /etc/otzi
-    chmod 750 /etc/otzi
+    chmod 2770 /etc/otzi
+
+    # /var/lib/otzi: 2770 root:otzi so group-otzi members can run setup
+    # (writes identity.json + pubkeys.json) — daemon (otzi user) reads via
+    # group membership. Setgid makes new files group-otzi.
+    [ -d /var/lib/otzi ] || mkdir -p /var/lib/otzi
+    chown root:otzi /var/lib/otzi
+    chmod 2770 /var/lib/otzi
+
+    # /var/run/otzi: holds the UDS socket. Created here for safety, but
+    # systemd-tmpfiles also recreates it on boot (in case /var/run is tmpfs).
+    [ -d /var/run/otzi ] || mkdir -p /var/run/otzi
+    chown root:otzi /var/run/otzi
+    chmod 2770 /var/run/otzi
+
+    # Add operator users to the otzi group.
+    db_get otzi-headless/operators || true
+    OPERATORS="$RET"
+    for U in $OPERATORS; do
+      if getent passwd "$U" >/dev/null 2>&1; then
+        usermod -aG otzi "$U" || true
+        echo "otzi-headless: added user '$U' to group 'otzi'"
+      else
+        echo "otzi-headless: WARNING — user '$U' does not exist; skipping group add" >&2
+      fi
+    done
+
+    # Persist the bootstrap secret. It will be wiped by the daemon after
+    # the first successful DKG.
+    db_get otzi-headless/bootstrap-secret || true
+    BOOTSTRAP_SECRET="$RET"
+    if [ -n "$BOOTSTRAP_SECRET" ]; then
+      umask 027
+      printf '%s\n' "$BOOTSTRAP_SECRET" >/var/lib/otzi/bootstrap-secret
+      chown root:otzi /var/lib/otzi/bootstrap-secret
+      chmod 660 /var/lib/otzi/bootstrap-secret
+    fi
 
     # Render daemon.toml only if missing — preserve operator edits across upgrades.
     if [ ! -f /etc/otzi/daemon.toml ]; then
-      db_get otzi-headless/role || true;            ROLE="$RET"
-      db_get otzi-headless/network || true;         NETWORK="$RET"
-      db_get otzi-headless/opnet-rpc || true;       OPNET_RPC="$RET"
-      db_get otzi-headless/peer-hostnames || true;  PEER_HOSTS="$RET"
-      db_get otzi-headless/transport || true;       TRANSPORT="$RET"
-      db_get otzi-headless/listen || true;          LISTEN="$RET"
-      db_get otzi-headless/relay-url || true;       RELAY_URL="$RET"
-      db_get otzi-headless/operator-bind || true;   OPERATOR_BIND="$RET"
-      db_get otzi-headless/node-id || true;         NODE_ID="$RET"
+      db_get otzi-headless/role || true;                  ROLE="$RET"
+      db_get otzi-headless/network || true;               NETWORK="$RET"
+      db_get otzi-headless/opnet-rpc || true;             OPNET_RPC="$RET"
+      db_get otzi-headless/peer-hostnames || true;        PEER_HOSTS="$RET"
+      db_get otzi-headless/transport || true;             TRANSPORT="$RET"
+      db_get otzi-headless/listen || true;                LISTEN="$RET"
+      db_get otzi-headless/relay-url || true;             RELAY_URL="$RET"
+      db_get otzi-headless/bootstrap-bind || true;        BOOTSTRAP_BIND="$RET"
+      db_get otzi-headless/bootstrap-leader-url || true;  BOOTSTRAP_LEADER_URL="$RET"
+      db_get otzi-headless/node-id || true;               NODE_ID="$RET"
 
-      [ -n "$NODE_ID" ]       || NODE_ID="$(hostname -s 2>/dev/null || hostname)"
-      [ -n "$OPERATOR_BIND" ] || OPERATOR_BIND="127.0.0.1:7080"
-      [ -n "$LISTEN" ]        || LISTEN="0.0.0.0:8800"
-      [ -n "$NETWORK" ]       || NETWORK="testnet"
-      [ -n "$OPNET_RPC" ]     || OPNET_RPC="https://testnet.opnet.org"
-      [ -n "$TRANSPORT" ]     || TRANSPORT="peer-mesh"
+      [ -n "$NODE_ID" ]        || NODE_ID="$(hostname -s 2>/dev/null || hostname)"
+      [ -n "$LISTEN" ]         || LISTEN="0.0.0.0:8800"
+      [ -n "$NETWORK" ]        || NETWORK="testnet"
+      [ -n "$OPNET_RPC" ]      || OPNET_RPC="https://testnet.opnet.org"
+      [ -n "$TRANSPORT" ]      || TRANSPORT="peer-mesh"
+      [ -n "$ROLE" ]           || ROLE="leaf"
+      [ -n "$BOOTSTRAP_BIND" ] || BOOTSTRAP_BIND="0.0.0.0:7090"
 
       ENODE_ID="$(toml_escape "$NODE_ID")"
       EOPNET_RPC="$(toml_escape "$OPNET_RPC")"
       ELISTEN="$(toml_escape "$LISTEN")"
       ERELAY_URL="$(toml_escape "$RELAY_URL")"
-      EOPERATOR_BIND="$(toml_escape "$OPERATOR_BIND")"
+      EBOOTSTRAP_BIND="$(toml_escape "$BOOTSTRAP_BIND")"
+      EBOOTSTRAP_LEADER_URL="$(toml_escape "$BOOTSTRAP_LEADER_URL")"
 
       umask 027
       cat >/etc/otzi/daemon.toml <<EOF
@@ -120,32 +157,60 @@ strategy = "auto"
 signing_ms = 300000
 dkg_ms = 900000
 
+[bootstrap]
+role = "$ROLE"
+EOF
+
+      if [ "$ROLE" = "leader" ]; then
+        cat >>/etc/otzi/daemon.toml <<EOF
+bind = "$EBOOTSTRAP_BIND"
+
+EOF
+      else
+        cat >>/etc/otzi/daemon.toml <<EOF
+leader_url = "$EBOOTSTRAP_LEADER_URL"
+
+EOF
+      fi
+
+      cat >>/etc/otzi/daemon.toml <<EOF
 [[triggers]]
-kind = "http"
-[triggers.params]
-bind = "$EOPERATOR_BIND"
-auth_token_env = "OTZI_OPERATOR_TOKEN"
+kind = "uds"
+path = "/var/run/otzi/otzi.sock"
 EOF
 
       chown root:otzi /etc/otzi/daemon.toml
       chmod 640 /etc/otzi/daemon.toml
 
+      # Print role-conditional next steps.
       cat <<EOF
 
 otzi-headless installed. Next steps:
 
   1. Bootstrap pubkey exchange:
-       leader node:  sudo -u otzi otzi setup leader /etc/otzi/daemon.toml --bind 0.0.0.0:7090
-       leaf nodes:   sudo -u otzi otzi setup leaf   /etc/otzi/daemon.toml --leader http://<leader-host>:7090
+EOF
+      if [ "$ROLE" = "leader" ]; then
+        cat <<EOF
+       sudo -u otzi otzi setup /etc/otzi/daemon.toml
+EOF
+      else
+        cat <<EOF
+       sudo -u otzi otzi setup /etc/otzi/daemon.toml
+       (Edit /etc/otzi/daemon.toml first to set [bootstrap].leader_url
+        if the leader URL changed since install.)
+EOF
+      fi
+      cat <<EOF
   2. Edit /etc/otzi/daemon.toml — fill in [[peers]] from /var/lib/otzi/pubkeys.json.
   3. Generate the threshold share:
        sudo -u otzi otzi generate /etc/otzi/daemon.toml
-  4. Enable + start the daemon (intentionally not auto-enabled — incomplete
-     bootstrap would crash-loop):
+  4. Enable + start the daemon:
        sudo systemctl enable --now otzi
 
+Operators (in 'otzi' group): $OPERATORS
 Config: /etc/otzi/daemon.toml (chmod 640, owned root:otzi)
-Data:   /var/lib/otzi/                (owned otzi:otzi)
+Data:   /var/lib/otzi/                (mode 2770, owned root:otzi setgid)
+UDS:    /var/run/otzi/otzi.sock       (mode 660, owned otzi:otzi)
 Logs:   journalctl -u otzi
 EOF
     fi
