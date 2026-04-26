@@ -6,8 +6,10 @@
 - `nodejs` ≥ 22. On Ubuntu 24.04, the default `nodejs` package is too old —
   install [nodesource's 22.x](https://github.com/nodesource/distributions) first.
 - systemd (the .deb installs a unit file at `/lib/systemd/system/otzi.service`).
-- Two open ports per node: one for peer-mesh (default `8800`), one for the
-  operator HTTP API (default `127.0.0.1:7080`, loopback only).
+- One open port per node for peer-mesh (default `8800`); leader nodes also
+  open the bootstrap-server port temporarily (default `7090`) during initial
+  pubkey exchange. The operator API is local-only over a UDS at
+  `/var/run/otzi/otzi.sock` — no operator-facing port is exposed.
 
 ## Install
 
@@ -19,71 +21,37 @@ sudo apt install ./otzi-headless_0.0.1_amd64.deb
 the install and tell you why. (Plain `dpkg -i` will fail on unmet deps —
 follow up with `sudo apt -f install` to resolve.)
 
-## debconf prompts
+## Install walkthrough
 
-The install asks the following at default priority (high) — others fall
-back to defaults you can override after install by editing
-`/etc/otzi/daemon.toml`.
+1. **Install the .deb.**
+   ```
+   sudo apt install ./otzi-headless_<version>_<arch>.deb
+   ```
+   debconf will prompt for:
+   - **Node role** (`leader` / `leaf`) — leader hosts bootstrap, leaves connect to it.
+   - **Operator usernames** (space-separated) — each gets `usermod -aG otzi`.
+   - **Bootstrap secret** (shared passphrase, agreed out-of-band among
+     operators before install).
+   - **Bitcoin network** + **OPNet RPC URL** (per-network defaults provided).
+   - **Transport kind** + **listen address** (or **relay URL**).
+   - **Bootstrap bind** (leader) or **leader URL** (leaf).
+   - **Peer hostnames** (optional, populates `[[peers]]` stubs).
+   - **Node identifier** (defaults to `hostname -s`).
 
-| Prompt | Choices / default | What it does |
-|---|---|---|
-| **Node role for bootstrap** | `leader` / `leaf` | Picks which `otzi setup …` subcommand the install message tells you to run. Doesn't affect runtime — all nodes are peers in the threshold ceremony. |
-| **Bitcoin network** | `mainnet` / `testnet` / `regtest` | Sets `[network].name` and seeds `opnet_rpc` with the per-network default. |
-| **Transport kind** | `peer-mesh` / `relay` | `peer-mesh` for direct WebSocket links between nodes; `relay` if going through a coordinator. |
-| **Relay WebSocket URL** | string | Only asked when transport is `relay` (e.g. `ws://relay.example:9000`). |
+2. **Log out / log back in** (or `newgrp otzi`) so your shell picks up
+   the new group membership.
 
-Lower-priority prompts (visible at `medium` priority or above):
+3. **Run `otzi setup`** on every node:
+   ```
+   sudo -u otzi otzi setup /etc/otzi/daemon.toml
+   ```
+   (Or, as a member of the `otzi` group, just `otzi setup
+   /etc/otzi/daemon.toml`.) Records identity pubkeys in
+   `/var/lib/otzi/pubkeys.json` and prints the 8-char SHA-256
+   fingerprint. **Verify the same fingerprint on every node** out-of-band.
 
-- **OPNet RPC URL** — defaults per network: `https://api.opnet.org` (mainnet),
-  `https://testnet.opnet.org` (testnet), `http://127.0.0.1:9001` (regtest).
-- **Peer hostnames** — space-separated list of the other nodes (e.g.
-  `node-b.example node-c.example`). Used to write commented `[[peers]]`
-  stubs in `daemon.toml`. Optional — leave blank to fill in by hand.
-- **Peer-mesh listen address** — default `0.0.0.0:8800`.
-- **Operator HTTP API bind** — default `127.0.0.1:7080` (loopback). Edit
-  the toml after install to bind to a UDS or a non-loopback address.
-- **Node identifier** — defaults to `hostname -s`. Used as `[node].id` in
-  the toml; must be unique across the ring.
-
-To re-run the prompts after install:
-
-```bash
-sudo rm /etc/otzi/daemon.toml      # postinst won't clobber an existing file
-sudo dpkg-reconfigure otzi-headless
-```
-
-## Post-install setup
-
-The package intentionally does **not** auto-start the daemon — the rendered
-`daemon.toml` has commented `[[peers]]` stubs that the bootstrap step
-populates, and starting before bootstrap would just crash-loop.
-
-### 1. Bootstrap pubkey exchange
-
-On the **leader** node (run first):
-
-```bash
-sudo -u otzi otzi setup leader /etc/otzi/daemon.toml --bind 0.0.0.0:7090
-```
-
-The leader generates an ECDH identity (if missing), starts a one-shot HTTP
-server, waits for every leaf to register, and prints an 8-char fingerprint.
-Compare the fingerprint out-of-band to detect MITM.
-
-On each **leaf** node:
-
-```bash
-sudo -u otzi otzi setup leaf /etc/otzi/daemon.toml --leader http://<leader-host>:7090
-```
-
-Each leaf POSTs its identity, long-polls for the full pubkey book, prints
-the same fingerprint, and writes `/var/lib/otzi/pubkeys.json`.
-
-### 2. Fill in the `[[peers]]` block
-
-Open `/var/lib/otzi/pubkeys.json` and copy each peer's `nodeId`, `partyId`,
-and `walletAddress` (= `0x` + hex(SHA256(mldsaPubKey))) into the matching
-`[[peers]]` stubs in `/etc/otzi/daemon.toml`:
+4. **Edit `/etc/otzi/daemon.toml`** and complete `[[peers]]` from
+   `pubkeys.json`:
 
 ```toml
 [[peers]]
@@ -93,32 +61,36 @@ wallet_address = "0xabc..."
 endpoint = "ws://node-b.example:8800"
 ```
 
-### 3. Generate the threshold share
+5. **Run `otzi generate`** on the leader to trigger DKG. Daemon writes
+   the share file; the bootstrap-secret is wiped automatically once DKG
+   completes:
+   ```
+   sudo -u otzi otzi generate /etc/otzi/daemon.toml
+   ```
 
-Start the daemon (it'll come up in DKG-only mode since no share exists yet):
-
-```bash
-sudo systemctl start otzi
-```
-
-From any shell on the leader node:
-
-```bash
-sudo -u otzi otzi generate /etc/otzi/daemon.toml
-```
-
-This POSTs a DKG ceremony to the local daemon's HTTP trigger, runs the
-combined ML-DSA + FROST DKG across all peers, and writes an encrypted V3
-share to `/var/lib/otzi/share.json` on each node.
-
-### 4. Enable + restart for full mode
-
-```bash
-sudo systemctl enable --now otzi
-sudo systemctl restart otzi      # reload to pick up the persisted share
-```
+6. **Enable + start the daemon:**
+   ```
+   sudo systemctl enable --now otzi
+   ```
 
 Logs: `journalctl -u otzi -f`.
+
+## Operator API
+
+Default: UDS at `/var/run/otzi/otzi.sock` (mode 660, owned otzi:otzi).
+Anyone in the `otzi` group can connect via the CLI.
+
+To add a new operator after install:
+```
+sudo usermod -aG otzi <user>
+```
+(They'll need to log out / back in to pick up the group.)
+
+To re-run the install prompts:
+```
+sudo rm /etc/otzi/daemon.toml      # postinst won't clobber an existing file
+sudo dpkg-reconfigure otzi-headless
+```
 
 ## File layout
 
@@ -127,10 +99,14 @@ Logs: `journalctl -u otzi -f`.
 | `/usr/bin/otzi` | CLI wrapper | root:root 755 |
 | `/usr/lib/otzi/entrypoint.mjs` | esbuild bundle | root:root 644 |
 | `/lib/systemd/system/otzi.service` | systemd unit | root:root 644 |
+| `/etc/otzi/` | config dir (setgid; group otzi can edit) | root:otzi 2770 |
 | `/etc/otzi/daemon.toml` | rendered config (preserved across upgrades) | root:otzi 640 |
-| `/var/lib/otzi/identity.json` | ECDH identity | otzi:otzi 600 |
-| `/var/lib/otzi/pubkeys.json` | pubkey book from bootstrap | otzi:otzi 600 |
+| `/var/lib/otzi/` | data dir (setgid; group otzi can write) | root:otzi 2770 |
+| `/var/lib/otzi/identity.json` | ECDH identity | written 660 |
+| `/var/lib/otzi/pubkeys.json` | pubkey book from bootstrap | otzi:otzi 644 |
 | `/var/lib/otzi/share.json` | encrypted DKG share | otzi:otzi 600 |
+| `/var/lib/otzi/bootstrap-secret` | shared passphrase, wiped after DKG | root:otzi 660 |
+| `/var/run/otzi/otzi.sock` | UDS socket for operator CLI | otzi:otzi 660 |
 
 ## Uninstall
 
