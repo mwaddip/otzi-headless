@@ -17,11 +17,10 @@ The page loads with no network calls beyond `localhost`. All dependencies (preac
 
 ## Workflow
 
-1. Switch to **Headless** mode (default; **Full** mode is reserved for v2).
-2. Fill in **Meta** (project name, description, icon).
-3. Add **Contracts** — pick a key, label, address, and either a shorthand ABI (`OP_20` / `OP_20S` / `OP_721`) or paste a custom `AbiEntry[]` array.
-4. Add **Operations** — pick a contract + method, then add params with types, scaling, sources.
-5. Click **Download .otzi.json**. The button is disabled while validation errors exist.
+1. Fill in **Meta** (project name, description).
+2. Add **Contracts** — pick a key, label, address, and either a shorthand ABI (`OP_20` / `OP_20S` / `OP_721`) or paste a custom `AbiEntry[]` array.
+3. Add **Operations** — pick a contract + method, then add params with types, scaling, sources.
+4. Click **Download .otzi.json**. The button is disabled while validation errors exist.
 
 To edit an existing manifest: click **Load .otzi.json** at the top of the sidebar.
 
@@ -31,26 +30,6 @@ To edit an existing manifest: click **Load .otzi.json** at the top of the sideba
 - `Param.source: contract:<key>` resolves from `contracts[key].address` in the manifest itself, not from a separate Ötzi settings store.
 
 The full v2 schema is at [`schema.json`](./schema.json), mirrored byte-equal from [`docs/otzi-manifest-schema.json`](../../docs/otzi-manifest-schema.json).
-
-## Headless vs Full mode
-
-The builder ships primarily for otzi-headless. Full mode is a forward-looking export path for when the same builder gets adopted by Ötzi's React UI repo.
-
-| Section / Field | Headless | Full (v2) |
-|---|---|---|
-| `Meta.name`, `Meta.description` | ✓ | ✓ |
-| `Meta.icon` | hidden | ✓ |
-| `Contracts.{key, label, address, abi}` | ✓ | ✓ |
-| `Operation.{id, label, description, contract, method}` | ✓ | ✓ |
-| `Operation.confirm` | hidden | ✓ |
-| `Operation.condition`, `Operation.ownerOnly` | hidden | ✓ |
-| `Param.{name, type, scale}` | ✓ | ✓ |
-| `Param.source` (`contract:` / `setting:`) | ✓ | ✓ |
-| `Param.source: read:` | hidden | ✓ |
-| `Param.label`, `Param.placeholder`, `Param.options` | hidden | ✓ |
-| `reads`, `status`, `theme` sections | greyed | ✓ |
-
-Output JSON is schema-valid in both modes — Headless strips fields that have no headless-CLI use (UI cosmetics, polling-dependent values, dynamic dropdowns).
 
 ## Development
 

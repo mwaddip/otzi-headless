@@ -9,14 +9,13 @@ import { slugify } from './slugify.js';
 const html = htm.bind(h);
 
 const state = signal(emptyManifest());
-const mode = signal('headless'); // 'headless' | 'full'
 const activeSection = signal('meta');
 const schema = signal(schemaData);
 const banner = signal(null);
 
 const validation = computed(() => {
   if (!schema.value) return { errors: [], warnings: [] };
-  return validateManifest(state.value, mode.value, schema.value);
+  return validateManifest(state.value, schema.value);
 });
 
 const errorsBySection = computed(() => {
@@ -42,7 +41,7 @@ function loadFile(file) {
         banner.value = { kind: 'error', text: 'Schema not loaded yet — try again.' };
         return;
       }
-      const r = validateManifest(parsed, mode.value, schema.value);
+      const r = validateManifest(parsed, schema.value);
       if (r.errors.length > 0) {
         banner.value = { kind: 'error', text: `Invalid manifest: ${r.errors[0].message} at ${r.errors[0].path || '<root>'}` };
         return;
@@ -58,7 +57,7 @@ function loadFile(file) {
 
 function exportFile() {
   if (validation.value.errors.length > 0) return;
-  const out = exportManifest(state.value, mode.value);
+  const out = exportManifest(state.value);
   const json = JSON.stringify(out, null, 2);
   const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -75,33 +74,22 @@ function Sidebar() {
     contracts: Object.keys(state.value.contracts).length,
     operations: state.value.operations.length,
   };
-  const sectionItem = (key, label, count, errCount, disabled) => html`
+  const sectionItem = (key, label, count, errCount) => html`
     <button
-      class=${`nav-item ${activeSection.value === key ? 'active' : ''} ${disabled ? 'disabled' : ''}`}
-      onClick=${() => !disabled && (activeSection.value = key)}
-      disabled=${disabled}>
+      class=${`nav-item ${activeSection.value === key ? 'active' : ''}`}
+      onClick=${() => (activeSection.value = key)}>
       ${label}${count != null ? ` (${count})` : ''}${errCount > 0 ? html`<span class="err-badge">⚠ ${errCount}</span>` : null}
     </button>`;
-  const fullDisabled = mode.value === 'headless';
   return html`
     <aside class="sidebar">
-      <div class="mode">
-        <label><input type="radio" name="mode" checked=${mode.value === 'headless'}
-          onChange=${() => (mode.value = 'headless')}/> Headless</label>
-        <label><input type="radio" name="mode" checked=${mode.value === 'full'}
-          onChange=${() => (mode.value = 'full')}/> Full</label>
-      </div>
       <label class="load-btn">
         Load .otzi.json
         <input type="file" accept=".json" onChange=${(e) => e.target.files[0] && loadFile(e.target.files[0])}/>
       </label>
       <hr/>
-      ${sectionItem('meta', 'Meta', null, errs.meta, false)}
-      ${sectionItem('contracts', 'Contracts', counts.contracts, errs.contracts, false)}
-      ${sectionItem('operations', 'Operations', counts.operations, errs.operations, false)}
-      ${sectionItem('reads', 'Reads', null, 0, fullDisabled)}
-      ${sectionItem('status', 'Status', null, 0, fullDisabled)}
-      ${sectionItem('theme', 'Theme', null, 0, fullDisabled)}
+      ${sectionItem('meta', 'Meta', null, errs.meta)}
+      ${sectionItem('contracts', 'Contracts', counts.contracts, errs.contracts)}
+      ${sectionItem('operations', 'Operations', counts.operations, errs.operations)}
     </aside>`;
 }
 
@@ -123,7 +111,6 @@ function FieldErrors({ path }) {
 }
 
 function MetaSection() {
-  const isFull = mode.value === 'full';
   return html`
     <section>
       <h2>Project metadata</h2>
@@ -131,10 +118,6 @@ function MetaSection() {
         onInput=${(e) => update((s) => ({ ...s, name: e.target.value }))}/></label>
       <label>Description <input value=${state.value.description ?? ''}
         onInput=${(e) => update((s) => ({ ...s, description: e.target.value }))}/></label>
-      ${isFull ? html`
-        <label>Icon URL <input value=${state.value.icon ?? ''}
-          onInput=${(e) => update((s) => ({ ...s, icon: e.target.value }))}/></label>
-      ` : null}
     </section>`;
 }
 
@@ -198,17 +181,12 @@ function ParamCard({ opIndex, paramIndex, param }) {
     ops[opIndex] = op;
     return { ...s, operations: ops };
   });
-  const isFull = mode.value === 'full';
   return html`
     <div class="param-card">
       <label>Name <input value=${param.name} onInput=${(e) => setParam((p) => ({ ...p, name: e.target.value }))}/></label>
       <label>Type <select value=${param.type} onChange=${(e) => setParam((p) => ({ ...p, type: e.target.value }))}>
         <option>uint256</option><option>address</option><option>bool</option><option>bytes</option>
       </select></label>
-      ${isFull ? html`
-        <label>Label <input value=${param.label ?? ''} onInput=${(e) => setParam((p) => ({ ...p, label: e.target.value }))}/></label>
-        <label>Placeholder <input value=${param.placeholder ?? ''} onInput=${(e) => setParam((p) => ({ ...p, placeholder: e.target.value }))}/></label>
-      ` : null}
       <label>Scale <input type="number" value=${param.scale ?? ''} onInput=${(e) => setParam((p) => ({ ...p, scale: e.target.value === '' ? undefined : Number(e.target.value) }))}/></label>
       <label>Source <input value=${param.source ?? ''} placeholder="contract:foo or setting:bar"
         onInput=${(e) => setParam((p) => ({ ...p, source: e.target.value || undefined }))}/></label>
@@ -226,16 +204,12 @@ function OperationCard({ index, op }) {
   const methods = op.contract && op.contract !== '$dynamic' && state.value.contracts[op.contract]
     ? resolveAbiMethods(state.value.contracts[op.contract].abi)
     : [];
-  const isFull = mode.value === 'full';
   return html`
     <div class="card">
       <header><strong>${op.id || '(unnamed)'}</strong> — ${op.label || ''}</header>
       <label>ID <input value=${op.id} onInput=${(e) => setOp((o) => ({ ...o, id: e.target.value }))}/></label>
       <label>Label <input value=${op.label} onInput=${(e) => setOp((o) => ({ ...o, label: e.target.value }))}/></label>
       <label>Description <input value=${op.description ?? ''} onInput=${(e) => setOp((o) => ({ ...o, description: e.target.value }))}/></label>
-      ${isFull ? html`
-        <label>Confirm prompt <input value=${op.confirm ?? ''} onInput=${(e) => setOp((o) => ({ ...o, confirm: e.target.value }))}/></label>
-      ` : null}
       <label>Contract <select value=${op.contract} onChange=${(e) => setOp((o) => ({ ...o, contract: e.target.value }))}>
         <option value="">(pick)</option>
         ${contractKeys.map((k) => html`<option>${k}</option>`)}
@@ -277,7 +251,6 @@ function App() {
     case 'meta': body = html`<${MetaSection}/>`; break;
     case 'contracts': body = html`<${ContractsSection}/>`; break;
     case 'operations': body = html`<${OperationsSection}/>`; break;
-    default: body = html`<section><p class="hint">Full mode — coming in v2.</p></section>`;
   }
   return html`
     <div class="layout">

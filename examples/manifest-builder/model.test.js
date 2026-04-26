@@ -86,7 +86,7 @@ describe('exportManifest', () => {
       version: 2, name: 'x', description: '', icon: '',
       contracts: {}, operations: [], reads: {}, status: [],
     };
-    const out = exportManifest(m, 'headless');
+    const out = exportManifest(m);
     expect(out).not.toHaveProperty('description');
     expect(out).not.toHaveProperty('icon');
     expect(out).not.toHaveProperty('reads');
@@ -98,11 +98,11 @@ describe('exportManifest', () => {
       version: 2, name: 'x', description: 'desc',
       contracts: {}, operations: [],
     };
-    const out = exportManifest(m, 'headless');
+    const out = exportManifest(m);
     expect(out.description).toBe('desc');
   });
 
-  it('omits Operation.confirm, condition, ownerOnly in headless mode', () => {
+  it('omits Operation.confirm, condition, ownerOnly', () => {
     const m = {
       version: 2, name: 'x',
       contracts: {},
@@ -111,28 +111,13 @@ describe('exportManifest', () => {
         confirm: 'Sure?', condition: { read: 'x', eq: 1 }, ownerOnly: true,
       }],
     };
-    const out = exportManifest(m, 'headless');
+    const out = exportManifest(m);
     expect(out.operations[0]).not.toHaveProperty('confirm');
     expect(out.operations[0]).not.toHaveProperty('condition');
     expect(out.operations[0]).not.toHaveProperty('ownerOnly');
   });
 
-  it('preserves Operation.confirm, condition, ownerOnly in full mode', () => {
-    const m = {
-      version: 2, name: 'x',
-      contracts: {},
-      operations: [{
-        id: 'op1', label: 'Op', contract: 'c', method: 'm', params: [],
-        confirm: 'Sure?', condition: { read: 'x', eq: 1 }, ownerOnly: true,
-      }],
-    };
-    const out = exportManifest(m, 'full');
-    expect(out.operations[0].confirm).toBe('Sure?');
-    expect(out.operations[0].condition).toEqual({ read: 'x', eq: 1 });
-    expect(out.operations[0].ownerOnly).toBe(true);
-  });
-
-  it('omits Param.label, placeholder, options in headless mode', () => {
+  it('omits Param.label, placeholder, options', () => {
     const m = {
       version: 2, name: 'x', contracts: {},
       operations: [{
@@ -144,49 +129,22 @@ describe('exportManifest', () => {
         }],
       }],
     };
-    const out = exportManifest(m, 'headless');
+    const out = exportManifest(m);
     expect(out.operations[0].params[0]).not.toHaveProperty('label');
     expect(out.operations[0].params[0]).not.toHaveProperty('placeholder');
     expect(out.operations[0].params[0]).not.toHaveProperty('options');
   });
 
-  it('preserves Param.label, placeholder, options in full mode', () => {
-    const m = {
-      version: 2, name: 'x', contracts: {},
-      operations: [{
-        id: 'op1', label: 'Op', contract: 'c', method: 'm',
-        params: [{
-          name: 'p', type: 'uint256',
-          label: 'Amount', placeholder: 'e.g. 100',
-          options: { count: { contract: 'c', method: 'count' }, item: { contract: 'c', method: 'at' } },
-        }],
-      }],
-    };
-    const out = exportManifest(m, 'full');
-    expect(out.operations[0].params[0].label).toBe('Amount');
-    expect(out.operations[0].params[0].placeholder).toBe('e.g. 100');
-    expect(out.operations[0].params[0].options).toBeDefined();
-  });
-
-  it('omits Meta.icon in headless mode', () => {
+  it('omits Meta.icon', () => {
     const m = {
       version: 2, name: 'x', icon: 'https://example.com/icon.png',
       contracts: {}, operations: [],
     };
-    const out = exportManifest(m, 'headless');
+    const out = exportManifest(m);
     expect(out).not.toHaveProperty('icon');
   });
 
-  it('preserves Meta.icon in full mode', () => {
-    const m = {
-      version: 2, name: 'x', icon: 'https://example.com/icon.png',
-      contracts: {}, operations: [],
-    };
-    const out = exportManifest(m, 'full');
-    expect(out.icon).toBe('https://example.com/icon.png');
-  });
-
-  it('omits Param.source: read: in headless mode', () => {
+  it('omits Param.source: read:', () => {
     const m = {
       version: 2, name: 'x', contracts: {},
       operations: [{
@@ -194,7 +152,7 @@ describe('exportManifest', () => {
         params: [{ name: 'p', type: 'uint256', source: 'read:foo' }],
       }],
     };
-    const out = exportManifest(m, 'headless');
+    const out = exportManifest(m);
     expect(out.operations[0].params[0]).not.toHaveProperty('source');
   });
 });

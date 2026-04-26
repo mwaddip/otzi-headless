@@ -9,7 +9,6 @@ export function emptyManifest() {
     version: 2,
     name: '',
     description: '',
-    icon: '',
     contracts: {},
     operations: [],
   };
@@ -48,54 +47,35 @@ export function renameContractKey(manifest, oldKey, newKey) {
   return { ...manifest, contracts: nextContracts, operations: nextOps };
 }
 
-function stripOperation(op, mode) {
+function stripOperation(op) {
   const out = {
     id: op.id, label: op.label, contract: op.contract, method: op.method,
-    params: (op.params ?? []).map((p) => stripParam(p, mode)),
+    params: (op.params ?? []).map((p) => stripParam(p)),
   };
   if (op.description) out.description = op.description;
-  if (mode === 'full') {
-    if (op.confirm) out.confirm = op.confirm;
-    if (op.condition !== undefined) out.condition = op.condition;
-    if (op.ownerOnly) out.ownerOnly = op.ownerOnly;
-  }
   return out;
 }
 
-function stripParam(p, mode) {
+function stripParam(p) {
   const out = { name: p.name, type: p.type };
   if (typeof p.scale === 'number') out.scale = p.scale;
-  if (mode === 'full') {
-    if (p.label) out.label = p.label;
-    if (p.placeholder) out.placeholder = p.placeholder;
-    if (p.options) out.options = p.options;
-  }
-  if (p.source) {
-    if (mode === 'headless' && p.source.startsWith('read:')) {
-      // omit — read: requires reads polling, not supported in headless.
-    } else {
-      out.source = p.source;
-    }
+  if (p.source && !p.source.startsWith('read:')) {
+    // read: sources require reads polling, not supported headless — omit.
+    out.source = p.source;
   }
   return out;
 }
 
-export function exportManifest(manifest, mode) {
+export function exportManifest(manifest) {
   const out = {
     version: manifest.version,
     name: manifest.name,
     contracts: {},
-    operations: (manifest.operations ?? []).map((op) => stripOperation(op, mode)),
+    operations: (manifest.operations ?? []).map((op) => stripOperation(op)),
   };
   if (manifest.description) out.description = manifest.description;
   for (const [k, v] of Object.entries(manifest.contracts ?? {})) {
     out.contracts[k] = { label: v.label, abi: v.abi, address: v.address };
-  }
-  if (mode === 'full') {
-    if (manifest.icon) out.icon = manifest.icon;
-    if (manifest.theme) out.theme = manifest.theme;
-    if (manifest.reads && Object.keys(manifest.reads).length > 0) out.reads = manifest.reads;
-    if (Array.isArray(manifest.status) && manifest.status.length > 0) out.status = manifest.status;
   }
   return out;
 }

@@ -81,7 +81,7 @@ function crossFieldErrors(manifest) {
   return { errors, warnings };
 }
 
-export function validateManifest(manifest, mode, schema) {
+export function validateManifest(manifest, schema) {
   const errors = schemaErrors(manifest, schema);
   const cross = crossFieldErrors(manifest);
   return {
