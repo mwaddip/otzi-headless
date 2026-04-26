@@ -44,11 +44,31 @@ export interface VaultPubkeyFileInputs {
   outputPath?: string;
 }
 
+/**
+ * Pure derivation: same `btcAddress` + `opnetAddress` that
+ * `writeVaultPubkeyFile` would write. Used by the daemon's HTTP layer to
+ * include the addresses in the `dkg-combined` response without writing
+ * anything to disk.
+ */
+export function deriveVaultAddresses(
+  network: NetworkName,
+  frostUntweakedPubKey: Uint8Array,
+  mldsaPubKey: Uint8Array,
+): { btcAddress: string; opnetAddress: string } {
+  return {
+    btcAddress: deriveBtcAddressForNetwork(frostUntweakedPubKey, network),
+    opnetAddress: '0x' + toHex(sha256(mldsaPubKey)),
+  };
+}
+
 export async function writeVaultPubkeyFile(input: VaultPubkeyFileInputs): Promise<void> {
   const path = input.outputPath ?? resolveVaultPubkeyPath();
 
-  const btcAddress = deriveBtcAddress(input.frostUntweakedPubKey, input.network);
-  const opnetAddress = '0x' + toHex(sha256(input.mldsaPubKey));
+  const { btcAddress, opnetAddress } = deriveVaultAddresses(
+    input.network,
+    input.frostUntweakedPubKey,
+    input.mldsaPubKey,
+  );
 
   const payload = {
     network: input.network,
@@ -63,7 +83,7 @@ export async function writeVaultPubkeyFile(input: VaultPubkeyFileInputs): Promis
   await writeFile(path, JSON.stringify(payload, null, 2), { mode: 0o644 });
 }
 
-function deriveBtcAddress(untweakedPubKey: Uint8Array, network: NetworkName): string {
+function deriveBtcAddressForNetwork(untweakedPubKey: Uint8Array, network: NetworkName): string {
   if (network === 'regtest') {
     const internalXOnly = toXOnly(Buffer.from(untweakedPubKey) as never);
     const addr = payments.p2tr({

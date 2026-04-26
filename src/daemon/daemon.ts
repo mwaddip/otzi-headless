@@ -47,6 +47,8 @@ import { toHex } from '../wire/hex';
 import { fromHex } from '../wire/hex';
 import type { LoadedDaemonState } from './config-merge';
 import { GateRejection, LeaderDispatcher } from './leader';
+import { deriveVaultAddresses } from './vault-pubkey';
+import type { NetworkName } from '../config/types';
 
 export interface DaemonDeps {
   state: LoadedDaemonState;
@@ -160,7 +162,9 @@ export class Daemon {
       logger: this.log,
     });
 
-    const httpHandler = deps.httpHandler ?? buildDefaultHttpHandler(this.leader, this.log);
+    const httpHandler =
+      deps.httpHandler
+      ?? buildDefaultHttpHandler(this.leader, configNetwork, this.log);
     this.triggers = buildTriggers(deps.state.config.triggers, httpHandler, deps.cronHandlers, this.log);
   }
 
@@ -260,6 +264,7 @@ function optionalStringParam(
 
 export function buildDefaultHttpHandler(
   leader: LeaderDispatcher,
+  network: NetworkName,
   logger: Logger = NOOP_LOGGER,
 ): HttpHandler {
   return async (req: HttpRequest): Promise<HttpResponse> => {
@@ -283,6 +288,16 @@ export function buildDefaultHttpHandler(
             parties: requireNumber(b, 'parties'),
             level: requireNumber(b, 'level'),
           });
+          // Compute the operator-facing addresses on the fly so the response
+          // matches what `otzi generate` will print AND what
+          // /var/lib/otzi/vault-pubkey.json will hold post-restart. Failure
+          // (e.g. invalid pubkey on a corrupted DKG output) is surfaced as a
+          // 500 — the DKG itself succeeded, but the operator can't proceed.
+          const { btcAddress, opnetAddress } = deriveVaultAddresses(
+            network,
+            result.frost.keyPackage.untweakedVerifyingKey,
+            result.mldsa.publicKey,
+          );
           return {
             status: 200,
             body: {
@@ -290,6 +305,9 @@ export function buildDefaultHttpHandler(
               status: 'done',
               mldsaPublicKeyHex: toHex(result.mldsa.publicKey),
               frostVerifyingKeyHex: toHex(result.frost.publicKeyPackage.verifyingKey),
+              btcAddress,
+              opnetAddress,
+              network,
             },
           };
         }

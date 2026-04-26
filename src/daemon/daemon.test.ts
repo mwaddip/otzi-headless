@@ -213,11 +213,17 @@ describe('Daemon — HTTP-driven DKG end-to-end', () => {
         status: string;
         mldsaPublicKeyHex: string;
         frostVerifyingKeyHex: string;
+        btcAddress: string;
+        opnetAddress: string;
+        network: string;
       };
       expect(json.ceremonyId).toBe(ceremonyId);
       expect(json.status).toBe('done');
       expect(json.mldsaPublicKeyHex.length).toBeGreaterThan(0);
       expect(json.frostVerifyingKeyHex.length).toBe(66); // 33B compressed secp → 66 hex
+      expect(json.btcAddress.length).toBeGreaterThan(0);
+      expect(json.opnetAddress).toMatch(/^0x[0-9a-f]{64}$/);
+      expect(['mainnet', 'testnet', 'regtest']).toContain(json.network);
     } finally {
       for (const d of daemons) await d.stop();
     }
