@@ -88,7 +88,6 @@ Byte-for-byte compatible surface (port carefully, verify against Ötzi):
 - **Wire format** — DKG and signing-round blob encoding. See `~/projects/otzi/src/lib/dkg.ts` (Phase 3+4 checksums live here) and the ceremony components.
 - **Crypto primitives** — `@mwaddip/frots` (pure TS FROST, at `~/projects/frots`), `@btc-vision/post-quantum` (ML-DSA; Ötzi vendors it at `vendor/post-quantum/`).
 - **Relay client** — `~/projects/otzi/src/lib/relay.ts` is clean, class-based, event-emitter-style. Largely reusable as-is.
-- **Manifest schema** — `~/projects/otzi/docs/otzi-manifest-schema.json`.
 - **Broadcast adapters** — `backend/src/routes/btc.ts` (BTC vault) and `tx.ts` (OPNet contract sighash/broadcast) are already non-UI. `backend/src/lib/frost-psbt-signer.ts` and `backend/src/lib/threshold-signer.ts` are already headless.
 
 ## What to Rewrite (Not Port)
@@ -111,7 +110,6 @@ Useful during the port:
 - `backend/src/routes/btc.ts` — BTC prepare/broadcast (adapt).
 - `backend/src/routes/tx.ts` — OPNet contract sighash/broadcast + ABI resolution (adapt).
 - `docs/signing-flows.md` — documented ceremony flows.
-- `docs/otzi-manifest-schema.json` — manifest format.
 
 ## Identity Model
 

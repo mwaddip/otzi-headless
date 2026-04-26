@@ -45,7 +45,6 @@ Full vendored copy of `@btc-vision/post-quantum` (ML-DSA, Threshold ML-DSA, ML-K
 ### `docs/`
 
 - `signing-flows.md` — documented ceremony flows (reference).
-- `otzi-manifest-schema.json` — manifest JSON schema (reference).
 
 ### Scaffold
 

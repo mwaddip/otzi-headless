@@ -299,7 +299,6 @@
 - None; these are data-processing helpers.
 
 **Invariants:**
-- Manifest schema is the canonical reference (not docs/otzi-manifest-schema.json).
 - Condition evaluation is boolean-complete; no short-circuit side effects.
 
 **Cross-component contracts:**
