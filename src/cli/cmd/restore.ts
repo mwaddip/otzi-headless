@@ -50,7 +50,6 @@ import {
   BACKUP_MAGIC_LEN,
   BACKUP_PBKDF2_ITERATIONS,
   BACKUP_SALT_LEN,
-  BACKUP_TAG_LEN,
   DEFAULT_IDENTITY_PATH,
   DEFAULT_PUBKEY_BOOK_PATH,
   stripLeadingSlash,
@@ -185,15 +184,29 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
     throw new Error('not an otzi backup archive (magic mismatch)');
   }
   const magicBytes = buf.subarray(0, BACKUP_MAGIC_LEN);
-  // Magic is NUL-padded ASCII; trim trailing NULs before comparing.
-  const magicStr = magicBytes.toString('ascii').replace(/\0+$/, '');
-  if (magicStr !== BACKUP_MAGIC) {
+  // Magic is exactly BACKUP_MAGIC ('OTZI-BACKUP-V1') followed by NUL padding
+  // out to BACKUP_MAGIC_LEN. Compare the prefix directly, then enforce that
+  // the remaining bytes are all NUL (defends against future format-versioning
+  // ambiguity — e.g. a hypothetical 'OTZI-BACKUP-V1XXX' should be rejected,
+  // not silently treated as V1).
+  const expectedMagic = Buffer.from(BACKUP_MAGIC, 'ascii');
+  const actualPrefix = magicBytes.subarray(0, expectedMagic.length);
+  if (!actualPrefix.equals(expectedMagic)) {
     throw new Error('not an otzi backup archive (magic mismatch)');
+  }
+  for (let i = expectedMagic.length; i < BACKUP_MAGIC_LEN; i++) {
+    if (magicBytes[i] !== 0) {
+      throw new Error('not an otzi backup archive (magic mismatch)');
+    }
   }
 
   // --- Pre-flight check 2: refuse if /etc/otzi/daemon.toml exists.
   if (await configExists()) {
-    throw new Error('config already present at /etc/otzi/daemon.toml; remove it first');
+    const configPath =
+      root === '/'
+        ? '/etc/otzi/daemon.toml'
+        : join(root, 'etc/otzi/daemon.toml');
+    throw new Error(`config already present at ${configPath}; remove it first`);
   }
 
   // --- Pre-flight check 3: refuse if daemon is running.
@@ -215,10 +228,6 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
     BACKUP_HEADER_LEN,
   );
   const ciphertext = buf.subarray(BACKUP_HEADER_LEN);
-  if (tag.length !== BACKUP_TAG_LEN) {
-    // Should be impossible given the length check above, but defense in depth.
-    throw new Error('not an otzi backup archive (magic mismatch)');
-  }
 
   const key = pbkdf2Sync(
     Buffer.from(password, 'utf8'),
@@ -321,36 +330,65 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
     }
 
     // --- Categorize entries → real path + mode.
+    // Track every real-path file we've placed so we can roll them back if a
+    // later iteration throws. Without this, a partial restore would leave
+    // host paths under /etc/otzi and /var/lib/otzi half-populated — which
+    // contradicts the "atomic-ish" guarantee the operator banner promises.
+    // We deliberately do NOT track or remove parent directories: they may
+    // have existed before restore (postinst sets them up), and mkdir with
+    // recursive:true is idempotent — undoing it can't be done safely.
     restoredFiles = [];
-    for (const entryPath of entryPaths) {
-      // tar emits both directory and file entries; skip directories (paths
-      // ending in '/').
-      if (entryPath.endsWith('/')) continue;
-      // Normalize the in-archive path: strip any leading '/' (defense in
-      // depth — tar already strips, but the entryPath here might still
-      // have one if preservePaths were ever flipped on).
-      const normalized = stripLeadingSlash(entryPath);
-      if (normalized === META_TAR_PATH) continue; // never write meta.json
+    const placedPaths: string[] = [];
+    try {
+      for (const entryPath of entryPaths) {
+        // tar emits both directory and file entries; skip directories (paths
+        // ending in '/').
+        if (entryPath.endsWith('/')) continue;
+        // Normalize the in-archive path: strip any leading '/' (defense in
+        // depth — tar already strips, but the entryPath here might still
+        // have one if preservePaths were ever flipped on).
+        const normalized = stripLeadingSlash(entryPath);
+        if (normalized === META_TAR_PATH) continue; // never write meta.json
 
-      // Mode lookup precedence: dynamic (from daemon.toml) → fixed table.
-      // Unknown entries (operator-injected mystery files) fall back to
-      // SHARE_MODE (0o600) — most-restrictive default.
-      const mode =
-        dynamicModes.get(normalized) ?? FIXED_FILE_MODES[normalized] ?? SHARE_MODE;
-      const stagedSrc = join(stageDir, normalized);
-      const realDest = resolve(root, normalized);
+        // Mode lookup precedence: dynamic (from daemon.toml) → fixed table.
+        // Unknown entries (operator-injected mystery files) fall back to
+        // SHARE_MODE (0o600) — most-restrictive default.
+        const mode =
+          dynamicModes.get(normalized) ?? FIXED_FILE_MODES[normalized] ?? SHARE_MODE;
+        const stagedSrc = join(stageDir, normalized);
+        const realDest = resolve(root, normalized);
 
-      // Move staged → real path. Use rename within same FS where possible;
-      // fall back to copy+remove. Since stageDir is in os.tmpdir() and real
-      // dests are in /etc and /var, rename will usually fail (cross-device).
-      // Always copy via readFile/writeFile to avoid that failure mode.
-      const fileBuf = await readFile(stagedSrc);
-      await mkdir(dirname(realDest), { recursive: true });
-      await writeFile(realDest, fileBuf, { mode });
-      // writeFile honors umask; chmod again to set the mode unconditionally.
-      await chmod(realDest, mode);
+        // Move staged → real path. Use rename within same FS where possible;
+        // fall back to copy+remove. Since stageDir is in os.tmpdir() and real
+        // dests are in /etc and /var, rename will usually fail (cross-device).
+        // Always copy via readFile/writeFile to avoid that failure mode.
+        const fileBuf = await readFile(stagedSrc);
+        await mkdir(dirname(realDest), { recursive: true });
+        await writeFile(realDest, fileBuf, { mode });
+        placedPaths.push(realDest);
+        // writeFile honors umask; chmod again to set the mode unconditionally.
+        await chmod(realDest, mode);
 
-      restoredFiles.push({ path: realDest, mode });
+        restoredFiles.push({ path: realDest, mode });
+      }
+    } catch (err) {
+      // Best-effort rollback: remove every file we placed so the host is
+      // left in the same state it was in before this call. Reverse order is
+      // cosmetic (matches the order we'd have unwound a stack), not
+      // load-bearing — files are independent. Individual rm failures are
+      // swallowed so a transient unlink error can't shadow the original
+      // cause the caller actually needs to see.
+      console.error(
+        `otzi restore: placement failed; rolling back ${placedPaths.length} file(s) already placed`,
+      );
+      for (const p of [...placedPaths].reverse()) {
+        try {
+          await rm(p, { force: true });
+        } catch {
+          // Swallow — the original error is what the caller needs.
+        }
+      }
+      throw err;
     }
   } finally {
     await rm(stageDir, { recursive: true, force: true });

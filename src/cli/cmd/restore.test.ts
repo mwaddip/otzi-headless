@@ -360,7 +360,7 @@ describe('runRestore', () => {
     ).rejects.toThrow('not an otzi backup archive (magic mismatch)');
   });
 
-  it('refuses to restore over an existing daemon.toml', async () => {
+  it('refuses to restore over an existing daemon.toml (rootOverride: error message names the override-prefixed path)', async () => {
     const backupRoot = join(tmp, 'src');
     const f = await buildBackupFixture(backupRoot);
     const backup = await runBackup({
@@ -373,15 +373,42 @@ describe('runRestore', () => {
       },
     });
 
+    const dstRoot = join(tmp, 'dst');
+    const expectedConfigPath = join(dstRoot, 'etc/otzi/daemon.toml');
     await expect(
       runRestore({
         archivePath: backup.path,
         password: backup.password,
-        rootOverride: join(tmp, 'dst'),
+        rootOverride: dstRoot,
         configExistsCheck: () => Promise.resolve(true),
         daemonStatusCheck: NEVER_RUNNING,
       }),
-    ).rejects.toThrow('config already present at /etc/otzi/daemon.toml; remove it first');
+    ).rejects.toThrow(
+      `config already present at ${expectedConfigPath}; remove it first`,
+    );
+  });
+
+  it('refuses to restore over an existing daemon.toml (production default path: no rootOverride)', async () => {
+    // No rootOverride → root === '/' → error message uses the canonical
+    // production path. Uses a stub archive that passes the magic check and
+    // a configExistsCheck that asserts true — we never reach the decryption
+    // path.
+    const fakeArchive = join(tmp, 'fake.otzi-backup');
+    const buf = Buffer.alloc(BACKUP_HEADER_LEN + 16, 0);
+    buf.write('OTZI-BACKUP-V1', 0, 'ascii');
+    await writeFile(fakeArchive, buf);
+
+    await expect(
+      runRestore({
+        archivePath: fakeArchive,
+        password: 'whatever',
+        // NO rootOverride — exercise the production code path.
+        configExistsCheck: () => Promise.resolve(true),
+        daemonStatusCheck: NEVER_RUNNING,
+      }),
+    ).rejects.toThrow(
+      'config already present at /etc/otzi/daemon.toml; remove it first',
+    );
   });
 
   it('refuses to restore while the daemon is running', async () => {
@@ -550,6 +577,76 @@ describe('runRestore', () => {
     expect(result.metaPartyId).toBe(7);
   });
 
+  it('atomicity (I-1): a placement failure mid-loop rolls back files placed before the failure', async () => {
+    // Build a real archive, then arrange for a mid-loop placement to throw
+    // by pre-creating one of the destination paths as a DIRECTORY. writeFile
+    // against an existing directory yields EISDIR, which propagates out of
+    // the placement loop and triggers the rollback path.
+    //
+    // The first file the loop tries to place is `etc/otzi/daemon.toml`
+    // (by tar entry order — see backup.ts fileSet). The second is
+    // `etc/otzi/manifest.otzi.json`. Sabotage the second to fail; assert
+    // that the first was rolled back (no file at `<restoreRoot>/etc/otzi/
+    // daemon.toml`) and that NO files anywhere under restoreRoot survive.
+    const backupRoot = join(tmp, 'src');
+    const f = await buildBackupFixture(backupRoot);
+    const backup = await runBackup({
+      configPath: f.configPath,
+      outputDir: join(tmp, 'archive'),
+      pathOverrides: {
+        manifest: f.manifestPath,
+        vaultPubkey: f.vaultPubkeyPath,
+        bootstrapSecret: f.bootstrapSecretPath,
+      },
+    });
+
+    const restoreRoot = join(tmp, 'dst-rollback');
+    // Pre-create the manifest *path* as a directory so writeFile() will
+    // throw EISDIR when the loop reaches it.
+    const sabotagePath = join(restoreRoot, 'etc/otzi/manifest.otzi.json');
+    await mkdir(sabotagePath, { recursive: true });
+
+    const daemonTomlDest = join(restoreRoot, 'etc/otzi/daemon.toml');
+
+    await expect(
+      runRestore({
+        archivePath: backup.path,
+        password: backup.password,
+        rootOverride: restoreRoot,
+        configExistsCheck: NEVER_EXISTS,
+        daemonStatusCheck: NEVER_RUNNING,
+      }),
+    ).rejects.toThrow(/EISDIR|illegal operation on a directory/);
+
+    // The file placed BEFORE the failure (daemon.toml) must NOT exist after
+    // rollback. This is the load-bearing assertion: if rollback is broken,
+    // daemon.toml will still be on disk.
+    expect(await pathExists(daemonTomlDest)).toBe(false);
+
+    // The sabotage directory itself should remain (it predates the call —
+    // we don't touch parent directories).
+    expect(await pathExists(sabotagePath)).toBe(true);
+
+    // No other restored files should survive either. Walk the var-tree
+    // dest paths the fixture would have produced.
+    const shareRel = f.sharePath.startsWith('/') ? f.sharePath.slice(1) : f.sharePath;
+    const identityRel = f.identityPath.startsWith('/')
+      ? f.identityPath.slice(1)
+      : f.identityPath;
+    const pubkeysRel = f.pubkeyBookPath.startsWith('/')
+      ? f.pubkeyBookPath.slice(1)
+      : f.pubkeyBookPath;
+    expect(await pathExists(resolve(restoreRoot, shareRel))).toBe(false);
+    expect(await pathExists(resolve(restoreRoot, identityRel))).toBe(false);
+    expect(await pathExists(resolve(restoreRoot, pubkeysRel))).toBe(false);
+    expect(
+      await pathExists(resolve(restoreRoot, 'var/lib/otzi/vault-pubkey.json')),
+    ).toBe(false);
+    expect(
+      await pathExists(resolve(restoreRoot, 'var/lib/otzi/bootstrap-secret')),
+    ).toBe(false);
+  });
+
   it('magic mismatch error fires before pre-flight checks against existing config (cheap precheck order)', async () => {
     // Both pre-flight checks would refuse — but magic check should run
     // first to give the clearest error to the operator.
@@ -608,6 +705,32 @@ describe('magic byte boundary', () => {
     const buf = Buffer.alloc(BACKUP_HEADER_LEN + 16, 0);
     // 'OTZI-BACKUP-V1' is 14 chars; write 'OTZI-BACKUP-V1XXXXXX' (corrupted).
     buf.write('OTZI-BACKUP-V1XX', 0, 'ascii');
+    await writeFile(path, buf);
+
+    await expect(
+      runRestore({
+        archivePath: path,
+        password: 'whatever',
+        rootOverride: join(tmp, 'dst'),
+        configExistsCheck: NEVER_EXISTS,
+        daemonStatusCheck: NEVER_RUNNING,
+      }),
+    ).rejects.toThrow('not an otzi backup archive (magic mismatch)');
+  });
+
+  it('rejects archive with valid magic + NUL + non-NUL bytes inside the padding region', async () => {
+    // Strict-NUL-padding check (I-3): bytes 14..32 of the magic field MUST
+    // all be NUL. An archive shaped like 'OTZI-BACKUP-V1\0XYZ\0...' (correct
+    // magic, terminating NUL, then garbage in the padding region) was
+    // accepted by the old `replace(/\0+$/, '')` check because it trimmed
+    // only TRAILING NULs. The strict check rejects it — defends against
+    // future format-versioning ambiguity.
+    const path = join(tmp, 'fake.otzi-backup');
+    const buf = Buffer.alloc(BACKUP_HEADER_LEN + 16, 0);
+    buf.write('OTZI-BACKUP-V1', 0, 'ascii');
+    // bytes 14..15 = NUL (already from alloc), then inject garbage at 15.
+    buf.write('XYZ', 15, 'ascii');
+    // bytes 18..32 stay as NUL.
     await writeFile(path, buf);
 
     await expect(
