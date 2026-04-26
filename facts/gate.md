@@ -280,15 +280,13 @@
     - `'policy'` → `new PolicyGate(parsePolicyParams(config.params ?? {}))`.
     - `'exec'` → `new ExecGate(parseExecParams(config.params ?? {}))`.
     - `'webhook'` → `new WebhookGate(parseWebhookParams(config.params ?? {}))`.
-    - `'cli'`, `'queue'` → Throw "spec'd but not implemented".
     - Fallback → Throw "unreachable" (exhaustive check via TypeScript `never`).
-  - **Throws:** Error (not ConfigError) for cli/queue; ConfigError from parse* helpers if params are invalid.
+  - **Throws:** ConfigError from parse* helpers if params are invalid.
   - **Note:** Passing `config.params ?? {}` ensures parse* helpers receive an object (even if params is undefined).
 
 **Invariants:**
 - Exactly one gate is constructed per daemon (singleton at startup, used for every ceremony).
 - Each strategy's `parseFooParams()` is called here; errors abort daemon startup.
-- `cli`/`queue` throw at startup if configured (fail-fast; not deferred).
 
 **Cross-component contracts:**
 - Called by daemon entrypoint (phase 5b gate narrowing).
@@ -297,7 +295,6 @@
 
 **Notes / gotchas:**
 - `config.params` defaults to empty object (`{}`) if undefined; ensures parse* helpers don't crash on null/undefined.
-- Throwing on cli/queue prevents silent ignoring of misconfigured strategies.
 - TypeScript exhaustive check (`const _exhaustive: never = ...`) ensures new strategies require explicit dispatch.
 
 ---

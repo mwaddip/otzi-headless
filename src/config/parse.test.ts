@@ -198,7 +198,7 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
   it('rejects unknown gate.strategy', () => {
     const toml = MINIMAL_TOML.replace('strategy = "auto"', 'strategy = "telepathy"');
     expect(() => parseDaemonConfigToml(toml)).toThrow(
-      /gate\.strategy.*must be one of auto \| policy \| exec \| webhook \| cli \| queue/,
+      /gate\.strategy.*must be one of auto \| policy \| exec \| webhook/,
     );
   });
 

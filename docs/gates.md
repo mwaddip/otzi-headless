@@ -141,10 +141,6 @@ bearer_token_env = "APPROVER_TOKEN"    # optional: env var carrying bearer token
 
 Daemon POSTs the `CeremonySpec` JSON to `url`. The approver endpoint must respond with `200 OK` and a JSON body `{"decision": "approve" | "reject"}`. The request holds the connection open for up to `timeout_sec`; long-polling is fine. Non-200 responses or missing/unexpected decision fields are treated as errors (→ reject).
 
-### `cli` / `queue` — not yet implemented
-
-Spec'd but not shipping in this release. `cli` is for interactive operator sessions; `queue` is for a daemon-held in-memory pending queue polled by a separate CLI tool. File an issue if you need one.
-
 ## Operator-in-the-loop timeouts
 
 Ceremony-wide deadline auto-scales with strategy:

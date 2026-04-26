@@ -11,7 +11,7 @@
 export const TRANSPORT_KINDS = ['peer-mesh', 'relay'] as const;
 export type TransportKind = (typeof TRANSPORT_KINDS)[number];
 
-export const GATE_STRATEGIES = ['auto', 'policy', 'exec', 'webhook', 'cli', 'queue'] as const;
+export const GATE_STRATEGIES = ['auto', 'policy', 'exec', 'webhook'] as const;
 export type GateStrategy = (typeof GATE_STRATEGIES)[number];
 
 export const TRIGGER_KINDS = ['http', 'uds', 'cron'] as const;
@@ -76,7 +76,7 @@ export interface PeerEntry {
 
 export interface GateConfig {
   strategy: GateStrategy;
-  /** Strategy-specific config (allowlists, webhook URL, queue path, ...). Narrowed in 5b. */
+  /** Strategy-specific config (allowlists, webhook URL, exec command, ...). Narrowed in 5b. */
   params?: Record<string, unknown>;
 }
 

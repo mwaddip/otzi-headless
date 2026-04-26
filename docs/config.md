@@ -106,7 +106,6 @@ params directly (flat, not under a sub-table).
 | `policy` | Rule engine over structural `CeremonySpec` fields. Strict-by-default (rejects anything not matched by a rule). |
 | `exec` | Spawn operator-supplied command; approval = first line of stdout. |
 | `webhook` | POST spec JSON to a URL; approval = `{ "decision" }` response. |
-| `cli` / `queue` | Reserved — throws at gate construction. Write an `exec`/`webhook` gate against `examples/gate-file-approver.sh` instead. |
 
 ### `strategy = "auto"`
 
@@ -193,10 +192,10 @@ attempts) is separate and not configurable via the TOML yet.
 | `signing_ms` | integer ≥ 1 | `300_000` (5 min) | Signing ceremony deadline. |
 | `dkg_ms` | integer ≥ 1 | `900_000` (15 min) | DKG ceremony deadline. |
 
-The `CLAUDE.md` § Core Architecture table says `exec`/`webhook`/`cli`/`queue`
-gates want unbounded signing deadlines (operator review takes hours). This
-is an operator decision: set `signing_ms = 86400000` (24 h) or similar on
-those daemons.
+The `CLAUDE.md` § Core Architecture table says `exec`/`webhook` gates want
+unbounded signing deadlines (operator review takes hours). This is an
+operator decision: set `signing_ms = 86400000` (24 h) or similar on those
+daemons.
 
 ## `[[triggers]]` (optional)
 

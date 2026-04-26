@@ -462,13 +462,6 @@ describe('createGate', () => {
     expect(await gate.approve(signingSpec({ amount: 10n ** 18n }))).toBe('approve');
   });
 
-  it('throws for unimplemented strategies', () => {
-    for (const strategy of ['cli', 'queue'] as const) {
-      const cfg: GateConfig = { strategy };
-      expect(() => createGate(cfg)).toThrow(/not implemented yet/);
-    }
-  });
-
   it('propagates policy param errors at construction time', () => {
     expect(() =>
       createGate({ strategy: 'policy', params: { max_amount: -1 } }),
