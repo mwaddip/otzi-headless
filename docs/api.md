@@ -31,7 +31,7 @@ Every request body is a JSON object. All ceremony requests accept:
 
 | Field | Type | Notes |
 |---|---|---|
-| `op` | string, required | One of `dkg-combined`, `dkg-mldsa`, `dkg-frost`, `sign`. |
+| `op` | string, required | One of `dkg-combined`, `dkg-mldsa`, `dkg-frost`, `sign`, `vault-info`. |
 | `ceremonyId` | string, optional | Operator-supplied. When omitted, the daemon generates `"<op>-<uuid>"`. Must not contain `#` (reserved for ML-DSA retry suffixes). |
 
 Every successful response body includes:
@@ -80,9 +80,46 @@ Response:
   "ceremonyId": "dkg-combined-…",
   "status": "done",
   "mldsaPublicKeyHex": "…",           // 1312B hex at level 44
-  "frostVerifyingKeyHex": "…"         // 33B SEC1 compressed, tweaked aggregate key
+  "frostVerifyingKeyHex": "…",        // 33B SEC1 compressed, tweaked aggregate key
+  "btcAddress": "tb1p…",              // bech32m P2TR — fund here for BTC
+  "opnetAddress": "0x…",              // 0x + sha256(mldsaPubKey) — send OP20 / contract calls here
+  "network": "testnet"                // mirrors [network].name
 }
 ```
+
+The `btcAddress` / `opnetAddress` / `network` fields match what
+`/var/lib/otzi/vault-pubkey.json` will hold once the daemon is restarted.
+`otzi generate` prints them in its banner so the operator doesn't have to
+read the cache file separately.
+
+## `op: "vault-info"`
+
+Read-only metadata for the vault. Used by the CLI (`otzi sign`, `otzi btc send`)
+to discover the signer set + threshold without reading the share file. Returns
+the same `btcAddress` / `opnetAddress` as `dkg-combined` so callers can verify
+they're talking to the right vault.
+
+Request:
+
+```jsonc
+{ "op": "vault-info" }
+```
+
+Response (`200`):
+
+```jsonc
+{
+  "partyIds": [0, 1, 2],
+  "threshold": 2,
+  "parties": 3,
+  "network": "testnet",
+  "btcAddress": "tb1p…",
+  "opnetAddress": "0x…"
+}
+```
+
+If the daemon has no share loaded (DKG hasn't run yet), responds `409`:
+`{ "error": "vault-info: no share loaded (run `otzi generate` first)" }`.
 
 ## `op: "dkg-mldsa"`
 
