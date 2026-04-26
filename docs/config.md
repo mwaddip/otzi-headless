@@ -204,11 +204,36 @@ How ceremonies are initiated on this daemon. Each entry has a `kind` plus
 kind-specific params flat in the same table. Zero triggers = nothing can
 initiate a ceremony on this daemon (peer-side participation still works).
 
-### `kind = "http"`
+### `kind = "uds"`
+
+Operator API over a Unix domain socket. Default in deb-installed daemons.
 
 | Key | Type | Notes |
 |---|---|---|
-| `bind` | string | `host:port`. No default — `0.0.0.0` is not assumed. Prefer `127.0.0.1:<port>` or a reverse proxy; see the operator-API-localhost-only note in [`api.md`](./api.md#transport--auth). |
+| `path` | string (absolute) | UDS socket path. Parent dir must exist with appropriate group perms. |
+
+Example:
+
+```toml
+[[triggers]]
+kind = "uds"
+path = "/var/run/otzi/otzi.sock"
+```
+
+Permission model: filesystem ACL on the socket file gates access. The
+deb's postinst sets `/var/run/otzi/` to `chmod 2770 root:otzi` (setgid),
+so the socket lands at `chmod 660 root:otzi`. Any user in the `otzi`
+group can connect; nobody else.
+
+### `kind = "http"` (loopback only)
+
+Optional TCP listener for advanced use cases (e.g., remote-CLI later).
+Parser enforces that `bind` is `127.0.0.1`, `::1`, `localhost`, or an
+absolute UDS path. External binds are rejected at parse time.
+
+| Key | Type | Notes |
+|---|---|---|
+| `bind` | string | `host:port`. Loopback enforced — `0.0.0.0` and external IPs are rejected. |
 | `auth_token_env` | string, optional | When set, the daemon requires `Authorization: Bearer <value-of-env>` on every request. Missing env at startup → refuse to start. |
 
 ### `kind = "cron"`
@@ -219,20 +244,47 @@ initiate a ceremony on this daemon (peer-side participation still works).
 | `job_name` | string | Name matching a handler registered via `DaemonDeps.cronHandlers`. Unknown name → startup fails. |
 | `timezone` | string, optional | IANA zone (e.g. `Europe/Amsterdam`). Defaults to the daemon's local tz. |
 
-Multiple trigger entries are fine — e.g. one HTTP for operator CLI + one
+Multiple trigger entries are fine — e.g. one UDS for operator CLI + one
 cron for a daily health-check ceremony:
 
 ```toml
 [[triggers]]
-kind           = "http"
-bind           = "127.0.0.1:7080"
-auth_token_env = "OTZI_API_TOKEN"
+kind = "uds"
+path = "/var/run/otzi/otzi.sock"
 
 [[triggers]]
 kind      = "cron"
 schedule  = "0 3 * * *"
 job_name  = "daily-healthcheck"
 timezone  = "UTC"
+```
+
+## `[bootstrap]`
+
+Bootstrap-time config. Read by `otzi setup` (zero-arg) to dispatch to
+leader vs leaf bootstrap. Dormant after `pubkeys.json` is written;
+harmless to leave in config.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `role` | `'leader'` \| `'leaf'` | yes | Leader hosts the registration server; leaves POST to it. |
+| `bind` | string | leader-only | `host:port` for the leader's bootstrap HTTP listener. |
+| `leader_url` | string | leaf-only | Full URL of the leader's bootstrap endpoint. |
+
+Example (leader):
+
+```toml
+[bootstrap]
+role = "leader"
+bind = "0.0.0.0:7090"
+```
+
+Example (leaf):
+
+```toml
+[bootstrap]
+role = "leaf"
+leader_url = "http://node-a:7090"
 ```
 
 ## Cross-field validation
