@@ -9,25 +9,20 @@
  * - Duplicate method names within a contract's `abi[]` are rejected.
  *
  * The vendored schema lives at `docs/headless-manifest-schema.json` and is
- * loaded synchronously at module init via `node:fs.readFileSync`.
+ * imported as JSON so esbuild inlines it at bundle time (the .deb ships a
+ * single .mjs and does not include `docs/`).
  */
 
 import Ajv2020 from 'ajv/dist/2020';
 import type { ErrorObject } from 'ajv';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import schema from '../../docs/headless-manifest-schema.json' with { type: 'json' };
 import type { HeadlessManifest } from './manifest-types';
-
-const here = dirname(fileURLToPath(import.meta.url));
-const schemaPath = join(here, '..', '..', 'docs', 'headless-manifest-schema.json');
-const schema = JSON.parse(readFileSync(schemaPath, 'utf8'));
 
 // `strict: false` because the if/then conditional in the schema references
 // `type` in nested `properties` clauses; ajv-strict flags those as ambiguous
 // even though the meaning is unambiguous (the `if` is gated by `required`).
 const ajv = new Ajv2020({ strict: false, allErrors: true });
-const validateSchema = ajv.compile(schema);
+const validateSchema = ajv.compile<HeadlessManifest>(schema as object);
 
 export type ValidationResult =
   | { ok: true; manifest: HeadlessManifest }
@@ -39,7 +34,7 @@ export function validateManifest(input: unknown): ValidationResult {
     return { ok: false, errors: formatErrors(validateSchema.errors ?? []) };
   }
 
-  const m = input as HeadlessManifest;
+  const m = input;
 
   const errors: string[] = [];
   const contractNames = new Set<string>();

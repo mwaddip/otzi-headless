@@ -468,14 +468,30 @@ async function runBackupCommand(_args: string[]): Promise<void> {
 // ─────────────────────────────────────────────────────────────────────────
 
 async function runRestoreCommand(args: string[]): Promise<void> {
-  const { positional, flags } = parsePositionalAndFlags(args);
-  const archivePath = positional[0];
+  // `--password-stdin` is a boolean toggle; the generic parsePositionalAndFlags
+  // treats every `--flag` as flag-with-value and would consume the path as the
+  // flag's value. Parse manually for this verb.
+  let archivePath: string | undefined;
+  let passwordStdin = false;
+  for (const arg of args) {
+    if (arg === '--password-stdin') {
+      passwordStdin = true;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      throw new Error(`unknown flag: ${arg}`);
+    }
+    if (archivePath !== undefined) {
+      throw new Error('usage: otzi restore <archive-path> [--password-stdin]');
+    }
+    archivePath = arg;
+  }
   if (!archivePath)
     throw new Error('usage: otzi restore <archive-path> [--password-stdin]');
   const { runRestore } = await import('../cli/cmd/restore');
   const result = await runRestore({
     archivePath,
-    ...(flags.has('password-stdin') ? { passwordStdin: true } : {}),
+    ...(passwordStdin ? { passwordStdin: true } : {}),
   });
   console.log('Restored files:');
   for (const f of result.restoredFiles) {

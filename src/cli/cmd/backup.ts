@@ -36,7 +36,7 @@ import { createCipheriv, pbkdf2Sync, randomBytes } from 'node:crypto';
 import { hostname, homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { create as tarCreate } from 'tar';
-import { parseDaemonConfigToml } from '../../config/parse';
+import { parse as parseToml } from 'smol-toml';
 
 export const DEFAULT_DAEMON_CONFIG_PATH = '/etc/otzi/daemon.toml';
 export const DEFAULT_MANIFEST_PATH = '/etc/otzi/manifest.otzi.json';
@@ -146,11 +146,26 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
       );
     throw err;
   }
-  const config = parseDaemonConfigToml(configText);
-  const sharePath = config.share.path;
-  const identityPath = config.node.identityKeyFile ?? DEFAULT_IDENTITY_PATH;
-  const pubkeyBookPath = config.node.pubkeyBookFile ?? DEFAULT_PUBKEY_BOOK_PATH;
-  const partyId = config.node.partyId;
+  // Parse the TOML loosely — we only need three string paths and the partyId.
+  // Backup is a read-only operation; it must work even on a daemon whose
+  // [[peers]] block hasn't been filled in yet (e.g. mid-bootstrap state).
+  const rawConfig = parseToml(configText) as Record<string, unknown>;
+  const shareTable = (rawConfig.share ?? {}) as Record<string, unknown>;
+  const nodeTable = (rawConfig.node ?? {}) as Record<string, unknown>;
+  const sharePath =
+    typeof shareTable.path === 'string' ? shareTable.path : DEFAULT_SHARE_PATH;
+  const identityPath =
+    typeof nodeTable.identity_key_file === 'string'
+      ? nodeTable.identity_key_file
+      : DEFAULT_IDENTITY_PATH;
+  const pubkeyBookPath =
+    typeof nodeTable.pubkey_book_file === 'string'
+      ? nodeTable.pubkey_book_file
+      : DEFAULT_PUBKEY_BOOK_PATH;
+  const partyId =
+    typeof nodeTable.party_id === 'number' || typeof nodeTable.party_id === 'bigint'
+      ? Number(nodeTable.party_id)
+      : 0;
 
   const manifestSource = opts.pathOverrides?.manifest ?? DEFAULT_MANIFEST_PATH;
   const vaultPubkeySource =

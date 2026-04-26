@@ -42,7 +42,7 @@ import { dirname, join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 import { extract as tarExtract } from 'tar';
-import { parseDaemonConfigToml } from '../../config/parse';
+import { parse as parseToml } from 'smol-toml';
 import {
   BACKUP_HEADER_LEN,
   BACKUP_IV_LEN,
@@ -52,6 +52,7 @@ import {
   BACKUP_SALT_LEN,
   DEFAULT_IDENTITY_PATH,
   DEFAULT_PUBKEY_BOOK_PATH,
+  DEFAULT_SHARE_PATH,
   stripLeadingSlash,
 } from './backup';
 
@@ -310,14 +311,27 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
         join(stageDir, 'etc/otzi/daemon.toml'),
         'utf8',
       );
-      const config = parseDaemonConfigToml(tomlText);
-      const shareTar = stripLeadingSlash(config.share.path);
-      const identityTar = stripLeadingSlash(
-        config.node.identityKeyFile ?? DEFAULT_IDENTITY_PATH,
-      );
-      const pubkeyTar = stripLeadingSlash(
-        config.node.pubkeyBookFile ?? DEFAULT_PUBKEY_BOOK_PATH,
-      );
+      // Loose TOML parse — restore must work even if the backed-up daemon.toml
+      // wouldn't pass full validation (e.g. mid-bootstrap, missing peers).
+      // We only need three string paths.
+      const rawConfig = parseToml(tomlText) as Record<string, unknown>;
+      const shareTable = (rawConfig.share ?? {}) as Record<string, unknown>;
+      const nodeTable = (rawConfig.node ?? {}) as Record<string, unknown>;
+      const sharePath =
+        typeof shareTable.path === 'string'
+          ? shareTable.path
+          : DEFAULT_SHARE_PATH;
+      const identityPath =
+        typeof nodeTable.identity_key_file === 'string'
+          ? nodeTable.identity_key_file
+          : DEFAULT_IDENTITY_PATH;
+      const pubkeyPath =
+        typeof nodeTable.pubkey_book_file === 'string'
+          ? nodeTable.pubkey_book_file
+          : DEFAULT_PUBKEY_BOOK_PATH;
+      const shareTar = stripLeadingSlash(sharePath);
+      const identityTar = stripLeadingSlash(identityPath);
+      const pubkeyTar = stripLeadingSlash(pubkeyPath);
       dynamicModes.set(shareTar, SHARE_MODE);
       dynamicModes.set(identityTar, IDENTITY_MODE);
       dynamicModes.set(pubkeyTar, PUBKEYS_MODE);
