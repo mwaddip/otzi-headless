@@ -5,6 +5,7 @@
  *   otzi setup <config.toml>                    — run bootstrap (reads [bootstrap].role from config)
  *   otzi generate <config.toml> [flags]         — trigger DKG against local daemon
  *   otzi install <path>                         — install a manifest
+ *   otzi sync <path>                            — distribute a manifest to all peers (bootstrap-window-only)
  *   otzi list                                   — show the installed manifest
  *   otzi uninstall                              — remove the installed manifest
  *   otzi sign <contract> <method> <args...>     — sign + broadcast OPNet contract call
@@ -51,6 +52,9 @@ export async function main(argv: readonly string[]): Promise<void> {
     case 'install':
       await runInstallCommand(rest);
       return;
+    case 'sync':
+      await runSyncCommand(rest);
+      return;
     case 'list':
       await runListCommand(rest);
       return;
@@ -81,6 +85,7 @@ function usage(): string {
     '  otzi setup <path/to/daemon.toml>',
     '  otzi generate <path/to/daemon.toml> [--threshold N] [--level 44] [--ceremony-id <id>]',
     '  otzi install <path>',
+    '  otzi sync <path>',
     '  otzi list',
     '  otzi uninstall',
     '  otzi sign <contract> <method> [args...] [--config <path>] [--fee-rate <sat/vB>]',
@@ -309,6 +314,22 @@ async function runInstallCommand(args: string[]): Promise<void> {
   const { install } = await import('../cli/cmd/install');
   await install({ source });
   console.error(`otzi: installed manifest from ${source}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi sync <path>` — distribute a manifest to all peers
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runSyncCommand(args: string[]): Promise<void> {
+  const { positional, flags } = parsePositionalAndFlags(args);
+  const source = positional[0];
+  if (!source) throw new Error('usage: otzi sync <path>');
+  const configPath = flags.get('config') || DEFAULT_DAEMON_CONFIG_PATH;
+  const { sync } = await import('../cli/cmd/sync');
+  const result = await sync({ configPath, source });
+  console.error(
+    `otzi sync: manifest installed locally + broadcast to ${result.peersNotified} peer(s) (ceremonyId=${result.ceremonyId})`,
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
