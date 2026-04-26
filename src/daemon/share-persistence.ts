@@ -12,10 +12,12 @@
 
 import { chmod, mkdir, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import type { NetworkName } from '../config/types';
 import type { CombinedDkgResult } from '../core/ceremony-runner';
 import { getKL } from '../wire/dkg';
 import { toHex } from '../wire/hex';
 import { encryptShareV3 } from '../wire/share-write';
+import { writeVaultPubkeyFile } from './vault-pubkey';
 
 const BOOTSTRAP_SECRET_PATH = '/var/lib/otzi/bootstrap-secret';
 
@@ -26,6 +28,14 @@ export interface PersistDkgShareArgs {
   level: number;
   path: string;
   password: string;
+  /**
+   * Optional network. When set, also refresh the operator-facing vault
+   * metadata cache (`/var/lib/otzi/vault-pubkey.json`) so the CLI can read
+   * the new addresses without waiting for daemon restart. When unset
+   * (e.g. test fixtures), skip the cache write — it's a non-essential
+   * artifact for vault discovery.
+   */
+  network?: NetworkName;
 }
 
 export async function persistCombinedDkgShare(args: PersistDkgShareArgs): Promise<void> {
@@ -69,6 +79,25 @@ export async function persistCombinedDkgShare(args: PersistDkgShareArgs): Promis
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
       console.error(
         `share-persistence: failed to unlink bootstrap-secret: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  // Refresh the operator-facing vault metadata cache so a CLI invocation
+  // immediately after DKG sees the new addresses (without waiting for a
+  // daemon restart). Same try/catch posture as the bootstrap-secret wipe:
+  // share is already durable, cache refresh failure is a soft error.
+  if (args.network) {
+    try {
+      await writeVaultPubkeyFile({
+        network: args.network,
+        frostUntweakedPubKey: args.result.frost.keyPackage.untweakedVerifyingKey,
+        frostTweakedPubKey: args.result.frost.keyPackage.verifyingKey,
+        mldsaPubKey: args.result.mldsa.publicKey,
+      });
+    } catch (err) {
+      console.error(
+        `share-persistence: failed to refresh vault-pubkey cache: ${(err as Error).message}`,
       );
     }
   }

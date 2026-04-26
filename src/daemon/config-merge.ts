@@ -211,6 +211,7 @@ function makePersistSink(config: DaemonConfig, password: string): DkgPersistence
       level: meta.level,
       path: config.share.path,
       password,
+      network: config.network.name,
     });
 }
 
