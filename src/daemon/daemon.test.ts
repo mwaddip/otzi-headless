@@ -324,6 +324,29 @@ describe('Daemon — HTTP error paths', () => {
     }
   });
 
+  it('rejects deprecated protocol:opnet with 400', async () => {
+    const { baseUrl, cleanup } = await bootLeaderOnly();
+    try {
+      const res = await fetch(`${baseUrl}/`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          op: 'sign',
+          scheme: 'frost',
+          protocol: 'opnet',
+          signers: [0, 1],
+          unsignedTxHex: '00',
+          inputs: [{ scriptHex: 'aa', valueSat: '1000' }],
+        }),
+      });
+      expect(res.status).toBe(400);
+      const json = await res.json();
+      expect(json.error).toMatch(/deprecated|opnet-params/i);
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('returns 403 when the gate rejects a signing request', async () => {
     const ring = buildRing(3, '127.0.0.1:0');
     // Override leader gate to policy with a cap that will reject generic signings.

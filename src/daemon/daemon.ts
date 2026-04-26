@@ -372,46 +372,28 @@ export function buildDefaultHttpHandler(
               },
             });
           } else if (protocol === 'opnet') {
-            const rawInputs = b.inputs;
-            if (!Array.isArray(rawInputs))
-              return { status: 400, body: { error: "'inputs' must be an array for protocol='opnet'" } };
-            const inputs = rawInputs.map((inp, i) => {
-              if (!inp || typeof inp !== 'object')
-                throw new Error(`inputs[${i}] must be { scriptHex, valueSat, tweaked }`);
-              const item = inp as Record<string, unknown>;
-              const rawValue = item.valueSat;
-              const valueSat =
-                typeof rawValue === 'string'
-                  ? rawValue
-                  : typeof rawValue === 'number'
-                    ? String(Math.trunc(rawValue))
-                    : null;
-              if (valueSat === null)
-                throw new Error(`inputs[${i}].valueSat must be a string or integer`);
-              return {
-                scriptHex: requireString(item, 'scriptHex'),
-                valueSat,
-                tweaked: typeof item.tweaked === 'boolean' ? item.tweaked : true,
-              };
-            });
-            const hintsRaw = b.hints;
-            let hints: { contractAddress?: string; method?: string; amountTokenAtomic?: string } | undefined;
-            if (hintsRaw && typeof hintsRaw === 'object') {
-              const h = hintsRaw as Record<string, unknown>;
-              hints = {};
-              if (typeof h.contractAddress === 'string') hints.contractAddress = h.contractAddress;
-              if (typeof h.method === 'string') hints.method = h.method;
-              if (typeof h.amountTokenAtomic === 'string') hints.amountTokenAtomic = h.amountTokenAtomic;
-            }
-            result = await leader.sign({
-              ceremonyId,
-              scheme: 'frost',
-              protocol: 'opnet',
-              signers,
-              unsignedTx: fromHex(requireString(b, 'unsignedTxHex')),
-              inputs,
-              ...(hints ? { hints } : {}),
-            });
+            // DEPRECATED: raw unsigned-tx path. Participants extract sighashes
+            // from operator-supplied bytes but CANNOT independently verify them
+            // against the announced contract/method/amount — `hints` are advisory
+            // only, so gate policy evaluates untrusted fields. A rogue leader can
+            // sign something other than what the operator intended; threshold
+            // bounds DoS but not theft-by-misdirection within an allowlist.
+            //
+            // Use `protocol: 'opnet-params'` (Phase 8) for any new work — every
+            // node rebuilds the tx independently from construction params and
+            // sighash-checks before signing.
+            //
+            // Re-enable here only if you accept the above and have a use case the
+            // SDK can't reach via construction params (e.g. multi-op packages,
+            // contract deployments). The underlying helpers in
+            // src/broadcast/opnet-capture.ts and opnet-broadcast.ts remain in
+            // place; only the public HTTP entry point is gated off.
+            return {
+              status: 400,
+              body: {
+                error: "protocol 'opnet' is deprecated — use 'opnet-params' instead. See docs/api.md.",
+              },
+            };
           } else if (protocol === 'opnet-params') {
             const rawParams = b.params;
             if (!Array.isArray(rawParams))
