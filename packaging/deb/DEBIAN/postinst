@@ -46,6 +46,61 @@ case "$1" in
       fi
     done
 
+    # Restore-from-backup branch (run BEFORE bootstrap-secret + daemon.toml
+    # render). If the operator picked "yes" at the debconf prompt, pipe the
+    # password to `otzi restore --password-stdin <path>` and short-circuit the
+    # fresh-install path. NEVER pass the password as an argv flag — it would
+    # leak via /proc/<pid>/cmdline + ps. db_reset wipes the password from
+    # /var/cache/debconf/passwords.dat on EVERY exit path.
+    db_get otzi-headless/restore-from-backup || true
+    RESTORE_REQUESTED="$RET"
+    if [ "$RESTORE_REQUESTED" = "true" ]; then
+      db_get otzi-headless/backup-path || true
+      BACKUP_PATH="$RET"
+      db_get otzi-headless/backup-password || true
+      BACKUP_PASSWORD="$RET"
+
+      if [ -z "$BACKUP_PATH" ] || [ -z "$BACKUP_PASSWORD" ]; then
+        echo "otzi-headless: restore selected but backup-path or backup-password is empty" >&2
+        db_reset otzi-headless/backup-password 2>/dev/null || true
+        exit 1
+      fi
+
+      if [ ! -f "$BACKUP_PATH" ]; then
+        echo "otzi-headless: backup file not found at $BACKUP_PATH" >&2
+        db_reset otzi-headless/backup-password 2>/dev/null || true
+        exit 1
+      fi
+
+      echo "otzi-headless: attempting restore from $BACKUP_PATH"
+      if printf '%s\n' "$BACKUP_PASSWORD" | otzi restore --password-stdin "$BACKUP_PATH"; then
+        # Wipe password from debconf cache before continuing.
+        db_reset otzi-headless/backup-password 2>/dev/null || true
+        echo "otzi-headless: restored from backup; skipping fresh-install configuration"
+        cat <<'BANNER'
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  otzi-headless restored from backup.
+
+  Verify the restored config:
+    sudo cat /etc/otzi/daemon.toml
+  Then start the daemon:
+    sudo systemctl enable --now otzi
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BANNER
+        db_stop || true
+        exit 0
+      else
+        # Restore failed — wipe password and abort. Operator can
+        # `dpkg-reconfigure otzi-headless` to retry (or decline restore).
+        db_reset otzi-headless/backup-password 2>/dev/null || true
+        echo "otzi-headless: restore failed. To retry: dpkg-reconfigure otzi-headless" >&2
+        echo "otzi-headless: (or remove the package + reinstall with a valid backup)" >&2
+        exit 1
+      fi
+    fi
+
     # Persist the bootstrap secret. It will be wiped by the daemon after
     # the first successful DKG.
     db_get otzi-headless/bootstrap-secret || true

@@ -1,3 +1,21 @@
+Template: otzi-headless/restore-from-backup
+Type: boolean
+Default: false
+Description: Restore from a backup?
+ If you are reinstalling on a new host and have an otzi-backup file from
+ the previous host, you can restore it now. Otherwise, decline and the
+ installer will prompt you for fresh configuration.
+
+Template: otzi-headless/backup-path
+Type: string
+Description: Path to backup file:
+ Absolute path to the .otzi-backup file (e.g. /tmp/otzi-backup-...otzi-backup).
+
+Template: otzi-headless/backup-password
+Type: password
+Description: Backup password:
+ The 32-character password printed by `otzi backup` when the file was created.
+
 Template: otzi-headless/role
 Type: select
 Choices: leader, leaf

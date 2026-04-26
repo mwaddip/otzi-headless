@@ -3,6 +3,23 @@ set -e
 
 . /usr/share/debconf/confmodule
 
+# Restore-from-backup branch — asked first, so an operator reinstalling on a
+# fresh host can short-circuit the rest of the prompts. If declined (default),
+# fall through to the normal fresh-install prompt flow. If accepted, postinst
+# will run `otzi restore`; on success the rest of the config flow is skipped,
+# on failure postinst exits non-zero (operator can `dpkg-reconfigure` to retry
+# or decline restore).
+db_input high otzi-headless/restore-from-backup || true
+db_go || true
+db_get otzi-headless/restore-from-backup || true
+if [ "$RET" = "true" ]; then
+  db_input critical otzi-headless/backup-path || true
+  db_input critical otzi-headless/backup-password || true
+  db_go || true
+  # Skip the rest of the prompts — postinst short-circuits on restore success.
+  exit 0
+fi
+
 # Pre-seed defaults conditionally
 db_get otzi-headless/network || true
 case "$RET" in
