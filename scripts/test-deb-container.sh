@@ -56,12 +56,14 @@ apt-get install -y -qq nodejs >/dev/null
 
 debconf-set-selections <<'EOF'
 otzi-headless otzi-headless/role select leader
+otzi-headless otzi-headless/operators string
+otzi-headless otzi-headless/bootstrap-secret password test-bootstrap-secret
 otzi-headless otzi-headless/network select testnet
 otzi-headless otzi-headless/opnet-rpc string https://testnet.opnet.org
 otzi-headless otzi-headless/peer-hostnames string node-b.example node-c.example
 otzi-headless otzi-headless/transport select peer-mesh
 otzi-headless otzi-headless/listen string 0.0.0.0:8800
-otzi-headless otzi-headless/operator-bind string 127.0.0.1:7080
+otzi-headless otzi-headless/bootstrap-bind string 0.0.0.0:7090
 otzi-headless otzi-headless/node-id string testnode-a
 EOF
 
@@ -86,9 +88,22 @@ grep -q "name = \"testnet\""               /etc/otzi/daemon.toml
 grep -q "opnet_rpc = \"https://testnet"    /etc/otzi/daemon.toml
 grep -q "kind = \"peer-mesh\""             /etc/otzi/daemon.toml
 grep -q "listen = \"0.0.0.0:8800\""        /etc/otzi/daemon.toml
-grep -q "bind = \"127.0.0.1:7080\""        /etc/otzi/daemon.toml
 grep -q "endpoint = \"ws://node-b.example" /etc/otzi/daemon.toml
+grep -q "^kind = \"uds\""                  /etc/otzi/daemon.toml
+grep -q "^role = "                         /etc/otzi/daemon.toml
+grep -q "^bind = \"0.0.0.0:7090\""         /etc/otzi/daemon.toml
 echo "OK: rendered toml"
+'
+
+echo ">> verifying phase 9a perms + bootstrap-secret"
+docker exec "$CONTAINER" bash -euo pipefail -c '
+stat -c "%a %U:%G" /etc/otzi      | grep -q "^2770 root:otzi$"     || { echo "FAIL: /etc/otzi mode/owner";       exit 1; }
+stat -c "%a %U:%G" /var/lib/otzi  | grep -q "^2770 root:otzi$"     || { echo "FAIL: /var/lib/otzi mode/owner";   exit 1; }
+test -d /var/run/otzi             || { echo "FAIL: /var/run/otzi missing"; exit 1; }
+stat -c "%a %U:%G" /var/run/otzi  | grep -q "^2770 root:otzi$"     || { echo "FAIL: /var/run/otzi mode/owner";   exit 1; }
+test -f /var/lib/otzi/bootstrap-secret                              || { echo "FAIL: bootstrap-secret missing";  exit 1; }
+stat -c "%a %U:%G" /var/lib/otzi/bootstrap-secret | grep -q "^660 root:otzi$" || { echo "FAIL: bootstrap-secret perms"; exit 1; }
+echo "OK: phase 9a perms"
 '
 
 echo ">> running otzi (usage banner)"
