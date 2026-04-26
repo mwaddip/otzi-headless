@@ -10,6 +10,7 @@
 **Public surface:**
 - `TRANSPORT_KINDS`, `GATE_STRATEGIES`, `TRIGGER_KINDS`, `NETWORK_NAMES` — const string tuples (readonly arrays)
   - **Post:** Used as discriminators in union types and enum validation. Exported for re-export in other modules.
+  - **Note:** `TRIGGER_KINDS = ['http', 'uds', 'cron']` as of phase 9a; `'uds'` is the default for operator API in deb-installed daemons.
 
 - `NetworkConfig` — interface
   - **Pre:** `name` ∈ `NETWORK_NAMES`; `opnetRpc` is a non-empty string (not validated here).
@@ -93,6 +94,7 @@
   - **Pre:** Each receives raw section from TOML parse tree.
   - **Post:** Typed section object (e.g., `ShareConfig`).
   - **Throws:** `ConfigError` with key paths like "share.path", "node.party_id", "gate.strategy", etc.
+  - **UDS trigger params:** `params.path` is the absolute UDS socket path. No `bind`, no `auth_token_env`. Validated at parse time as a non-empty string starting with `/`.
 
 - `validateCoherence(cfg)` — function
   - **Pre:** Fully parsed `DaemonConfig`.
