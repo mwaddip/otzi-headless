@@ -70,6 +70,7 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 - The daemon's operator API binds to a UDS socket by default (`[[triggers]] kind="uds" path="/var/run/otzi/otzi.sock"`). Filesystem permissions (chmod 660 root:otzi) are the auth model.
 - An optional `kind="http"` trigger is supported for the future remote-CLI case, but the parser ENFORCES that the bind host is loopback (`127.0.0.1`, `::1`, `localhost`) or a UDS path. External binds are rejected at parse time.
 - Group-membership-based access is the precondition for `feedback_cli_is_primary_entrypoint` — the CLI is THE operator surface, and any user in the `otzi` group can run it without sudo.
+- **`otzi <subcommand>` is THE operator-facing surface.** Direct `curl` calls to the daemon UDS are not a supported workflow. If a flow exists in production, it should be reachable via `otzi <subcommand>`. New ops added to the daemon HTTP handler should land alongside a CLI verb that wraps them; raw HTTP usage is reserved for tests + debugging.
 
 ### `#N` retry suffix (ML-DSA signing)
 - Leader appends `#N` to `ceremonyId` on combine retry. `baseCeremonyId` is stable across retries. **`ceremonyId` MUST NOT contain `#`** ; tighten with a check if ceremonyIds ever come from untrusted sources.

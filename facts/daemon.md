@@ -247,9 +247,11 @@
   - **Throws:** `Error` on missing required params or missing cron handler.
 
 - **Default HTTP handler** (buildDefaultHttpHandler)
-  - **Pre:** POST requests to handler.
-  - **Post:** Discriminated dispatch on `req.body.op` field: 'dkg-combined', 'dkg-mldsa', 'dkg-frost', 'sign'.
-  - **DKG ops:** Extract threshold, parties, level; invoke leader; return ceremony result + public keys.
+  - **Pre:** POST requests to handler. Constructed with `(leader, network: NetworkName, state: LoadedDaemonState, logger)`.
+  - **Post:** Discriminated dispatch on `req.body.op` field: 'vault-info', 'dkg-combined', 'dkg-mldsa', 'dkg-frost', 'sign'.
+  - **vault-info (read):** Returns `{ partyIds, threshold, parties, network, btcAddress, opnetAddress }` from in-memory state. 409 if no share is loaded yet (`vault-info: no share loaded (run 'otzi generate' first)`).
+  - **dkg-combined:** Runs combined DKG; response carries `mldsaPublicKeyHex`, `frostVerifyingKeyHex`, plus operator-facing `btcAddress` + `opnetAddress` + `network` (computed via `deriveVaultAddresses`). The address triple matches what `vault-pubkey.json` will hold post-restart.
+  - **DKG ops (mldsa, frost):** Extract threshold, parties, level; invoke leader; return ceremony result + public keys.
   - **sign op:** Discriminate on scheme + protocol; parse BTC/OPNet/opnet-params/raw-mldsa request; invoke leader.sign; return signatures + optional txid.
   - **Status 403 on gate reject:** `{ error: 'gate rejected', decision, ceremonyId }`.
   - **Status 500 on other errors:** `{ error: <message>, ceremonyId }`.
