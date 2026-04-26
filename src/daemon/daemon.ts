@@ -35,6 +35,7 @@ import {
 } from '../orchestrator/types';
 import { CronTrigger } from '../triggers/cron';
 import { HttpTrigger } from '../triggers/http';
+import { UdsTrigger } from '../triggers/uds';
 import type {
   CronHandler,
   HttpHandler,
@@ -204,6 +205,11 @@ function buildTriggers(
         const bind = requireStringParam(entry.params, 'bind', path);
         const authTokenEnv = optionalStringParam(entry.params, 'auth_token_env', path);
         out.push(new HttpTrigger({ bind, authTokenEnv, handler: httpHandler, logger: log }));
+        break;
+      }
+      case 'uds': {
+        const socketPath = requireStringParam(entry.params, 'path', path);
+        out.push(new UdsTrigger({ path: socketPath, handler: httpHandler, logger: log }));
         break;
       }
       case 'cron': {
