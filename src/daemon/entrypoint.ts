@@ -1,16 +1,17 @@
 /**
  * CLI entrypoint — dispatches to subcommands:
  *
- *   otzi daemon <config.toml>                              — run the daemon
- *   otzi setup leader <config.toml> --bind <host:port>     — run bootstrap (leader side)
- *   otzi setup leaf <config.toml> --leader <url>           — run bootstrap (leaf side)
- *   otzi generate <config.toml> [flags]                    — trigger DKG against local daemon
+ *   otzi daemon <config.toml>                   — run the daemon
+ *   otzi setup <config.toml>                    — run bootstrap (reads [bootstrap].role from config)
+ *   otzi generate <config.toml> [flags]         — trigger DKG against local daemon
  *
  * The `daemon` subcommand loads config + share + identity + pubkey book and
  * starts the transport + Daemon. SIGINT/SIGTERM trigger graceful shutdown.
  * If the configured share file is missing, the daemon comes up in DKG-only
  * mode (signing rejected; DKG works) — operator runs `otzi generate` against
  * it from another shell, then restarts to load the persisted share.
+ *
+ * (Phase 9b/9c add: install / list / sign / uninstall / vault / btc / op20 / sync.)
  *
  * Explicitly does NOT call `initEccLib` — phase-4d trap: double-init would
  * silently misroute the FROST legacy-sig monkey-patch when BTC broadcast
@@ -44,8 +45,7 @@ function usage(): string {
   return [
     'usage:',
     '  otzi daemon <path/to/daemon.toml>',
-    '  otzi setup leader <path/to/daemon.toml> --bind <host:port>',
-    '  otzi setup leaf <path/to/daemon.toml> --leader <url>',
+    '  otzi setup <path/to/daemon.toml>',
     '  otzi generate <path/to/daemon.toml> [--threshold N] [--level 44] [--ceremony-id <id>]',
   ].join('\n');
 }
@@ -110,23 +110,23 @@ async function runDaemonCommand(args: string[]): Promise<void> {
 // ─────────────────────────────────────────────────────────────────────────
 
 async function runSetupCommand(args: string[]): Promise<void> {
-  const [subcmd, configPath, ...flags] = args;
-  if (!subcmd || !configPath) throw new Error(usage());
-
-  const flagMap = parseFlags(flags);
-  if (subcmd === 'leader') {
-    const bind = flagMap.get('bind');
-    if (!bind) throw new Error('otzi setup leader: --bind <host:port> is required');
-    await setupMaster(configPath, bind);
+  const configPath = args[0];
+  if (!configPath) throw new Error(usage());
+  const config = await loadDaemonConfig(configPath);
+  if (!config.bootstrap)
+    throw new Error(
+      'otzi setup: [bootstrap] section missing in daemon.toml — set role + bind/leader_url and re-run.',
+    );
+  const { role } = config.bootstrap;
+  if (role === 'leader') {
+    if (!config.bootstrap.bind)
+      throw new Error('otzi setup: bootstrap.bind missing for role=leader');
+    await setupMaster(configPath, config.bootstrap.bind);
     return;
   }
-  if (subcmd === 'leaf') {
-    const leaderUrl = flagMap.get('leader');
-    if (!leaderUrl) throw new Error('otzi setup leaf: --leader <url> is required');
-    await setupMember(configPath, leaderUrl);
-    return;
-  }
-  throw new Error(`unknown setup subcommand '${subcmd}'\n${usage()}`);
+  if (!config.bootstrap.leaderUrl)
+    throw new Error('otzi setup: bootstrap.leader_url missing for role=leaf');
+  await setupMember(configPath, config.bootstrap.leaderUrl);
 }
 
 // ─────────────────────────────────────────────────────────────────────────

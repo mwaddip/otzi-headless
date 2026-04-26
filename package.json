@@ -10,8 +10,7 @@
     "test:watch": "vitest",
     "otzi": "tsx src/daemon/entrypoint.ts",
     "daemon": "tsx src/daemon/entrypoint.ts daemon",
-    "setup:leader": "tsx src/daemon/entrypoint.ts setup leader",
-    "setup:leaf": "tsx src/daemon/entrypoint.ts setup leaf",
+    "setup": "tsx src/daemon/entrypoint.ts setup",
     "build:deb": "bash scripts/build-deb.sh"
   },
   "bin": {
