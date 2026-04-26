@@ -10,7 +10,7 @@ The default config path is `/etc/otzi/daemon.toml` — operators can override pe
 
 - `otzi daemon <config.toml>` — run the daemon (long-lived; usually started by systemd, not by hand).
 - `otzi setup <config.toml>` — bootstrap pubkey exchange. Reads `[bootstrap].role` from the config and runs leader or leaf flow accordingly.
-- `otzi generate <config.toml> [--threshold N] [--level 44] [--ceremony-id <id>]` — trigger combined DKG against the local daemon. Banner prints the resulting BTC + OPNet vault addresses on success.
+- `otzi generate <config.toml> [--ceremony-id <id>]` — trigger combined DKG against the local daemon. The leader derives `parties` from its configured peer set (`peers.length + 1`) and uses `threshold = parties` (v0.1 is n-of-n by design — see `INTERFACES.md` § Trust model). Banner prints the resulting BTC + OPNet vault addresses on success.
 
 ### Manifest
 

@@ -62,14 +62,18 @@ calls against the resulting vault (the SDK replays it via `withFrostLegacySig`
 during tx construction). Regtest skips the keylink phase; OPNet contract
 calls against such a vault will fail at capture.
 
+`parties` is derived by the leader from its own configured peer set
+(`peers.length + 1`); `threshold = parties` (v0.1 is n-of-n by design — see
+`INTERFACES.md` § Trust model); `level = 44` (only level supported on OPNet).
+The CLI doesn't pass any of these; the request body is just `op` + optional
+`ceremonyId`.
+
 Request:
 
 ```jsonc
 {
   "op": "dkg-combined",
-  "threshold": 2,       // t-of-n; required
-  "parties": 3,         // n; required
-  "level": 44           // ML-DSA security level — OPNet requires 44
+  "ceremonyId": "..."   // optional; daemon auto-generates if absent
 }
 ```
 
@@ -125,17 +129,14 @@ If the daemon has no share loaded (DKG hasn't run yet), responds `409`:
 
 Pure ML-DSA DKG. Produces an ML-DSA key share only — no FROST, no
 `frostLegacySig`. Useful when the federation isn't using FROST (signing
-arbitrary bytes via `scheme='mldsa'`).
+arbitrary bytes via `scheme='mldsa'`). Same parameter-derivation rules as
+`dkg-combined`: parties derived from configured peers, threshold = parties,
+level = 44.
 
 Request:
 
 ```jsonc
-{
-  "op": "dkg-mldsa",
-  "threshold": 2,
-  "parties": 3,
-  "level": 44
-}
+{ "op": "dkg-mldsa", "ceremonyId": "..." }   // ceremonyId optional
 ```
 
 Response:
@@ -147,11 +148,12 @@ Response:
 ## `op: "dkg-frost"`
 
 Pure FROST DKG (secp256k1). Produces a FROST key share only — no ML-DSA.
+Same parameter-derivation rules as `dkg-combined`.
 
 Request:
 
 ```jsonc
-{ "op": "dkg-frost", "threshold": 2, "parties": 3 }
+{ "op": "dkg-frost", "ceremonyId": "..." }   // ceremonyId optional
 ```
 
 Response:

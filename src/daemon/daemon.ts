@@ -392,11 +392,15 @@ export function buildDefaultHttpHandler(
           };
         }
         case 'dkg-combined': {
+          // n derived from configured peer set (peersById includes self).
+          // v0.1 is n-of-n by design: threshold == parties. ML-DSA level
+          // is fixed at 44 (only level supported on OPNet).
+          const parties = state.peersById.size;
           const result = await leader.runCombinedDkg({
             ceremonyId,
-            threshold: requireNumber(b, 'threshold'),
-            parties: requireNumber(b, 'parties'),
-            level: requireNumber(b, 'level'),
+            threshold: parties,
+            parties,
+            level: 44,
           });
           // Compute the operator-facing addresses on the fly so the response
           // matches what `otzi generate` will print AND what
@@ -422,11 +426,12 @@ export function buildDefaultHttpHandler(
           };
         }
         case 'dkg-mldsa': {
+          const parties = state.peersById.size;
           const result = await leader.runMldsaDkg({
             ceremonyId,
-            threshold: requireNumber(b, 'threshold'),
-            parties: requireNumber(b, 'parties'),
-            level: requireNumber(b, 'level'),
+            threshold: parties,
+            parties,
+            level: 44,
           });
           return {
             status: 200,
@@ -434,10 +439,11 @@ export function buildDefaultHttpHandler(
           };
         }
         case 'dkg-frost': {
+          const parties = state.peersById.size;
           const result = await leader.runFrostDkg({
             ceremonyId,
-            threshold: requireNumber(b, 'threshold'),
-            parties: requireNumber(b, 'parties'),
+            threshold: parties,
+            parties,
           });
           return {
             status: 200,

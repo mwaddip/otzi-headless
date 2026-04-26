@@ -92,7 +92,7 @@ function usage(): string {
     'usage:',
     '  otzi daemon <path/to/daemon.toml>',
     '  otzi setup <path/to/daemon.toml>',
-    '  otzi generate <path/to/daemon.toml> [--threshold N] [--level 44] [--ceremony-id <id>]',
+    '  otzi generate <path/to/daemon.toml> [--ceremony-id <id>]',
     '  otzi install <path>',
     '  otzi sync <path>',
     '  otzi list',
@@ -234,24 +234,18 @@ async function runGenerateCommand(args: string[]): Promise<void> {
     headers['authorization'] = `Bearer ${token}`;
   }
 
-  const parties = config.peers.length + 1;
-  const threshold = flags.has('threshold')
-    ? Number(flags.get('threshold'))
-    : Math.ceil((parties * 2) / 3);
-  const level = flags.has('level') ? Number(flags.get('level')) : 44;
   const ceremonyId = flags.get('ceremony-id') ?? `dkg-${new Date().toISOString().replace(/[:.]/g, '-')}`;
 
-  if (!Number.isInteger(threshold) || threshold < 1 || threshold > parties)
-    throw new Error(`otzi generate: --threshold must be an integer in [1, ${parties}]`);
-
+  // Daemon derives parties (= configured peers + 1) and threshold (= parties,
+  // n-of-n by v0.1 design); we just kick the ceremony.
   console.error(
-    `otzi generate: triggering combined DKG (parties=${parties}, threshold=${threshold}, level=${level}, ceremonyId=${ceremonyId}) → POST ${url}`,
+    `otzi generate: triggering combined DKG (ceremonyId=${ceremonyId}) → POST ${url}`,
   );
 
   const res = await fetch(url, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ op: 'dkg-combined', ceremonyId, threshold, parties, level }),
+    body: JSON.stringify({ op: 'dkg-combined', ceremonyId }),
   });
   const bodyText = await res.text();
   if (res.status !== 200)

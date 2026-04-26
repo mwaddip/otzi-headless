@@ -295,13 +295,7 @@ describe('Daemon integration — peer-mesh transport', () => {
     const res = await fetch(`${harness.httpAddrs[0]}/`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        op: 'dkg-combined',
-        ceremonyId,
-        threshold: 2,
-        parties: 3,
-        level: 44,
-      }),
+      body: JSON.stringify({ op: 'dkg-combined', ceremonyId }),
     });
     const bodyText = await res.text();
     if (res.status !== 200) {
@@ -464,9 +458,6 @@ describe('Daemon integration — DKG persistence + restart', () => {
         body: JSON.stringify({
           op: 'dkg-combined',
           ceremonyId: 'integration-persistence-dkg',
-          threshold: 2,
-          parties: 3,
-          level: 44,
         }),
       });
       const dkgBodyText = await dkgRes.text();
@@ -493,7 +484,7 @@ describe('Daemon integration — DKG persistence + restart', () => {
         expect(sharefile.publicKey).toBe(dkgJson.mldsaPublicKeyHex);
         expect(sharefile.frostPublicKey).toBe(dkgJson.frostVerifyingKeyHex);
         expect(sharefile.partyId).toBe(i);
-        expect(sharefile.threshold).toBe(2);
+        expect(sharefile.threshold).toBe(3);
         expect(sharefile.parties).toBe(3);
         expect(sharefile.level).toBe(44);
         // Decrypt round-trip — proves password + V3 deserialize work.
@@ -561,7 +552,7 @@ describe('Daemon integration — DKG persistence + restart', () => {
           protocol: 'raw',
           ceremonyId: 'integration-persistence-sign',
           messageHex: toHex(message),
-          signers: [0, 1],
+          signers: [0, 1, 2],
         }),
       });
       const signBodyText = await signRes.text();
@@ -797,13 +788,7 @@ describe('Daemon integration — relay transport', () => {
     const res = await fetch(`${harness.httpAddrs[0]}/`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        op: 'dkg-combined',
-        ceremonyId,
-        threshold: 2,
-        parties: 3,
-        level: 44,
-      }),
+      body: JSON.stringify({ op: 'dkg-combined', ceremonyId }),
     });
     const bodyText = await res.text();
     if (res.status !== 200) {
