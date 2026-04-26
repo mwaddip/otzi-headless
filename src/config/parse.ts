@@ -8,6 +8,8 @@
 
 import { parse as parseToml } from 'smol-toml';
 import {
+  BootstrapConfig,
+  BOOTSTRAP_ROLES,
   DaemonConfig,
   DeadlineConfig,
   GateConfig,
@@ -189,21 +191,65 @@ function parseDeadlines(raw: unknown): DeadlineConfig {
   };
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+
+function validateHttpTriggerParams(params: Record<string, unknown>, path: string): void {
+  const bind = params.bind;
+  if (typeof bind !== 'string')
+    throw new ConfigError(`${path}.bind`, 'must be a string');
+  // Allow UDS paths (start with /) — operator can opt into UDS via http kind too.
+  if (bind.startsWith('/')) return;
+  // host:port form — verify host is loopback. Bracketed IPv6 supported.
+  const m = /^\[?([^\]]+)\]?:(\d+)$/.exec(bind);
+  if (!m)
+    throw new ConfigError(`${path}.bind`, `must be 'host:port' or absolute UDS path (got '${bind}')`);
+  const host = m[1]!;
+  if (!LOOPBACK_HOSTS.has(host))
+    throw new ConfigError(
+      `${path}.bind`,
+      `host must be loopback (127.0.0.1, ::1, localhost) — got '${host}'. The operator API is local-only; remote binds are forbidden.`,
+    );
+}
+
+function validateUdsTriggerParams(params: Record<string, unknown>, path: string): void {
+  const p = params.path;
+  if (typeof p !== 'string')
+    throw new ConfigError(`${path}.path`, 'must be a string');
+  if (!p.startsWith('/'))
+    throw new ConfigError(`${path}.path`, `must be an absolute path (got '${p}')`);
+}
+
 function parseTrigger(raw: unknown, i: number): TriggerEntry {
   const path = `triggers[${i}]`;
   const o = asObject(raw, path);
   const kind = asEnum(o.kind, `${path}.kind`, TRIGGER_KINDS);
   const { kind: _, ...rest } = o;
-  return {
-    kind,
-    params: Object.keys(rest).length > 0 ? rest : undefined,
-  };
+  const params = Object.keys(rest).length > 0 ? rest : undefined;
+  if (params) {
+    if (kind === 'http') validateHttpTriggerParams(params, path);
+    if (kind === 'uds') validateUdsTriggerParams(params, path);
+  }
+  return { kind, params };
 }
 
 function parseTriggers(raw: unknown): TriggerEntry[] {
   if (raw === undefined) return [];
   const arr = asArray(raw, 'triggers');
   return arr.map((t, i) => parseTrigger(t, i));
+}
+
+function parseBootstrap(raw: unknown): BootstrapConfig | undefined {
+  if (raw === undefined) return undefined;
+  const o = asObject(raw, 'bootstrap');
+  const role = asEnum(o.role, 'bootstrap.role', BOOTSTRAP_ROLES);
+  if (role === 'leader') {
+    if (o.bind === undefined)
+      throw new ConfigError('bootstrap.bind', 'required when bootstrap.role = "leader"');
+    return { role, bind: asString(o.bind, 'bootstrap.bind') };
+  }
+  if (o.leader_url === undefined)
+    throw new ConfigError('bootstrap.leader_url', 'required when bootstrap.role = "leaf"');
+  return { role, leaderUrl: asString(o.leader_url, 'bootstrap.leader_url') };
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +276,7 @@ function validateCoherence(cfg: DaemonConfig): void {
 /** Validate a parsed-from-TOML raw value and shape it into a `DaemonConfig`. */
 export function parseDaemonConfig(raw: unknown): DaemonConfig {
   const o = asObject(raw, '<root>');
+  const bootstrap = parseBootstrap(o.bootstrap);
   const cfg: DaemonConfig = {
     share: parseShare(o.share),
     node: parseNode(o.node),
@@ -239,6 +286,7 @@ export function parseDaemonConfig(raw: unknown): DaemonConfig {
     gate: parseGate(o.gate),
     deadlines: parseDeadlines(o.deadlines),
     triggers: parseTriggers(o.triggers),
+    ...(bootstrap !== undefined ? { bootstrap } : {}),
   };
   validateCoherence(cfg);
   return cfg;

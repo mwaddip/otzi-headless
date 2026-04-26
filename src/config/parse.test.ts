@@ -294,3 +294,101 @@ describe('ConfigError', () => {
     }
   });
 });
+
+describe('[bootstrap] parsing', () => {
+  it('parses leader role with bind', () => {
+    const cfg = parseDaemonConfigToml(
+      MINIMAL_TOML + '\n[bootstrap]\nrole = "leader"\nbind = "0.0.0.0:7090"\n',
+    );
+    expect(cfg.bootstrap).toEqual({ role: 'leader', bind: '0.0.0.0:7090' });
+  });
+
+  it('parses leaf role with leader_url', () => {
+    const cfg = parseDaemonConfigToml(
+      MINIMAL_TOML + '\n[bootstrap]\nrole = "leaf"\nleader_url = "http://leader-host:7090"\n',
+    );
+    expect(cfg.bootstrap).toEqual({ role: 'leaf', leaderUrl: 'http://leader-host:7090' });
+  });
+
+  it('returns undefined when [bootstrap] is absent', () => {
+    const cfg = parseDaemonConfigToml(MINIMAL_TOML);
+    expect(cfg.bootstrap).toBeUndefined();
+  });
+
+  it('throws when role is unknown', () => {
+    expect(() =>
+      parseDaemonConfigToml(MINIMAL_TOML + '\n[bootstrap]\nrole = "broker"\n'),
+    ).toThrow(/bootstrap\.role.*must be one of/);
+  });
+
+  it('throws when leader role has no bind', () => {
+    expect(() =>
+      parseDaemonConfigToml(MINIMAL_TOML + '\n[bootstrap]\nrole = "leader"\n'),
+    ).toThrow(/bootstrap\.bind.*required/);
+  });
+
+  it('throws when leaf role has no leader_url', () => {
+    expect(() =>
+      parseDaemonConfigToml(MINIMAL_TOML + '\n[bootstrap]\nrole = "leaf"\n'),
+    ).toThrow(/bootstrap\.leader_url.*required/);
+  });
+});
+
+describe('http trigger loopback enforcement', () => {
+  it('accepts 127.0.0.1', () => {
+    const cfg = parseDaemonConfigToml(
+      MINIMAL_TOML + '\n[[triggers]]\nkind = "http"\nbind = "127.0.0.1:7080"\n',
+    );
+    expect(cfg.triggers[0]!.kind).toBe('http');
+  });
+
+  it('accepts ::1', () => {
+    const cfg = parseDaemonConfigToml(
+      MINIMAL_TOML + '\n[[triggers]]\nkind = "http"\nbind = "[::1]:7080"\n',
+    );
+    expect(cfg.triggers[0]!.kind).toBe('http');
+  });
+
+  it('accepts localhost', () => {
+    const cfg = parseDaemonConfigToml(
+      MINIMAL_TOML + '\n[[triggers]]\nkind = "http"\nbind = "localhost:7080"\n',
+    );
+    expect(cfg.triggers[0]!.kind).toBe('http');
+  });
+
+  it('rejects 0.0.0.0', () => {
+    expect(() =>
+      parseDaemonConfigToml(
+        MINIMAL_TOML + '\n[[triggers]]\nkind = "http"\nbind = "0.0.0.0:7080"\n',
+      ),
+    ).toThrow(/bind.*loopback/);
+  });
+
+  it('rejects external IPs', () => {
+    expect(() =>
+      parseDaemonConfigToml(
+        MINIMAL_TOML + '\n[[triggers]]\nkind = "http"\nbind = "10.0.0.1:7080"\n',
+      ),
+    ).toThrow(/bind.*loopback/);
+  });
+});
+
+describe('uds trigger params', () => {
+  it('parses path', () => {
+    const cfg = parseDaemonConfigToml(
+      MINIMAL_TOML + '\n[[triggers]]\nkind = "uds"\npath = "/var/run/otzi/otzi.sock"\n',
+    );
+    expect(cfg.triggers[0]).toMatchObject({
+      kind: 'uds',
+      params: { path: '/var/run/otzi/otzi.sock' },
+    });
+  });
+
+  it('rejects relative paths', () => {
+    expect(() =>
+      parseDaemonConfigToml(
+        MINIMAL_TOML + '\n[[triggers]]\nkind = "uds"\npath = "otzi.sock"\n',
+      ),
+    ).toThrow(/path.*absolute/);
+  });
+});
