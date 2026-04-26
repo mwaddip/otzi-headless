@@ -39,6 +39,46 @@ Two ceremonies happen under the hood: ML-DSA pre-sign over `sha256(calldata)` (t
 - `otzi vault [--json]` — print vault BTC + OPNet addresses (and the underlying pubkeys when `--json`).
 - `otzi op20 balance <ticker|ID>` — read the vault's balance for an OP20/OP20S contract from the manifest. Output respects the manifest-stored `decimals`.
 
+### Backup + restore
+
+- `otzi backup` — produce a password-protected archive of the full daemon state at `~/otzi-backup-<ISO>.otzi-backup` (mode 0600). Captures `daemon.toml`, share, identity, pubkey book, manifest (if installed), vault-pubkey cache, bootstrap-secret (pre-DKG only), and a `meta.json`. AES-256-GCM with PBKDF2-SHA256 (600k iterations). The 32-char password is auto-generated (~190 bits entropy) and printed once to stdout in a banner; write it down. Exit code 0 on success.
+
+  ```bash
+  otzi backup
+  ```
+
+  Output:
+  ```
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    Backup written: /home/operator/otzi-backup-2026-04-26T12-34-56Z.otzi-backup
+    Password:       a8K2zP4mQ9xR7sN3vL5jB6tH1wF0gY9c
+
+    WRITE THIS DOWN. There is no recovery path if you lose this password.
+    Store the backup file and password in physically separate locations.
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ```
+
+- `otzi restore <archive-path> [--password-stdin]` — decrypt an `otzi-backup` archive and restore files to their canonical paths with canonical modes. Without `--password-stdin`, the CLI prompts for the password interactively (TTY-masked). With `--password-stdin`, reads the password from stdin until newline — used by debconf during fresh installs and by scripted runs.
+
+  Refuses (exit 1) if:
+  - `/etc/otzi/daemon.toml` already exists. Run `sudo rm /etc/otzi/daemon.toml` first.
+  - `systemctl is-active otzi` returns 0. Run `sudo systemctl stop otzi` first.
+  - Archive magic isn't `OTZI-BACKUP-V1`.
+  - Decryption fails — wrong password OR tampered archive (same error; doesn't leak which).
+
+  ```bash
+  sudo systemctl stop otzi
+  sudo rm /etc/otzi/daemon.toml
+  sudo otzi restore ~/otzi-backup-2026-04-26T12-34-56Z.otzi-backup
+
+  # Or scripted:
+  echo "$BACKUP_PWD" | sudo otzi restore --password-stdin ~/otzi-backup-...otzi-backup
+  ```
+
+  On success, prints a per-file summary and a `Run systemctl start otzi` next-step.
+
+  **Why stdin and not a `--password=<pwd>` flag?** A CLI flag would leak the password via `/proc/<pid>/cmdline` and `ps`. Stdin is the only safe non-interactive channel.
+
 ## Examples
 
 ```bash

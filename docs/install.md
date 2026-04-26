@@ -145,9 +145,105 @@ or ship logs to an external collector (rsyslog, Loki, Vector, etc.).
 
 ### Backup + recovery
 
-See `otzi backup` (TBD — ships in a follow-up workstream). For now, manual
-backup of `/var/lib/otzi/` (share + identity + pubkey book) plus
-`/etc/otzi/daemon.toml` covers everything a node needs to come back online.
+#### Backup
+
+Run `otzi backup` after every config change, every peer change, and after
+initial DKG completes. Beyond that, cadence is per-operator risk tolerance.
+
+```
+otzi backup
+```
+
+Output: a single password-protected archive in your home directory:
+
+```
+~/otzi-backup-2026-04-26T12-34-56Z.otzi-backup    # mode 0600
+```
+
+The archive contains:
+
+- `etc/otzi/daemon.toml` — daemon config.
+- `etc/otzi/share.json` — encrypted DKG share.
+- `etc/otzi/pubkey-book.json` — peer pubkey book from bootstrap.
+- `var/lib/otzi/identity.json` — Noise-KK identity keypair.
+- `etc/otzi/manifest.otzi.json` — installed manifest (if any).
+- `var/lib/otzi/vault-pubkey.json` — derived addresses cache (if present).
+- `var/lib/otzi/bootstrap-secret` — shared passphrase (only pre-DKG; wiped after).
+- `meta.json` — `{ version, createdAt, hostname, partyId }`.
+
+The password is auto-generated (32 chars from `[A-Za-z0-9]`, ~190 bits
+entropy) and printed once to stdout:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Backup written: /home/operator/otzi-backup-2026-04-26T12-34-56Z.otzi-backup
+  Password:       a8K2zP4mQ9xR7sN3vL5jB6tH1wF0gY9c
+
+  WRITE THIS DOWN. There is no recovery path if you lose this password.
+  Store the backup file and password in physically separate locations.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**Write down the password.** Loss of the password is loss of the backup —
+there is no recovery path. Store the archive and the password in physically
+separate locations: e.g., archive in cloud storage, password in a password
+manager OR a sealed envelope in a different room. An attacker who gets both
+can sign as your slot in the federation.
+
+#### Recovery
+
+Two paths.
+
+**1. Fresh-install via debconf (preferred).**
+
+When installing the .deb on a new host, answer `Yes` to "Restore from a
+backup?". debconf prompts for the archive path and password; postinst
+pipes the password via stdin to `otzi restore --password-stdin`. If
+restore succeeds, the rest of the install prompts (network, role,
+peers, bootstrap-secret, etc.) are skipped — config came from the
+backup.
+
+If restore fails (wrong password, corrupted archive, missing file),
+dpkg flags the package as half-installed. Retry via:
+
+```
+sudo dpkg-reconfigure otzi-headless
+```
+
+Decline restore this time, OR provide a valid backup + password.
+
+**2. Manual via `otzi restore`.**
+
+If you've already done a fresh install (or the daemon is in a
+half-state), stop the daemon, remove the existing config, then run
+restore manually:
+
+```
+sudo systemctl stop otzi
+sudo rm /etc/otzi/daemon.toml
+sudo otzi restore ~/otzi-backup-2026-04-26T12-34-56Z.otzi-backup
+```
+
+The CLI prompts for the password interactively. Use
+`--password-stdin` for scripted runs.
+
+**Restore refuses if:**
+
+- `/etc/otzi/daemon.toml` already exists — operator must remove it first
+  (loud failure beats silent overwrite).
+- `systemctl is-active otzi` returns 0 — operator must `systemctl stop
+  otzi` first.
+- Archive magic doesn't match `OTZI-BACKUP-V1`.
+- Decryption fails — wrong password OR tampered archive (same error
+  message; the daemon doesn't leak which one).
+
+#### What the archive does NOT contain
+
+- Other federation members' shares — you can only sign for your own slot.
+- The federation's threshold-key public material — recoverable from any
+  peer via re-bootstrap.
+- Blockchain state — vault funds live on-chain, not in the backup.
+- The `.deb` package itself — download from releases for the install.
 
 ## Uninstall
 
