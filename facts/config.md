@@ -40,9 +40,16 @@
   - **Pre:** `signingMs`, `dkgMs` positive integers (validated in parser).
   - **Post:** Ceremony timeout overrides.
 
+- `BootstrapConfig` — interface
+  - **Pre:** `role` ∈ `{'leader', 'leaf'}`. For `'leader'`, `bind` is `host:port`. For `'leaf'`, `leaderUrl` is full URL. Both fields optional in TS but enforced by parser at runtime per role.
+  - **Post:** Read by `otzi setup` (zero-arg) to dispatch to leader or leaf bootstrap path. Dormant after `pubkeys.json` is written; harmless to leave in config.
+
+- `DaemonConfig.bootstrap?: BootstrapConfig` — optional
+  - **Post:** Present in deb-rendered `daemon.toml`; absent in test fixtures.
+
 - `TriggerEntry` — interface
   - **Pre:** `kind` ∈ `TRIGGER_KINDS`; `params` opaque.
-  - **Post:** One trigger for ceremony activation (http or cron).
+  - **Post:** One trigger for ceremony activation (http, uds, or cron).
 
 - `DaemonConfig` — interface
   - **Pre:** All sub-interfaces must satisfy their constraints. Coherence checks run post-parse (no self-collisions, etc.).
@@ -96,6 +103,11 @@
   - **Throws:** `ConfigError` with key paths like "share.path", "node.party_id", "gate.strategy", etc.
   - **UDS trigger params:** `params.path` is the absolute UDS socket path. No `bind`, no `auth_token_env`. Validated at parse time as a non-empty string starting with `/`.
 
+- `parseBootstrap(raw)` — section-level parser for `[bootstrap]`
+  - **Pre:** Optional in tests (returns `undefined`); required in production daemon.toml rendered by debconf.
+  - **Post:** Returns `BootstrapConfig | undefined`; validates `role ∈ {'leader', 'leaf'}`; for leader, `bind` is required `host:port`; for leaf, `leader_url` is required `http(s)://...`.
+  - **Throws:** `ConfigError` on missing required fields or invalid role.
+
 - `validateCoherence(cfg)` — function
   - **Pre:** Fully parsed `DaemonConfig`.
   - **Post:** None (checks only; no mutation).
@@ -107,6 +119,7 @@
 - Deadlines default to 5min / 15min if section missing.
 - Transport.url required for relay; Transport.listen optional for peer-mesh (error deferred).
 - Peers must have at least one entry.
+- **HTTP trigger loopback enforcement.** When `kind = "http"`, `parseTrigger` validates that the bind host is `127.0.0.1`, `::1`, `localhost`, or a UDS-style absolute path. Any other host (e.g. `0.0.0.0`, external IP) is rejected with a clear error. Localhost binding is load-bearing for the security posture (CLI is THE operator surface; non-loopback HTTP would let external attackers forge ceremony triggers).
 
 **Cross-component contracts:**
 - Used by `load.ts` to wrap file I/O.
