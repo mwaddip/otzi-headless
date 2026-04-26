@@ -33,6 +33,7 @@
 
 import { loadDaemonConfig } from '../config/load';
 import { loadAndValidate } from './config-merge';
+import { createConsoleLogger } from './console-logger';
 import { Daemon } from './daemon';
 import { setupMaster, setupMember } from './setup';
 import { buildTransportFromFiles } from './transport-factory';
@@ -114,8 +115,15 @@ async function runDaemonCommand(args: string[]): Promise<void> {
   const configPath = args[0];
   if (!configPath) throw new Error(usage());
 
+  // The daemon path is the only entrypoint that needs a real Logger — all other
+  // verbs are short-lived CLI commands talking to the daemon over UDS. Ship the
+  // logger to both the transport (for peer-mesh allowlist warns picked up by
+  // fail2ban via journald) and to the Daemon (for orchestrator/leader/triggers
+  // info+error context). stderr only — stdout is reserved for CLI machine output.
+  const logger = createConsoleLogger();
+
   const state = await loadAndValidate(configPath);
-  const bundle = await buildTransportFromFiles(state);
+  const bundle = await buildTransportFromFiles(state, { logger });
   await bundle.start();
 
   const daemon = new Daemon({
@@ -132,6 +140,7 @@ async function runDaemonCommand(args: string[]): Promise<void> {
       maxDelayMs: 2_000,
       deadlineMs: 120_000,
     },
+    logger,
   });
 
   await daemon.start();
