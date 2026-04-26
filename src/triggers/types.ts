@@ -55,6 +55,17 @@ export interface HttpTriggerConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// UDS trigger
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface UdsTriggerConfig {
+  /** Absolute UDS socket path. Parent directory MUST exist before start(). */
+  path: string;
+  handler: HttpHandler;
+  logger?: Logger;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Cron trigger
 // ─────────────────────────────────────────────────────────────────────────
 
