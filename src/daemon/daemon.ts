@@ -43,9 +43,15 @@ import type {
   HttpResponse,
   TriggerSource,
 } from '../triggers/types';
+import { encodeCeremonyMessage, manifestPushMessage } from '../core/ceremony-messages';
 import { toHex } from '../wire/hex';
 import { fromHex } from '../wire/hex';
 import type { LoadedDaemonState } from './config-merge';
+import {
+  ControlPlane,
+  ControlPlaneClosed,
+  type ControlPlaneOpts,
+} from './control-plane';
 import { GateRejection, LeaderDispatcher } from './leader';
 import { deriveVaultAddresses } from './vault-pubkey';
 import type { NetworkName } from '../config/types';
@@ -86,11 +92,18 @@ export interface DaemonDeps {
   };
   /** Seed fill for the 32B opnet-params random seed. Defaults to WebCrypto. */
   opnetSeedFill?: (buf: Uint8Array) => void;
+  /**
+   * Override the control-plane file paths (Phase 9c). Defaults to
+   * `/var/lib/otzi/bootstrap-secret` + `/etc/otzi/manifest.otzi.json`.
+   * Tests inject tmpdir-scoped paths.
+   */
+  controlPlaneOpts?: Pick<ControlPlaneOpts, 'secretPath' | 'manifestPath'>;
 }
 
 export class Daemon {
   readonly orchestrator: Orchestrator;
   readonly leader: LeaderDispatcher;
+  readonly controlPlane: ControlPlane;
   private readonly store: BlobStore;
   private readonly server: BlobServer;
   private readonly triggers: TriggerSource[];
@@ -124,6 +137,13 @@ export class Daemon {
     const opnetProvider = deps.opnetProvider
       ?? (keylinkNetwork ? getProvider(keylinkNetwork) : undefined);
 
+    const controlPlane = new ControlPlane({
+      ...(deps.controlPlaneOpts?.secretPath ? { secretPath: deps.controlPlaneOpts.secretPath } : {}),
+      ...(deps.controlPlaneOpts?.manifestPath ? { manifestPath: deps.controlPlaneOpts.manifestPath } : {}),
+      logger: this.log,
+    });
+    this.controlPlane = controlPlane;
+
     this.orchestrator = new Orchestrator({
       transport: deps.transport,
       runner,
@@ -140,6 +160,7 @@ export class Daemon {
       ...(deps.state.frostLegacySig ? { frostLegacySig: deps.state.frostLegacySig } : {}),
       sdkWalletMnemonic,
       persistDkgShare: deps.state.persistDkgShare,
+      controlPlane,
       logger: this.log,
     });
 
@@ -164,7 +185,14 @@ export class Daemon {
 
     const httpHandler =
       deps.httpHandler
-      ?? buildDefaultHttpHandler(this.leader, configNetwork, deps.state, this.log);
+      ?? buildDefaultHttpHandler(
+        this.leader,
+        configNetwork,
+        deps.state,
+        controlPlane,
+        deps.transport,
+        this.log,
+      );
     this.triggers = buildTriggers(deps.state.config.triggers, httpHandler, deps.cronHandlers, this.log);
   }
 
@@ -266,6 +294,8 @@ export function buildDefaultHttpHandler(
   leader: LeaderDispatcher,
   network: NetworkName,
   state: LoadedDaemonState,
+  controlPlane: ControlPlane,
+  transport: Transport,
   logger: Logger = NOOP_LOGGER,
 ): HttpHandler {
   return async (req: HttpRequest): Promise<HttpResponse> => {
@@ -282,6 +312,57 @@ export function buildDefaultHttpHandler(
 
     try {
       switch (op) {
+        case 'sync': {
+          // Phase 9c: HMAC-authenticated manifest distribution. Bootstrap-window-only.
+          // Local install runs first (so failure on this node short-circuits the
+          // broadcast — peers don't need to know about a manifest the operator's
+          // own node refused). On success, broadcast `manifest-push` to all peers.
+          const manifest = requireString(b, 'manifest');
+          const hmacHex = requireString(b, 'hmac');
+          try {
+            await controlPlane.installPushedManifest({ manifest, hmacHex });
+          } catch (err) {
+            if (err instanceof ControlPlaneClosed) {
+              return { status: 410, body: { error: 'control plane closed', ceremonyId } };
+            }
+            return {
+              status: 400,
+              body: {
+                error: (err as Error).message,
+                kind: (err as Error).name,
+                ceremonyId,
+              },
+            };
+          }
+          // Transport.broadcast fans out to all peers in one call; per-peer
+          // ack/error is not exposed by the transport surface (broadcast is
+          // best-effort fire-and-forget). Operators verify peer state via
+          // logs / `otzi list` on each node if they need confirmation.
+          const peerCount = state.peersById.size - 1;
+          if (peerCount > 0) {
+            try {
+              await transport.broadcast(
+                encodeCeremonyMessage(manifestPushMessage({ manifest, hmac: hmacHex })),
+              );
+            } catch (err) {
+              logger.warn('op:sync: broadcast failed (manifest installed locally)', {
+                err: err instanceof Error ? err.message : String(err),
+              });
+              return {
+                status: 502,
+                body: {
+                  error: 'manifest installed locally; broadcast to peers failed',
+                  kind: 'BroadcastFailed',
+                  ceremonyId,
+                },
+              };
+            }
+          }
+          return {
+            status: 200,
+            body: { ceremonyId, status: 'done', peersNotified: peerCount },
+          };
+        }
         case 'vault-info': {
           // Read-only metadata: peer set + threshold + cached vault
           // addresses. Used by the CLI to discover the signer set + verify

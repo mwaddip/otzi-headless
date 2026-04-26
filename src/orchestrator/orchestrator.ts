@@ -191,6 +191,34 @@ export class Orchestrator {
       msg.kind === 'signoff-aborted'
     ) {
       this.handleSignoff(from, msg);
+      return;
+    }
+
+    if (msg.kind === 'manifest-push') {
+      void this.handleManifestPush(from, msg);
+    }
+  }
+
+  private async handleManifestPush(
+    from: PartyId,
+    msg: Extract<CeremonyMessage, { kind: 'manifest-push' }>,
+  ): Promise<void> {
+    if (!this.deps.controlPlane) {
+      this.log.debug('orchestrator: manifest-push received but no control-plane configured; dropping', { from });
+      return;
+    }
+    try {
+      await this.deps.controlPlane.installPushedManifest({
+        manifest: msg.manifest,
+        hmacHex: msg.hmac,
+      });
+      this.log.info('orchestrator: manifest-push installed', { from });
+    } catch (err) {
+      this.log.warn('orchestrator: manifest-push rejected', {
+        from,
+        kind: (err as Error).name,
+        err: errString(err),
+      });
     }
   }
 

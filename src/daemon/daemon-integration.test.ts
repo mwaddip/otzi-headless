@@ -1,6 +1,7 @@
 import { ThresholdMLDSA } from '@btc-vision/post-quantum/threshold-ml-dsa.js';
 import { type Rng } from '@mwaddip/frots';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createHmac } from 'node:crypto';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -586,6 +587,194 @@ describe('Daemon integration — DKG persistence + restart', () => {
     },
     300_000,
   );
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 9c: control-plane manifest sync
+// ─────────────────────────────────────────────────────────────────────────
+
+const VALID_MANIFEST_TEXT = JSON.stringify({
+  version: 1,
+  name: 'IntegrationTest',
+  contracts: [
+    { name: 'C', address: '0x' + 'aa'.repeat(32), type: 'OP20', decimals: 6 },
+  ],
+});
+
+function hmacOf(secret: string, payload: string): string {
+  return createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+}
+
+interface SyncHarness {
+  daemons: Daemon[];
+  bundles: TransportBundle[];
+  httpAddrs: string[];
+  manifestPaths: string[];
+  secretPaths: string[];
+  tmp: string;
+  teardown: () => Promise<void>;
+}
+
+async function buildSyncHarness(n: number, sharedSecret: string | null): Promise<SyncHarness> {
+  const tmp = await mkdtemp(join(tmpdir(), 'otzi-sync-'));
+  const identities = await Promise.all(Array.from({ length: n }, () => generateIdentity(true)));
+  const listenPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
+  const httpPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
+  const shares = dealerKeygen(2, n);
+  const book = await buildBookFromIdentities(identities);
+
+  const secretPaths = Array.from({ length: n }, (_, i) => join(tmp, `secret-${i}`));
+  const manifestPaths = Array.from({ length: n }, (_, i) => join(tmp, `manifest-${i}.json`));
+
+  if (sharedSecret !== null) {
+    for (const sp of secretPaths) await writeFile(sp, sharedSecret);
+  }
+
+  const daemons: Daemon[] = [];
+  const bundles: TransportBundle[] = [];
+  for (let i = 0; i < n; i++) {
+    const peerIds = [];
+    for (let j = 0; j < n; j++) {
+      if (i === j) continue;
+      peerIds.push({
+        id: `node-${j}`,
+        partyId: j,
+        endpoint: `ws://127.0.0.1:${listenPorts[j]}`,
+      });
+    }
+    const cfg = makeIntegrationConfig({
+      nodeId: `node-${i}`,
+      partyId: i,
+      peerIds,
+      transport: { kind: 'peer-mesh', listen: `127.0.0.1:${listenPorts[i]}` },
+      httpBind: `127.0.0.1:${httpPorts[i]}`,
+    });
+    const state = buildStateFromShare(cfg, shares[i]!);
+    const logger = makeLogger(`peer${i}`);
+    const bundle = await buildTransportFromMemory(state, identities[i]!, book, { logger });
+    await bundle.start();
+    const daemon = new Daemon({
+      state,
+      transport: bundle.transport,
+      rng: SYSTEM_RNG,
+      pullOpts: DKG_PULL_OPTS,
+      logger,
+      controlPlaneOpts: {
+        secretPath: secretPaths[i]!,
+        manifestPath: manifestPaths[i]!,
+      },
+    });
+    bundles.push(bundle);
+    daemons.push(daemon);
+  }
+
+  for (const d of daemons) await d.start();
+
+  return {
+    daemons,
+    bundles,
+    httpAddrs: httpPorts.map((p) => `http://127.0.0.1:${p}`),
+    manifestPaths,
+    secretPaths,
+    tmp,
+    teardown: async () => {
+      for (const d of daemons) await d.stop();
+      for (const b of bundles) await b.stop();
+      await rm(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(condition: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await condition()) return;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`waitFor: condition did not hold within ${timeoutMs}ms`);
+}
+
+describe('Daemon integration — phase 9c: manifest sync', () => {
+  let harness: SyncHarness | null = null;
+  afterEach(async () => {
+    if (harness) await harness.teardown();
+    harness = null;
+  });
+
+  it('3-peer ring: op:sync installs manifest on every peer', async () => {
+    harness = await buildSyncHarness(3, 'shared-bootstrap-secret');
+    for (const b of harness.bundles) await waitUntilConnected(b, 2);
+
+    const hmac = hmacOf('shared-bootstrap-secret', VALID_MANIFEST_TEXT);
+    const res = await fetch(`${harness.httpAddrs[0]}/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ op: 'sync', manifest: VALID_MANIFEST_TEXT, hmac }),
+    });
+    const bodyText = await res.text();
+    if (res.status !== 200) throw new Error(`op:sync returned ${res.status}: ${bodyText}`);
+    const json = JSON.parse(bodyText) as {
+      ceremonyId: string;
+      status: string;
+      peersNotified: number;
+    };
+    expect(json.status).toBe('done');
+    expect(json.peersNotified).toBe(2);
+
+    expect(await readFile(harness.manifestPaths[0]!, 'utf8')).toBe(VALID_MANIFEST_TEXT);
+
+    // Wait for the broadcast to land + peers to install. Each peer's
+    // ControlPlane runs the schema validator (a few ms) before the file
+    // appears.
+    for (let i = 1; i < 3; i++) {
+      await waitFor(() => fileExists(harness!.manifestPaths[i]!));
+      expect(await readFile(harness.manifestPaths[i]!, 'utf8')).toBe(VALID_MANIFEST_TEXT);
+    }
+  }, 60_000);
+
+  it('3-peer ring: bad HMAC — peers reject; no peer installs', async () => {
+    harness = await buildSyncHarness(3, 'shared-bootstrap-secret');
+    for (const b of harness.bundles) await waitUntilConnected(b, 2);
+
+    const badHmac = 'aa'.repeat(32);
+    const res = await fetch(`${harness.httpAddrs[0]}/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ op: 'sync', manifest: VALID_MANIFEST_TEXT, hmac: badHmac }),
+    });
+    expect(res.status).toBe(400);
+
+    // Local install was the first thing to fail; nothing should be on disk.
+    for (let i = 0; i < 3; i++) {
+      expect(await fileExists(harness.manifestPaths[i]!)).toBe(false);
+    }
+  }, 30_000);
+
+  it('control plane closed: missing local secret returns 410, no broadcast', async () => {
+    harness = await buildSyncHarness(3, null);
+    for (const b of harness.bundles) await waitUntilConnected(b, 2);
+
+    const hmac = hmacOf('shared-bootstrap-secret', VALID_MANIFEST_TEXT);
+    const res = await fetch(`${harness.httpAddrs[0]}/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ op: 'sync', manifest: VALID_MANIFEST_TEXT, hmac }),
+    });
+    expect(res.status).toBe(410);
+
+    for (let i = 0; i < 3; i++) {
+      expect(await fileExists(harness.manifestPaths[i]!)).toBe(false);
+    }
+  }, 30_000);
 });
 
 // ─────────────────────────────────────────────────────────────────────────

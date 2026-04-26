@@ -21,6 +21,7 @@ import type { PullOpts } from '../core/blob-puller';
 import type { CeremonyRunner, CombinedDkgResult } from '../core/ceremony-runner';
 import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
+import type { ControlPlane } from '../daemon/control-plane';
 import type { ApprovalGate } from '../gate/types';
 import type { NetworkName } from '../node/types';
 import type { DecryptedShare } from '../wire/share-crypto';
@@ -156,5 +157,11 @@ export interface OrchestratorDeps {
    * monitors logs.
    */
   persistDkgShare?: DkgPersistenceSink;
+  /**
+   * Phase-9c control-plane sink. When set, the orchestrator routes incoming
+   * `manifest-push` wire messages to it. Optional: tests / DKG-only daemons
+   * may omit it; manifest-push messages then silent-drop.
+   */
+  controlPlane?: ControlPlane;
   logger?: Logger;
 }
