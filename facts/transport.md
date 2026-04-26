@@ -536,9 +536,9 @@
 **Notes / gotchas:**
 - Role is symmetric (lower dials, higher listens) but implemented via relay routing. Initiator sends hs1 as frame(to=partyId, payload=hs1); responder receives incoming(from=partyId, payload=hs1).
 - Per-peer `processing` flag is CRITICAL: without it, concurrent incoming frames could race the handshake state machine.
-- Relay connection drop is NOT recovered; operator must restart daemon. This is a documented gap (phase 3f).
-- No active reconnect to relay; WebSocket close triggers `handleRelayClose()` which sets all peers to disconnected and clears sessions.
 - Broadcast and pull are independent per-peer; one peer's failure doesn't affect others.
+
+**Reconnect behavior (operator-facing):** No automatic reconnect. If the relay WebSocket drops mid-session, `handleRelayClose()` sets all peers to disconnected and clears sessions; subsequent broadcasts silently no-op (offline peers are skipped) and pulls return null. The daemon does NOT re-dial. Operators recover via `systemctl restart otzi`. Acceptable for the bootstrap/control-plane path (short-lived); production federations that need stability should use peer-mesh transport, which has initiator-side exponential-backoff reconnect built in.
 
 ---
 
