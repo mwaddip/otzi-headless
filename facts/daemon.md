@@ -60,6 +60,12 @@
 - `frostLegacySig` is piggy-backed on the V3 envelope; Ötzi's decoder tolerates unknown keys.
 - DKG-only mode is a full operational mode (daemon can orchestrate + lead DKG); signing is rejected + logged.
 
+**Bootstrap-secret lifecycle (phase 9a)**
+- **Load:** `loadAndValidate` (in `config-merge.ts`) optionally reads `/var/lib/otzi/bootstrap-secret` if it exists. Stored on `LoadedDaemonState.bootstrapSecret: string | undefined`. ENOENT is fine — secret may have been wiped post-DKG.
+- **Use:** Phase 9c's control-plane wire opcode verifies the operator-typed shared secret via HMAC-SHA-256. Phase 9a only loads it; 9c consumes it.
+- **Wipe:** `share-persistence.persistCombinedDkgShare` `unlink()`s `/var/lib/otzi/bootstrap-secret` after the share is durably written. Daemon's in-memory `bootstrapSecret` is also cleared. Subsequent control-plane attempts get a defined "control plane closed" error.
+- **Reentrancy:** ENOENT on unlink is silently ignored (idempotent on retries / repeat DKG).
+
 ---
 
 ### `share-persistence.ts`
