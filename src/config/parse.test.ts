@@ -214,7 +214,7 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
     const toml =
       MINIMAL_TOML + '\n[[triggers]]\nkind = "carrier-pigeon"\n';
     expect(() => parseDaemonConfigToml(toml)).toThrow(
-      /triggers\[0\]\.kind.*must be one of http \| cron/,
+      /triggers\[0\]\.kind.*must be one of http \| uds \| cron/,
     );
   });
 
