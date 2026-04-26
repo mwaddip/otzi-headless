@@ -146,18 +146,14 @@ The bootstrap secret is short-lived: it lives at
 `/var/lib/otzi/bootstrap-secret` (mode 660 root:otzi) and is automatically
 wiped the moment DKG completes successfully.
 
-### 2. Add yourself to the `otzi` group
+postinst auto-adds every operator listed at the debconf prompt to the
+`otzi` group (so they can connect to the UDS at
+`/var/run/otzi/otzi.sock`). Linux supplementary-group changes don't
+affect already-running shells, so each listed operator must log out and
+back in once — or run `exec newgrp otzi` in their existing session —
+before the next step.
 
-```bash
-sudo usermod -aG otzi $USER
-exec newgrp otzi
-```
-
-Without this, you have to `sudo -u otzi otzi <subcommand>` for every CLI
-call. The group membership lets you connect to the daemon's UDS at
-`/var/run/otzi/otzi.sock` directly.
-
-### 3. Bootstrap pubkey exchange
+### 2. Bootstrap pubkey exchange
 
 The leader hosts a one-shot HTTP server on `:7090`; leaves register against
 it. Run leader first.
@@ -179,7 +175,7 @@ pubkey book. **Eyeball-compare the fingerprint across all three nodes.**
 If any node shows a different value, someone tampered with the exchange —
 delete `/var/lib/otzi/pubkeys.json` everywhere and start over.
 
-### 4. Complete the peer entries
+### 3. Complete the peer entries
 
 After `otzi setup` finishes, each node has a `pubkeys.json` but
 `/etc/otzi/daemon.toml`'s `[[peers]]` blocks are stubs. Edit them in,
@@ -202,7 +198,7 @@ endpoint = "ws://node-c.example:8800"
 Same on every node, with each node's own block omitted. `party_id` values
 are assigned during bootstrap and recorded in `pubkeys.json`.
 
-### 5. Run DKG
+### 4. Run DKG
 
 **On the leader only** (the daemon must already be reachable via systemd
 — start it now):
@@ -227,7 +223,7 @@ otzi generate: DKG complete (status=done)
   share path:        /var/lib/otzi/share.json
 ```
 
-### 6. Fund the vault
+### 5. Fund the vault
 
 Send testnet BTC (or OP20 tokens for an OPNet flow) to the printed vault
 addresses. Verify on a block explorer; the daemon does not watch chains.
@@ -237,7 +233,7 @@ otzi btc balance              # poll until you see your funding
 otzi op20 balance BHTT        # if your manifest defines OP20 tokens
 ```
 
-### 7. Install a manifest
+### 6. Install a manifest
 
 A manifest (`.otzi.json`) is a per-project file enumerating contract
 addresses, ABI shorthand (OP20 / OP20S / OP721 / Custom), and per-token
@@ -258,7 +254,7 @@ in [`docs/cli.md`](docs/cli.md) — HMAC-authenticated push to all peers
 in one call. After DKG, manifest distribution is operator-local
 (`otzi install` on each node).
 
-### 8. Sign your first transaction
+### 7. Sign your first transaction
 
 OPNet contract call:
 
