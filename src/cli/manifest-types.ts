@@ -6,7 +6,7 @@
  * contracts + addresses + mutating-method ABIs. No UI fields.
  */
 
-export type ContractType = 'OP20' | 'OP20S' | 'OP271' | 'Custom';
+export type ContractType = 'OP20' | 'OP20S' | 'OP721' | 'Custom';
 
 export type AbiParamType =
   | 'address'

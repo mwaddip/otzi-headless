@@ -23,7 +23,7 @@
       "properties": {
         "name": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
         "address": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
-        "type": { "type": "string", "enum": ["OP20", "OP20S", "OP271", "Custom"] },
+        "type": { "type": "string", "enum": ["OP20", "OP20S", "OP721", "Custom"] },
         "decimals": { "type": "integer", "minimum": 0, "maximum": 38 },
         "abi": {
           "type": "array",
@@ -36,7 +36,7 @@
           "then": { "required": ["decimals"], "not": { "required": ["abi"] } }
         },
         {
-          "if": { "properties": { "type": { "const": "OP271" } }, "required": ["type"] },
+          "if": { "properties": { "type": { "const": "OP721" } }, "required": ["type"] },
           "then": { "not": { "required": ["abi"] } }
         },
         {
