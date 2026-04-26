@@ -1,6 +1,11 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import * as http from 'node:http';
 import { CronTrigger } from './cron';
 import { HttpTrigger } from './http';
+import { UdsTrigger } from './uds';
 import type { HttpHandler, HttpRequest } from './types';
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -291,5 +296,92 @@ describe('CronTrigger — scheduling', () => {
     t.start();
     t.stop();
     t.stop();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// UDS trigger
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('UdsTrigger', () => {
+  let tmpDir: string;
+  let socketPath: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'otzi-uds-test-'));
+    socketPath = join(tmpDir, 'otzi.sock');
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it('binds to the socket path on start and removes it on stop', async () => {
+    const trigger = new UdsTrigger({
+      path: socketPath,
+      handler: async () => ({ status: 200, body: { ok: true } }),
+    });
+
+    await trigger.start();
+    expect(trigger.address()).toEqual({ path: socketPath });
+
+    const { stat } = await import('node:fs/promises');
+    const st = await stat(socketPath);
+    expect(st.isSocket()).toBe(true);
+
+    await trigger.stop();
+    expect(trigger.address()).toBeNull();
+
+    await expect(stat(socketPath)).rejects.toThrow();
+  });
+
+  it('forwards POSTed JSON to the handler', async () => {
+    const seenBodies: unknown[] = [];
+    const trigger = new UdsTrigger({
+      path: socketPath,
+      handler: async (req) => {
+        seenBodies.push(req.body);
+        return { status: 200, body: { echoed: req.body } };
+      },
+    });
+    await trigger.start();
+
+    const responseBody = await new Promise<string>((resolve, reject) => {
+      const req = http.request(
+        {
+          socketPath,
+          method: 'POST',
+          path: '/',
+          headers: { 'content-type': 'application/json' },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        },
+      );
+      req.on('error', reject);
+      req.end(JSON.stringify({ hello: 'uds' }));
+    });
+
+    expect(seenBodies).toEqual([{ hello: 'uds' }]);
+    expect(JSON.parse(responseBody)).toEqual({ echoed: { hello: 'uds' } });
+
+    await trigger.stop();
+  });
+
+  it('removes a stale socket file before binding', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(socketPath, '', { mode: 0o660 });
+
+    const trigger = new UdsTrigger({
+      path: socketPath,
+      handler: async () => ({ status: 200 }),
+    });
+    await trigger.start();
+    const { stat } = await import('node:fs/promises');
+    const st = await stat(socketPath);
+    expect(st.isSocket()).toBe(true);
+    await trigger.stop();
   });
 });
