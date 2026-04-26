@@ -192,11 +192,20 @@ async function runGenerateCommand(args: string[]): Promise<void> {
     status: string;
     mldsaPublicKeyHex: string;
     frostVerifyingKeyHex: string;
+    btcAddress?: string;
+    opnetAddress?: string;
+    network?: string;
   };
 
   console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.error(`  otzi generate: DKG complete (status=${result.status})`);
   console.error(`  ceremonyId:        ${result.ceremonyId}`);
+  if (result.btcAddress) {
+    console.error(`  vault BTC:         ${result.btcAddress} (fund here for BTC)`);
+  }
+  if (result.opnetAddress) {
+    console.error(`  vault OPNet:       ${result.opnetAddress} (send OP20/contract calls here)`);
+  }
   console.error(`  mldsaPublicKey:    ${result.mldsaPublicKeyHex}`);
   console.error(`  frostVerifyingKey: ${result.frostVerifyingKeyHex}`);
   console.error(`  share file:        ${config.share.path} (each peer also persisted its own copy)`);
