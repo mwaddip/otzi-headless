@@ -9,6 +9,22 @@ Description: Node role for bootstrap
  step (`otzi setup`). After bootstrap, all nodes are peers in the
  threshold ceremony.
 
+Template: otzi-headless/operators
+Type: string
+Description: Operator usernames (space-separated)
+ List the system usernames that should be able to run `otzi <command>`
+ without sudo. Each will be added to the `otzi` group. Leave blank to
+ add operators manually later via `sudo usermod -aG otzi <user>` or
+ `sudo dpkg-reconfigure otzi-headless`.
+
+Template: otzi-headless/bootstrap-secret
+Type: password
+Description: Bootstrap secret (shared passphrase)
+ Operators agree on this string out-of-band BEFORE install. It
+ authenticates control-plane CLI operations (e.g. `otzi sync`) during
+ the bootstrap window. Wiped from disk after DKG completes; cannot be
+ recovered. After DKG, manifest changes are operator-local per node.
+
 Template: otzi-headless/network
 Type: select
 Choices: mainnet, testnet, regtest
@@ -18,9 +34,9 @@ Description: Bitcoin network
 Template: otzi-headless/opnet-rpc
 Type: string
 Description: OPNet RPC URL
- Operator-side broadcast paths (and any future read endpoints) default
- to this URL. Per-network defaults: https://api.opnet.org (mainnet),
- https://testnet.opnet.org (testnet), http://127.0.0.1:9001 (regtest).
+ Operator-side broadcast paths default to this URL. Per-network
+ defaults: https://api.opnet.org (mainnet), https://testnet.opnet.org
+ (testnet), http://127.0.0.1:9001 (regtest).
 
 Template: otzi-headless/peer-hostnames
 Type: string
@@ -28,9 +44,7 @@ Description: Peer hostnames (space-separated, optional)
  List the hostnames or IPs of the other nodes in the ring (e.g.
  "node-b.example node-c.example"). Used to populate stub [[peers]]
  entries in the generated daemon.toml. Leave blank to fill in manually
- after bootstrap. The bootstrap step (`otzi setup`) discovers each
- peer's identity pubkey + party_id; you complete the [[peers]] block
- by editing /etc/otzi/daemon.toml.
+ after bootstrap.
 
 Template: otzi-headless/transport
 Type: select
@@ -39,8 +53,7 @@ Default: peer-mesh
 Description: Transport kind
  "peer-mesh" — direct WebSocket connections between daemons (recommended
  for permanent federations with stable hostnames). "relay" — daemons
- connect through a central relay server (simpler but requires a
- coordinator online).
+ connect through a central relay server.
 
 Template: otzi-headless/listen
 Type: string
@@ -53,13 +66,18 @@ Type: string
 Description: Relay WebSocket URL
  Required when transport is "relay" — e.g. ws://relay.example:9000.
 
-Template: otzi-headless/operator-bind
+Template: otzi-headless/bootstrap-bind
 Type: string
-Default: 127.0.0.1:7080
-Description: Operator HTTP API bind (host:port)
- Local address the operator-facing HTTP API listens on. Default is
- loopback (recommended). For UDS or remote bind, edit
- /etc/otzi/daemon.toml after install.
+Default: 0.0.0.0:7090
+Description: Bootstrap server bind address (host:port) — leader only
+ Address this node binds for inbound bootstrap registrations from
+ leaves. Used only by `otzi setup` on the leader; ignored on leaves.
+
+Template: otzi-headless/bootstrap-leader-url
+Type: string
+Description: Bootstrap leader URL — leaf only
+ URL of the leader's bootstrap server (e.g. http://leader-host:7090).
+ Used only by `otzi setup` on leaves; ignored on the leader.
 
 Template: otzi-headless/node-id
 Type: string
