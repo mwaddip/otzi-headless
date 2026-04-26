@@ -153,7 +153,7 @@ party_id = 2
 endpoint = "ws://node-c.example:8800"
 
 [gate]
-strategy = "auto"                       # auto | policy | webhook | cli | queue
+strategy = "auto"                       # auto | policy | exec | webhook
 
 [deadlines]
 signing_ms = 300000
