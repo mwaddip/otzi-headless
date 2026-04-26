@@ -14,7 +14,7 @@
 ## Install
 
 ```bash
-sudo apt install ./otzi-headless_0.0.1_amd64.deb
+sudo apt install ./otzi-headless_<version>_amd64.deb
 ```
 
 `apt` resolves the `nodejs` dependency; if it's missing, `apt` will refuse

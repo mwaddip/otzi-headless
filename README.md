@@ -1,345 +1,465 @@
 # otzi-headless
 
-Headless daemon variant of [Ötzi](https://github.com/mwaddip/otzi) — automated
-ML-DSA + FROST threshold signing over OPNet Bitcoin L1.
+[![Release](https://img.shields.io/github/v/tag/mwaddip/otzi-headless?label=release)](https://github.com/mwaddip/otzi-headless/releases)
 
-Where Ötzi is a browser app for humans running ad-hoc ceremonies, `otzi-headless`
-is a long-running daemon for servers running unattended ones: bridge reserves,
-liquidity pools, multi-party server vaults, automated triggers.
+A federated threshold-signing **daemon** for OPNet Bitcoin L1 vaults. ML-DSA
+post-quantum auth + FROST Schnorr signing, run unattended across a small
+ring of trusted operator nodes — bridge reserves, liquidity pools,
+multi-party server vaults. Headless variant of [Ötzi](https://github.com/mwaddip/otzi).
 
-## Status
+`otzi-headless` is a **signing backend**, not a wallet, chain watcher, or
+decision engine. Operators POST construction parameters via the CLI; the
+daemon's only job is custody of threshold-shared keys and execution of
+signing ceremonies. Chain monitoring, autonomous triggers, and business
+logic live in the operator's own infrastructure.
 
-| Area | Status |
-|---|---|
-| Ceremony core (ML-DSA threshold signing, FROST signing, 3 DKG flavors) | ✅ |
-| Broadcast pipeline (OPNet calldata + capture + broadcast, BTC vault + fees) | ✅ |
-| Testnet end-to-end (signet — BHTT.transfer + BTC return landed 2026-04-23) | ✅ |
-| Daemon entrypoint (HTTP / cron triggers, approval gate, orchestrator) | ✅ |
-| Transport (Noise-KK peer-mesh + minimal Node relay) | ✅ |
-| Bootstrap (identity exchange + fingerprint verification) | ✅ |
-| FROST `PublicKeyPackage` reconstruction from V3 share | ⏳ |
-| DKG result persistence (encrypted share file) | ⏳ |
-| Packaging (Docker, `.deb`, systemd unit) | ⏳ |
+> **Status:** v0.1.0 — first pre-release. No deployed users yet; the wire
+> format and config schema may still change before v1.
 
-**264/264 tests green**, `tsc --noEmit` clean.
+## Table of contents
 
-## Why a headless variant
+- [Threat model](#threat-model)
+- [Architecture](#architecture)
+- [Setup walkthrough — 3-of-3 federation](#setup-walkthrough--3-of-3-federation)
+- [CLI](#cli)
+- [Gates: writing your own approver](#gates-writing-your-own-approver)
+- [Manifest builder](#manifest-builder)
+- [Backup & restore](#backup--restore)
+- [fail2ban](#fail2ban)
+- [Repo layout](#repo-layout)
+- [License](#license)
 
-Ötzi's React UI coordinates ceremonies via 500 ms state-broadcasts with
-barrier synchronization — necessary machinery when participants are browser
-tabs that can close, reload, or drift in time. Servers don't have that
-fragility. The headless daemon drops the coordination primitive entirely and
-replaces it with **pull-based** blob exchange:
+---
 
-- Each peer produces its ceremony blobs locally and stores them.
-- For each round, each peer requests the blobs it needs from its producers.
-- No heartbeats, no barrier sync, no 500 ms tick — just explicit pulls.
+## Threat model
 
-Same wire format and crypto as Ötzi (byte-compat), but a much simpler state
-machine. See `CLAUDE.md` for the full design rationale.
+The security boundary is a **ring of trust** established at DKG time.
 
-## Relation to Ötzi
+- **Threshold cryptography.** Compromising fewer than `t` of the `n`
+  key shares yields nothing — the threshold-secured key cannot be
+  reconstructed or used to forge.
+- **Federation trust is axiomatic.** Members trust each other by virtue of
+  being on the ring. The worst a rogue insider can do is DoS the federation
+  (refuse to sign); they cannot extract key material.
+- **Operational policy: n-of-n in v0.1.** The cryptographic protocol
+  supports `t-of-n`, but the v0.1 CLI signs with all `n` peers. An offline
+  peer in a headless federation is a red flag (compromise / partition /
+  sabotage), not a graceful-degradation budget. The `t < n` setting is
+  defense-in-depth against key-share compromise — it is *not* an
+  operational budget for absent signers.
+- **Per-node approval gate (optional).** Defense-in-depth against a single
+  compromised *machine* (vs. compromised key share) being used as a
+  signing oracle. Each node optionally vets each ceremony locally before
+  participating: `auto` / `policy` / `exec` / `webhook`. See
+  [Gates](#gates-writing-your-own-approver) below.
+- **Network pre-filter.** The peer-mesh transport drops inbound TCP
+  connections from any source IP not in the resolved peer-endpoint
+  allowlist before the WebSocket handshake completes (silent
+  `socket.destroy()`, no 401 response on the wire). Independent from and
+  additive to the cryptographic Noise-KK + ML-DSA mutual auth.
+- **Out of scope.** Anti-insider verification, chain watching, autonomous
+  triggers, decision intelligence, manifest parsing or ABI awareness inside
+  the daemon. All of those belong in the operator's own infrastructure.
 
-| | Ötzi | `otzi-headless` |
-|---|---|---|
-| Interface | React SPA | CLI + HTTP API |
-| Coordination | Leader-broadcasts-state, 500 ms ticks, barrier sync | Pull-based |
-| Transport | Centralized Go relay | Peer-mesh WebSocket OR minimal Node relay |
-| Identity | Per-session Web Crypto ECDH | Per-node long-term ECDH P-256 (bootstrapped once) |
-| DKG / signing primitives | Same `@btc-vision/post-quantum` ML-DSA + [`@mwaddip/frots`](https://github.com/mwaddip/frots) FROST |
-| OPNet / BTC broadcast | `backend/src/routes/tx.ts`, `btc.ts` | `src/broadcast/*.ts` (ported; verify-key bug fixed) |
-| Share files | V3 JSON (encrypted) | Same format |
+Full invariants live in [`INTERFACES.md`](INTERFACES.md) and
+[`CLAUDE.md`](CLAUDE.md).
 
-Ötzi: <https://github.com/mwaddip/otzi>.
+---
 
-## Architecture snapshot
+## Architecture
+
+Three properties shape everything else:
+
+1. **Pull-based blob exchange.** Each peer produces ceremony blobs locally
+   and stores them. For each round, peers pull missing inputs from
+   producers reactively. No 500 ms state ticks, no barriers, no heartbeats.
+2. **Signing is leader-asymmetric, DKG is symmetric.** A signing trigger
+   (HTTP / cron / UDS) fires on exactly one node; that node drives all
+   rounds, runs `combine`, and broadcasts the result. DKG, by contrast, is
+   leaderless — every party computes its own unique key share.
+3. **CLI is the operator-facing surface.** The daemon's UDS / HTTP API is
+   an internal implementation detail. Every operator workflow goes through
+   `otzi <subcommand>`; the daemon socket binds to loopback or UDS only
+   (parser-enforced).
 
 ```
-┌─────────────┐       ┌──────────────┐       ┌──────────────┐
-│   Trigger   │──────▶│  LeaderDisp  │──────▶│  Transport   │
-│ (HTTP/cron) │       │ (gate check) │       │ (peer-mesh / │
-└─────────────┘       │  ceremony    │       │   relay)     │
-                      │  dispatch)   │       └──────┬───────┘
-                      └──────────────┘              │
-                                                    ▼
-                       ┌──────────────┐      ┌──────────────┐
-                       │ Orchestrator │◀─────│  incoming    │
-                       │   + Gate     │      │  announce    │
-                       │  (particip.) │      └──────────────┘
-                       └──────┬───────┘
-                              ▼
-                      ┌──────────────────┐
-                      │ CeremonyRunner   │ ML-DSA / FROST / DKG
-                      │  + BlobStore     │
-                      │  + BlobServer    │
-                      │  + BlobPuller    │
-                      └──────────────────┘
+┌──────────┐    ┌────────────┐    ┌─────────────┐    ┌─────────────┐
+│ operator │ ─▶ │  otzi CLI  │ ─▶ │   daemon    │ ◀─▶ │   peers     │
+│  shell   │    │ (UDS / SSH)│    │ leader/orch │    │ (mesh/relay)│
+└──────────┘    └────────────┘    └─────────────┘    └─────────────┘
+                                         │
+                                         ▼
+                                  ┌─────────────┐
+                                  │ approval    │ ── exec / webhook
+                                  │ gate        │      → external
+                                  │ (per-node)  │        approver
+                                  └─────────────┘
 ```
 
-- **Security boundary (CLAUDE.md § Security Model)**: ring of trust + threshold.
-  Compromising <t peers yields nothing. Peer allowlist drops traffic from
-  unknown sources at the transport layer. Optional per-node **approval gate**
-  gives defence-in-depth against a single compromised machine being used as a
-  signing oracle — `auto` / `policy` / `webhook` / `cli` / `queue` strategies,
-  opt-in, strict-by-default.
+---
 
-- **Transport**: classical Noise-KK over ECDH P-256 + AES-256-GCM. No
-  post-quantum in the transport layer (2026-04-23 decision — ML-DSA already
-  covers quantum-safe identity at the threshold layer). Authentication is
-  implicit in the DH math; no transcript signatures. See
-  `SESSION_CONTEXT.md § Transport encryption` for the threat-model note.
+## Setup walkthrough — 3-of-3 federation
 
-## Requirements
+Three nodes, all online, signing all together. Replace `node-a / node-b /
+node-c` with your real hostnames. Steps run **on every node** unless marked
+otherwise.
 
-- Node.js ≥ 22 (some `@btc-vision/*` deps prefer 24; warnings only on 22).
-- Network connectivity between peers for `peer-mesh`, or a reachable relay
-  server for `relay`.
-- For FROST signing end-to-end: currently blocked on V3 share-file
-  `PublicKeyPackage` reconstruction (DKG works fine without it).
+### 1. Install the .deb
 
-## Install
+Download `otzi-headless_0.1.0_amd64.deb` from
+[releases](https://github.com/mwaddip/otzi-headless/releases) onto each
+host. Then:
 
 ```bash
-git clone https://github.com/mwaddip/otzi-headless.git
-cd otzi-headless
-npm install
+sudo apt install ./otzi-headless_0.1.0_amd64.deb
 ```
 
-The daemon runs as TypeScript via [`tsx`](https://github.com/privatenumber/tsx)
-— no separate build step is needed. The `bin/otzi` shim dispatches subcommands:
+`apt` resolves the `nodejs ≥ 22` dependency automatically. (Plain `dpkg
+-i` will fail on unmet deps — follow up with `sudo apt -f install`.)
+
+debconf will prompt — answer the same way on each node:
+
+| Prompt | `node-a` | `node-b` | `node-c` |
+|---|---|---|---|
+| Restore from backup? | No | No | No |
+| Bootstrap role | `leader` | `leaf` | `leaf` |
+| Operator usernames (space-separated) | your shell user | your shell user | your shell user |
+| Bootstrap secret (shared passphrase) | *agreed out-of-band* | *same* | *same* |
+| Bitcoin network | `testnet` | `testnet` | `testnet` |
+| OPNet RPC URL | `https://testnet.opnet.org` | *same* | *same* |
+| Transport kind | `peer-mesh` | `peer-mesh` | `peer-mesh` |
+| Listen address | `0.0.0.0:8800` | `0.0.0.0:8800` | `0.0.0.0:8800` |
+| Bootstrap bind / leader URL | bind `0.0.0.0:7090` | leader `http://node-a:7090` | leader `http://node-a:7090` |
+| Peer hostnames | `node-b node-c` | `node-a node-c` | `node-a node-b` |
+| Node identifier | `node-a` | `node-b` | `node-c` |
+
+The bootstrap secret is short-lived: it lives at
+`/var/lib/otzi/bootstrap-secret` (mode 660 root:otzi) and is automatically
+wiped the moment DKG completes successfully.
+
+### 2. Add yourself to the `otzi` group
 
 ```bash
-./bin/otzi                                                    # prints usage
-./bin/otzi daemon config.toml                                 # run daemon
-./bin/otzi setup leader config.toml --bind 0.0.0.0:7090       # bootstrap leader
-./bin/otzi setup leaf config.toml --leader http://<leader>:7090  # bootstrap leaf
+sudo usermod -aG otzi $USER
+exec newgrp otzi
 ```
 
-Or from inside the repo: `npm run daemon -- config.toml`, `npm run setup:leader -- config.toml --bind …`, etc.
+Without this, you have to `sudo -u otzi otzi <subcommand>` for every CLI
+call. The group membership lets you connect to the daemon's UDS at
+`/var/run/otzi/otzi.sock` directly.
 
-## Setting up a federation
+### 3. Bootstrap pubkey exchange
 
-### 1. Write the config
+The leader hosts a one-shot HTTP server on `:7090`; leaves register against
+it. Run leader first.
 
-Each node needs its own `daemon.toml`. Example for a 3-node 2-of-3 ring
-(`node-a` is partyId 0, `node-b` is 1, `node-c` is 2). Each node's file
-differs only in the `[node]` section.
+**On `node-a` (leader):**
+
+```bash
+otzi setup /etc/otzi/daemon.toml
+```
+
+**On `node-b` and `node-c`:**
+
+```bash
+otzi setup /etc/otzi/daemon.toml
+```
+
+Each node prints its own 8-character SHA-256 fingerprint of the resulting
+pubkey book. **Eyeball-compare the fingerprint across all three nodes.**
+If any node shows a different value, someone tampered with the exchange —
+delete `/var/lib/otzi/pubkeys.json` everywhere and start over.
+
+### 4. Complete the peer entries
+
+After `otzi setup` finishes, each node has a `pubkeys.json` but
+`/etc/otzi/daemon.toml`'s `[[peers]]` blocks are stubs. Edit them in,
+copying `wallet_address` from the freshly written `pubkeys.json`:
 
 ```toml
-# daemon.toml — on node-a
-
-[share]
-path = "/etc/otzi/share.json"           # Ötzi-compatible V3 share file
-password_env = "OTZI_SHARE_PASSWORD"    # env var name (not the password)
-
-[node]
-id = "node-a"
-party_id = 0
-identity_key_file = "/var/lib/otzi/identity.json"
-pubkey_book_file = "/var/lib/otzi/pubkeys.json"
-
-[transport]
-kind = "peer-mesh"                      # or "relay"
-listen = "0.0.0.0:8800"                 # omit for relay
-
 [[peers]]
 id = "node-b"
 party_id = 1
+wallet_address = "0xabc..."
 endpoint = "ws://node-b.example:8800"
 
 [[peers]]
 id = "node-c"
 party_id = 2
+wallet_address = "0xdef..."
 endpoint = "ws://node-c.example:8800"
-
-[gate]
-strategy = "auto"                       # auto | policy | exec | webhook
-
-[deadlines]
-signing_ms = 300000
-dkg_ms = 900000
-
-[[triggers]]
-kind = "http"
-bind = "127.0.0.1:8080"
-auth_token_env = "OTZI_TRIGGER_TOKEN"   # optional; if set, Bearer auth required
 ```
 
-For `kind = "relay"`, drop `transport.listen` and add `transport.url = "ws://relay-host:9000"`.
+Same on every node, with each node's own block omitted. `party_id` values
+are assigned during bootstrap and recorded in `pubkeys.json`.
 
-### 2. Bootstrap identity + pubkey book
+### 5. Run DKG
 
-The bootstrap exchanges each daemon's long-term ECDH public key. Designate
-one node as the **leader** for setup; others `register` against it.
-Run the daemons **sequentially** — leader first, then each leaf.
-
-**On the leader (`node-a`):**
+**On the leader only** (the daemon must already be reachable via systemd
+— start it now):
 
 ```bash
-./bin/otzi setup leader /etc/otzi/daemon.toml --bind 0.0.0.0:7090
+sudo systemctl enable --now otzi    # on every node
+otzi generate /etc/otzi/daemon.toml # on the leader only
 ```
 
-Leader generates an identity keypair (if one doesn't already exist), starts
-a one-shot HTTP server, and waits for every expected peer to register. On
-completion, it writes `pubkey_book_file` and prints the fingerprint.
+The leader derives `parties = 3` from its configured peer set and runs a
+3-of-3 combined DKG (ML-DSA + FROST + key-link). Each node persists its
+own encrypted share to `/var/lib/otzi/share.json`. The bootstrap secret is
+wiped automatically. The CLI prints:
 
-**On each leaf (`node-b`, `node-c`):**
+```
+otzi generate: DKG complete (status=done)
+  ceremonyId:        dkg-2026-04-26T12-34-56-789Z
+  vault BTC:         tb1p…   (fund here for BTC)
+  vault OPNet:       0x…     (send OP20 / contract calls here)
+  ML-DSA pubkey:     …
+  FROST verifying:   …
+  share path:        /var/lib/otzi/share.json
+```
+
+### 6. Fund the vault
+
+Send testnet BTC (or OP20 tokens for an OPNet flow) to the printed vault
+addresses. Verify on a block explorer; the daemon does not watch chains.
 
 ```bash
-./bin/otzi setup leaf /etc/otzi/daemon.toml --leader http://node-a.example:7090
+otzi btc balance              # poll until you see your funding
+otzi op20 balance BHTT        # if your manifest defines OP20 tokens
 ```
 
-Each leaf generates its own identity, POSTs it to leader, and long-polls
-until leader returns the full pubkey book. It writes the same book locally
-and prints the fingerprint.
+### 7. Install a manifest
 
-### 3. Verify fingerprints
-
-Each node prints:
-
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  otzi: setup complete — node-a (partyId 0)
-  fingerprint: a7c9b3e1
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
-**Manually eyeball-compare fingerprints across every node.** If any node
-shows a different value, someone tampered with the bootstrap exchange:
-delete all pubkey books and start over.
-
-### 4. Run the daemons
-
-On each node:
+A manifest (`.otzi.json`) is a per-project file enumerating contract
+addresses, ABI shorthand (OP20 / OP20S / OP721 / Custom), and per-token
+decimals. The CLI consumes it for `otzi sign` / `otzi op20 balance`. Hand
+it to every node:
 
 ```bash
-export OTZI_SHARE_PASSWORD='<share password>'
-export OTZI_TRIGGER_TOKEN='<random token>'   # if configured
-./bin/otzi daemon /etc/otzi/daemon.toml
+otzi install ./my-project.otzi.json
+otzi list                    # confirm operations
 ```
 
-Daemons connect over the configured transport and idle until a trigger fires.
+(You can author manifests via the [manifest builder](#manifest-builder)
+or write them by hand against
+[`docs/headless-manifest-schema.json`](docs/headless-manifest-schema.json).)
 
-### 5. Run a DKG ceremony
+For multi-node distribution during the bootstrap window, see `otzi sync`
+in [`docs/cli.md`](docs/cli.md) — HMAC-authenticated push to all peers
+in one call. After DKG, manifest distribution is operator-local
+(`otzi install` on each node).
 
-Once all daemons are running, POST to any node's HTTP trigger:
+### 8. Sign your first transaction
+
+OPNet contract call:
 
 ```bash
-curl -X POST http://node-a.example:8080/ \
-  -H 'Authorization: Bearer <OTZI_TRIGGER_TOKEN>' \
-  -H 'Content-Type: application/json' \
-  -d '{"op":"dkg-combined","ceremonyId":"initial-dkg","threshold":2,"parties":3,"level":44}'
+otzi sign BHTT transfer tb1p…dest 1000000
 ```
 
-Response (HTTP 200):
-
-```json
-{
-  "ceremonyId": "initial-dkg",
-  "status": "done",
-  "mldsaPublicKeyHex": "...",
-  "frostVerifyingKeyHex": "04..."
-}
-```
-
-**Known gap**: the daemon does not yet persist DKG results to a share file
-(`encryptShareFile` helper not yet ported). For now, DKG output is returned
-in the HTTP response — you'd capture it and write the share manually. This
-closes when the V3 share-file write path lands.
-
-### Other HTTP operations
-
-| op | Body fields | Notes |
-|---|---|---|
-| `dkg-combined` | `threshold`, `parties`, `level` | ML-DSA + FROST under one sessionId |
-| `dkg-mldsa` | `threshold`, `parties`, `level` | ML-DSA only |
-| `dkg-frost` | `threshold`, `parties` | FROST only (secp256k1) |
-| `sign-mldsa` | `messageHex`, `signers[]` | Generic ML-DSA signing |
-| `sign-frost` | `sighashes[{hashHex,tweaked}]`, `signers[]` | Generic FROST signing |
-
-BTC- / OPNet-specific endpoints (encoded calldata, prepare-and-sign, broadcast)
-compose on top of these but are not yet exposed at the HTTP layer — driven
-programmatically via `scripts/testnet-e2e.ts` today.
-
-## Packaging
-
-### npm tarball
+Or a plain BTC vault transfer:
 
 ```bash
-npm pack
+otzi btc send tb1p…dest 50000sats --fee-rate 10
 ```
 
-Produces `otzi-headless-<version>.tgz` containing the files listed in
-`package.json#files` (`src/`, `bin/`, `vendor/`, etc.). Install with:
+The CLI runs the full ceremony — ML-DSA pre-sign over `sha256(calldata)`,
+then FROST `opnet-params` for OPNet (or `btc` construction-params for the
+plain vault transfer) — and prints the resulting transaction ID. The
+daemon broadcasts internally for OPNet; for BTC the CLI returns the tx ID
+once mempool.space confirms acceptance.
+
+For the deeper deep-dive (every prompt, every file, every uninstall path),
+see [`docs/install.md`](docs/install.md).
+
+---
+
+## CLI
+
+The CLI is the only operator-facing surface. Direct `curl` calls to the
+daemon UDS are reserved for tests + debugging.
+
+| Verb | Purpose |
+|---|---|
+| `otzi daemon <config>` | Run the daemon (long-lived; usually started by systemd). |
+| `otzi setup <config>` | Bootstrap pubkey exchange. Reads `[bootstrap].role`. |
+| `otzi generate <config>` | Trigger combined DKG against the local daemon (leader only). |
+| `otzi install <manifest>` | Install a `.otzi.json` manifest at `/etc/otzi/manifest.otzi.json`. |
+| `otzi list` | List operations from the installed manifest. |
+| `otzi uninstall` | Remove the installed manifest. |
+| `otzi sync <manifest>` | Distribute a manifest to all peers (bootstrap-window only). |
+| `otzi sign <contract> <method> <args...>` | Run a threshold-signed OPNet contract call. |
+| `otzi btc send <addr> <amount>[unit]` | BTC vault transfer (units: `sats` `btc` `mbtc` `ubtc`). |
+| `otzi btc balance [--unit ...]` | Read vault BTC balance (chain-direct, no daemon round-trip). |
+| `otzi op20 balance <ticker\|ID>` | Read vault OP20 balance using manifest decimals. |
+| `otzi vault [--json]` | Print vault addresses + pubkeys. |
+| `otzi backup` | Produce a password-protected archive of full daemon state. |
+| `otzi restore [--password-stdin] <archive>` | Recover from a backup (refuses if config exists or daemon running). |
+
+Full reference with flags + examples: [`docs/cli.md`](docs/cli.md).
+HTTP/UDS endpoint reference: [`docs/api.md`](docs/api.md).
+
+---
+
+## Gates: writing your own approver
+
+The `ApprovalGate` is a per-node *signaling surface*, not a decision
+engine. It answers `approve(spec) → approve | reject | pending` for each
+ceremony. The daemon ships with four built-in strategies — kept thin
+deliberately, so opinionated auth schemes live outside the daemon's audit
+surface:
+
+| Strategy | What it is |
+|---|---|
+| `auto` | Tautological — always approves. The default. |
+| `policy` | Generic rule engine over structural spec fields (`max_btc_per_tx`, `allowed_btc_recipients`, `allowed_contracts`, `max_ceremonies_per_hour`, …). Strict-by-default. |
+| `exec` | Spawns an operator-supplied process; writes the spec on stdin, reads `approve` / `reject` from stdout. |
+| `webhook` | POSTs the spec to an operator-supplied URL; expects `{"decision": "approve" | "reject" | "pending"}`. |
+
+To plug in a custom decision logic — ML-DSA wallet-signed approvals,
+SSO, hardware tokens, Slack approvals — you build an **external service**
+that consumes either the `exec` or `webhook` interface. The daemon
+doesn't change.
+
+The bundled reference example is `examples/gate-web-opwallet/`: a
+standalone Node.js service that holds the daemon's webhook request open
+while a browser-based operator UI signs the decision via OPWallet's
+`signMLDSA`. See its `README.md` for the architecture diagram, the
+signed-payload byte layout, and customization guidance.
+
+For the file-drop pattern (no HTTP), see `examples/gate-file-approver.sh`
+— a single-file `inotifywait`-based exec gate that watches a directory.
+
+Full gate contract + spec schema: [`docs/gates.md`](docs/gates.md).
+
+---
+
+## Manifest builder
+
+A manifest (`.otzi.json`) is per-project UI/ABI configuration: contract
+names, addresses, ABI shorthand (`OP20`, `OP20S`, `OP721`, or inline
+`Custom` ABI), per-token decimals. One installed manifest per daemon.
+
+Authoring options:
+
+1. **Visual builder** (recommended). `examples/manifest-builder/` is a
+   static Preact UI vendored with offline JS bundles. Run:
+   ```bash
+   cd examples/manifest-builder
+   bash serve.sh             # Python's stdlib HTTP server on :8765
+   ```
+   Open <http://localhost:8765/index.html>, fill in contracts, hit
+   *Export*. The output is schema-validated against the same validator
+   the daemon uses.
+
+2. **By hand** against
+   [`docs/headless-manifest-schema.json`](docs/headless-manifest-schema.json).
+
+Distribute the resulting `.otzi.json` to every operator node. During the
+bootstrap window (pre-DKG), `otzi sync <path>` HMAC-pushes it to all
+peers in one call. After DKG, distribution is per-node
+(`otzi install <path>` on each).
+
+Builder design notes: [`docs/manifest-builder-spec.md`](docs/manifest-builder-spec.md).
+
+---
+
+## Backup & restore
+
+`otzi-headless` ships with first-class backup. Run after every config
+change, every peer change, and after initial DKG:
 
 ```bash
-tar xzf otzi-headless-*.tgz
-cd package
-npm install --omit=dev        # installs runtime deps (including tsx)
-./bin/otzi daemon daemon.toml
+otzi backup
+# → ~/otzi-backup-<ISO-timestamp>.otzi-backup (mode 0600)
+# Password (32 chars, ~190 bits entropy) printed once to stdout — write it down.
 ```
 
-Or globally: `npm install -g ./otzi-headless-*.tgz` — then `otzi` is on PATH.
+The archive is AES-256-GCM with PBKDF2-SHA256 (600k iterations) and
+contains every file needed to fully restore a node's slot in the
+federation: `daemon.toml`, encrypted share, identity keypair, pubkey book,
+installed manifest, vault-pubkey cache, and (pre-DKG only) the bootstrap
+secret.
 
-### `.deb`
+Recovery has two paths:
 
-Not yet shipped. Planned for phase 6 alongside the systemd unit:
+- **Fresh install via debconf** — answer *Yes* to "Restore from a
+  backup?" during `apt install`. The rest of the install prompts (role,
+  peers, bootstrap secret, etc.) are skipped; config comes from the
+  archive.
+- **Manual** via `otzi restore <archive>` (or `--password-stdin` for
+  scripted runs). Refuses to overwrite an existing config or run while
+  the daemon is up — loud failure beats silent overwrite.
 
-```
-/usr/bin/otzi                             # the bin/otzi shim
-/usr/lib/otzi-headless/                   # src/, vendor/, node_modules/
-/etc/otzi/daemon.toml                     # sample config (operator-edited)
-/lib/systemd/system/otzi.service          # service unit
-/var/lib/otzi/                            # identity + pubkey book files
-```
+What the archive does **not** contain: other federation members' shares,
+on-chain vault funds, the .deb itself.
 
-Route to packaging is either [`fpm`](https://fpm.readthedocs.io/) (simplest,
-one-shot from the `npm pack` tree) or a full Debian `debian/` directory. TBD
-when operator deployment concretely needs it.
+Full operations + recovery details: [`docs/install.md`](docs/install.md)
+§ Backup + recovery.
 
-## Development
+---
+
+## fail2ban
+
+The peer-mesh transport drops non-peer source IPs at the WebSocket
+upgrade layer (`socket.destroy()` before any HTTP response is written),
+with a `peer-allowlist:` warn line emitted to journald. To escalate
+repeat offenders to an iptables ban, install the bundled fail2ban plugin:
 
 ```bash
-npm test                    # full vitest suite (~30s; includes real-WS + relay integration)
-npm run typecheck           # tsc --noEmit
-npx vitest                  # watch mode
-npx vitest run <path>       # single file / directory
-
-# Enable verbose per-peer logging inside integration tests:
-OTZI_TEST_LOG=1 npx vitest run src/daemon/daemon-integration.test.ts
-
-# Testnet end-to-end (costs ~200k sats + ~15 min wait; requires opnet-testnet.env):
-source ~/projects/sharedenv/opnet-testnet.env && npx tsx scripts/testnet-e2e.ts
+sudo cp examples/fail2ban/otzi.conf  /etc/fail2ban/filter.d/
+sudo cp examples/fail2ban/otzi.local /etc/fail2ban/jail.d/
+sudo systemctl reload fail2ban
+fail2ban-client status otzi
 ```
 
-Source layout under `src/`:
+Tunable parameters (`maxretry` / `findtime` / `bantime`) live in
+`otzi.local`. For stable production federations, tighten `bantime` to
+permanent — legitimate peers never trip the allowlist in steady state.
 
-- `core/` — ceremony runner, session wrappers, in-memory transport.
-- `wire/` — Ötzi byte-compat codecs. **Do not edit.**
-- `node/` — Ötzi backend crypto adapters. **Do not edit.**
-- `broadcast/` — OPNet + BTC pipeline functions (pure).
-- `config/` — TOML parser + `DaemonConfig` types.
-- `gate/` — approval gate interface + auto/policy implementations.
-- `orchestrator/` — participant-side ceremony dispatcher.
-- `triggers/` — HTTP + cron trigger sources.
-- `daemon/` — composition root, leader dispatcher, CLI entrypoint.
-- `bootstrap/` — pubkey-book + master/member bootstrap helpers.
-- `transport/` — Noise KK handshake, AES-GCM record layer.
-  - `peer-mesh/` — direct-WebSocket transport.
-  - `relay/` — minimal Node relay + client transport.
+See `examples/fail2ban/README.md` for the journald regex dry-run, port
+adjustment, and tuning notes.
 
-See `SESSION_CONTEXT.md` for the per-file inventory and the lessons learned
-during phases 4d, 5, and 3f — especially the double-`initEccLib` trap and
-the handshake-message-loss race.
+---
 
-## Related projects
+## Repo layout
 
-- **Ötzi** — browser app, full UI. <https://github.com/mwaddip/otzi>
-- **`@mwaddip/frots`** — pure-TypeScript FROST (secp256k1) used by both.
-  <https://github.com/mwaddip/frots>
-- **`@btc-vision/post-quantum`** — ML-DSA + threshold-ML-DSA (vendored under `vendor/post-quantum/`).
-- **OPNet** — smart-contract protocol on Bitcoin L1. <https://opnet.org>
-  / <https://github.com/btc-vision/opnet>
+```
+src/
+├── core/         ceremony runner, blob store + server + puller, wire codecs
+├── wire/         lifted byte-compat from Ötzi — DO NOT EDIT
+├── node/         lifted backend lib from Ötzi — DO NOT EDIT
+├── broadcast/    OPNet calldata + capture + broadcast, BTC vault
+├── bootstrap/    one-shot pubkey-book exchange
+├── transport/    Noise-KK over P-256, peer-mesh + relay
+├── config/       TOML parser + DaemonConfig types
+├── gate/         ApprovalGate + auto / policy / exec / webhook
+├── orchestrator/ participant-side dispatcher (verify-before-gate)
+├── triggers/     HTTP / UDS / cron sources
+├── cli/          per-command modules (install, sign, btc, op20, vault, ...)
+└── daemon/       composition root, leader dispatcher, console logger, entrypoint
+
+examples/
+├── gate-file-approver.sh      reference exec gate (file-drop)
+├── gate-web-opwallet/         reference webhook gate (OPWallet UI)
+├── manifest-builder/          static Preact UI for authoring .otzi.json
+└── fail2ban/                  filter + jail for peer-allowlist drops
+
+docs/
+├── install.md                 operator install walkthrough
+├── cli.md                     CLI reference
+├── api.md                     HTTP / UDS endpoint reference
+├── config.md                  daemon.toml reference
+├── gates.md                   ApprovalGate contract + strategies
+├── manifest-builder-spec.md   builder UI design notes
+└── headless-manifest-schema.json   manifest JSON Schema
+
+facts/                        per-subsystem contracts (read in dependency order)
+INTERFACES.md                 global invariants + contract index
+CLAUDE.md                     project-wide design rationale
+```
+
+---
 
 ## License
 
