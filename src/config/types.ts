@@ -14,7 +14,7 @@ export type TransportKind = (typeof TRANSPORT_KINDS)[number];
 export const GATE_STRATEGIES = ['auto', 'policy', 'exec', 'webhook', 'cli', 'queue'] as const;
 export type GateStrategy = (typeof GATE_STRATEGIES)[number];
 
-export const TRIGGER_KINDS = ['http', 'cron'] as const;
+export const TRIGGER_KINDS = ['http', 'uds', 'cron'] as const;
 export type TriggerKind = (typeof TRIGGER_KINDS)[number];
 
 export const NETWORK_NAMES = ['mainnet', 'testnet', 'regtest'] as const;
