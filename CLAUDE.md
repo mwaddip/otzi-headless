@@ -45,7 +45,7 @@ This leader is trigger-assigned — a static role for the ceremony, not an elect
 
 **DKG remains leaderless and symmetric.** Every party computes its own unique key share; there is no single public aggregation step. All peers run the full protocol and self-determine completion from their own outputs.
 
-**Abort/timeout.** Per-request retry: exponential backoff 1s → 30s cap, max 5 attempts. Ceremony-wide deadline scales with approval strategy: `auto` / `policy` → 5 min signing, 15 min DKG (machine-only — don't let phantom ceremonies linger); `exec` / `webhook` → unbounded by default, operator cap (e.g. 24h). All values config-driven. DKG aborts if any peer drops or rejects (threshold = n); signing degrades gracefully iff ≥ t peers remain responsive.
+**Abort/timeout.** Per-request retry: exponential backoff 1s → 30s cap, max 5 attempts. Ceremony-wide deadline scales with approval strategy: `auto` / `policy` → 5 min signing, 15 min DKG (machine-only — don't let phantom ceremonies linger); `exec` / `webhook` → unbounded by default, operator cap (e.g. 24h). All values config-driven. DKG and signing both abort if any peer drops or rejects — by design in v0.1 the CLI signs with all n peers, not a t-subset. An offline peer in a headless federation is a red flag (compromise, partition, sabotage), not a graceful-degradation budget. The t-of-n share's `t` is defense-in-depth against key-share compromise (any <t shares are useless to an attacker), separate from the operational requirement that all n peers participate.
 
 ## Security Model: Ring of Trust
 
@@ -59,7 +59,7 @@ Ring of trust established at DKG time. The security boundary is:
 
 - Config-selectable strategy per node: `auto` (pure headless, the default), `policy` (deterministic rule check — amount ≤ X, destination ∈ allowlist, method ∈ allowlist), `exec` (spawn operator command, read approve/reject from stdout), `webhook` (POST spec to external approver, await signed response).
 - Interface: `approve(ceremonySpec) → approve | reject | pending`. Pending re-checks on external signal.
-- Semantics: a gate can only *further restrict* what its node will sign, never widen. A rejecting node stays silent; to peers it is indistinguishable from offline. DKG aborts on any reject (threshold = n); signing proceeds iff ≥ t peers approve.
+- Semantics: a gate can only *further restrict* what its node will sign, never widen. A rejecting node stays silent; to peers it is indistinguishable from offline. DKG and signing both abort on any reject — in v0.1 the CLI signs with all n peers (see § Core Architecture).
 - Lives in the trigger layer. Ceremony core and transport do not know the gate exists — they just see a slower or absent peer.
 
 Default is `auto` everywhere. The gate is opt-in per node, not required infrastructure.
