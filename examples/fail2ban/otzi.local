@@ -1,0 +1,39 @@
+# /etc/fail2ban/jail.d/otzi.local
+#
+# fail2ban jail for otzi-headless peer-mesh IP allowlist drops.
+#
+# This jail consumes the `peer-allowlist:` warn lines emitted when a non-peer
+# source attempts to open a WebSocket to the daemon's listen port, and asks
+# fail2ban to ban repeat-offender IPs at the iptables/nftables layer.
+#
+# The .deb installs the daemon as the `otzi.service` systemd unit, which
+# writes its stderr to the systemd journal. The default `backend = systemd`
+# form below reads from journald via `journalmatch`. If you have configured
+# the daemon to log to a file instead, comment that out and uncomment the
+# `logpath` form.
+
+[otzi]
+enabled  = true
+filter   = otzi
+
+# --- Source: systemd journal (recommended default) ---
+backend      = systemd
+journalmatch = _SYSTEMD_UNIT=otzi.service
+
+# --- Source: log file (alternative — requires daemon-side log redirection) ---
+# backend = polling
+# logpath = /var/log/otzi/daemon.log
+
+# Listen port — adjust to your daemon's `transport.listen` (in /etc/otzi/daemon.toml).
+# The .deb's debconf default is 8800; multi-instance setups may use a range.
+port = 8800
+
+# Tuning. These are starting points for a small federation; production
+# deployments with stable peers should tighten.
+maxretry = 5         # bans an IP after 5 hits within `findtime`
+findtime = 600       # 10-minute sliding window
+bantime  = 3600      # 1-hour ban (raise to `-1` for permanent in stable rings)
+
+# Default banaction is `iptables-multiport` on Debian/Ubuntu. If your host
+# uses nftables natively, set:
+# banaction = nftables-multiport
