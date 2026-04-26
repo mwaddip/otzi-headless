@@ -22,8 +22,10 @@ import type { DaemonConfig } from '../config/types';
 import type { PartyId } from '../core/types';
 import type { DkgPersistenceSink } from '../orchestrator/types';
 import { buildFrostPublicKeyPackage } from '../wire/frost-reconstruct';
+import { fromHex } from '../wire/hex';
 import { decryptShareFile, type DecryptedShare, type ShareFile } from '../wire/share-crypto';
 import { persistCombinedDkgShare } from './share-persistence';
+import { writeVaultPubkeyFile } from './vault-pubkey';
 
 export type ShareDecryptor = (file: ShareFile, password: string) => Promise<DecryptedShare>;
 
@@ -127,6 +129,27 @@ export async function validateLoaded(
   const base = buildStateFromShare(config, share);
   const frostLegacySig = extractFrostLegacySig(shareFile, config.share.path);
   const persistDkgShare = makePersistSink(config, password);
+
+  // Refresh the operator-facing vault metadata cache on every startup so the
+  // CLI always reads addresses that match the currently-loaded share. Wrap
+  // in try/catch — the daemon must not fail to start if /var/lib/otzi/ isn't
+  // writable; CLI commands that need the file will tell the operator how to
+  // recover.
+  if (share.frostKeyPackage) {
+    try {
+      await writeVaultPubkeyFile({
+        network: config.network.name,
+        frostUntweakedPubKey: share.frostKeyPackage.untweakedVerifyingKey,
+        frostTweakedPubKey: share.frostKeyPackage.verifyingKey,
+        mldsaPubKey: fromHex(share.publicKey),
+      });
+    } catch (err) {
+      console.error(
+        `daemon: failed to refresh vault-pubkey cache: ${(err as Error).message}`,
+      );
+    }
+  }
+
   return {
     ...base,
     ...(frostLegacySig ? { frostLegacySig } : {}),

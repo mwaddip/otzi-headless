@@ -26,17 +26,26 @@ import { toHex } from '../wire/hex';
 
 export const DEFAULT_VAULT_PUBKEY_PATH = '/var/lib/otzi/vault-pubkey.json';
 
+/**
+ * Resolve where the cache should be written. Test envs override via
+ * `OTZI_VAULT_PUBKEY_PATH` so they don't have to be able to write
+ * `/var/lib/otzi/`.
+ */
+export function resolveVaultPubkeyPath(): string {
+  return process.env.OTZI_VAULT_PUBKEY_PATH ?? DEFAULT_VAULT_PUBKEY_PATH;
+}
+
 export interface VaultPubkeyFileInputs {
   network: NetworkName;
   frostUntweakedPubKey: Uint8Array;
   frostTweakedPubKey: Uint8Array;
   mldsaPubKey: Uint8Array;
-  /** Defaults to `/var/lib/otzi/vault-pubkey.json`. */
+  /** Defaults to `resolveVaultPubkeyPath()` (env var or production default). */
   outputPath?: string;
 }
 
 export async function writeVaultPubkeyFile(input: VaultPubkeyFileInputs): Promise<void> {
-  const path = input.outputPath ?? DEFAULT_VAULT_PUBKEY_PATH;
+  const path = input.outputPath ?? resolveVaultPubkeyPath();
 
   const btcAddress = deriveBtcAddress(input.frostUntweakedPubKey, input.network);
   const opnetAddress = '0x' + toHex(sha256(input.mldsaPubKey));
