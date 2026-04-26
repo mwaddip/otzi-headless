@@ -16,10 +16,12 @@
  * only when `key.from` isn't in the peer list (config-level error).
  */
 
+import type { IncomingMessage } from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { BlobKey, PartyId, Unsubscribe } from '../../core/types';
 import type { Transport } from '../../core/transport';
 import type { IdentityKeyPair } from '../identity';
+import { PeerAllowlist } from './allowlist';
 import { PeerConnection } from './connection';
 import {
   broadcastBytes,
@@ -87,6 +89,7 @@ export class PeerMeshTransport implements Transport {
   private readonly wsCtor: typeof WebSocket;
   private readonly log: Logger;
   private readonly pullTimeoutMs: number;
+  private readonly allowlist: PeerAllowlist;
   private stopped = false;
 
   constructor(options: PeerMeshOptions) {
@@ -96,6 +99,10 @@ export class PeerMeshTransport implements Transport {
     this.wsCtor = options.wsCtor ?? WebSocket;
     this.log = options.logger ?? NOOP_LOGGER;
     this.pullTimeoutMs = options.pullTimeoutMs ?? DEFAULT_PULL_TIMEOUT_MS;
+    this.allowlist = new PeerAllowlist(
+      options.peers.map((p) => ({ partyId: p.partyId, endpoint: p.endpoint })),
+      this.log,
+    );
 
     const parsed = parseBind(options.listen);
     this.listenHost = parsed.host;
@@ -123,7 +130,27 @@ export class PeerMeshTransport implements Transport {
 
   async start(): Promise<void> {
     if (this.server) return;
-    const server = new WebSocketServer({ host: this.listenHost, port: this.listenPort });
+    // Fail-fast at startup if any peer endpoint can't be DNS-resolved — a
+    // running server with an empty allowlist would silently drop everything.
+    await this.allowlist.resolve();
+    const server = new WebSocketServer({
+      host: this.listenHost,
+      port: this.listenPort,
+      // Synchronous verifyClient runs BEFORE ws writes the HTTP 101 upgrade
+      // response. Returning false makes ws abort with 401 — but we destroy
+      // the socket first so the response never reaches the wire (truly
+      // silent black-hole drop, no info leak to scanners).
+      verifyClient: (info: { origin: string; secure: boolean; req: IncomingMessage }) => {
+        const remote = info.req.socket.remoteAddress ?? null;
+        if (remote && this.allowlist.has(remote)) return true;
+        this.log.warn('peer-allowlist: dropped connection from non-peer source', {
+          ip: remote,
+          port: info.req.socket.remotePort,
+        });
+        info.req.socket.destroy();
+        return false;
+      },
+    });
     await new Promise<void>((resolve, reject) => {
       const onError = (err: Error) => {
         server.off('listening', onListening);

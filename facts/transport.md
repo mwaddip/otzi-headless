@@ -310,6 +310,46 @@
 
 ---
 
+### `allowlist.ts`
+**Purpose:** L4 source-IP filter for peer-mesh inbound connections. Defense-in-depth against random scanners; cryptographic auth (Noise-KK + ML-DSA pubkey book) remains the primary security boundary.
+
+**Public surface:**
+- `AllowlistPeer` — `{ partyId: number; endpoint?: string }`. Endpoint-less peers (relay-only) are skipped.
+
+- `PeerAllowlist`
+  - **Pre:** Constructor takes `peers: ReadonlyArray<AllowlistPeer>` and a `Logger`.
+  - **Post:** Constructed empty; no DNS performed until `resolve()` runs.
+
+- `resolve(): Promise<void>`
+  - **Pre:** None.
+  - **Post:** DNS-resolves every peer endpoint's hostname via `node:dns/promises` `lookup(host, { all: true, family: 0 })` (both A and AAAA records). Populates the internal IP set, normalizing `::ffff:`-mapped IPv4 to bare IPv4.
+  - **Throws:** `Error` if any endpoint hostname can't be parsed or resolved (fail-fast at startup; daemon refuses to start with a misconfigured peer list).
+
+- `has(ip: string): boolean`
+  - **Post:** True iff `ip` (after stripping `::ffff:` prefix) is in the resolved set.
+
+- `refresh(): Promise<void>`
+  - **Post:** Re-resolves all hostnames. Logs at info level under `peer-allowlist: membership changed` when the set differs (with `added` / `removed` arrays). B.1 only resolves at startup; `refresh()` is exposed for future periodic re-resolution.
+  - **Throws:** `Error` on lookup failure (caller decides whether to keep the old set).
+
+**Invariants:**
+- IPs are stored in normalized form (no `::ffff:` prefix) and `has()` normalizes its input — `has('127.0.0.1')` and `has('::ffff:127.0.0.1')` are equivalent.
+- Endpoints must be `ws://` or `wss://` URLs; other schemes throw at `resolve()`.
+- Bracketed IPv6 hostnames (`ws://[::1]:8800`) are accepted; brackets are stripped before DNS lookup.
+- The allowlist is a denylist for everything not on it; cryptographic auth still gates whoever passes the L4 check.
+
+**Cross-component contracts:**
+- Depends on: `node:dns/promises`, `Logger` (from `orchestrator/types`).
+- Used by: `peer-mesh.ts` `verifyClient` filter at WS server bind.
+- Wire/byte format: N/A (not a wire-format component).
+
+**Notes / gotchas:**
+- The allowlist resolves once at startup. DNS drift is operator-managed (restart the daemon when peer IPs change). `refresh()` exists for future automation.
+- Relay-only peers (no `endpoint`) are skipped in the resolution loop — they don't dial in over peer-mesh.
+- Logging prefix is `peer-allowlist:` (NOT `peer-mesh:`) so log scrapers like fail2ban can pin to the drop event without false positives.
+
+---
+
 ### `peer-mesh.ts`
 **Purpose:** Real-network peer-to-peer transport over persistent WebSocket connections; lower partyId dials, higher listens; exponential backoff reconnect on initiator side.
 
@@ -326,9 +366,9 @@
   - **Throws:** `Error` if self is in peer list or an initiator peer lacks endpoint.
 
 - `start(): Promise<void>`
-  - **Pre:** Transport not already started.
-  - **Post:** Binds WebSocket server to listen address. Registers inbound connection handler. Kicks off initiator-side dials (exponential backoff reconnect on failure).
-  - **Throws:** `Error` if bind fails.
+  - **Pre:** Transport not already started. Every peer endpoint hostname must be DNS-resolvable.
+  - **Post:** DNS-resolves all peer endpoints into the L4 IP allowlist (fail-fast — daemon refuses to start with a misconfigured peer list). Binds WebSocket server with `verifyClient` allowlist filter (non-peer source IPs are silently dropped via `socket.destroy()` before the WS handshake completes; warn line emitted under prefix `peer-allowlist:`). Registers inbound connection handler. Kicks off initiator-side dials (exponential backoff reconnect on failure).
+  - **Throws:** `Error` if any peer endpoint can't be DNS-resolved or if bind fails.
 
 - `stop(): Promise<void>`
   - **Pre:** Transport started or already stopped (idempotent).
@@ -366,6 +406,7 @@
 - Offline peers are silently skipped (broadcast) or return null (pull); no error.
 - All peer connections are closed gracefully on stop(); pending pulls are rejected.
 - `partyId` is immutable; peers list is derived from options and cannot change post-construction.
+- Inbound connections from non-peer source IPs are silently destroyed (no WS upgrade response) before the handshake. The allowlist resolves at startup only; relay-only peers without an `endpoint` are skipped. The cryptographic layer (Noise-KK + ML-DSA pubkey book) is the security boundary; the allowlist is defense-in-depth against random scanners.
 
 **Cross-component contracts:**
 - Depends on: WebSocket (ws library), PeerConnection (handshake + record layer), wire format (broadcast, pull-req, pull-resp).
