@@ -109,6 +109,7 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 - Don't add a centralized policy engine that duplicates threshold enforcement.
 - Don't put manifest parsing or ABI awareness in the daemon (CLI is the operator-side parser).
 - Don't add anti-insider verification to the gate.
+- Don't try to add or remove peers from a running federation. Ring membership is fixed at bootstrap time (pubkey book + Noise-KK identities are pinned post-bootstrap). Rotation = build a new federation and migrate funds; there is no in-place membership change path by design.
 - Don't put decision logic (ML-DSA verify, SSO, wallet auth) in the daemon's gate layer. Thin delegators only (`exec`/`webhook`); opinionated auth ships under `examples/`.
 - Don't run combined DKG with `spec.network` unset in production (share persists without `frostLegacySig` → OPNet calls fail at capture).
 - Don't bloat the .deb past 2 MB (release workflow's size-regression guard fails).
