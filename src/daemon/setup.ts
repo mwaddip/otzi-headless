@@ -126,7 +126,7 @@ async function loadOrGenerateIdentity(config: DaemonConfig): Promise<IdentityKey
       null,
       2,
     ),
-    { mode: 0o600 },
+    { mode: 0o660 },
   );
   return identity;
 }
