@@ -60,12 +60,17 @@ export interface DaemonDeps {
   state: LoadedDaemonState;
   transport: Transport;
   /**
-   * Self's partyId, resolved from the pubkey book by pubkey match. The
-   * authoritative runtime partyId — `state.config.node.partyId` is
-   * deprecated (Phase F removes it). Caller obtains this from
-   * `TransportBundle.selfPartyId`.
+   * Self's partyId, resolved from the pubkey book by pubkey match. Caller
+   * obtains this from `TransportBundle.selfPartyId`.
    */
   selfPartyId: number;
+  /**
+   * Logging-label map for orchestrator + leader. Built by transport-factory
+   * from book entries (synth `peer-${partyId}` labels for non-self; self
+   * uses operator's local `node.id`). Caller obtains from
+   * `TransportBundle.peersById`.
+   */
+  peersById: ReadonlyMap<PartyId, string>;
   rng: Rng;
   pullOpts: PullOpts;
   /** FROST key material, when the share was produced by a V3 combined DKG. */
@@ -146,7 +151,7 @@ export class Daemon {
       runner,
       gate,
       node: { id: deps.state.config.node.id, partyId: deps.selfPartyId },
-      peersById: deps.state.peersById,
+      peersById: deps.peersById,
       share: deps.state.share,
       frostKeyPackage: deps.frostKeyPackage ?? deps.state.share?.frostKeyPackage,
       frostPublicKeyPackage: deps.frostPublicKeyPackage ?? deps.state.frostPublicKeyPackage,
@@ -164,7 +169,7 @@ export class Daemon {
       runner,
       gate,
       node: { id: deps.state.config.node.id, partyId: deps.selfPartyId },
-      peersById: deps.state.peersById,
+      peersById: deps.peersById,
       share: deps.state.share,
       frostKeyPackage: deps.frostKeyPackage ?? deps.state.share?.frostKeyPackage,
       frostPublicKeyPackage: deps.frostPublicKeyPackage ?? deps.state.frostPublicKeyPackage,
@@ -184,6 +189,7 @@ export class Daemon {
         this.leader,
         configNetwork,
         deps.state,
+        deps.peersById,
         controlPlane,
         deps.transport,
         this.log,
@@ -289,6 +295,7 @@ export function buildDefaultHttpHandler(
   leader: LeaderDispatcher,
   network: NetworkName,
   state: LoadedDaemonState,
+  peersById: ReadonlyMap<PartyId, string>,
   controlPlane: ControlPlane,
   transport: Transport,
   logger: Logger = NOOP_LOGGER,
@@ -333,7 +340,7 @@ export function buildDefaultHttpHandler(
           // ack/error is not exposed by the transport surface (broadcast is
           // best-effort fire-and-forget). Operators verify peer state via
           // logs / `otzi list` on each node if they need confirmation.
-          const peerCount = state.peersById.size - 1;
+          const peerCount = peersById.size - 1;
           if (peerCount > 0) {
             try {
               await transport.broadcast(
@@ -368,7 +375,7 @@ export function buildDefaultHttpHandler(
               body: { error: 'vault-info: no share loaded (run `otzi generate` first)' },
             };
           }
-          const partyIds = [...state.peersById.keys()].sort((a, b) => a - b);
+          const partyIds = [...peersById.keys()].sort((a, b) => a - b);
           const { btcAddress, opnetAddress } = deriveVaultAddresses(
             network,
             state.share.frostKeyPackage.untweakedVerifyingKey,
@@ -390,7 +397,7 @@ export function buildDefaultHttpHandler(
           // n derived from configured peer set (peersById includes self).
           // v0.1 is n-of-n by design: threshold == parties. ML-DSA level
           // is fixed at 44 (only level supported on OPNet).
-          const parties = state.peersById.size;
+          const parties = peersById.size;
           const result = await leader.runCombinedDkg({
             ceremonyId,
             threshold: parties,
@@ -421,7 +428,7 @@ export function buildDefaultHttpHandler(
           };
         }
         case 'dkg-mldsa': {
-          const parties = state.peersById.size;
+          const parties = peersById.size;
           const result = await leader.runMldsaDkg({
             ceremonyId,
             threshold: parties,
@@ -434,7 +441,7 @@ export function buildDefaultHttpHandler(
           };
         }
         case 'dkg-frost': {
-          const parties = state.peersById.size;
+          const parties = peersById.size;
           const result = await leader.runFrostDkg({
             ceremonyId,
             threshold: parties,

@@ -12,7 +12,6 @@ password_env = "OTZI_SHARE_PASSWORD"
 
 [node]
 id = "node-a"
-party_id = 1
 
 [network]
 name = "testnet"
@@ -20,14 +19,13 @@ opnet_rpc = "https://testnet.opnet.org"
 
 [transport]
 kind = "peer-mesh"
+advertised_endpoint = "127.0.0.1:8800"
 
 [[peers]]
-id = "node-b"
-party_id = 2
+endpoint = "127.0.0.1:8801"
 
 [[peers]]
-id = "node-c"
-party_id = 3
+endpoint = "127.0.0.1:8802"
 
 [gate]
 strategy = "auto"
@@ -40,15 +38,18 @@ describe('parseDaemonConfigToml — happy paths', () => {
       path: '/etc/otzi/share.json',
       passwordEnv: 'OTZI_SHARE_PASSWORD',
     });
-    expect(cfg.node).toEqual({ id: 'node-a', partyId: 1 });
+    expect(cfg.node).toEqual({ id: 'node-a' });
     expect(cfg.network).toEqual({
       name: 'testnet',
       opnetRpc: 'https://testnet.opnet.org',
     });
-    expect(cfg.transport).toEqual({ kind: 'peer-mesh' });
+    expect(cfg.transport).toEqual({
+      kind: 'peer-mesh',
+      advertisedEndpoint: '127.0.0.1:8800',
+    });
     expect(cfg.peers).toEqual([
-      { id: 'node-b', partyId: 2, walletAddress: undefined, endpoint: undefined },
-      { id: 'node-c', partyId: 3, walletAddress: undefined, endpoint: undefined },
+      { endpoint: '127.0.0.1:8801' },
+      { endpoint: '127.0.0.1:8802' },
     ]);
     expect(cfg.gate).toEqual({ strategy: 'auto', params: undefined });
     expect(cfg.deadlines).toEqual({
@@ -66,7 +67,6 @@ password_env = "OTZI_PWD"
 
 [node]
 id = "alpha"
-party_id = 2
 
 [network]
 name = "mainnet"
@@ -77,15 +77,9 @@ kind = "relay"
 url = "wss://relay.example.com"
 
 [[peers]]
-id = "bravo"
-party_id = 1
-wallet_address = "0xdeadbeef"
 endpoint = "bravo.example:8443"
 
 [[peers]]
-id = "charlie"
-party_id = 3
-wallet_address = "0xfeedface"
 endpoint = "charlie.example:8443"
 
 [gate]
@@ -108,12 +102,8 @@ schedule = "0 */6 * * *"
 `;
     const cfg = parseDaemonConfigToml(toml);
     expect(cfg.transport).toEqual({ kind: 'relay', url: 'wss://relay.example.com' });
-    expect(cfg.peers[0]).toEqual({
-      id: 'bravo',
-      partyId: 1,
-      walletAddress: '0xdeadbeef',
-      endpoint: 'bravo.example:8443',
-    });
+    expect(cfg.peers[0]).toEqual({ endpoint: 'bravo.example:8443' });
+    expect(cfg.peers[1]).toEqual({ endpoint: 'charlie.example:8443' });
     expect(cfg.gate.strategy).toBe('policy');
     expect(cfg.gate.params).toEqual({
       max_amount_sats: 100000,
@@ -137,7 +127,7 @@ describe('parseDaemonConfigToml — missing required tables', () => {
     expect(() => parseDaemonConfigToml(toml)).toThrow(/share.*missing required table/);
   });
   it('rejects missing [node]', () => {
-    const toml = MINIMAL_TOML.replace(/\[node\][\s\S]*?(?=\n\[transport\])/, '');
+    const toml = MINIMAL_TOML.replace(/\[node\][\s\S]*?(?=\n\[network\])/, '');
     expect(() => parseDaemonConfigToml(toml)).toThrow(/node.*missing required table/);
   });
   it('rejects missing [transport]', () => {
@@ -164,16 +154,6 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
     expect(() => parseDaemonConfigToml(toml)).toThrow(/share\.path.*must be a string/);
   });
 
-  it('rejects non-integer party_id', () => {
-    const toml = MINIMAL_TOML.replace('party_id = 1', 'party_id = 1.5');
-    expect(() => parseDaemonConfigToml(toml)).toThrow(/node\.party_id.*must be an integer/);
-  });
-
-  it('rejects negative party_id', () => {
-    const toml = MINIMAL_TOML.replace('party_id = 1', 'party_id = -1');
-    expect(() => parseDaemonConfigToml(toml)).toThrow(/node\.party_id.*must be >= 0/);
-  });
-
   it('rejects unknown transport.kind', () => {
     const toml = MINIMAL_TOML.replace('kind = "peer-mesh"', 'kind = "smoke-signal"');
     expect(() => parseDaemonConfigToml(toml)).toThrow(
@@ -189,7 +169,9 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
   });
 
   it('rejects relay transport without url', () => {
-    const toml = MINIMAL_TOML.replace('kind = "peer-mesh"', 'kind = "relay"');
+    const toml = MINIMAL_TOML
+      .replace('kind = "peer-mesh"', 'kind = "relay"')
+      .replace('advertised_endpoint = "127.0.0.1:8800"', '');
     expect(() => parseDaemonConfigToml(toml)).toThrow(
       /transport\.url.*required when transport\.kind = "relay"/,
     );
@@ -229,7 +211,6 @@ password_env = "P"
 
 [node]
 id = "a"
-party_id = 1
 
 [network]
 name = "testnet"
@@ -237,6 +218,7 @@ opnet_rpc = "https://testnet.opnet.org"
 
 [transport]
 kind = "peer-mesh"
+advertised_endpoint = "127.0.0.1:8800"
 
 [gate]
 strategy = "auto"
@@ -247,50 +229,74 @@ strategy = "auto"
   });
 });
 
-describe('parseDaemonConfigToml — coherence', () => {
-  it('rejects duplicate peer ids', () => {
-    const toml = MINIMAL_TOML.replace('id = "node-c"', 'id = "node-b"');
+describe('parseDaemonConfigToml — Phase F legacy-field rejection', () => {
+  it('rejects node.party_id', () => {
+    const toml = MINIMAL_TOML.replace('id = "node-a"', 'id = "node-a"\nparty_id = 0');
     expect(() => parseDaemonConfigToml(toml)).toThrow(
-      /peers\[1\]\.id.*duplicate id 'node-b'/,
+      /node\.party_id.*no longer supported.*derived from the pubkey book/,
     );
   });
 
-  it('rejects duplicate peer partyIds', () => {
+  it('rejects [[peers]].id', () => {
     const toml = MINIMAL_TOML.replace(
-      '[[peers]]\nid = "node-c"\nparty_id = 3',
-      '[[peers]]\nid = "node-c"\nparty_id = 2',
+      'endpoint = "127.0.0.1:8801"',
+      'id = "node-b"\nendpoint = "127.0.0.1:8801"',
     );
     expect(() => parseDaemonConfigToml(toml)).toThrow(
-      /peers\[1\]\.party_id.*duplicate partyId 2/,
+      /peers\[0\]\.id.*no longer supported/,
     );
   });
 
-  it('rejects peer partyId colliding with node partyId', () => {
+  it('rejects [[peers]].party_id', () => {
     const toml = MINIMAL_TOML.replace(
-      '[[peers]]\nid = "node-b"\nparty_id = 2',
-      '[[peers]]\nid = "node-b"\nparty_id = 1',
+      'endpoint = "127.0.0.1:8801"',
+      'party_id = 1\nendpoint = "127.0.0.1:8801"',
     );
     expect(() => parseDaemonConfigToml(toml)).toThrow(
-      /peers\[0\]\.party_id.*duplicate partyId 1/,
+      /peers\[0\]\.party_id.*no longer supported/,
     );
   });
 
-  it('rejects peer id colliding with node id', () => {
-    const toml = MINIMAL_TOML.replace('id = "node-b"', 'id = "node-a"');
-    expect(() => parseDaemonConfigToml(toml)).toThrow(
-      /peers\[0\]\.id.*duplicate id 'node-a'/,
+  it('rejects [[peers]].wallet_address', () => {
+    const toml = MINIMAL_TOML.replace(
+      'endpoint = "127.0.0.1:8801"',
+      'wallet_address = "0xfeedface"\nendpoint = "127.0.0.1:8801"',
     );
+    expect(() => parseDaemonConfigToml(toml)).toThrow(
+      /peers\[0\]\.wallet_address.*no longer supported/,
+    );
+  });
+
+  it('rejects transport.listen', () => {
+    const toml = MINIMAL_TOML.replace(
+      'advertised_endpoint = "127.0.0.1:8800"',
+      'listen = "127.0.0.1:8800"',
+    );
+    expect(() => parseDaemonConfigToml(toml)).toThrow(
+      /transport\.listen.*no longer supported.*advertised_endpoint/,
+    );
+  });
+
+  it('rejects [[peers]] without endpoint', () => {
+    const toml = MINIMAL_TOML.replace(
+      `[[peers]]
+endpoint = "127.0.0.1:8801"`,
+      '[[peers]]\n',
+    );
+    expect(() => parseDaemonConfigToml(toml)).toThrow(/peers\[0\]\.endpoint.*required/);
   });
 });
 
 describe('ConfigError', () => {
   it('carries a path field for programmatic consumers', () => {
     try {
-      parseDaemonConfigToml(MINIMAL_TOML.replace('party_id = 1', 'party_id = "1"'));
+      parseDaemonConfigToml(
+        MINIMAL_TOML.replace('path = "/etc/otzi/share.json"', 'path = 42'),
+      );
       expect.fail('should have thrown');
     } catch (err) {
       expect(err).toBeInstanceOf(ConfigError);
-      expect((err as ConfigError).path).toBe('node.party_id');
+      expect((err as ConfigError).path).toBe('share.path');
     }
   });
 });
@@ -401,16 +407,13 @@ path = "/x"
 password_env = "P"
 [node]
 id = "a"
-party_id = 0
 [network]
 name = "testnet"
 opnet_rpc = "https://testnet.opnet.org"
 [transport]
 kind = "peer-mesh"
-listen = "127.0.0.1:8800"
+advertised_endpoint = "127.0.0.1:8800"
 [[peers]]
-id = "b"
-party_id = 1
 endpoint = "Node-B.example.com"
 [gate]
 strategy = "auto"
@@ -419,14 +422,13 @@ strategy = "auto"
     expect(cfg.peers[0]!.endpoint).toBe('node-b.example.com:8800');
   });
 
-  it('accepts transport.advertised_endpoint and stores canonical in both fields', () => {
+  it('canonicalizes transport.advertised_endpoint with default port', () => {
     const text = `
 [share]
 path = "/x"
 password_env = "P"
 [node]
 id = "a"
-party_id = 0
 [network]
 name = "testnet"
 opnet_rpc = "https://testnet.opnet.org"
@@ -434,39 +436,12 @@ opnet_rpc = "https://testnet.opnet.org"
 kind = "peer-mesh"
 advertised_endpoint = "192.168.1.5"
 [[peers]]
-id = "b"
-party_id = 1
+endpoint = "127.0.0.1:8801"
 [gate]
 strategy = "auto"
 `;
     const cfg = parseDaemonConfigToml(text);
     expect(cfg.transport.advertisedEndpoint).toBe('192.168.1.5:8800');
-    expect(cfg.transport.listen).toBe('192.168.1.5:8800');
-  });
-
-  it('accepts transport.listen (legacy) and stores canonical in both fields', () => {
-    const text = `
-[share]
-path = "/x"
-password_env = "P"
-[node]
-id = "a"
-party_id = 0
-[network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
-[transport]
-kind = "peer-mesh"
-listen = "192.168.1.5:1044"
-[[peers]]
-id = "b"
-party_id = 1
-[gate]
-strategy = "auto"
-`;
-    const cfg = parseDaemonConfigToml(text);
-    expect(cfg.transport.advertisedEndpoint).toBe('192.168.1.5:1044');
-    expect(cfg.transport.listen).toBe('192.168.1.5:1044');
   });
 
   it('rejects wildcard 0.0.0.0 in transport.advertised_endpoint', () => {
@@ -476,7 +451,6 @@ path = "/x"
 password_env = "P"
 [node]
 id = "a"
-party_id = 0
 [network]
 name = "testnet"
 opnet_rpc = "https://testnet.opnet.org"
@@ -484,8 +458,7 @@ opnet_rpc = "https://testnet.opnet.org"
 kind = "peer-mesh"
 advertised_endpoint = "0.0.0.0:8800"
 [[peers]]
-id = "b"
-party_id = 1
+endpoint = "127.0.0.1:8801"
 [gate]
 strategy = "auto"
 `;
@@ -499,16 +472,13 @@ path = "/x"
 password_env = "P"
 [node]
 id = "a"
-party_id = 0
 [network]
 name = "testnet"
 opnet_rpc = "https://testnet.opnet.org"
 [transport]
 kind = "peer-mesh"
-listen = "127.0.0.1:8800"
+advertised_endpoint = "127.0.0.1:8800"
 [[peers]]
-id = "b"
-party_id = 1
 endpoint = "0.0.0.0:8800"
 [gate]
 strategy = "auto"

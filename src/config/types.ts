@@ -46,10 +46,8 @@ export interface ShareConfig {
 }
 
 export interface NodeConfig {
-  /** Logical node identifier (e.g. "node-a"). */
+  /** Logical node identifier (e.g. "node-a"). Local logging label only. */
   id: string;
-  /** 0..n-1; must match the decrypted share's `partyId` at load time. */
-  partyId: number;
   /** Path to the PKCS#8 ECDH identity private key (required for real transports). */
   identityKeyFile?: string;
   /** Path to the JSON pubkey book produced by bootstrap (required for real transports). */
@@ -62,27 +60,15 @@ export interface TransportConfig {
   url?: string;
   /**
    * Peer-mesh: this node's reachable address (canonical `host:port` form).
-   * Phase E switches consumers to read this; Phase F drops `listen`.
-   * Operator may write either `advertised_endpoint` (preferred) or `listen`
-   * (legacy) in TOML — parser canonicalizes either into this field.
+   * Required when `kind === 'peer-mesh'`; populated by the parser from the
+   * TOML `transport.advertised_endpoint` field.
    */
   advertisedEndpoint?: string;
-  /**
-   * @deprecated — superseded by `advertisedEndpoint`. Phase F removes this.
-   * Phase D's parser accepts both keys but stores the canonical form here
-   * AND in `advertisedEndpoint` for transitional consumer compatibility.
-   */
-  listen?: string;
 }
 
 export interface PeerEntry {
-  /** Logical peer id matching the peer's own `node.id`. */
-  id: string;
-  partyId: number;
-  /** `0x` + hex(SHA256(mldsaPubKey)). Optional in 5a; required by phase 3. */
-  walletAddress?: string;
-  /** WebSocket endpoint for peer-mesh. Optional; absent means relay-only. */
-  endpoint?: string;
+  /** Canonical `host:port` form (post-parse). */
+  endpoint: string;
 }
 
 export interface GateConfig {

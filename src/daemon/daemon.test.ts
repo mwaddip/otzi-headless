@@ -56,23 +56,32 @@ function dealerKeygen(t: number, n: number, level = 44): DecryptedShare[] {
 
 function makeConfig(overrides: {
   nodeId: string;
-  partyId: PartyId;
-  peerIds: ReadonlyArray<{ id: string; partyId: PartyId }>;
+  peerCount: number;
   httpBind?: string;
   gateStrategy?: 'auto' | 'policy';
 }): DaemonConfig {
   return {
     share: { path: '/dev/null', passwordEnv: 'UNUSED' },
-    node: { id: overrides.nodeId, partyId: overrides.partyId },
+    node: { id: overrides.nodeId },
     network: { name: 'testnet', opnetRpc: 'https://testnet.opnet.org' },
-    transport: { kind: 'peer-mesh' },
-    peers: overrides.peerIds.map((p) => ({ id: p.id, partyId: p.partyId })),
+    transport: { kind: 'peer-mesh', advertisedEndpoint: '127.0.0.1:8800' },
+    peers: Array.from({ length: overrides.peerCount }, (_, i) => ({
+      endpoint: `127.0.0.1:${8801 + i}`,
+    })),
     gate: { strategy: overrides.gateStrategy ?? 'auto' },
     deadlines: { signingMs: 60_000, dkgMs: 180_000 },
     triggers: overrides.httpBind
       ? [{ kind: 'http', params: { bind: overrides.httpBind } }]
       : [],
   };
+}
+
+function buildPeersByIdLabels(parties: number, selfPartyId: PartyId, selfNodeId: string): ReadonlyMap<PartyId, string> {
+  const map = new Map<PartyId, string>();
+  for (let i = 0 as PartyId; i < parties; i++) {
+    map.set(i, i === selfPartyId ? selfNodeId : `peer-${i}`);
+  }
+  return map;
 }
 
 interface Ring {
@@ -88,15 +97,11 @@ function buildRing(parties: number, leaderHttpBind: string, threshold = 2): Ring
   const configs = new Map<PartyId, DaemonConfig>();
   for (const pid of peerIds) {
     const nodeId = `node-${pid}`;
-    const peerList = peerIds
-      .filter((p) => p !== pid)
-      .map((p) => ({ id: `node-${p}`, partyId: p }));
     configs.set(
       pid,
       makeConfig({
         nodeId,
-        partyId: pid,
-        peerIds: peerList,
+        peerCount: parties - 1,
         httpBind: pid === 0 ? leaderHttpBind : undefined,
       }),
     );
@@ -108,66 +113,18 @@ async function buildDaemon(
   transport: Transport,
   config: DaemonConfig,
   share: DecryptedShare,
+  selfPartyId: PartyId,
 ): Promise<Daemon> {
   const state = buildStateFromShare(config, share);
   return new Daemon({
     state,
     transport,
-    selfPartyId: config.node.partyId,
+    selfPartyId,
+    peersById: buildPeersByIdLabels(share.parties, selfPartyId, config.node.id),
     rng: SYSTEM_RNG,
     pullOpts: FAST_PULL,
   });
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// config-merge
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('buildStateFromShare — cross-validation', () => {
-  it('accepts a coherent config + share', () => {
-    const shares = dealerKeygen(2, 3);
-    const cfg = makeConfig({
-      nodeId: 'node-0',
-      partyId: 0,
-      peerIds: [{ id: 'node-1', partyId: 1 }, { id: 'node-2', partyId: 2 }],
-    });
-    const state = buildStateFromShare(cfg, shares[0]!);
-    expect(state.peersById.get(0)).toBe('node-0');
-    expect(state.peersById.get(1)).toBe('node-1');
-    expect(state.peersById.get(2)).toBe('node-2');
-    expect(state.peersById.size).toBe(3);
-  });
-
-  // Removed: 'rejects partyId mismatch between config and share' — the check
-  // moved from config-merge.validateAlignment to
-  // transport-factory.resolveSelfFromBook, which compares share.partyId
-  // against the book entry resolved by pubkey match (the authoritative
-  // source). Phase F drops config.node.partyId outright.
-
-  it('rejects peer-count mismatch', () => {
-    const shares = dealerKeygen(2, 3);
-    const cfg = makeConfig({
-      nodeId: 'node-0',
-      partyId: 0,
-      peerIds: [{ id: 'node-1', partyId: 1 }], // only 1 peer, share.parties=3
-    });
-    expect(() => buildStateFromShare(cfg, shares[0]!)).toThrow(
-      /peers count \+ self \(2\) does not match share\.parties \(3\)/,
-    );
-  });
-
-  it('rejects partyId gap in the ring', () => {
-    const shares = dealerKeygen(2, 3);
-    const cfg = makeConfig({
-      nodeId: 'node-0',
-      partyId: 0,
-      peerIds: [{ id: 'node-1', partyId: 1 }, { id: 'node-2', partyId: 3 }], // missing 2
-    });
-    expect(() => buildStateFromShare(cfg, shares[0]!)).toThrow(
-      /partyId 2 missing from config/,
-    );
-  });
-});
 
 // ─────────────────────────────────────────────────────────────────────────
 // Daemon — HTTP-driven combined DKG
@@ -179,7 +136,7 @@ describe('Daemon — HTTP-driven DKG end-to-end', () => {
     const daemons: Daemon[] = [];
     for (const pid of [0, 1, 2] as PartyId[]) {
       daemons.push(
-        await buildDaemon(ring.transports.get(pid)!, ring.configs.get(pid)!, ring.shares[pid]!),
+        await buildDaemon(ring.transports.get(pid)!, ring.configs.get(pid)!, ring.shares[pid]!, pid),
       );
     }
     for (const d of daemons) await d.start();
@@ -235,7 +192,7 @@ describe('Daemon — HTTP-driven ML-DSA signing', () => {
     const daemons: Daemon[] = [];
     for (const pid of [0, 1, 2] as PartyId[]) {
       daemons.push(
-        await buildDaemon(ring.transports.get(pid)!, ring.configs.get(pid)!, ring.shares[pid]!),
+        await buildDaemon(ring.transports.get(pid)!, ring.configs.get(pid)!, ring.shares[pid]!, pid),
       );
     }
     // Use `pullOpts` with more attempts — ML-DSA signing can need a few retries
@@ -287,6 +244,7 @@ describe('Daemon — HTTP error paths', () => {
       ring.transports.get(0)!,
       ring.configs.get(0)!,
       ring.shares[0]!,
+      0,
     );
     await daemon.start();
     const http = (daemon as unknown as { triggers: Array<{ address?: () => { host: string; port: number } | null }> })
@@ -353,7 +311,7 @@ describe('Daemon — HTTP error paths', () => {
     // Override leader gate to policy with a cap that will reject generic signings.
     const leaderCfg = { ...ring.configs.get(0)! };
     leaderCfg.gate = { strategy: 'policy', params: { max_amount: 1 } };
-    const leader = await buildDaemon(ring.transports.get(0)!, leaderCfg, ring.shares[0]!);
+    const leader = await buildDaemon(ring.transports.get(0)!, leaderCfg, ring.shares[0]!, 0);
     await leader.start();
     try {
       const http = (leader as unknown as { triggers: Array<{ address?: () => { host: string; port: number } | null }> })
@@ -387,7 +345,7 @@ describe('Daemon — HTTP error paths', () => {
 describe('Daemon — lifecycle', () => {
   it('double-start / double-stop are idempotent', async () => {
     const ring = buildRing(3, '127.0.0.1:0');
-    const daemon = await buildDaemon(ring.transports.get(0)!, ring.configs.get(0)!, ring.shares[0]!);
+    const daemon = await buildDaemon(ring.transports.get(0)!, ring.configs.get(0)!, ring.shares[0]!, 0);
     await daemon.start();
     await daemon.start();
     await daemon.stop();
@@ -405,6 +363,7 @@ describe('Daemon — lifecycle', () => {
         state: buildStateFromShare(cfg, ring.shares[0]!),
         transport: ring.transports.get(0)!,
         selfPartyId: 0,
+        peersById: buildPeersByIdLabels(ring.shares[0]!.parties, 0, cfg.node.id),
         rng: SYSTEM_RNG,
         pullOpts: FAST_PULL,
       }),

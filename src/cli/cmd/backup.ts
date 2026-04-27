@@ -146,9 +146,10 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
       );
     throw err;
   }
-  // Parse the TOML loosely — we only need three string paths and the partyId.
-  // Backup is a read-only operation; it must work even on a daemon whose
-  // [[peers]] block hasn't been filled in yet (e.g. mid-bootstrap state).
+  // Parse the TOML loosely — we only need three string paths. Backup is a
+  // read-only operation; it must work even on a daemon whose [[peers]] block
+  // hasn't been filled in yet (e.g. mid-bootstrap state). PartyId is read
+  // from the share file's top-level (unencrypted) `partyId` field below.
   const rawConfig = parseToml(configText) as Record<string, unknown>;
   const shareTable = (rawConfig.share ?? {}) as Record<string, unknown>;
   const nodeTable = (rawConfig.node ?? {}) as Record<string, unknown>;
@@ -162,10 +163,6 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
     typeof nodeTable.pubkey_book_file === 'string'
       ? nodeTable.pubkey_book_file
       : DEFAULT_PUBKEY_BOOK_PATH;
-  const partyId =
-    typeof nodeTable.party_id === 'number' || typeof nodeTable.party_id === 'bigint'
-      ? Number(nodeTable.party_id)
-      : 0;
 
   const manifestSource = opts.pathOverrides?.manifest ?? DEFAULT_MANIFEST_PATH;
   const vaultPubkeySource =
@@ -220,6 +217,19 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
     );
   }
 
+  // Read partyId from share.json's top-level (unencrypted) field. Best-effort
+  // — meta.json's partyId is informational, used only as a confirmation banner
+  // at restore time. Falls back to undefined on malformed share.
+  let partyId: number | undefined;
+  try {
+    const shareRaw = JSON.parse(await readFile(sharePath, 'utf8')) as {
+      partyId?: unknown;
+    };
+    if (typeof shareRaw.partyId === 'number') partyId = shareRaw.partyId;
+  } catch {
+    /* ignore */
+  }
+
   // --- Step 4: stage files into a tmpdir under their tar-relative paths so
   // `tar.create({ cwd: staging, ... })` produces the correct in-archive layout.
   const staging = await mkdtemp(join(tmpdir(), 'otzi-backup-stage-'));
@@ -238,7 +248,7 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
       version: 1,
       createdAt: now.toISOString(),
       hostname: hostname(),
-      partyId,
+      ...(partyId !== undefined ? { partyId } : {}),
     };
     const metaPath = join(staging, 'meta.json');
     await writeFile(metaPath, JSON.stringify(meta, null, 2));

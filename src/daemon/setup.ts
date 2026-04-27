@@ -46,20 +46,14 @@ export async function setupMaster(configPath: string, bind: string): Promise<voi
   if (config.transport.kind !== 'peer-mesh') {
     throw new Error('setup: bootstrap requires transport.kind = "peer-mesh"');
   }
-  const selfAdvertisedEndpoint =
-    config.transport.advertisedEndpoint ?? config.transport.listen;
+  const selfAdvertisedEndpoint = config.transport.advertisedEndpoint;
   if (!selfAdvertisedEndpoint) {
     throw new Error(
-      'setup: bootstrap requires transport.advertised_endpoint (or legacy transport.listen) set to this node\'s reachable address',
+      "setup: bootstrap requires transport.advertised_endpoint set to this node's reachable address",
     );
   }
 
-  const expectedPeers = config.peers.map((p, i) => {
-    if (!p.endpoint) {
-      throw new Error(`setup: peers[${i}].endpoint is required (post-Phase C bootstrap addresses peers by endpoint)`);
-    }
-    return { advertisedEndpoint: p.endpoint };
-  });
+  const expectedPeers = config.peers.map((p) => ({ advertisedEndpoint: p.endpoint }));
 
   const identity = await loadOrGenerateIdentity(config);
 
@@ -67,7 +61,7 @@ export async function setupMaster(configPath: string, bind: string): Promise<voi
     `otzi: setup master — listening on ${bind}, expecting ${expectedPeers.length} peer(s) to register`,
   );
   const { book, fingerprint } = await runMasterBootstrap({
-    self: { nodeId: config.node.id, identity, advertisedEndpoint: selfAdvertisedEndpoint },
+    self: { identity, advertisedEndpoint: selfAdvertisedEndpoint },
     expectedPeers,
     bind,
   });
@@ -91,11 +85,10 @@ export async function setupMember(configPath: string, masterUrl: string): Promis
   if (config.transport.kind !== 'peer-mesh') {
     throw new Error('setup: bootstrap requires transport.kind = "peer-mesh"');
   }
-  const selfAdvertisedEndpoint =
-    config.transport.advertisedEndpoint ?? config.transport.listen;
+  const selfAdvertisedEndpoint = config.transport.advertisedEndpoint;
   if (!selfAdvertisedEndpoint) {
     throw new Error(
-      'setup: bootstrap requires transport.advertised_endpoint (or legacy transport.listen) set to this node\'s reachable address',
+      "setup: bootstrap requires transport.advertised_endpoint set to this node's reachable address",
     );
   }
 
@@ -103,7 +96,7 @@ export async function setupMember(configPath: string, masterUrl: string): Promis
 
   console.error(`otzi: setup member — registering with ${masterUrl}`);
   const { book, fingerprint } = await runMemberRegister({
-    self: { nodeId: config.node.id, identity, advertisedEndpoint: selfAdvertisedEndpoint },
+    self: { identity, advertisedEndpoint: selfAdvertisedEndpoint },
     masterUrl,
   });
 

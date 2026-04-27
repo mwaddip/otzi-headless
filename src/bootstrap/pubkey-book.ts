@@ -14,16 +14,11 @@ import type { PartyId } from '../core/types';
 import { fromHex, toHex } from '../wire/hex';
 
 export interface PubkeyBookEntry {
-  nodeId: string;
   partyId: PartyId;
   /** 130-char hex; the raw 65-byte uncompressed P-256 point. */
   publicKeyHex: string;
-  /**
-   * Canonical `host:port` form (use `canonicalizeEndpoint`). Optional during
-   * Phase B's transition — Phase F drops the optional marker once Phase C has
-   * populated this on every newly-built book.
-   */
-  advertisedEndpoint?: string;
+  /** Canonical `host:port` form (use `canonicalizeEndpoint`). */
+  advertisedEndpoint: string;
 }
 
 export interface PubkeyBook {
@@ -37,7 +32,6 @@ export function buildBook(entries: Iterable<PubkeyBookEntry>): PubkeyBook {
   const sorted = [...entries].sort((a, b) => a.partyId - b.partyId);
   for (const e of sorted) validateEntry(e, '<buildBook>');
   assertUniquePartyIds(sorted);
-  assertUniqueNodeIds(sorted);
   assertUniquePublicKeys(sorted);
   return { entries: sorted };
 }
@@ -54,18 +48,20 @@ export function parseBook(text: string): PubkeyBook {
     if (!item || typeof item !== 'object')
       throw new Error(`parseBook: entries[${i}] is not an object`);
     const o = item as Record<string, unknown>;
-    if (typeof o.nodeId !== 'string') throw new Error(`parseBook: entries[${i}].nodeId must be a string`);
+    if ('nodeId' in o)
+      throw new Error(
+        `parseBook: entries[${i}].nodeId is no longer supported — re-run 'otzi setup' to regenerate the book`,
+      );
     if (typeof o.partyId !== 'number' || !Number.isInteger(o.partyId) || o.partyId < 0)
       throw new Error(`parseBook: entries[${i}].partyId must be a non-negative integer`);
     if (typeof o.publicKeyHex !== 'string')
       throw new Error(`parseBook: entries[${i}].publicKeyHex must be a string`);
-    if (o.advertisedEndpoint !== undefined && typeof o.advertisedEndpoint !== 'string')
+    if (typeof o.advertisedEndpoint !== 'string')
       throw new Error(`parseBook: entries[${i}].advertisedEndpoint must be a string`);
     const entry: PubkeyBookEntry = {
-      nodeId: o.nodeId,
       partyId: o.partyId,
       publicKeyHex: o.publicKeyHex,
-      ...(o.advertisedEndpoint !== undefined ? { advertisedEndpoint: o.advertisedEndpoint } : {}),
+      advertisedEndpoint: o.advertisedEndpoint,
     };
     validateEntry(entry, `entries[${i}]`);
     return entry;
@@ -110,7 +106,8 @@ function validateEntry(e: PubkeyBookEntry, path: string): void {
     throw new Error(`${path}.publicKeyHex must start with 0x04 (uncompressed P-256)`);
   if (e.partyId < 0 || !Number.isInteger(e.partyId))
     throw new Error(`${path}.partyId must be a non-negative integer`);
-  if (e.nodeId.length === 0) throw new Error(`${path}.nodeId must be non-empty`);
+  if (e.advertisedEndpoint.length === 0)
+    throw new Error(`${path}.advertisedEndpoint must be non-empty`);
 }
 
 function assertUniquePartyIds(entries: PubkeyBookEntry[]): void {
@@ -119,15 +116,6 @@ function assertUniquePartyIds(entries: PubkeyBookEntry[]): void {
     if (seen.has(e.partyId))
       throw new Error(`pubkey book: duplicate partyId ${e.partyId}`);
     seen.add(e.partyId);
-  }
-}
-
-function assertUniqueNodeIds(entries: PubkeyBookEntry[]): void {
-  const seen = new Set<string>();
-  for (const e of entries) {
-    if (seen.has(e.nodeId))
-      throw new Error(`pubkey book: duplicate nodeId '${e.nodeId}'`);
-    seen.add(e.nodeId);
   }
 }
 

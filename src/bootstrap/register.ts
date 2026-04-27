@@ -1,12 +1,10 @@
 /**
  * Member-side bootstrap.
  *
- * POSTs `{ public_key_hex, advertised_endpoint, node_id }` to the master's
- * `/register` endpoint and waits (long-poll) for the complete pubkey book.
- * Validates that the returned book contains this leaf's own entry
- * (matched by pubkey) and that the entry's advertisedEndpoint round-trips
- * unchanged. nodeId is informational only — leader stamps whatever the
- * leaf sent.
+ * POSTs `{ public_key_hex, advertised_endpoint }` to the master's `/register`
+ * endpoint and waits (long-poll) for the complete pubkey book. Validates that
+ * the returned book contains this leaf's own entry (matched by pubkey) and
+ * that the entry's advertisedEndpoint round-trips unchanged.
  */
 
 import type { IdentityKeyPair } from '../transport/identity';
@@ -20,7 +18,6 @@ import {
 
 export interface MemberRegisterInputs {
   self: {
-    nodeId: string;
     identity: IdentityKeyPair;
     /** Canonical `host:port` form. */
     advertisedEndpoint: string;
@@ -49,7 +46,6 @@ export async function runMemberRegister(
   const url = `${input.masterUrl.replace(/\/+$/, '')}/register`;
   log.info('register: POST', {
     url,
-    nodeId: input.self.nodeId,
     advertisedEndpoint: input.self.advertisedEndpoint,
   });
 
@@ -62,7 +58,6 @@ export async function runMemberRegister(
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        node_id: input.self.nodeId,
         public_key_hex: publicKeyHex,
         advertised_endpoint: input.self.advertisedEndpoint,
       }),

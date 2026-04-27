@@ -103,24 +103,18 @@ function dealerKeygen(t: number, n: number, level = 44): DecryptedShare[] {
 
 function makeIntegrationConfig(args: {
   nodeId: string;
-  partyId: PartyId;
-  peerIds: Array<{ id: string; partyId: PartyId; endpoint?: string }>;
-  transport: { kind: 'peer-mesh'; listen: string } | { kind: 'relay'; url: string };
+  peerEndpoints: ReadonlyArray<string>;
+  transport:
+    | { kind: 'peer-mesh'; advertisedEndpoint: string }
+    | { kind: 'relay'; url: string };
   httpBind: string;
 }): DaemonConfig {
   return {
     share: { path: '/dev/null', passwordEnv: 'UNUSED' },
-    node: { id: args.nodeId, partyId: args.partyId },
+    node: { id: args.nodeId },
     network: { name: 'testnet', opnetRpc: 'https://testnet.opnet.org' },
     transport: args.transport,
-    peers: args.peerIds.map((p) => {
-      const out: { id: string; partyId: PartyId; endpoint?: string } = {
-        id: p.id,
-        partyId: p.partyId,
-      };
-      if (p.endpoint !== undefined) out.endpoint = p.endpoint;
-      return out;
-    }),
+    peers: args.peerEndpoints.map((endpoint) => ({ endpoint })),
     gate: { strategy: 'auto' },
     deadlines: { signingMs: 60_000, dkgMs: 180_000 },
     triggers: [{ kind: 'http', params: { bind: args.httpBind } }],
@@ -129,16 +123,13 @@ function makeIntegrationConfig(args: {
 
 async function buildBookFromIdentities(
   identities: IdentityKeyPair[],
-  advertisedEndpoints?: ReadonlyArray<string>,
+  advertisedEndpoints: ReadonlyArray<string>,
 ): Promise<PubkeyBook> {
   return buildBook(
     identities.map((id, i) => ({
-      nodeId: `node-${i}`,
       partyId: i,
       publicKeyHex: toHex(id.publicKeyRaw),
-      ...(advertisedEndpoints !== undefined
-        ? { advertisedEndpoint: advertisedEndpoints[i]! }
-        : {}),
+      advertisedEndpoint: advertisedEndpoints[i]!,
     })),
   );
 }
@@ -161,20 +152,15 @@ async function buildPeerMeshHarness(n: number): Promise<Harness> {
   const daemons: Daemon[] = [];
   const bundles: TransportBundle[] = [];
   for (let i = 0; i < n; i++) {
-    const peerIds = [];
+    const peerEndpoints: string[] = [];
     for (let j = 0; j < n; j++) {
       if (i === j) continue;
-      peerIds.push({
-        id: `node-${j}`,
-        partyId: j,
-        endpoint: advertised[j]!,
-      });
+      peerEndpoints.push(advertised[j]!);
     }
     const cfg = makeIntegrationConfig({
       nodeId: `node-${i}`,
-      partyId: i,
-      peerIds,
-      transport: { kind: 'peer-mesh', listen: advertised[i]! },
+      peerEndpoints,
+      transport: { kind: 'peer-mesh', advertisedEndpoint: advertised[i]! },
       httpBind: `127.0.0.1:${httpPorts[i]}`,
     });
     const state = buildStateFromShare(cfg, shares[i]!);
@@ -185,6 +171,7 @@ async function buildPeerMeshHarness(n: number): Promise<Harness> {
       state,
       transport: bundle.transport,
       selfPartyId: bundle.selfPartyId,
+      peersById: bundle.peersById,
       rng: SYSTEM_RNG,
       pullOpts: DKG_PULL_OPTS,
       logger,
@@ -216,20 +203,18 @@ async function buildRelayHarness(n: number): Promise<{ harness: Harness; relay: 
   const identities = await Promise.all(Array.from({ length: n }, () => generateIdentity(true)));
   const httpPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
   const shares = dealerKeygen(2, n);
-  const book = await buildBookFromIdentities(identities);
+  // Relay path doesn't dial peer endpoints, but the book still needs canonical
+  // advertisedEndpoint values (parser/builder requires them post-Phase-F);
+  // synth from a stable port range so they don't collide.
+  const advertised = Array.from({ length: n }, (_, i) => `127.0.0.1:${20000 + i}`);
+  const book = await buildBookFromIdentities(identities, advertised);
 
   const daemons: Daemon[] = [];
   const bundles: TransportBundle[] = [];
   for (let i = 0; i < n; i++) {
-    const peerIds = [];
-    for (let j = 0; j < n; j++) {
-      if (i === j) continue;
-      peerIds.push({ id: `node-${j}`, partyId: j });
-    }
     const cfg = makeIntegrationConfig({
       nodeId: `node-${i}`,
-      partyId: i,
-      peerIds,
+      peerEndpoints: [],
       transport: { kind: 'relay', url: `ws://127.0.0.1:${relayPort}` },
       httpBind: `127.0.0.1:${httpPorts[i]}`,
     });
@@ -240,6 +225,7 @@ async function buildRelayHarness(n: number): Promise<{ harness: Harness; relay: 
       state,
       transport: bundle.transport,
       selfPartyId: bundle.selfPartyId,
+      peersById: bundle.peersById,
       rng: SYSTEM_RNG,
       pullOpts: DKG_PULL_OPTS,
     });
@@ -376,22 +362,18 @@ describe('Daemon integration — DKG persistence + restart', () => {
       }
 
       const configs: DaemonConfig[] = Array.from({ length: n }, (_, i) => {
-        const peers = [];
+        const peers: Array<{ endpoint: string }> = [];
         for (let j = 0; j < n; j++) {
           if (i === j) continue;
-          peers.push({
-            id: `node-${j}`,
-            partyId: j,
-            endpoint: advertised[j]!,
-          });
+          peers.push({ endpoint: advertised[j]! });
         }
         return {
           share: { path: sharePaths[i]!, passwordEnv: passwordEnvs[i]! },
-          node: { id: `node-${i}`, partyId: i },
+          node: { id: `node-${i}` },
           network: { name: 'testnet' as const, opnetRpc: 'https://testnet.opnet.org' },
           transport: {
             kind: 'peer-mesh' as const,
-            listen: advertised[i]!,
+            advertisedEndpoint: advertised[i]!,
           },
           peers,
           gate: { strategy: 'auto' as const },
@@ -427,6 +409,7 @@ describe('Daemon integration — DKG persistence + restart', () => {
           state: round1States[i]!,
           transport: bundle.transport,
           selfPartyId: bundle.selfPartyId,
+          peersById: bundle.peersById,
           rng: SYSTEM_RNG,
           pullOpts: DKG_PULL_OPTS,
         });
@@ -531,6 +514,7 @@ describe('Daemon integration — DKG persistence + restart', () => {
           state: round2States[i]!,
           transport: bundle.transport,
           selfPartyId: bundle.selfPartyId,
+          peersById: bundle.peersById,
           rng: SYSTEM_RNG,
           pullOpts: DKG_PULL_OPTS,
         });
@@ -635,20 +619,15 @@ async function buildSyncHarness(n: number, sharedSecret: string | null): Promise
   const daemons: Daemon[] = [];
   const bundles: TransportBundle[] = [];
   for (let i = 0; i < n; i++) {
-    const peerIds = [];
+    const peerEndpoints: string[] = [];
     for (let j = 0; j < n; j++) {
       if (i === j) continue;
-      peerIds.push({
-        id: `node-${j}`,
-        partyId: j,
-        endpoint: advertised[j]!,
-      });
+      peerEndpoints.push(advertised[j]!);
     }
     const cfg = makeIntegrationConfig({
       nodeId: `node-${i}`,
-      partyId: i,
-      peerIds,
-      transport: { kind: 'peer-mesh', listen: advertised[i]! },
+      peerEndpoints,
+      transport: { kind: 'peer-mesh', advertisedEndpoint: advertised[i]! },
       httpBind: `127.0.0.1:${httpPorts[i]}`,
     });
     const state = buildStateFromShare(cfg, shares[i]!);
@@ -659,6 +638,7 @@ async function buildSyncHarness(n: number, sharedSecret: string | null): Promise
       state,
       transport: bundle.transport,
       selfPartyId: bundle.selfPartyId,
+      peersById: bundle.peersById,
       rng: SYSTEM_RNG,
       pullOpts: DKG_PULL_OPTS,
       logger,

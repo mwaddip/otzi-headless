@@ -2,15 +2,16 @@
  * Master-side bootstrap.
  *
  * Stands up a short-lived HTTP server on `bind`. Each leaf POSTs its
- * `{ public_key_hex, advertised_endpoint, node_id }` to `/register`.
- * Master canonicalizes the incoming `advertised_endpoint` and validates it
- * against an operator-supplied allowlist. Once all expected peers + self
- * have registered, master sorts the collected entries by raw pubkey bytes
+ * `{ public_key_hex, advertised_endpoint }` to `/register`. Master
+ * canonicalizes the incoming `advertised_endpoint` and validates it against
+ * an operator-supplied allowlist. Once all expected peers + self have
+ * registered, master sorts the collected entries by raw pubkey bytes
  * ascending, assigns `partyId = index`, builds the book, and fans it out
  * as the response to every waiting registration handler.
  *
  * Error responses:
- *   400 — bad body / pubkey format / non-canonical or wildcard endpoint
+ *   400 — bad body / pubkey format / non-canonical or wildcard endpoint /
+ *         legacy `node_id` field present
  *   404 — advertised_endpoint not on the operator's allowlist
  *   409 — endpoint already registered OR pubkey already registered
  *   408 — server-side bootstrap timeout
@@ -31,7 +32,6 @@ import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 
 export interface MasterBootstrapInputs {
   self: {
-    nodeId: string;
     identity: IdentityKeyPair;
     /** Canonical `host:port` form (post-`canonicalizeEndpoint`). */
     advertisedEndpoint: string;
@@ -54,7 +54,6 @@ export interface MasterBootstrapResult {
 }
 
 interface RegisteredEntry {
-  nodeId: string;
   publicKey: Uint8Array;
   /** Canonical form. */
   advertisedEndpoint: string;
@@ -109,7 +108,6 @@ export async function runMasterBootstrap(
   // registered keyed by canonical advertisedEndpoint
   const registered = new Map<string, RegisteredEntry>();
   registered.set(input.self.advertisedEndpoint, {
-    nodeId: input.self.nodeId,
     publicKey: input.self.identity.publicKeyRaw,
     advertisedEndpoint: input.self.advertisedEndpoint,
   });
@@ -126,7 +124,6 @@ export async function runMasterBootstrap(
       Buffer.compare(Buffer.from(a.publicKey), Buffer.from(b.publicKey)),
     );
     const entries: PubkeyBookEntry[] = sorted.map((r, idx) => ({
-      nodeId: r.nodeId,
       partyId: idx as PartyId,
       publicKeyHex: toHex(r.publicKey),
       advertisedEndpoint: r.advertisedEndpoint,
@@ -215,14 +212,16 @@ async function handleRequest(
     return;
   }
 
-  const nodeId = body.node_id ?? body.nodeId;
+  if ('node_id' in body || 'nodeId' in body) {
+    respondJson(res, 400, {
+      error: "'node_id' is no longer supported in the register payload",
+    });
+    return;
+  }
+
   const publicKeyHex = body.public_key_hex ?? body.publicKeyHex;
   const rawEndpoint = body.advertised_endpoint ?? body.advertisedEndpoint;
 
-  if (typeof nodeId !== 'string' || nodeId.length === 0) {
-    respondJson(res, 400, { error: "'node_id' missing or empty" });
-    return;
-  }
   if (typeof publicKeyHex !== 'string' || publicKeyHex.length !== 65 * 2) {
     respondJson(res, 400, { error: "'public_key_hex' must be 130 hex chars (65 bytes)" });
     return;
@@ -268,11 +267,10 @@ async function handleRequest(
   }
 
   ctx.registered.set(advertisedEndpoint, {
-    nodeId,
     publicKey: new Uint8Array(Buffer.from(lowerHex, 'hex')),
     advertisedEndpoint,
   });
-  ctx.log.info('master bootstrap: registered', { nodeId, advertisedEndpoint });
+  ctx.log.info('master bootstrap: registered', { advertisedEndpoint });
   ctx.completeIfReady();
 
   // Long-poll: await the single-shot completion gate, respond when it fires.

@@ -107,9 +107,13 @@ function parseShare(raw: unknown): ShareConfig {
 
 function parseNode(raw: unknown): NodeConfig {
   const o = asObject(raw, 'node');
+  if ('party_id' in o)
+    throw new ConfigError(
+      'node.party_id',
+      'no longer supported — partyId is derived from the pubkey book at startup',
+    );
   const out: NodeConfig = {
     id: asString(o.id, 'node.id'),
-    partyId: asInteger(o.party_id, 'node.party_id', 0),
   };
   if (o.identity_key_file !== undefined)
     out.identityKeyFile = asString(o.identity_key_file, 'node.identity_key_file');
@@ -134,27 +138,22 @@ function parseTransport(raw: unknown): TransportConfig {
       throw new ConfigError('transport.url', 'required when transport.kind = "relay"');
     return { kind, url: asString(o.url, 'transport.url') };
   }
-  // peer-mesh — accept `advertised_endpoint` (preferred) or `listen` (legacy).
-  // Both represent this node's reachable address. Either is canonicalized at
-  // parse time; result is stored in BOTH `advertisedEndpoint` and `listen`
-  // so transitional consumers can read either field.
+  if ('listen' in o)
+    throw new ConfigError(
+      'transport.listen',
+      'no longer supported — use transport.advertised_endpoint',
+    );
   const out: TransportConfig = { kind };
-  const rawEndpoint = o.advertised_endpoint ?? o.listen;
-  if (rawEndpoint !== undefined) {
-    const fieldPath =
-      o.advertised_endpoint !== undefined ? 'transport.advertised_endpoint' : 'transport.listen';
-    const rawStr = asString(rawEndpoint, fieldPath);
-    let canonical: string;
+  if (o.advertised_endpoint !== undefined) {
+    const rawStr = asString(o.advertised_endpoint, 'transport.advertised_endpoint');
     try {
-      canonical = canonicalizeEndpoint(rawStr);
+      out.advertisedEndpoint = canonicalizeEndpoint(rawStr);
     } catch (err) {
       if (err instanceof EndpointParseError) {
-        throw new ConfigError(fieldPath, err.message);
+        throw new ConfigError('transport.advertised_endpoint', err.message);
       }
       throw err;
     }
-    out.advertisedEndpoint = canonical;
-    out.listen = canonical; // mirror for transitional consumers
   }
   return out;
 }
@@ -162,26 +161,24 @@ function parseTransport(raw: unknown): TransportConfig {
 function parsePeer(raw: unknown, i: number): PeerEntry {
   const path = `peers[${i}]`;
   const o = asObject(raw, path);
-  const out: PeerEntry = {
-    id: asString(o.id, `${path}.id`),
-    partyId: asInteger(o.party_id, `${path}.party_id`, 0),
-    walletAddress:
-      o.wallet_address === undefined
-        ? undefined
-        : asString(o.wallet_address, `${path}.wallet_address`),
-  };
-  if (o.endpoint !== undefined) {
-    const rawStr = asString(o.endpoint, `${path}.endpoint`);
-    try {
-      out.endpoint = canonicalizeEndpoint(rawStr);
-    } catch (err) {
-      if (err instanceof EndpointParseError) {
-        throw new ConfigError(`${path}.endpoint`, err.message);
-      }
-      throw err;
-    }
+  for (const legacy of ['id', 'party_id', 'wallet_address']) {
+    if (legacy in o)
+      throw new ConfigError(
+        `${path}.${legacy}`,
+        'no longer supported — peers carry only `endpoint` post-cleanup',
+      );
   }
-  return out;
+  if (o.endpoint === undefined)
+    throw new ConfigError(`${path}.endpoint`, 'required');
+  const rawStr = asString(o.endpoint, `${path}.endpoint`);
+  try {
+    return { endpoint: canonicalizeEndpoint(rawStr) };
+  } catch (err) {
+    if (err instanceof EndpointParseError) {
+      throw new ConfigError(`${path}.endpoint`, err.message);
+    }
+    throw err;
+  }
 }
 
 function parsePeers(raw: unknown): PeerEntry[] {
@@ -286,16 +283,11 @@ function parseBootstrap(raw: unknown): BootstrapConfig | undefined {
 // ---------------------------------------------------------------------------
 
 function validateCoherence(cfg: DaemonConfig): void {
-  const seenIds = new Set<string>([cfg.node.id]);
-  const seenPids = new Set<number>([cfg.node.partyId]);
-  cfg.peers.forEach((p, i) => {
-    if (seenIds.has(p.id))
-      throw new ConfigError(`peers[${i}].id`, `duplicate id '${p.id}' (collides with node or earlier peer)`);
-    if (seenPids.has(p.partyId))
-      throw new ConfigError(`peers[${i}].party_id`, `duplicate partyId ${p.partyId} (collides with node or earlier peer)`);
-    seenIds.add(p.id);
-    seenPids.add(p.partyId);
-  });
+  // Peer-uniqueness is enforced via canonical-form pubkey-book matching at
+  // transport-factory; nothing additional to check here. Endpoint-collision
+  // (two `[[peers]]` rows pointing at the same advertisedEndpoint) would
+  // surface as a book mismatch downstream.
+  void cfg;
 }
 
 // ---------------------------------------------------------------------------

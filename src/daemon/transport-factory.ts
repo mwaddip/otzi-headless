@@ -22,6 +22,7 @@
 import { readFile } from 'node:fs/promises';
 import { parseBook, type PubkeyBook, type PubkeyBookEntry } from '../bootstrap/pubkey-book';
 import type { Transport } from '../core/transport';
+import type { PartyId } from '../core/types';
 import type { Logger } from '../orchestrator/types';
 import { PeerMeshTransport } from '../transport/peer-mesh/peer-mesh';
 import { RelayTransport } from '../transport/relay/relay-transport';
@@ -37,6 +38,12 @@ export interface TransportBundle {
   selfPartyId: number;
   /** Self's book entry. */
   selfEntry: PubkeyBookEntry;
+  /**
+   * Logging-label map: `partyId → "peer-${partyId}"` for non-self entries,
+   * `selfPartyId → config.node.id` for self. Built from the book at startup;
+   * the operator's local `node.id` label is used only for self.
+   */
+  peersById: ReadonlyMap<PartyId, string>;
   /** SHA-256 hex of concatenated pubkeys — same on every peer. */
   ringId: string;
   start: () => Promise<void>;
@@ -127,9 +134,19 @@ async function buildFromState(args: BuildFromStateArgs): Promise<TransportBundle
   // the partyId + publicKey of every peer.
   const bookPeers = pubkeyBook.entries.filter((e) => e.partyId !== selfPartyId);
 
+  // peersById is the daemon-wide logging-label map. Operator-supplied
+  // `[[peers]].id` is gone post-Phase-F, so non-self labels are synthetic.
+  // Self uses `config.node.id` (the operator's local label, free-form).
+  const peersById = new Map<PartyId, string>();
+  for (const e of pubkeyBook.entries) {
+    peersById.set(
+      e.partyId,
+      e.partyId === selfPartyId ? config.node.id : `peer-${e.partyId}`,
+    );
+  }
+
   if (config.transport.kind === 'peer-mesh') {
-    const advertised =
-      config.transport.advertisedEndpoint ?? config.transport.listen;
+    const advertised = config.transport.advertisedEndpoint;
     if (!advertised) {
       throw new Error(
         'buildTransport: transport.advertised_endpoint required when transport.kind = "peer-mesh"',
@@ -138,21 +155,13 @@ async function buildFromState(args: BuildFromStateArgs): Promise<TransportBundle
     validatePeersAgainstBook(pubkeyBook, config.peers, selfPartyId);
 
     // peer-mesh expects ws:// URLs (PeerConnection.dial uses `new URL`).
-    // Book + config carry canonical host:port post-Phase-D; prepend ws://
-    // here so peer-mesh internals don't change. Phase F can revisit when
-    // [[peers]] is dropped.
-    const peers = bookPeers.map((e) => {
-      if (e.advertisedEndpoint === undefined) {
-        throw new Error(
-          `transport-factory: book entry partyId=${e.partyId} missing advertisedEndpoint — re-run 'otzi setup'`,
-        );
-      }
-      return {
-        partyId: e.partyId,
-        publicKey: fromHex(e.publicKeyHex),
-        endpoint: `ws://${e.advertisedEndpoint}`,
-      };
-    });
+    // Book carries canonical host:port; prepend ws:// here so peer-mesh
+    // internals don't change.
+    const peers = bookPeers.map((e) => ({
+      partyId: e.partyId,
+      publicKey: fromHex(e.publicKeyHex),
+      endpoint: `ws://${e.advertisedEndpoint}`,
+    }));
     const transport = new PeerMeshTransport({
       self: { partyId: selfPartyId, identity },
       listen: advertised,
@@ -165,6 +174,7 @@ async function buildFromState(args: BuildFromStateArgs): Promise<TransportBundle
       pubkeyBook,
       selfPartyId,
       selfEntry,
+      peersById,
       ringId,
       start: () => transport.start(),
       stop: () => transport.stop(),
@@ -191,6 +201,7 @@ async function buildFromState(args: BuildFromStateArgs): Promise<TransportBundle
       pubkeyBook,
       selfPartyId,
       selfEntry,
+      peersById,
       ringId,
       start: () => transport.start(),
       stop: () => transport.stop(),
@@ -234,25 +245,16 @@ function resolveSelfFromBook(identity: IdentityKeyPair, book: PubkeyBook): Pubke
 
 function validatePeersAgainstBook(
   book: PubkeyBook,
-  configPeers: ReadonlyArray<{ id: string; partyId: number; endpoint?: string }>,
+  configPeers: ReadonlyArray<{ endpoint: string }>,
   selfPartyId: number,
 ): void {
   const bookEndpoints = new Set<string>();
   for (const e of book.entries) {
     if (e.partyId === selfPartyId) continue;
-    if (e.advertisedEndpoint === undefined) {
-      throw new Error(
-        `transport-factory: book entry partyId=${e.partyId} missing advertisedEndpoint — re-run 'otzi setup'`,
-      );
-    }
     bookEndpoints.add(e.advertisedEndpoint);
   }
   const configEndpoints = new Set<string>();
-  for (let i = 0; i < configPeers.length; i++) {
-    const p = configPeers[i]!;
-    if (p.endpoint === undefined) {
-      throw new Error(`transport-factory: peers[${i}].endpoint required (was: '${p.id}')`);
-    }
+  for (const p of configPeers) {
     configEndpoints.add(p.endpoint);
   }
   for (const ep of configEndpoints) {

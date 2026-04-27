@@ -31,15 +31,13 @@ async function freePort(): Promise<number> {
 }
 
 async function makePeer(
-  nodeId: string,
+  _label: string,
   port: number,
 ): Promise<{
-  nodeId: string;
   identity: IdentityKeyPair;
   advertisedEndpoint: string;
 }> {
   return {
-    nodeId,
     identity: await generateIdentity(),
     advertisedEndpoint: `127.0.0.1:${port}`,
   };
@@ -57,9 +55,9 @@ describe('pubkey-book — serialize + parse round-trip', () => {
       makePeer('node-c', 18802),
     ]);
     const entries: PubkeyBookEntry[] = [a, b, c].map((p, i) => ({
-      nodeId: p.nodeId,
       partyId: i,
       publicKeyHex: toHex(p.identity.publicKeyRaw),
+      advertisedEndpoint: p.advertisedEndpoint,
     }));
     const book = buildBook(entries);
     const text = serializeBook(book);
@@ -69,9 +67,9 @@ describe('pubkey-book — serialize + parse round-trip', () => {
 
   it('sorts by partyId', () => {
     const unsorted: PubkeyBookEntry[] = [
-      { nodeId: 'c', partyId: 2, publicKeyHex: '04' + '00'.repeat(64) },
-      { nodeId: 'a', partyId: 0, publicKeyHex: '04' + '11'.repeat(64) },
-      { nodeId: 'b', partyId: 1, publicKeyHex: '04' + '22'.repeat(64) },
+      { partyId: 2, publicKeyHex: '04' + '00'.repeat(64), advertisedEndpoint: '127.0.0.1:18802' },
+      { partyId: 0, publicKeyHex: '04' + '11'.repeat(64), advertisedEndpoint: '127.0.0.1:18800' },
+      { partyId: 1, publicKeyHex: '04' + '22'.repeat(64), advertisedEndpoint: '127.0.0.1:18801' },
     ];
     const book = buildBook(unsorted);
     expect(book.entries.map((e) => e.partyId)).toEqual([0, 1, 2]);
@@ -80,30 +78,21 @@ describe('pubkey-book — serialize + parse round-trip', () => {
   it('rejects duplicate partyIds', () => {
     expect(() =>
       buildBook([
-        { nodeId: 'a', partyId: 0, publicKeyHex: '04' + '00'.repeat(64) },
-        { nodeId: 'b', partyId: 0, publicKeyHex: '04' + '11'.repeat(64) },
+        { partyId: 0, publicKeyHex: '04' + '00'.repeat(64), advertisedEndpoint: '127.0.0.1:18800' },
+        { partyId: 0, publicKeyHex: '04' + '11'.repeat(64), advertisedEndpoint: '127.0.0.1:18801' },
       ]),
     ).toThrow(/duplicate partyId/);
   });
 
-  it('rejects duplicate nodeIds', () => {
-    expect(() =>
-      buildBook([
-        { nodeId: 'same', partyId: 0, publicKeyHex: '04' + '00'.repeat(64) },
-        { nodeId: 'same', partyId: 1, publicKeyHex: '04' + '11'.repeat(64) },
-      ]),
-    ).toThrow(/duplicate nodeId/);
-  });
-
   it('rejects wrong pubkey length', () => {
     expect(() =>
-      buildBook([{ nodeId: 'a', partyId: 0, publicKeyHex: '04abc' }]),
+      buildBook([{ partyId: 0, publicKeyHex: '04abc', advertisedEndpoint: '127.0.0.1:18800' }]),
     ).toThrow(/130 chars/);
   });
 
   it('rejects non-0x04 prefix', () => {
     expect(() =>
-      buildBook([{ nodeId: 'a', partyId: 0, publicKeyHex: '02' + '00'.repeat(64) }]),
+      buildBook([{ partyId: 0, publicKeyHex: '02' + '00'.repeat(64), advertisedEndpoint: '127.0.0.1:18800' }]),
     ).toThrow(/0x04/);
   });
 
@@ -111,9 +100,9 @@ describe('pubkey-book — serialize + parse round-trip', () => {
     const a = await makePeer('a', 18800);
     const book = buildBook([
       {
-        nodeId: a.nodeId,
         partyId: 0,
         publicKeyHex: toHex(a.identity.publicKeyRaw),
+        advertisedEndpoint: a.advertisedEndpoint,
       },
     ]);
     const fp = await computeFingerprint(book);
@@ -124,13 +113,13 @@ describe('pubkey-book — serialize + parse round-trip', () => {
   it('fingerprint changes if any pubkey is substituted', async () => {
     const [a, b] = await Promise.all([makePeer('a', 18800), makePeer('b', 18801)]);
     const book1 = buildBook([
-      { nodeId: a.nodeId, partyId: 0, publicKeyHex: toHex(a.identity.publicKeyRaw) },
-      { nodeId: b.nodeId, partyId: 1, publicKeyHex: toHex(b.identity.publicKeyRaw) },
+      { partyId: 0, publicKeyHex: toHex(a.identity.publicKeyRaw), advertisedEndpoint: a.advertisedEndpoint },
+      { partyId: 1, publicKeyHex: toHex(b.identity.publicKeyRaw), advertisedEndpoint: b.advertisedEndpoint },
     ]);
     const impostor = await generateIdentity();
     const book2 = buildBook([
-      { nodeId: a.nodeId, partyId: 0, publicKeyHex: toHex(a.identity.publicKeyRaw) },
-      { nodeId: b.nodeId, partyId: 1, publicKeyHex: toHex(impostor.publicKeyRaw) },
+      { partyId: 0, publicKeyHex: toHex(a.identity.publicKeyRaw), advertisedEndpoint: a.advertisedEndpoint },
+      { partyId: 1, publicKeyHex: toHex(impostor.publicKeyRaw), advertisedEndpoint: b.advertisedEndpoint },
     ]);
     const fp1 = await computeFingerprint(book1);
     const fp2 = await computeFingerprint(book2);
@@ -138,40 +127,51 @@ describe('pubkey-book — serialize + parse round-trip', () => {
   });
 });
 
-describe('pubkey-book — advertisedEndpoint (optional)', () => {
+describe('pubkey-book — advertisedEndpoint', () => {
   const VALID_PUBKEY = '04' + 'aa'.repeat(64);
 
-  it('round-trips an entry with advertisedEndpoint', () => {
+  it('round-trips an entry with canonicalized advertisedEndpoint', () => {
     const book = buildBook([
       {
-        nodeId: 'a',
         partyId: 0,
         publicKeyHex: VALID_PUBKEY,
-        advertisedEndpoint: canonicalizeEndpoint('192.168.1.5:8800'),
+        advertisedEndpoint: canonicalizeEndpoint('Node-B.example.com'),
       },
     ]);
+    expect(book.entries[0]!.advertisedEndpoint).toBe('node-b.example.com:8800');
     const text = serializeBook(book);
     const parsed = parseBook(text);
-    expect(parsed.entries[0]!.advertisedEndpoint).toBe('192.168.1.5:8800');
+    expect(parsed.entries[0]!.advertisedEndpoint).toBe('node-b.example.com:8800');
   });
 
-  it('accepts an entry without advertisedEndpoint (legacy shape)', () => {
-    const book = buildBook([
-      { nodeId: 'a', partyId: 0, publicKeyHex: VALID_PUBKEY },
-    ]);
-    expect(book.entries[0]!.advertisedEndpoint).toBeUndefined();
-    const text = serializeBook(book);
-    const parsed = parseBook(text);
-    expect(parsed.entries[0]!.advertisedEndpoint).toBeUndefined();
+  it('rejects entries missing advertisedEndpoint', () => {
+    const obj = {
+      entries: [{ partyId: 0, publicKeyHex: VALID_PUBKEY }],
+    };
+    expect(() => parseBook(JSON.stringify(obj))).toThrow(/advertisedEndpoint must be a string/);
   });
 
   it('rejects an advertisedEndpoint that is not a string', () => {
     const obj = {
       entries: [
-        { nodeId: 'a', partyId: 0, publicKeyHex: VALID_PUBKEY, advertisedEndpoint: 1234 },
+        { partyId: 0, publicKeyHex: VALID_PUBKEY, advertisedEndpoint: 1234 },
       ],
     };
     expect(() => parseBook(JSON.stringify(obj))).toThrow(/advertisedEndpoint must be a string/);
+  });
+
+  it('rejects entries containing legacy nodeId field', () => {
+    const obj = {
+      entries: [
+        {
+          nodeId: 'a',
+          partyId: 0,
+          publicKeyHex: VALID_PUBKEY,
+          advertisedEndpoint: '127.0.0.1:8800',
+        },
+      ],
+    };
+    expect(() => parseBook(JSON.stringify(obj))).toThrow(/nodeId is no longer supported/);
   });
 });
 
@@ -182,16 +182,16 @@ describe('pubkey-book — pubkey uniqueness', () => {
   it('rejects two entries with the same publicKeyHex', () => {
     expect(() =>
       buildBook([
-        { nodeId: 'a', partyId: 0, publicKeyHex: PUBKEY_A },
-        { nodeId: 'b', partyId: 1, publicKeyHex: PUBKEY_A },
+        { partyId: 0, publicKeyHex: PUBKEY_A, advertisedEndpoint: '127.0.0.1:18800' },
+        { partyId: 1, publicKeyHex: PUBKEY_A, advertisedEndpoint: '127.0.0.1:18801' },
       ]),
     ).toThrow(/duplicate publicKey/i);
   });
 
   it('accepts entries with distinct publicKeyHex', () => {
     const book = buildBook([
-      { nodeId: 'a', partyId: 0, publicKeyHex: PUBKEY_A },
-      { nodeId: 'b', partyId: 1, publicKeyHex: PUBKEY_B },
+      { partyId: 0, publicKeyHex: PUBKEY_A, advertisedEndpoint: '127.0.0.1:18800' },
+      { partyId: 1, publicKeyHex: PUBKEY_B, advertisedEndpoint: '127.0.0.1:18801' },
     ]);
     expect(book.entries.length).toBe(2);
   });

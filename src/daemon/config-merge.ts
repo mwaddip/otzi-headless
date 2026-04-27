@@ -19,7 +19,6 @@ import type { PublicKeyPackage } from '@mwaddip/frots';
 import { readFile } from 'node:fs/promises';
 import { loadDaemonConfig } from '../config/load';
 import type { DaemonConfig } from '../config/types';
-import type { PartyId } from '../core/types';
 import type { DkgPersistenceSink } from '../orchestrator/types';
 import { buildFrostPublicKeyPackage } from '../wire/frost-reconstruct';
 import { fromHex } from '../wire/hex';
@@ -43,8 +42,6 @@ export interface LoadedDaemonState {
    * byte-compat files). Consumed by `opnet-params` capture verification.
    */
   frostLegacySig?: Uint8Array;
-  /** Includes self. Orchestrator + leader consume this directly. */
-  peersById: ReadonlyMap<PartyId, string>;
   /** Pre-bound persistence sink. Present after `validateLoaded`; absent for `buildStateFromShare` / `buildStateNoShare`. */
   persistDkgShare?: DkgPersistenceSink;
   /**
@@ -168,38 +165,26 @@ function extractFrostLegacySig(shareFile: ShareFile, path: string): Uint8Array |
 }
 
 /**
- * Pure validation + peersById assembly from an already-decrypted share.
- * The file-read/decrypt path is skipped entirely — tests pass a share from
- * `dealerKeygen` or an in-memory DKG, production calls `validateLoaded` via
- * `loadAndValidate`.
+ * Pure validation from an already-decrypted share. The file-read/decrypt
+ * path is skipped entirely — tests pass a share from `dealerKeygen` or an
+ * in-memory DKG, production calls `validateLoaded` via `loadAndValidate`.
  */
 export function buildStateFromShare(
   config: DaemonConfig,
   share: DecryptedShare,
 ): LoadedDaemonState {
-  validateAlignment(config, share);
-  const peersById = buildPeersById(config);
   const frostPublicKeyPackage = share.frostKeyPackage
     ? buildFrostPublicKeyPackage(share.frostKeyPackage)
     : undefined;
-  return { config, share, frostPublicKeyPackage, peersById };
+  return { config, share, frostPublicKeyPackage };
 }
 
 /**
  * Build state for a daemon that has no share yet (first-time DKG flow).
- * No share-vs-config alignment check possible; only config-internal coherence
- * was already verified by the TOML parser.
+ * No share-vs-config alignment check possible.
  */
 export function buildStateNoShare(config: DaemonConfig): LoadedDaemonState {
-  const peersById = buildPeersById(config);
-  return { config, peersById };
-}
-
-function buildPeersById(config: DaemonConfig): ReadonlyMap<PartyId, string> {
-  const peersById = new Map<PartyId, string>();
-  peersById.set(config.node.partyId, config.node.id);
-  for (const p of config.peers) peersById.set(p.partyId, p.id);
-  return peersById;
+  return { config };
 }
 
 function makePersistSink(config: DaemonConfig, password: string): DkgPersistenceSink {
@@ -221,30 +206,6 @@ function isFileNotFound(err: unknown): boolean {
     err !== null &&
     (err as { code?: string }).code === 'ENOENT'
   );
-}
-
-function validateAlignment(config: DaemonConfig, share: DecryptedShare): void {
-  // share.partyId vs config.node.partyId mismatch check moved to
-  // transport-factory.resolveSelfFromBook (cross-checked against the book,
-  // which is the authoritative source). Phase F drops config.node.partyId.
-  if (config.peers.length + 1 !== share.parties)
-    throw new Error(
-      `daemon: peers count + self (${config.peers.length + 1}) does not match share.parties (${share.parties})`,
-    );
-
-  const all = new Set<number>([config.node.partyId, ...config.peers.map((p) => p.partyId)]);
-  for (let i = 0; i < share.parties; i++) {
-    if (!all.has(i))
-      throw new Error(
-        `daemon: partyId ${i} missing from config — partyIds must span [0, ${share.parties}) exactly`,
-      );
-  }
-  for (const pid of all) {
-    if (pid < 0 || pid >= share.parties)
-      throw new Error(
-        `daemon: partyId ${pid} out of range for share.parties=${share.parties}`,
-      );
-  }
 }
 
 function errMsg(err: unknown): string {

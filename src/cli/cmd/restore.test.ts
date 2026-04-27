@@ -64,7 +64,6 @@ password_env = "OTZI_SHARE_PASSWORD"
 
 [node]
 id = "node-a"
-party_id = 7
 identity_key_file = "${identityPath}"
 pubkey_book_file = "${pubkeyBookPath}"
 
@@ -74,10 +73,10 @@ opnet_rpc = "https://example/rpc"
 
 [transport]
 kind = "peer-mesh"
+advertised_endpoint = "127.0.0.1:8800"
 
 [[peers]]
-id = "node-b"
-party_id = 1
+endpoint = "127.0.0.1:8801"
 
 [gate]
 strategy = "auto"
@@ -573,7 +572,7 @@ describe('runRestore', () => {
       daemonStatusCheck: NEVER_RUNNING,
     });
 
-    // partyId is 7 in the fixture's daemon.toml.
+    // partyId is read from the share file's top-level field (= 7 in fixture).
     expect(result.metaPartyId).toBe(7);
   });
 

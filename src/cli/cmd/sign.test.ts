@@ -48,16 +48,14 @@ path = "/tmp/x"
 password_env = "X"
 [node]
 id = "a"
-party_id = 0
 [network]
 name = "regtest"
 opnet_rpc = "http://x"
 [transport]
 kind = "peer-mesh"
-listen = "127.0.0.1:8800"
+advertised_endpoint = "127.0.0.1:8800"
 [[peers]]
-id = "b"
-party_id = 1
+endpoint = "127.0.0.1:8801"
 [gate]
 strategy = "auto"
 [[triggers]]

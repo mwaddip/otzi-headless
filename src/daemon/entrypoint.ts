@@ -135,6 +135,7 @@ async function runDaemonCommand(args: string[]): Promise<void> {
     state,
     transport: bundle.transport,
     selfPartyId: bundle.selfPartyId,
+    peersById: bundle.peersById,
     rng: {
       fillBytes(dest) {
         crypto.getRandomValues(dest);
