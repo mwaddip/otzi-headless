@@ -29,7 +29,7 @@ import { Address, BitcoinUtils, ChallengeSolution } from '@btc-vision/transactio
 import { toXOnly } from '@btc-vision/bitcoin';
 import { getContract, UTXO as OpnetUtxo } from 'opnet';
 import type { NetworkName } from '../node/types.js';
-import { getProvider, getNetwork } from '../node/opnet-client.js';
+import { getNetwork } from '../node/opnet-client.js';
 import { ThresholdMLDSASigner } from '../node/threshold-signer.js';
 import { computeKeyLinkHash, withFrostLegacySig } from '../node/frost-link.js';
 import { resolveAbi } from './opnet-calldata.js';
@@ -222,11 +222,10 @@ export async function captureOpnetSighashes(
   const releaseLock = await acquireCaptureLock();
   const rndBytesPatch = rndBytesSeed ? installRndBytesPatch(rndBytesSeed) : null;
 
-  const realProvider = getProvider(networkName);
   const network = getNetwork(networkName);
   const contractAbi = resolveAbi(abi);
 
-  const capturingProvider = new CapturingProvider(realProvider as never);
+  const capturingProvider = new CapturingProvider(networkName);
 
   try {
     const mldsaPubKeyHex = Buffer.from(mldsaPubKey).toString('hex');
@@ -236,7 +235,7 @@ export async function captureOpnetSighashes(
     const contract = getContract(
       contractAddress,
       contractAbi as never,
-      capturingProvider.proxy as never,
+      capturingProvider,
       network,
       vaultAddr,
     );

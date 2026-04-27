@@ -1,51 +1,47 @@
+import { JSONRpcProvider } from 'opnet';
+import type { NetworkName } from '../node/types.js';
+import { getNetwork, RPC_URLS } from '../node/opnet-client.js';
+
 /**
- * Composition-style wrapper around an OPNet provider that intercepts
- * `sendRawTransaction` and `sendRawTransactionPackage` to record the
- * finalized template tx hex and abort broadcast (via the `__capture_only__`
- * sentinel) — replacement for the monkey-patches that previously mutated
- * the upstream provider object directly.
+ * Composition-style replacement for the sendRawTransaction(Package) monkey-
+ * patches in opnet-capture.ts. Subclasses `JSONRpcProvider` rather than
+ * wrapping it via Proxy because the SDK's `AbstractRpcProvider.call()` emits
+ * `new CallResult(result, this)` — the CallResult retains a reference to
+ * the actual provider instance, so a Proxy wrapper does not intercept the
+ * later `this.#provider.sendRawTransaction(Package)` call. Subclassing puts
+ * our overrides on the instance the SDK ends up holding.
  *
  * Usage:
- *   const wrapped = new CapturingProvider(realProvider);
- *   const contract = getContract(addr, abi, wrapped.proxy as never, ...);
+ *   const wrapped = new CapturingProvider(networkName);
+ *   const contract = getContract(addr, abi, wrapped as never, ..., vaultAddr);
  *   try { await callResult.sendTransaction(...); }
  *   catch (e) { if (!isCaptureOnlyError(e)) throw e; }
  *   const txs = wrapped.capturedTxs;
  *
- * The wrapper is per-capture; instances do NOT share state. The inner
- * provider is never mutated; the caller can hold the same provider across
- * multiple captures (each one creates its own `CapturingProvider`).
+ * One instance per capture run; instances do NOT share state. The upstream
+ * provider class is never mutated; only this subclass overrides the two
+ * broadcast methods.
  */
-export class CapturingProvider {
+export class CapturingProvider extends JSONRpcProvider {
   private readonly captured: string[] = [];
-  readonly proxy: object;
 
-  constructor(inner: object) {
-    this.proxy = new Proxy(inner, {
-      get: (target, prop, receiver) => {
-        if (prop === 'sendRawTransaction') {
-          return async (tx: string, _psbt: boolean): Promise<never> => {
-            this.captured.push(tx);
-            throw new Error('__capture_only__');
-          };
-        }
-        if (prop === 'sendRawTransactionPackage') {
-          return async (txs: string[], _isPackage?: boolean): Promise<never> => {
-            this.captured.push(...txs);
-            throw new Error('__capture_only__');
-          };
-        }
-        const value = Reflect.get(target, prop, receiver);
-        if (typeof value === 'function') return value.bind(target);
-        return value;
-      },
-    });
+  constructor(networkName: NetworkName) {
+    super({ url: RPC_URLS[networkName], network: getNetwork(networkName) });
+  }
+
+  override async sendRawTransaction(tx: string, _psbt: boolean): Promise<never> {
+    this.captured.push(tx);
+    throw new Error('__capture_only__');
+  }
+
+  override async sendRawTransactionPackage(txs: string[], _isPackage?: boolean): Promise<never> {
+    this.captured.push(...txs);
+    throw new Error('__capture_only__');
   }
 
   /**
    * Tx hex captured via `sendRawTransaction` / `sendRawTransactionPackage`,
-   * in call-order. Read after the SDK call settles. Persists for the
-   * wrapper's lifetime — instantiate a fresh wrapper per capture.
+   * in call-order. Read after the SDK call settles.
    */
   get capturedTxs(): readonly string[] {
     return this.captured;

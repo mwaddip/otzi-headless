@@ -45,6 +45,18 @@ describe('CaptureSigner', () => {
     expect('multiSignPsbt' in signer).toBe(true);
   });
 
+  it('exposes a 32-byte privateKey for TweakedSigner.tweakSigner', () => {
+    const signer = new CaptureSigner(TWEAKED_SEC1, INTERNAL_XONLY, UNTWEAKED_SEC1);
+    expect(signer.privateKey).toBeInstanceOf(Uint8Array);
+    expect(signer.privateKey.length).toBe(32);
+  });
+
+  it('generates a fresh privateKey per instance (throwaway bytes)', () => {
+    const a = new CaptureSigner(TWEAKED_SEC1, INTERNAL_XONLY, UNTWEAKED_SEC1);
+    const b = new CaptureSigner(TWEAKED_SEC1, INTERNAL_XONLY, UNTWEAKED_SEC1);
+    expect(Buffer.from(a.privateKey).equals(Buffer.from(b.privateKey))).toBe(false);
+  });
+
   it('records one CapturedCall per multiSignPsbt invocation', async () => {
     const signer = new CaptureSigner(TWEAKED_SEC1, INTERNAL_XONLY, UNTWEAKED_SEC1);
     const psbt = stubPsbt([{ tapInternalKey: INTERNAL_XONLY }]);

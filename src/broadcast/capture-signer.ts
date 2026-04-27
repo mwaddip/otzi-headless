@@ -1,14 +1,23 @@
+import { randomBytes } from 'node:crypto';
 import { type Psbt, equals, isTaprootInput } from '@btc-vision/bitcoin';
 
 /**
  * Composition-style replacement for the wallet.keypair graft in
- * `opnet-capture.ts`. Implements the minimal SDK signer surface:
+ * `opnet-capture.ts`. Implements the SDK signer surface that the OPNet
+ * transaction-construction path actually reads:
  *
  *  - `publicKey` — read by the OPNet SDK at multiple sites
  *    (TweakedTransaction, TransactionBuilder, ConsolidatedInteractionTransaction,
  *    DeploymentTransaction). Set to the **untweaked** FROST aggregate key
  *    in SEC1 compressed form — matches the on-chain "sender" identity the
  *    contract layer commits to.
+ *  - `privateKey` — read by `TweakedSigner.tweakSigner(signer, opts)` during
+ *    `generateLegacySignature()`. We supply 32 throwaway random bytes; the
+ *    derived tweakedSigner's `publicKey` is then overridden by
+ *    `withFrostLegacySig` to the correct FROST tweaked aggregate, and the
+ *    actual key-link signature is supplied via the patched ECC backend's
+ *    `signSchnorr`. The throwaway bytes never reach the chain — identical
+ *    posture to the previous throwaway-mnemonic pattern.
  *  - `multiSignPsbt(psbts)` — the wallet-mode signing entry point. The
  *    SDK detects this method and routes signing through it (skipping the
  *    raw-private-key tweaking path). For capture, we sign with dummy
@@ -37,6 +46,13 @@ export interface CapturedCall {
 export class CaptureSigner {
   /** Untweaked SEC1-compressed FROST aggregate pubkey. SDK reads this directly. */
   readonly publicKey: Uint8Array;
+  /**
+   * Throwaway 32-byte private key. Required by `TweakedSigner.tweakSigner` —
+   * never used to produce a signature that reaches the chain (the derived
+   * tweakedSigner's `publicKey` is overridden by `withFrostLegacySig`, and
+   * the legacy schnorr sig itself comes from the patched ECC backend).
+   */
+  readonly privateKey: Uint8Array;
 
   private readonly tweakedPublicKey: Uint8Array;
   private readonly internalXOnly: Uint8Array;
@@ -51,6 +67,7 @@ export class CaptureSigner {
     this.tweakedPublicKey = tweakedPublicKey;
     this.internalXOnly = internalXOnly;
     this.publicKey = untweakedPublicKey;
+    this.privateKey = new Uint8Array(randomBytes(32));
   }
 
   get calls(): readonly CapturedCall[] {

@@ -3,7 +3,7 @@ import { Mnemonic, MLDSASecurityLevel } from '@btc-vision/transaction';
 import { JSONRpcProvider } from 'opnet';
 import type { NetworkName } from './types.js';
 
-const RPC_URLS: Record<NetworkName, string> = {
+export const RPC_URLS: Record<NetworkName, string> = {
   testnet: 'https://testnet.opnet.org',
   mainnet: 'https://mainnet.opnet.org',
 };
