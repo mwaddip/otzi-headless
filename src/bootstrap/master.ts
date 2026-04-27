@@ -1,27 +1,26 @@
 /**
  * Master-side bootstrap.
  *
- * Stands up a short-lived HTTP server on `bind`. Each non-master daemon's
- * `register` command POSTs its `{ nodeId, partyId, publicKeyHex }` to
- * `/register`. Master validates against its expected-peer list, parks the
- * connection, and once all peers have registered, fans out the complete
- * pubkey book as the response body to every waiting registration (and to
- * master's own caller). Then the HTTP server shuts down.
- *
- * The long-poll pattern means first peers to register wait for the last —
- * one-time bootstrap cost, simpler than separate "fan-out" endpoints.
+ * Stands up a short-lived HTTP server on `bind`. Each leaf POSTs its
+ * `{ public_key_hex, advertised_endpoint, node_id }` to `/register`.
+ * Master canonicalizes the incoming `advertised_endpoint` and validates it
+ * against an operator-supplied allowlist. Once all expected peers + self
+ * have registered, master sorts the collected entries by raw pubkey bytes
+ * ascending, assigns `partyId = index`, builds the book, and fans it out
+ * as the response to every waiting registration handler.
  *
  * Error responses:
- *   400 — bad body / pubkey format / partyId mismatch
- *   404 — nodeId not in expected peer list
- *   409 — nodeId already registered
- *   408 — server-side bootstrap timeout (all in-flight waiters get this)
+ *   400 — bad body / pubkey format / non-canonical or wildcard endpoint
+ *   404 — advertised_endpoint not on the operator's allowlist
+ *   409 — endpoint already registered OR pubkey already registered
+ *   408 — server-side bootstrap timeout
  */
 
 import * as http from 'node:http';
 import type { PartyId } from '../core/types';
 import type { IdentityKeyPair } from '../transport/identity';
 import { toHex } from '../wire/hex';
+import { canonicalizeEndpoint, EndpointParseError } from '../util/endpoint';
 import {
   buildBook,
   computeFingerprint,
@@ -31,9 +30,18 @@ import {
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 
 export interface MasterBootstrapInputs {
-  self: { nodeId: string; partyId: PartyId; identity: IdentityKeyPair };
-  /** Peers master expects to register. Does NOT include self. */
-  expectedPeers: ReadonlyArray<{ nodeId: string; partyId: PartyId }>;
+  self: {
+    nodeId: string;
+    identity: IdentityKeyPair;
+    /** Canonical `host:port` form (post-`canonicalizeEndpoint`). */
+    advertisedEndpoint: string;
+  };
+  /**
+   * Allowlist of advertised endpoints master expects to register. Caller
+   * MUST pass canonical-form strings (apply `canonicalizeEndpoint` upstream).
+   * Does NOT include self.
+   */
+  expectedPeers: ReadonlyArray<{ advertisedEndpoint: string }>;
   bind: string;
   /** Defaults to 30 min. */
   timeoutMs?: number;
@@ -43,6 +51,13 @@ export interface MasterBootstrapInputs {
 export interface MasterBootstrapResult {
   book: PubkeyBook;
   fingerprint: string;
+}
+
+interface RegisteredEntry {
+  nodeId: string;
+  publicKey: Uint8Array;
+  /** Canonical form. */
+  advertisedEndpoint: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -60,9 +75,6 @@ class CompletionGate {
       this.resolveFn = resolve;
       this.rejectFn = reject;
     });
-    // Swallow unhandled rejection until someone awaits — tests spin registrations
-    // concurrently with the master, and their register() may throw before anyone
-    // attaches the gate's catch.
     this.promise.catch(() => {});
   }
 
@@ -90,15 +102,16 @@ export async function runMasterBootstrap(
   const { host, port } = parseBind(input.bind);
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-  const expected = new Map<string, PartyId>();
-  for (const p of input.expectedPeers) expected.set(p.nodeId, p.partyId);
-  const expectedTotal = expected.size + 1; // +1 for master itself
+  // Allowlist of canonical advertised endpoints (excludes self).
+  const expectedAllowlist = new Set<string>(input.expectedPeers.map((p) => p.advertisedEndpoint));
+  const expectedTotal = expectedAllowlist.size + 1; // +1 for self
 
-  const registered = new Map<string, PubkeyBookEntry>();
-  registered.set(input.self.nodeId, {
+  // registered keyed by canonical advertisedEndpoint
+  const registered = new Map<string, RegisteredEntry>();
+  registered.set(input.self.advertisedEndpoint, {
     nodeId: input.self.nodeId,
-    partyId: input.self.partyId,
-    publicKeyHex: toHex(input.self.identity.publicKeyRaw),
+    publicKey: input.self.identity.publicKeyRaw,
+    advertisedEndpoint: input.self.advertisedEndpoint,
   });
 
   const gate = new CompletionGate();
@@ -106,15 +119,27 @@ export async function runMasterBootstrap(
   const completeIfReady = (): void => {
     if (gate.isSettled) return;
     if (registered.size < expectedTotal) return;
-    gate.resolve(buildBook(registered.values()));
+
+    // Sort registered entries by raw pubkey bytes ascending — deterministic
+    // partyId assignment that all peers reproduce locally from the same book.
+    const sorted = [...registered.values()].sort((a, b) =>
+      Buffer.compare(Buffer.from(a.publicKey), Buffer.from(b.publicKey)),
+    );
+    const entries: PubkeyBookEntry[] = sorted.map((r, idx) => ({
+      nodeId: r.nodeId,
+      partyId: idx as PartyId,
+      publicKeyHex: toHex(r.publicKey),
+      advertisedEndpoint: r.advertisedEndpoint,
+    }));
+    gate.resolve(buildBook(entries));
   };
 
-  // Single-peer ring: master is already satisfied; resolve before even listening.
+  // Single-peer ring: master alone satisfies expectedTotal=1.
   completeIfReady();
 
   const server = http.createServer((req, res) => {
     void handleRequest(req, res, {
-      expected,
+      expectedAllowlist,
       registered,
       gate,
       completeIfReady,
@@ -153,11 +178,6 @@ export async function runMasterBootstrap(
     return { book, fingerprint };
   } finally {
     clearTimeout(timer);
-    // Graceful shutdown: server.close() stops accepting new connections and
-    // closes idle keep-alive conns, but leaves in-flight request handlers
-    // alone — they finish writing their responses, THEN the callback fires.
-    // Do NOT use closeAllConnections here (that would cut off peer
-    // registration responses that haven't flushed yet).
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
@@ -169,8 +189,8 @@ export async function runMasterBootstrap(
 // ─────────────────────────────────────────────────────────────────────────
 
 interface HandlerContext {
-  expected: Map<string, PartyId>;
-  registered: Map<string, PubkeyBookEntry>;
+  expectedAllowlist: Set<string>;
+  registered: Map<string, RegisteredEntry>;
   gate: CompletionGate;
   completeIfReady: () => void;
   log: Logger;
@@ -196,18 +216,13 @@ async function handleRequest(
   }
 
   const nodeId = body.node_id ?? body.nodeId;
-  const partyIdRaw = body.party_id ?? body.partyId;
   const publicKeyHex = body.public_key_hex ?? body.publicKeyHex;
+  const rawEndpoint = body.advertised_endpoint ?? body.advertisedEndpoint;
 
   if (typeof nodeId !== 'string' || nodeId.length === 0) {
     respondJson(res, 400, { error: "'node_id' missing or empty" });
     return;
   }
-  if (typeof partyIdRaw !== 'number' || !Number.isInteger(partyIdRaw) || partyIdRaw < 0) {
-    respondJson(res, 400, { error: "'party_id' must be a non-negative integer" });
-    return;
-  }
-  const partyId = partyIdRaw as PartyId;
   if (typeof publicKeyHex !== 'string' || publicKeyHex.length !== 65 * 2) {
     respondJson(res, 400, { error: "'public_key_hex' must be 130 hex chars (65 bytes)" });
     return;
@@ -216,29 +231,48 @@ async function handleRequest(
     respondJson(res, 400, { error: "'public_key_hex' must start with 04 (uncompressed P-256)" });
     return;
   }
-
-  const expectedPartyId = ctx.expected.get(nodeId);
-  if (expectedPartyId === undefined) {
-    respondJson(res, 404, { error: `unknown node_id '${nodeId}'` });
+  if (typeof rawEndpoint !== 'string' || rawEndpoint.length === 0) {
+    respondJson(res, 400, { error: "'advertised_endpoint' missing or empty" });
     return;
   }
-  if (expectedPartyId !== partyId) {
-    respondJson(res, 400, {
-      error: `party_id mismatch for '${nodeId}': expected ${expectedPartyId}, got ${partyId}`,
+
+  let advertisedEndpoint: string;
+  try {
+    advertisedEndpoint = canonicalizeEndpoint(rawEndpoint);
+  } catch (err) {
+    if (err instanceof EndpointParseError) {
+      respondJson(res, 400, { error: `invalid advertised_endpoint: ${err.message}` });
+      return;
+    }
+    throw err;
+  }
+
+  if (!ctx.expectedAllowlist.has(advertisedEndpoint)) {
+    respondJson(res, 404, {
+      error: `advertised_endpoint '${advertisedEndpoint}' not on expected-peer allowlist`,
     });
     return;
   }
-  if (ctx.registered.has(nodeId)) {
-    respondJson(res, 409, { error: `'${nodeId}' already registered` });
+  if (ctx.registered.has(advertisedEndpoint)) {
+    respondJson(res, 409, { error: `endpoint '${advertisedEndpoint}' already registered` });
     return;
   }
 
-  ctx.registered.set(nodeId, {
+  // Pubkey-collision check across already-registered entries (incl. self).
+  const lowerHex = publicKeyHex.toLowerCase();
+  for (const r of ctx.registered.values()) {
+    if (toHex(r.publicKey).toLowerCase() === lowerHex) {
+      respondJson(res, 409, { error: `publicKey already registered for a different endpoint` });
+      return;
+    }
+  }
+
+  ctx.registered.set(advertisedEndpoint, {
     nodeId,
-    partyId,
-    publicKeyHex: publicKeyHex.toLowerCase(),
+    publicKey: new Uint8Array(Buffer.from(lowerHex, 'hex')),
+    advertisedEndpoint,
   });
-  ctx.log.info('master bootstrap: registered', { nodeId, partyId });
+  ctx.log.info('master bootstrap: registered', { nodeId, advertisedEndpoint });
   ctx.completeIfReady();
 
   // Long-poll: await the single-shot completion gate, respond when it fires.
@@ -271,8 +305,6 @@ function readBody(req: http.IncomingMessage): Promise<Buffer> {
 function respondJson(res: http.ServerResponse, status: number, body: unknown): void {
   res.statusCode = status;
   res.setHeader('content-type', 'application/json; charset=utf-8');
-  // Force connection close so the server's `close()` wait doesn't hang on
-  // idle keep-alive sockets.
   res.setHeader('connection', 'close');
   res.end(JSON.stringify(body));
 }

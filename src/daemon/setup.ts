@@ -30,6 +30,7 @@ import {
   type IdentityKeyPair,
 } from '../transport/identity';
 import { fromHex, toHex } from '../wire/hex';
+import { canonicalizeEndpoint } from '../util/endpoint';
 
 export async function setupMaster(configPath: string, bind: string): Promise<void> {
   const config = await loadDaemonConfig(configPath);
@@ -43,14 +44,27 @@ export async function setupMaster(configPath: string, bind: string): Promise<voi
     return;
   }
 
+  if (config.transport.kind !== 'peer-mesh' || !config.transport.listen) {
+    throw new Error(
+      'setup: bootstrap requires transport.kind = "peer-mesh" and transport.listen set (this node\'s reachable address)',
+    );
+  }
+  const selfAdvertisedEndpoint = canonicalizeEndpoint(config.transport.listen);
+
+  const expectedPeers = config.peers.map((p, i) => {
+    if (!p.endpoint) {
+      throw new Error(`setup: peers[${i}].endpoint is required (post-Phase C bootstrap addresses peers by endpoint)`);
+    }
+    return { advertisedEndpoint: canonicalizeEndpoint(p.endpoint) };
+  });
+
   const identity = await loadOrGenerateIdentity(config);
-  const expectedPeers = config.peers.map((p) => ({ nodeId: p.id, partyId: p.partyId }));
 
   console.error(
     `otzi: setup master — listening on ${bind}, expecting ${expectedPeers.length} peer(s) to register`,
   );
   const { book, fingerprint } = await runMasterBootstrap({
-    self: { nodeId: config.node.id, partyId: config.node.partyId, identity },
+    self: { nodeId: config.node.id, identity, advertisedEndpoint: selfAdvertisedEndpoint },
     expectedPeers,
     bind,
   });
@@ -71,11 +85,18 @@ export async function setupMember(configPath: string, masterUrl: string): Promis
     return;
   }
 
+  if (config.transport.kind !== 'peer-mesh' || !config.transport.listen) {
+    throw new Error(
+      'setup: bootstrap requires transport.kind = "peer-mesh" and transport.listen set (this node\'s reachable address)',
+    );
+  }
+  const selfAdvertisedEndpoint = canonicalizeEndpoint(config.transport.listen);
+
   const identity = await loadOrGenerateIdentity(config);
 
   console.error(`otzi: setup member — registering with ${masterUrl}`);
   const { book, fingerprint } = await runMemberRegister({
-    self: { nodeId: config.node.id, partyId: config.node.partyId, identity },
+    self: { nodeId: config.node.id, identity, advertisedEndpoint: selfAdvertisedEndpoint },
     masterUrl,
   });
 
@@ -151,10 +172,9 @@ async function tryLoadExistingBook(config: DaemonConfig): Promise<PubkeyBook | n
 
 function announceComplete(fingerprint: string, config: DaemonConfig, note?: string): void {
   const nodeId = config.node.id;
-  const partyId = config.node.partyId;
   console.error('');
   console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.error(`  otzi: setup complete — ${nodeId} (partyId ${partyId})`);
+  console.error(`  otzi: setup complete — ${nodeId}`);
   console.error(`  fingerprint: ${fingerprint}`);
   console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.error('  ⚠ Verify this fingerprint is identical on EVERY other node.');

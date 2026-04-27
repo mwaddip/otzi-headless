@@ -32,9 +32,17 @@ async function freePort(): Promise<number> {
 
 async function makePeer(
   nodeId: string,
-  partyId: number,
-): Promise<{ nodeId: string; partyId: number; identity: IdentityKeyPair }> {
-  return { nodeId, partyId, identity: await generateIdentity() };
+  port: number,
+): Promise<{
+  nodeId: string;
+  identity: IdentityKeyPair;
+  advertisedEndpoint: string;
+}> {
+  return {
+    nodeId,
+    identity: await generateIdentity(),
+    advertisedEndpoint: `127.0.0.1:${port}`,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -44,13 +52,13 @@ async function makePeer(
 describe('pubkey-book — serialize + parse round-trip', () => {
   it('round-trips a 3-peer book', async () => {
     const [a, b, c] = await Promise.all([
-      makePeer('node-a', 0),
-      makePeer('node-b', 1),
-      makePeer('node-c', 2),
+      makePeer('node-a', 18800),
+      makePeer('node-b', 18801),
+      makePeer('node-c', 18802),
     ]);
-    const entries: PubkeyBookEntry[] = [a, b, c].map((p) => ({
+    const entries: PubkeyBookEntry[] = [a, b, c].map((p, i) => ({
       nodeId: p.nodeId,
-      partyId: p.partyId,
+      partyId: i,
       publicKeyHex: toHex(p.identity.publicKeyRaw),
     }));
     const book = buildBook(entries);
@@ -100,11 +108,11 @@ describe('pubkey-book — serialize + parse round-trip', () => {
   });
 
   it('fingerprint is 8 hex chars', async () => {
-    const [a] = await Promise.all([makePeer('a', 0)]);
+    const a = await makePeer('a', 18800);
     const book = buildBook([
       {
         nodeId: a.nodeId,
-        partyId: a.partyId,
+        partyId: 0,
         publicKeyHex: toHex(a.identity.publicKeyRaw),
       },
     ]);
@@ -114,7 +122,7 @@ describe('pubkey-book — serialize + parse round-trip', () => {
   });
 
   it('fingerprint changes if any pubkey is substituted', async () => {
-    const [a, b] = await Promise.all([makePeer('a', 0), makePeer('b', 1)]);
+    const [a, b] = await Promise.all([makePeer('a', 18800), makePeer('b', 18801)]);
     const book1 = buildBook([
       { nodeId: a.nodeId, partyId: 0, publicKeyHex: toHex(a.identity.publicKeyRaw) },
       { nodeId: b.nodeId, partyId: 1, publicKeyHex: toHex(b.identity.publicKeyRaw) },
@@ -195,22 +203,21 @@ describe('pubkey-book — pubkey uniqueness', () => {
 
 describe('bootstrap — 3-peer end-to-end', () => {
   it('master + 2 members: all derive matching books + fingerprints', async () => {
-    const master = await makePeer('node-a', 0);
-    const memberB = await makePeer('node-b', 1);
-    const memberC = await makePeer('node-c', 2);
+    const master = await makePeer('node-a', 18800);
+    const memberB = await makePeer('node-b', 18801);
+    const memberC = await makePeer('node-c', 18802);
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
       self: master,
       expectedPeers: [
-        { nodeId: memberB.nodeId, partyId: memberB.partyId },
-        { nodeId: memberC.nodeId, partyId: memberC.partyId },
+        { advertisedEndpoint: memberB.advertisedEndpoint },
+        { advertisedEndpoint: memberC.advertisedEndpoint },
       ],
       bind: `127.0.0.1:${port}`,
       timeoutMs: 10_000,
     });
 
-    // Give the server a moment to bind before members hit it.
     await new Promise((r) => setTimeout(r, 50));
 
     const bDone = runMemberRegister({
@@ -230,23 +237,24 @@ describe('bootstrap — 3-peer end-to-end', () => {
     expect(bResult.book.entries).toHaveLength(3);
     expect(cResult.book.entries).toHaveLength(3);
 
-    // All three fingerprints identical — the operator-eyeball check passes.
     expect(masterResult.fingerprint).toBe(bResult.fingerprint);
     expect(bResult.fingerprint).toBe(cResult.fingerprint);
 
-    // Book contents agree byte-for-byte.
     expect(serializeBook(masterResult.book)).toBe(serializeBook(bResult.book));
     expect(serializeBook(bResult.book)).toBe(serializeBook(cResult.book));
 
-    // Each pubkey in the book matches the party's actual identity.
+    // Every peer's pubkey appears in the book with their advertised endpoint.
     for (const peer of [master, memberB, memberC]) {
-      const entry = masterResult.book.entries.find((e) => e.nodeId === peer.nodeId)!;
-      expect(entry.publicKeyHex).toBe(toHex(peer.identity.publicKeyRaw));
+      const entry = masterResult.book.entries.find(
+        (e) => e.publicKeyHex.toLowerCase() === toHex(peer.identity.publicKeyRaw).toLowerCase(),
+      );
+      expect(entry).toBeDefined();
+      expect(entry!.advertisedEndpoint).toBe(peer.advertisedEndpoint);
     }
   }, 15_000);
 
   it('single-peer ring (master only): completes immediately', async () => {
-    const master = await makePeer('solo', 0);
+    const master = await makePeer('solo', 18800);
     const port = await freePort();
     const { book, fingerprint } = await runMasterBootstrap({
       self: master,
@@ -255,9 +263,56 @@ describe('bootstrap — 3-peer end-to-end', () => {
       timeoutMs: 5_000,
     });
     expect(book.entries).toHaveLength(1);
-    expect(book.entries[0]!.nodeId).toBe('solo');
+    expect(book.entries[0]!.publicKeyHex.toLowerCase()).toBe(
+      toHex(master.identity.publicKeyRaw).toLowerCase(),
+    );
+    expect(book.entries[0]!.advertisedEndpoint).toBe(master.advertisedEndpoint);
     expect(fingerprint).toHaveLength(8);
   }, 10_000);
+
+  it('partyId assigned by sorted-pubkey-bytes — registration timing does NOT affect partyIds', async () => {
+    const runOnce = async (delay: number) => {
+      const master = await makePeer('master', 18800);
+      const memberB = await makePeer('b', 18801);
+      const memberC = await makePeer('c', 18802);
+      const port = await freePort();
+
+      const masterDone = runMasterBootstrap({
+        self: master,
+        expectedPeers: [
+          { advertisedEndpoint: memberB.advertisedEndpoint },
+          { advertisedEndpoint: memberC.advertisedEndpoint },
+        ],
+        bind: `127.0.0.1:${port}`,
+        timeoutMs: 10_000,
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const bDone = runMemberRegister({ self: memberB, masterUrl: `http://127.0.0.1:${port}`, timeoutMs: 10_000 });
+      // memberC registers AFTER `delay` ms → in run #1 small delay, in run #2 large.
+      await new Promise((r) => setTimeout(r, delay));
+      const cDone = runMemberRegister({ self: memberC, masterUrl: `http://127.0.0.1:${port}`, timeoutMs: 10_000 });
+
+      const [m] = await Promise.all([masterDone, bDone, cDone]);
+      return { master, memberB, memberC, book: m.book };
+    };
+
+    const r1 = await runOnce(20);
+    const r2 = await runOnce(200);
+
+    const findPartyId = (book: typeof r1.book, peer: typeof r1.master) =>
+      book.entries.find((e) => e.publicKeyHex.toLowerCase() === toHex(peer.identity.publicKeyRaw).toLowerCase())!.partyId;
+    // Within ONE run, partyIds must match the pubkey-byte sort order (cross-run
+    // comparison is meaningless since each run uses freshly generated identities).
+    for (const r of [r1, r2]) {
+      const sortedPeers = [r.master, r.memberB, r.memberC].sort((a, b) =>
+        Buffer.compare(Buffer.from(a.identity.publicKeyRaw), Buffer.from(b.identity.publicKeyRaw)),
+      );
+      sortedPeers.forEach((peer, idx) => {
+        expect(findPartyId(r.book, peer)).toBe(idx);
+      });
+    }
+  }, 30_000);
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -265,14 +320,14 @@ describe('bootstrap — 3-peer end-to-end', () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('bootstrap — error paths', () => {
-  it('unknown nodeId → master rejects with 404', async () => {
-    const master = await makePeer('node-a', 0);
-    const stranger = await makePeer('uninvited', 99);
+  it('endpoint NOT on allowlist → master rejects with 404', async () => {
+    const master = await makePeer('node-a', 18800);
+    const stranger = await makePeer('uninvited', 19999);
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
       self: master,
-      expectedPeers: [{ nodeId: 'node-b', partyId: 1 }],
+      expectedPeers: [{ advertisedEndpoint: '127.0.0.1:18801' }],
       bind: `127.0.0.1:${port}`,
       timeoutMs: 2_000,
     }).catch((err) => ({ err }));
@@ -284,58 +339,63 @@ describe('bootstrap — error paths', () => {
         masterUrl: `http://127.0.0.1:${port}`,
         timeoutMs: 2_000,
       }),
-    ).rejects.toThrow(/unknown node_id/);
+    ).rejects.toThrow(/not on expected-peer allowlist/);
     await masterDone;
   }, 10_000);
 
-  it('partyId mismatch → master rejects with 400', async () => {
-    const master = await makePeer('node-a', 0);
-    const expectedB = { nodeId: 'node-b', partyId: 1 };
-    const wrongB = await makePeer('node-b', 5); // right nodeId, wrong partyId
+  it('non-canonical advertised_endpoint canonicalizes server-side and matches allowlist', async () => {
+    const master = await makePeer('node-a', 18800);
+    // memberB sends host with uppercase; allowlist has lowercase canonical.
+    const memberB = {
+      ...(await makePeer('node-b', 18801)),
+      advertisedEndpoint: 'NODE-B.EXAMPLE.COM:8800', // non-canonical input
+    };
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
       self: master,
-      expectedPeers: [expectedB],
+      expectedPeers: [{ advertisedEndpoint: 'node-b.example.com:8800' }],
       bind: `127.0.0.1:${port}`,
       timeoutMs: 2_000,
-    }).catch((err) => ({ err }));
+    });
     await new Promise((r) => setTimeout(r, 50));
 
+    // memberB sends non-canonical; master canonicalizes → matches allowlist.
+    // member's self-check then fails because returned book.advertisedEndpoint
+    // is canonical but member's own input was not. Acceptable: leaves should
+    // canonicalize before passing self.advertisedEndpoint.
     await expect(
       runMemberRegister({
-        self: wrongB,
+        self: memberB,
         masterUrl: `http://127.0.0.1:${port}`,
         timeoutMs: 2_000,
       }),
-    ).rejects.toThrow(/party_id mismatch/);
-    await masterDone;
+    ).rejects.toThrow(/advertisedEndpoint='node-b\.example\.com:8800' != ours='NODE-B\.EXAMPLE\.COM:8800'/);
+    await masterDone.catch(() => {}); // master times out since allowlisted member never properly registered
   }, 10_000);
 
   it('duplicate registration → second attempt rejected with 409', async () => {
-    const master = await makePeer('node-a', 0);
-    const memberB = await makePeer('node-b', 1);
-    const memberC = await makePeer('node-c', 2);
+    const master = await makePeer('node-a', 18800);
+    const memberB = await makePeer('node-b', 18801);
+    const memberC = await makePeer('node-c', 18802);
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
       self: master,
       expectedPeers: [
-        { nodeId: memberB.nodeId, partyId: memberB.partyId },
-        { nodeId: memberC.nodeId, partyId: memberC.partyId },
+        { advertisedEndpoint: memberB.advertisedEndpoint },
+        { advertisedEndpoint: memberC.advertisedEndpoint },
       ],
       bind: `127.0.0.1:${port}`,
       timeoutMs: 3_000,
     });
     await new Promise((r) => setTimeout(r, 50));
 
-    // First member registers successfully (will wait long-poll).
     const bFirst = runMemberRegister({
       self: memberB,
       masterUrl: `http://127.0.0.1:${port}`,
       timeoutMs: 3_000,
     });
-    // Second time the *same* memberB tries to register — should be rejected.
     await new Promise((r) => setTimeout(r, 100));
     await expect(
       runMemberRegister({
@@ -345,7 +405,6 @@ describe('bootstrap — error paths', () => {
       }),
     ).rejects.toThrow(/already registered/);
 
-    // Let memberC complete things so master can shut down.
     await runMemberRegister({
       self: memberC,
       masterUrl: `http://127.0.0.1:${port}`,
@@ -356,16 +415,15 @@ describe('bootstrap — error paths', () => {
   }, 10_000);
 
   it('master timeout if a peer never registers → waiters get 408', async () => {
-    const master = await makePeer('node-a', 0);
-    const memberB = await makePeer('node-b', 1);
-    // memberC is expected but never shows up.
+    const master = await makePeer('node-a', 18800);
+    const memberB = await makePeer('node-b', 18801);
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
       self: master,
       expectedPeers: [
-        { nodeId: 'node-b', partyId: 1 },
-        { nodeId: 'node-c-ghost', partyId: 2 },
+        { advertisedEndpoint: memberB.advertisedEndpoint },
+        { advertisedEndpoint: '127.0.0.1:19999' }, // ghost peer
       ],
       bind: `127.0.0.1:${port}`,
       timeoutMs: 500,

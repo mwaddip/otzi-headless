@@ -1,15 +1,14 @@
 /**
  * Member-side bootstrap.
  *
- * Runs the `register` side of the bootstrap exchange: POSTs this daemon's
- * identity pubkey to the master's `/register` endpoint and waits (long-poll)
- * for the complete pubkey book. Validates that the returned book contains
- * this node's own entry with the matching pubkey — if master silently
- * replaced it, the self-check catches it here (and the operator-eyeball
- * fingerprint comparison catches it across nodes).
+ * POSTs `{ public_key_hex, advertised_endpoint, node_id }` to the master's
+ * `/register` endpoint and waits (long-poll) for the complete pubkey book.
+ * Validates that the returned book contains this leaf's own entry
+ * (matched by pubkey) and that the entry's advertisedEndpoint round-trips
+ * unchanged. nodeId is informational only — leader stamps whatever the
+ * leaf sent.
  */
 
-import type { PartyId } from '../core/types';
 import type { IdentityKeyPair } from '../transport/identity';
 import { toHex } from '../wire/hex';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
@@ -20,7 +19,12 @@ import {
 } from './pubkey-book';
 
 export interface MemberRegisterInputs {
-  self: { nodeId: string; partyId: PartyId; identity: IdentityKeyPair };
+  self: {
+    nodeId: string;
+    identity: IdentityKeyPair;
+    /** Canonical `host:port` form. */
+    advertisedEndpoint: string;
+  };
   /** Master URL (without path). E.g. `http://10.0.0.1:7090`. */
   masterUrl: string;
   /** Defaults to 30 min to match master. */
@@ -43,7 +47,11 @@ export async function runMemberRegister(
   const publicKeyHex = toHex(input.self.identity.publicKeyRaw);
 
   const url = `${input.masterUrl.replace(/\/+$/, '')}/register`;
-  log.info('register: POST', { url, nodeId: input.self.nodeId, partyId: input.self.partyId });
+  log.info('register: POST', {
+    url,
+    nodeId: input.self.nodeId,
+    advertisedEndpoint: input.self.advertisedEndpoint,
+  });
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -55,8 +63,8 @@ export async function runMemberRegister(
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         node_id: input.self.nodeId,
-        party_id: input.self.partyId,
         public_key_hex: publicKeyHex,
+        advertised_endpoint: input.self.advertisedEndpoint,
       }),
       signal: controller.signal,
     });
@@ -92,23 +100,20 @@ export async function runMemberRegister(
 
   const book = parseBook(JSON.stringify(parsed.book));
 
-  // Self-check: our own entry must match what we sent. Defends against a
-  // compromised master substituting our pubkey — though the fingerprint
-  // cross-check across nodes is the last-line defense.
-  const self = book.entries.find((e) => e.nodeId === input.self.nodeId);
+  // Self-check: own entry identified by pubkey match.
+  const self = book.entries.find(
+    (e) => e.publicKeyHex.toLowerCase() === publicKeyHex.toLowerCase(),
+  );
   if (!self)
-    throw new Error(`register: returned book missing our own entry for '${input.self.nodeId}'`);
-  if (self.partyId !== input.self.partyId)
+    throw new Error('register: returned book missing our own pubkey entry');
+  if (self.advertisedEndpoint !== input.self.advertisedEndpoint) {
     throw new Error(
-      `register: book claims partyId ${self.partyId} for us; we are ${input.self.partyId}`,
+      `register: master returned advertisedEndpoint='${self.advertisedEndpoint}' != ours='${input.self.advertisedEndpoint}'`,
     );
-  if (self.publicKeyHex.toLowerCase() !== publicKeyHex.toLowerCase())
-    throw new Error('register: master returned a different pubkey for us than we sent');
+  }
 
   const fingerprint = await computeFingerprint(book);
   if (typeof parsed.fingerprint === 'string' && parsed.fingerprint !== fingerprint) {
-    // Master's advisory fingerprint disagrees with our computation — must not
-    // silently accept. Either book or fingerprint has been tampered with.
     throw new Error(
       `register: local fingerprint ${fingerprint} disagrees with master-advertised ${parsed.fingerprint}`,
     );
