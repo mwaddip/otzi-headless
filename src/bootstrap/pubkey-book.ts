@@ -18,6 +18,12 @@ export interface PubkeyBookEntry {
   partyId: PartyId;
   /** 130-char hex; the raw 65-byte uncompressed P-256 point. */
   publicKeyHex: string;
+  /**
+   * Canonical `host:port` form (use `canonicalizeEndpoint`). Optional during
+   * Phase B's transition — Phase F drops the optional marker once Phase C has
+   * populated this on every newly-built book.
+   */
+  advertisedEndpoint?: string;
 }
 
 export interface PubkeyBook {
@@ -32,6 +38,7 @@ export function buildBook(entries: Iterable<PubkeyBookEntry>): PubkeyBook {
   for (const e of sorted) validateEntry(e, '<buildBook>');
   assertUniquePartyIds(sorted);
   assertUniqueNodeIds(sorted);
+  assertUniquePublicKeys(sorted);
   return { entries: sorted };
 }
 
@@ -52,10 +59,13 @@ export function parseBook(text: string): PubkeyBook {
       throw new Error(`parseBook: entries[${i}].partyId must be a non-negative integer`);
     if (typeof o.publicKeyHex !== 'string')
       throw new Error(`parseBook: entries[${i}].publicKeyHex must be a string`);
+    if (o.advertisedEndpoint !== undefined && typeof o.advertisedEndpoint !== 'string')
+      throw new Error(`parseBook: entries[${i}].advertisedEndpoint must be a string`);
     const entry: PubkeyBookEntry = {
       nodeId: o.nodeId,
       partyId: o.partyId,
       publicKeyHex: o.publicKeyHex,
+      ...(o.advertisedEndpoint !== undefined ? { advertisedEndpoint: o.advertisedEndpoint } : {}),
     };
     validateEntry(entry, `entries[${i}]`);
     return entry;
@@ -118,5 +128,15 @@ function assertUniqueNodeIds(entries: PubkeyBookEntry[]): void {
     if (seen.has(e.nodeId))
       throw new Error(`pubkey book: duplicate nodeId '${e.nodeId}'`);
     seen.add(e.nodeId);
+  }
+}
+
+function assertUniquePublicKeys(entries: PubkeyBookEntry[]): void {
+  const seen = new Set<string>();
+  for (const e of entries) {
+    const key = e.publicKeyHex.toLowerCase();
+    if (seen.has(key))
+      throw new Error(`pubkey book: duplicate publicKey ${key.slice(0, 16)}…`);
+    seen.add(key);
   }
 }

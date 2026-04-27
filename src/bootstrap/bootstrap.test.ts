@@ -11,6 +11,7 @@ import {
 } from './pubkey-book';
 import { runMasterBootstrap } from './master';
 import { runMemberRegister } from './register';
+import { canonicalizeEndpoint } from '../util/endpoint';
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -126,6 +127,65 @@ describe('pubkey-book — serialize + parse round-trip', () => {
     const fp1 = await computeFingerprint(book1);
     const fp2 = await computeFingerprint(book2);
     expect(fp1).not.toBe(fp2);
+  });
+});
+
+describe('pubkey-book — advertisedEndpoint (optional)', () => {
+  const VALID_PUBKEY = '04' + 'aa'.repeat(64);
+
+  it('round-trips an entry with advertisedEndpoint', () => {
+    const book = buildBook([
+      {
+        nodeId: 'a',
+        partyId: 0,
+        publicKeyHex: VALID_PUBKEY,
+        advertisedEndpoint: canonicalizeEndpoint('192.168.1.5:8800'),
+      },
+    ]);
+    const text = serializeBook(book);
+    const parsed = parseBook(text);
+    expect(parsed.entries[0]!.advertisedEndpoint).toBe('192.168.1.5:8800');
+  });
+
+  it('accepts an entry without advertisedEndpoint (legacy shape)', () => {
+    const book = buildBook([
+      { nodeId: 'a', partyId: 0, publicKeyHex: VALID_PUBKEY },
+    ]);
+    expect(book.entries[0]!.advertisedEndpoint).toBeUndefined();
+    const text = serializeBook(book);
+    const parsed = parseBook(text);
+    expect(parsed.entries[0]!.advertisedEndpoint).toBeUndefined();
+  });
+
+  it('rejects an advertisedEndpoint that is not a string', () => {
+    const obj = {
+      entries: [
+        { nodeId: 'a', partyId: 0, publicKeyHex: VALID_PUBKEY, advertisedEndpoint: 1234 },
+      ],
+    };
+    expect(() => parseBook(JSON.stringify(obj))).toThrow(/advertisedEndpoint must be a string/);
+  });
+});
+
+describe('pubkey-book — pubkey uniqueness', () => {
+  const PUBKEY_A = '04' + 'aa'.repeat(64);
+  const PUBKEY_B = '04' + 'bb'.repeat(64);
+
+  it('rejects two entries with the same publicKeyHex', () => {
+    expect(() =>
+      buildBook([
+        { nodeId: 'a', partyId: 0, publicKeyHex: PUBKEY_A },
+        { nodeId: 'b', partyId: 1, publicKeyHex: PUBKEY_A },
+      ]),
+    ).toThrow(/duplicate publicKey/i);
+  });
+
+  it('accepts entries with distinct publicKeyHex', () => {
+    const book = buildBook([
+      { nodeId: 'a', partyId: 0, publicKeyHex: PUBKEY_A },
+      { nodeId: 'b', partyId: 1, publicKeyHex: PUBKEY_B },
+    ]);
+    expect(book.entries.length).toBe(2);
   });
 });
 
