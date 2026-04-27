@@ -186,9 +186,6 @@
     - `wallet` is derived OPNet wallet (path m/0/0/0, hardened=false).
   - **Throws:** On invalid mnemonic.
 
-- `generateMnemonic(): string`
-  - **Post:** Generates random BIP39 mnemonic string (12 words, entropy 128 bits).
-
 **Byte-format / wire contract:**
 - RPC URLs are hardcoded strings.
 - Network configuration is opaque SDK object.

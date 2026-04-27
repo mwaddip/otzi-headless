@@ -55,6 +55,7 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 - **`captureMutex` serializes all OPNet captures process-wide.** Concurrent captures interleave the `BitcoinUtils.rndBytes` monkey-patch counter — corrupts both. DO NOT bypass.
 - **`ChallengeSolution.toRaw()` is lossy.** `legacyPublicKey` is post-tweak 32B x-only; SDK needs 33B SEC1 original. Use `serializeChallengeForWire` from `opnet-params-reconstruct.ts`.
 - **`refundAddress` MUST be locally derived per peer** via `deriveVaultP2tr(untweakedPubKey, network)`. Bogus refund = theft of change (not just DoS).
+- **OPNet capture composition surface.** Provider broadcast and SDK signer are wrapped via composition (`CapturingProvider` Proxy + `CaptureSigner` class) — the upstream provider object is never mutated, and there is no graft on a wallet keypair (no mnemonic plumbing anywhere in the capture path). The lone remaining ambient mutation is `BitcoinUtils.rndBytes`; `rndbytes-canary.test.ts` asserts the symbol shape we depend on so version-pinning slip fails loudly. Long-term fix requires an upstream PR threading `randomBytes` through `CallResult.sendTransaction` → `factory.signInteraction`.
 
 ### Phase-4d trap (initEccLib)
 - **NEVER call `initEccLib(createNobleBackend())`** in any code path that imports `@btc-vision/transaction`. The package auto-inits at module load. Double-init silently misroutes the FROST legacy-sig monkey-patch.

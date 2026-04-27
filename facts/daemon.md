@@ -303,14 +303,9 @@
   - **Pre:** config.network.name is 'mainnet' | 'testnet' | 'regtest'.
   - **Post:** Regtest → key-link skipped, opnetProvider undefined; mainnet/testnet → key-link enabled, opnetProvider set.
 
-- **SDK mnemonic**
-  - **Pre:** deps.sdkWalletMnemonic optional (or injected for tests).
-  - **Post:** Generated once at startup (never signed; monkey-patched during capture); shared to both orchestrator + leader.
-
 **Invariants:**
 - HTTP listener should be localhost-bound (security assumption; should be enforced at HttpTrigger level).
 - Daemon does NOT call `initEccLib` (phase-4d trap; double-init misroutes FROST legacy-sig monkey-patch).
-- `sdkWalletMnemonic` is a disposable credential; daemon generates a new one each startup.
 - `opnetProvider` is only used on mainnet/testnet (regtest passes undefined).
 
 **Cross-component contracts:**

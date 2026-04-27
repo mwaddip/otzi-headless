@@ -162,7 +162,7 @@
 
 ### `opnet-capture.ts`
 
-**Purpose:** Deterministic OPNet contract-call sighash capture via SDK transaction construction with monkey-patched RNG and broadcast interception.
+**Purpose:** Deterministic OPNet contract-call sighash capture via SDK transaction construction. Provider broadcast and SDK signer are wrapped via composition (`CapturingProvider`, `CaptureSigner`); only the global `BitcoinUtils.rndBytes` RNG is monkey-patched (no clean alternative without an upstream PR threading `randomBytes` through `CallResult.sendTransaction`).
 
 **Public surface:**
 - `convertOpnetParams(rawParams: readonly unknown[], paramTypes: readonly ParamType[] | undefined) → unknown[]`
@@ -207,7 +207,6 @@
     - `frostTweakedPubKey` and `frostUntweakedPubKey` must be 33B SEC1 compressed (tweaked and untweaked respectively).
     - `frostLegacySig` required iff vault was DKG'd with V3 shares (detected by caller).
     - `refundAddress` must be valid bech32 for network.
-    - `sdkWalletMnemonic` must be valid (never signed with, just produces keypair slot).
     - `utxos` (if set) must be UTXO snapshot peer agrees on; `challenge` (if set) must be ChallengeSolution matching network state.
     - `rndBytesSeed` (if set) must be Uint8Array; used to patch BitcoinUtils.rndBytes.
   - **Post:** Returns sighashes (array of {index, hash, type}) and captureContext (templateTxs list, sighashMap for wire correlation). Sighashes indexed 0, 1, … across all template txs in order.
@@ -218,13 +217,14 @@
 **Invariants:**
 - captureMutex is process-global; all captures (across ceremony instances) serialized.
 - RNG patch (if installed) lives only within capture; restored in finally.
-- Monkey-patched sendRawTransaction/sendRawTransactionPackage throw `__capture_only__` to abort broadcast.
+- `CapturingProvider` (composition wrapper, not a mutation) intercepts `sendRawTransaction` / `sendRawTransactionPackage` to record tx hex and throw `__capture_only__`; the inner provider object is never modified.
+- `CaptureSigner` is a clean class (not a graft on `wallet.keypair`) implementing the SDK signer surface — `publicKey` (untweaked FROST aggregate) and `multiSignPsbt`. The SDK reads only these two members; there is no wallet, no mnemonic, no keypair anywhere in the capture path.
 - Sighashes correspond to final N multiSignPsbt calls matching N template txs (fee estimation rounds discarded).
 - captureContext.sighashMap keys are sighash hex strings; values map to {txIndex, inputIndex, type}.
 - `frostLegacySig` usage is transparent to caller — wrapped in `withFrostLegacySig` if present.
 
 **Cross-component contracts:**
-- Depends on: `@btc-vision/transaction` (Address, BitcoinUtils, ChallengeSolution), `opnet` (getContract, UTXO), `opnet-client` (getProvider, getNetwork, generateWallet), `frost-link` (computeKeyLinkHash, withFrostLegacySig), `opnet-calldata` (resolveAbi).
+- Depends on: `@btc-vision/transaction` (Address, BitcoinUtils, ChallengeSolution), `opnet` (getContract, UTXO), `opnet-client` (getProvider, getNetwork), `capturing-provider` (CapturingProvider, isCaptureOnlyError), `capture-signer` (CaptureSigner), `frost-link` (computeKeyLinkHash, withFrostLegacySig), `opnet-calldata` (resolveAbi).
 - Used by: Orchestrator for OPNet construction-params capture; participants to verify sighashes.
 - Byte/format contract: Sighash format opaque (captured hex strings); UTXO/ChallengeSolution are SDK native types.
 

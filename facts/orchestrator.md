@@ -42,7 +42,6 @@
 - `share` and FROST key material must be consistent: if share has `frostKeyPackage`, it MUST also be in `frostKeyPackage` param (or `node/opnet-client` re-derives it).
 - `network` is only meaningful when producing `frostLegacySig` (combined DKG on mainnet/testnet); regtest passes `undefined`, key-link skipped.
 - `frostLegacySig` is only valid after combined DKG runs; participant-side capture re-extracts it locally.
-- `sdkWalletMnemonic` never signs; it's a mnemonic for SDK's wallet slot during capture.
 - Persistence sink errors on participant side do NOT abort the ceremony — DKG memory result is final.
 
 **Cross-component contracts:**
