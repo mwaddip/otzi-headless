@@ -34,7 +34,7 @@ import { Address } from '@btc-vision/transaction';
 import { getContract, OP_20_ABI } from 'opnet';
 import { verifySignature, type Rng } from '@mwaddip/frots';
 import { schnorr } from '@noble/curves/secp256k1.js';
-import { getProvider, getNetwork, generateWallet, generateMnemonic } from '../src/node/opnet-client';
+import { getProvider, getNetwork, generateWallet } from '../src/node/opnet-client';
 import { createInMemoryRing } from '../src/core/in-memory-transport';
 import { BlobStore } from '../src/core/blob-store';
 import { BlobServer } from '../src/core/blob-server';
@@ -637,11 +637,6 @@ async function runMldsaThresholdSign(
  * key material, re-runs the capture, and compares sighashes. Throws on
  * any mismatch — that's the determinism invariant. On match, calls
  * `participateInFrostSigning`.
- *
- * Deliberately uses a DIFFERENT `sdkWalletMnemonic` than the leader to
- * exercise the invariant that capture output depends only on the shared
- * inputs (mnemonic only seeds a wallet slot the SDK never signs with
- * — publicKey is overridden, multiSignPsbt is monkey-patched).
  */
 async function orchestrateOpnetParamsParticipant(
   ctx: NodeCtx,
@@ -655,8 +650,6 @@ async function orchestrateOpnetParamsParticipant(
     frostUntweakedPubKey: dkg.untweakedSec1,
     frostLegacySig: dkg.frostLegacySig,
     network: 'testnet',
-    // Fresh mnemonic — different from the leader's. Capture must still be deterministic.
-    sdkWalletMnemonic: generateMnemonic(),
   };
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -734,7 +727,6 @@ async function phaseF(env: Env, dkg: DkgBundle): Promise<void> {
     pullOpts: FAST_PULL_OPTS,
     network: 'testnet',
     frostLegacySig: dkg.frostLegacySig,
-    sdkWalletMnemonic: generateMnemonic(),
     opnetProvider: getProvider('testnet'),
     logger: {
       debug: () => {},

@@ -764,12 +764,12 @@ export class Orchestrator {
   /**
    * Assemble the per-daemon key material for opnet-params capture. Returns
    * undefined if any required piece is missing (share, frost publicKeyPackage,
-   * frostLegacySig, network, sdkWalletMnemonic). Callers silent-drop the
-   * announce when this returns undefined.
+   * frostLegacySig, network). Callers silent-drop the announce when this
+   * returns undefined.
    */
   private buildOpnetParamsKeyMat(): OpnetParamsKeyMat | undefined {
-    const { share, frostPublicKeyPackage, frostLegacySig, network, sdkWalletMnemonic } = this.deps;
-    if (!share || !frostPublicKeyPackage || !frostLegacySig || !network || !sdkWalletMnemonic) {
+    const { share, frostPublicKeyPackage, frostLegacySig, network } = this.deps;
+    if (!share || !frostPublicKeyPackage || !frostLegacySig || !network) {
       return undefined;
     }
     return {
@@ -778,7 +778,6 @@ export class Orchestrator {
       frostUntweakedPubKey: frostPublicKeyPackage.untweakedVerifyingKey,
       frostLegacySig,
       network,
-      sdkWalletMnemonic,
     };
   }
 }

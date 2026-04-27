@@ -144,13 +144,6 @@ export interface OrchestratorDeps {
    */
   frostLegacySig?: Uint8Array;
   /**
-   * Throwaway mnemonic for the SDK's wallet-keypair slot during capture.
-   * Never signs anything that reaches the chain (multiSignPsbt is
-   * monkey-patched during capture). The daemon generates one at startup.
-   * Without it, `opnet-params` announces silent-drop.
-   */
-  sdkWalletMnemonic?: string;
-  /**
    * Persists this party's combined-DKG result after participation settles.
    * Errors are logged but do NOT abort the ceremony — DKG itself succeeded
    * in memory; persistence is best-effort on the participant side. Operator

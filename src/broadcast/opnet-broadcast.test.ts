@@ -14,10 +14,6 @@ vi.mock('../node/opnet-client.js', () => ({
     sendRawTransactionPackage: mocks.sendRawTransactionPackage,
   }),
   getNetwork: () => ({}),
-  generateWallet: () => ({
-    mnemonic: { zeroize: () => {} },
-    wallet: { zeroize: () => {}, keypair: {} },
-  }),
 }));
 
 import { broadcastOpnetTx } from './opnet-broadcast';

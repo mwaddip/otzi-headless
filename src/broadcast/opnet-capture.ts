@@ -29,11 +29,12 @@ import { Address, BitcoinUtils, ChallengeSolution } from '@btc-vision/transactio
 import { toXOnly } from '@btc-vision/bitcoin';
 import { getContract, UTXO as OpnetUtxo } from 'opnet';
 import type { NetworkName } from '../node/types.js';
-import { getProvider, getNetwork, generateWallet } from '../node/opnet-client.js';
+import { getProvider, getNetwork } from '../node/opnet-client.js';
 import { ThresholdMLDSASigner } from '../node/threshold-signer.js';
-import { FrostPsbtSigner } from '../node/frost-psbt-signer.js';
 import { computeKeyLinkHash, withFrostLegacySig } from '../node/frost-link.js';
 import { resolveAbi } from './opnet-calldata.js';
+import { CapturingProvider, isCaptureOnlyError } from './capturing-provider.js';
+import { CaptureSigner } from './capture-signer.js';
 
 const DEFAULT_FEE_RATE = 10;
 const DEFAULT_PRIORITY_FEE = 1000n;
@@ -82,15 +83,6 @@ export interface OpnetCaptureInputs {
 
   /** Bech32 P2TR refund address — typically `permafrost.frostP2tr`. */
   refundAddress: string;
-
-  /**
-   * Mnemonic used to construct a real `wallet.keypair` for the SDK's signer
-   * slot. It is NEVER used to produce signatures that reach the chain —
-   * `multiSignPsbt` intercepts every signing call and `publicKey` is
-   * overridden to the untweaked FROST key. The daemon trigger layer can
-   * safely pass a constant throwaway mnemonic generated once at startup.
-   */
-  sdkWalletMnemonic: string;
 
   feeRate?: number;
   priorityFee?: bigint;
@@ -217,7 +209,6 @@ export async function captureOpnetSighashes(
     frostUntweakedPubKey,
     frostLegacySig,
     refundAddress,
-    sdkWalletMnemonic,
     feeRate = DEFAULT_FEE_RATE,
     priorityFee = DEFAULT_PRIORITY_FEE,
     maximumAllowedSatToSpend = DEFAULT_MAX_SAT_SPEND,
@@ -231,17 +222,24 @@ export async function captureOpnetSighashes(
   const releaseLock = await acquireCaptureLock();
   const rndBytesPatch = rndBytesSeed ? installRndBytesPatch(rndBytesSeed) : null;
 
-  const provider = getProvider(networkName);
+  const realProvider = getProvider(networkName);
   const network = getNetwork(networkName);
   const contractAbi = resolveAbi(abi);
-  const { wallet, mnemonic } = generateWallet(sdkWalletMnemonic, networkName);
+
+  const capturingProvider = new CapturingProvider(realProvider as never);
 
   try {
     const mldsaPubKeyHex = Buffer.from(mldsaPubKey).toString('hex');
     const tweakedPubKeyHex = Buffer.from(frostTweakedPubKey).toString('hex');
     const vaultAddr = Address.fromString(mldsaPubKeyHex, tweakedPubKeyHex);
 
-    const contract = getContract(contractAddress, contractAbi as never, provider, network, vaultAddr);
+    const contract = getContract(
+      contractAddress,
+      contractAbi as never,
+      capturingProvider.proxy as never,
+      network,
+      vaultAddr,
+    );
     const fn = (contract as unknown as Record<string, unknown>)[method];
     if (typeof fn !== 'function') {
       throw new Error(`Method '${method}' not found on contract ${contractAddress}`);
@@ -262,37 +260,10 @@ export async function captureOpnetSighashes(
     const untweakedPubKeyBuf = Buffer.from(frostUntweakedPubKey);
     const internalXOnly = toXOnly(untweakedPubKeyBuf as never);
 
-    const { signer: captureSigner, calls: capturedCalls } =
-      FrostPsbtSigner.createCapture(tweakedPubKeyBuf, internalXOnly, untweakedPubKeyBuf);
-
-    // Graft capture behavior onto wallet.keypair: SDK internals read fields
-    // on the signer object beyond what we control; starting from a real
-    // keypair and overriding multiSignPsbt + publicKey is the minimal
-    // contortion that satisfies both paths.
-    const hybridSigner = wallet.keypair as typeof wallet.keypair & {
-      multiSignPsbt: typeof captureSigner.multiSignPsbt;
-    };
-    (hybridSigner as unknown as Record<string, unknown>).multiSignPsbt =
-      captureSigner.multiSignPsbt.bind(captureSigner);
-    Object.defineProperty(hybridSigner, 'publicKey', {
-      value: untweakedPubKeyBuf,
-      configurable: true,
-    });
-
-    const capturedTemplateTxs: string[] = [];
-    const origSendRawPkg = (provider as unknown as Record<string, unknown>).sendRawTransactionPackage as (...args: unknown[]) => Promise<unknown>;
-    const origSendRaw = (provider as unknown as Record<string, unknown>).sendRawTransaction as (...args: unknown[]) => Promise<unknown>;
-    (provider as unknown as Record<string, unknown>).sendRawTransactionPackage = async (txs: string[]) => {
-      capturedTemplateTxs.push(...txs);
-      throw new Error('__capture_only__');
-    };
-    (provider as unknown as Record<string, unknown>).sendRawTransaction = async (tx: string) => {
-      capturedTemplateTxs.push(tx);
-      throw new Error('__capture_only__');
-    };
+    const captureSigner = new CaptureSigner(tweakedPubKeyBuf, internalXOnly, untweakedPubKeyBuf);
 
     const sendTxParams = {
-      signer: hybridSigner as never,
+      signer: captureSigner as never,
       mldsaSigner: thresholdSigner,
       refundTo: refundAddress,
       network,
@@ -316,15 +287,14 @@ export async function captureOpnetSighashes(
         await callResult.sendTransaction(sendTxParams);
       }
     } catch (err) {
-      // `__capture_only__` is the expected sentinel — the monkey-patched
-      // provider throws it after templates are finalized to abort broadcast.
+      // `__capture_only__` is the expected sentinel — CapturingProvider
+      // throws it after templates are finalized to abort broadcast.
       // Other errors are real and need to surface for diagnosis.
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('__capture_only__')) sdkError = err;
-    } finally {
-      (provider as unknown as Record<string, unknown>).sendRawTransactionPackage = origSendRawPkg;
-      (provider as unknown as Record<string, unknown>).sendRawTransaction = origSendRaw;
+      if (!isCaptureOnlyError(err)) sdkError = err;
     }
+
+    const capturedTemplateTxs = [...capturingProvider.capturedTxs];
+    const capturedCalls = captureSigner.calls;
 
     if (capturedTemplateTxs.length === 0 || capturedCalls.length < capturedTemplateTxs.length) {
       const detail = sdkError instanceof Error ? `: ${sdkError.message}` : sdkError !== undefined ? `: ${String(sdkError)}` : '';
@@ -359,8 +329,6 @@ export async function captureOpnetSighashes(
 
     return { sighashes, captureContext: { templateTxs: capturedTemplateTxs, sighashMap } };
   } finally {
-    mnemonic.zeroize();
-    wallet.zeroize();
     rndBytesPatch?.restore();
     releaseLock();
   }

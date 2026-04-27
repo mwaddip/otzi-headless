@@ -51,7 +51,6 @@ function sampleKeyMat(): OpnetParamsKeyMat {
     frostTweakedPubKey: new Uint8Array(33).fill(2),
     frostUntweakedPubKey: new Uint8Array(33).fill(3),
     network: 'testnet',
-    sdkWalletMnemonic: 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
   };
 }
 
@@ -188,7 +187,6 @@ describe('buildCaptureInputsFromParams', () => {
     expect(inputs.priorityFee).toBe(1000n);
     expect(inputs.maximumAllowedSatToSpend).toBe(100000n);
     expect(inputs.refundAddress).toBe(p.refundAddress);
-    expect(inputs.sdkWalletMnemonic).toBe(keyMat.sdkWalletMnemonic);
     expect(inputs.mldsaPubKey).toBe(keyMat.mldsaPubKey);
     expect(inputs.frostTweakedPubKey).toBe(keyMat.frostTweakedPubKey);
     expect(inputs.frostUntweakedPubKey).toBe(keyMat.frostUntweakedPubKey);

@@ -25,7 +25,7 @@ import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
 import { createGate } from '../gate/factory';
 import type { ApprovalGate } from '../gate/types';
-import { generateMnemonic, getProvider } from '../node/opnet-client';
+import { getProvider } from '../node/opnet-client';
 import type { NetworkName as NodeNetworkName } from '../node/types';
 import { Orchestrator } from '../orchestrator/orchestrator';
 import {
@@ -76,12 +76,6 @@ export interface DaemonDeps {
   /** Optional env override for HTTP auth token lookup. Defaults to `process.env`. */
   env?: Readonly<Record<string, string | undefined>>;
   /**
-   * Throwaway mnemonic for the SDK's wallet-keypair slot during OPNet
-   * capture. Defaults to a freshly-generated one at startup. Tests inject a
-   * fixed value for reproducibility.
-   */
-  sdkWalletMnemonic?: string;
-  /**
    * OPNet provider — exposes `utxoManager.getUTXOs` + `getChallenge` for the
    * `opnet-params` leader flow. Defaults to a live `JSONRpcProvider` bound
    * to `config.network.name`; tests inject a stub.
@@ -128,12 +122,8 @@ export class Daemon {
     const keylinkNetwork: NodeNetworkName | undefined =
       configNetwork === 'regtest' ? undefined : configNetwork;
 
-    // `sdkWalletMnemonic` + `opnetProvider` are shared between orchestrator and
-    // leader for the `opnet-params` flow. Generate once at startup; the
-    // mnemonic never signs anything reaching chain (multiSignPsbt is
-    // monkey-patched during capture). `opnetProvider` is only used when
-    // keylinkNetwork is set — regtest skips it.
-    const sdkWalletMnemonic = deps.sdkWalletMnemonic ?? generateMnemonic();
+    // `opnetProvider` is shared between orchestrator and leader for the
+    // `opnet-params` flow. Only used when keylinkNetwork is set — regtest skips it.
     const opnetProvider = deps.opnetProvider
       ?? (keylinkNetwork ? getProvider(keylinkNetwork) : undefined);
 
@@ -158,7 +148,6 @@ export class Daemon {
       ceremonyDeadlines: deps.state.config.deadlines,
       network: keylinkNetwork,
       ...(deps.state.frostLegacySig ? { frostLegacySig: deps.state.frostLegacySig } : {}),
-      sdkWalletMnemonic,
       persistDkgShare: deps.state.persistDkgShare,
       controlPlane,
       logger: this.log,
@@ -176,7 +165,6 @@ export class Daemon {
       pullOpts: deps.pullOpts,
       network: keylinkNetwork,
       ...(deps.state.frostLegacySig ? { frostLegacySig: deps.state.frostLegacySig } : {}),
-      sdkWalletMnemonic,
       ...(opnetProvider ? { opnetProvider } : {}),
       ...(deps.opnetSeedFill ? { opnetSeedFill: deps.opnetSeedFill } : {}),
       persistDkgShare: deps.state.persistDkgShare,

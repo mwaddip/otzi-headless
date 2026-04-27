@@ -35,12 +35,6 @@ export interface OpnetParamsKeyMat {
   frostUntweakedPubKey: Uint8Array;
   frostLegacySig?: Uint8Array;
   network: NetworkName;
-  /**
-   * Throwaway mnemonic used only to produce a `wallet.keypair` slot the SDK
-   * writes into; never signs anything that reaches the chain (multiSignPsbt
-   * is monkey-patched). A constant daemon-start-time mnemonic is fine.
-   */
-  sdkWalletMnemonic: string;
 }
 
 /**
@@ -126,7 +120,6 @@ export function buildCaptureInputsFromParams(
     frostUntweakedPubKey: keyMat.frostUntweakedPubKey,
     ...(keyMat.frostLegacySig ? { frostLegacySig: keyMat.frostLegacySig } : {}),
     refundAddress: p.refundAddress,
-    sdkWalletMnemonic: keyMat.sdkWalletMnemonic,
     feeRate: p.feeRate,
     priorityFee: BigInt(p.priorityFeeSat),
     maximumAllowedSatToSpend: BigInt(p.maxSatToSpendSat),

@@ -67,12 +67,6 @@ export interface LeaderDeps {
    */
   frostLegacySig?: Uint8Array;
   /**
-   * Throwaway mnemonic for the SDK's wallet-keypair slot during capture
-   * (never signs; multiSignPsbt is monkey-patched). Daemon generates one at
-   * startup and reuses. Required for `opnet-params` leader flow.
-   */
-  sdkWalletMnemonic?: string;
-  /**
    * OPNet JSON-RPC provider for UTXO + challenge fetches during the
    * `opnet-params` flow. Tests inject a stub; production wires the real
    * `JSONRpcProvider` via `daemon.ts`. The type is intentionally loose —
@@ -406,11 +400,10 @@ export class LeaderDispatcher {
    * captureContext — operator has no way to broadcast externally.
    */
   private async signOpnetParams(req: LeaderSignOpnetParamsRequest): Promise<LeaderSignResult> {
-    const { share, frostKeyPackage, frostPublicKeyPackage, frostLegacySig, sdkWalletMnemonic, network, opnetProvider } = this.deps;
+    const { share, frostKeyPackage, frostPublicKeyPackage, frostLegacySig, network, opnetProvider } = this.deps;
     if (!share) throw new Error("leader: protocol='opnet-params' requires share");
     if (!frostKeyPackage || !frostPublicKeyPackage) throw new Error("leader: protocol='opnet-params' requires FROST key material");
     if (!frostLegacySig) throw new Error("leader: protocol='opnet-params' requires frostLegacySig (V3 share)");
-    if (!sdkWalletMnemonic) throw new Error("leader: protocol='opnet-params' requires sdkWalletMnemonic");
     if (!network) throw new Error("leader: protocol='opnet-params' requires network");
     if (!opnetProvider) throw new Error("leader: protocol='opnet-params' requires opnetProvider");
 
@@ -450,7 +443,6 @@ export class LeaderDispatcher {
       frostUntweakedPubKey,
       frostLegacySig,
       refundAddress,
-      sdkWalletMnemonic,
       feeRate,
       priorityFee,
       maximumAllowedSatToSpend,

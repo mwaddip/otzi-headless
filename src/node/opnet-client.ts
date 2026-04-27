@@ -23,7 +23,3 @@ export function generateWallet(mnemonic: string, networkName: NetworkName) {
   const wallet = m.deriveOPWallet(undefined, 0, 0, false);
   return { mnemonic: m, wallet };
 }
-
-export function generateMnemonic(): string {
-  return Mnemonic.generatePhrase();
-}
