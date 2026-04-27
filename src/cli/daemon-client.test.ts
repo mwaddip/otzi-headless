@@ -19,7 +19,7 @@ name = "regtest"
 opnet_rpc = "http://x"
 [transport]
 kind = "peer-mesh"
-listen = "127.0.0.1:0"
+listen = "127.0.0.1:8800"
 [[peers]]
 id = "b"
 party_id = 1
@@ -104,7 +104,7 @@ name = "regtest"
 opnet_rpc = "http://x"
 [transport]
 kind = "peer-mesh"
-listen = "127.0.0.1:0"
+listen = "127.0.0.1:8800"
 [[peers]]
 id = "b"
 party_id = 1
@@ -145,7 +145,7 @@ name = "regtest"
 opnet_rpc = "http://x"
 [transport]
 kind = "peer-mesh"
-listen = "127.0.0.1:0"
+listen = "127.0.0.1:8800"
 [[peers]]
 id = "b"
 party_id = 1
