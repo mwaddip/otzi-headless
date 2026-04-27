@@ -49,6 +49,11 @@ describe('canonicalizeEndpoint — IPv6', () => {
   it('rejects unbracketed IPv6 with port (ambiguous)', () => {
     expect(() => canonicalizeEndpoint('2a11:6c7::11:1044')).toThrow(EndpointParseError);
   });
+
+  it('rejects bare unbracketed IPv6 (no port) — must be bracketed', () => {
+    expect(() => canonicalizeEndpoint('2a11:6c7::11')).toThrow(EndpointParseError);
+    expect(() => canonicalizeEndpoint('::1')).toThrow(EndpointParseError);
+  });
 });
 
 describe('canonicalizeEndpoint — hostname', () => {
