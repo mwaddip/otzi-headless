@@ -224,10 +224,9 @@ function isFileNotFound(err: unknown): boolean {
 }
 
 function validateAlignment(config: DaemonConfig, share: DecryptedShare): void {
-  if (share.partyId !== config.node.partyId)
-    throw new Error(
-      `daemon: share.partyId (${share.partyId}) does not match config node.party_id (${config.node.partyId})`,
-    );
+  // share.partyId vs config.node.partyId mismatch check moved to
+  // transport-factory.resolveSelfFromBook (cross-checked against the book,
+  // which is the authoritative source). Phase F drops config.node.partyId.
   if (config.peers.length + 1 !== share.parties)
     throw new Error(
       `daemon: peers count + self (${config.peers.length + 1}) does not match share.parties (${share.parties})`,

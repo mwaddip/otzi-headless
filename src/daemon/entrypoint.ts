@@ -134,6 +134,7 @@ async function runDaemonCommand(args: string[]): Promise<void> {
   const daemon = new Daemon({
     state,
     transport: bundle.transport,
+    selfPartyId: bundle.selfPartyId,
     rng: {
       fillBytes(dest) {
         crypto.getRandomValues(dest);
@@ -164,7 +165,7 @@ async function runDaemonCommand(args: string[]): Promise<void> {
 
   const mode = state.share ? 'signing+DKG' : 'DKG-only (no share file present)';
   console.error(
-    `otzi daemon started — nodeId=${state.config.node.id} partyId=${state.config.node.partyId} ringId=${bundle.ringId.slice(0, 16)}... mode=${mode}`,
+    `otzi daemon started — nodeId=${state.config.node.id} partyId=${bundle.selfPartyId} ringId=${bundle.ringId.slice(0, 16)}... mode=${mode}`,
   );
   if (!state.share) {
     console.error(

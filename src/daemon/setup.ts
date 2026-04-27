@@ -30,7 +30,6 @@ import {
   type IdentityKeyPair,
 } from '../transport/identity';
 import { fromHex, toHex } from '../wire/hex';
-import { canonicalizeEndpoint } from '../util/endpoint';
 
 export async function setupMaster(configPath: string, bind: string): Promise<void> {
   const config = await loadDaemonConfig(configPath);
@@ -44,18 +43,22 @@ export async function setupMaster(configPath: string, bind: string): Promise<voi
     return;
   }
 
-  if (config.transport.kind !== 'peer-mesh' || !config.transport.listen) {
+  if (config.transport.kind !== 'peer-mesh') {
+    throw new Error('setup: bootstrap requires transport.kind = "peer-mesh"');
+  }
+  const selfAdvertisedEndpoint =
+    config.transport.advertisedEndpoint ?? config.transport.listen;
+  if (!selfAdvertisedEndpoint) {
     throw new Error(
-      'setup: bootstrap requires transport.kind = "peer-mesh" and transport.listen set (this node\'s reachable address)',
+      'setup: bootstrap requires transport.advertised_endpoint (or legacy transport.listen) set to this node\'s reachable address',
     );
   }
-  const selfAdvertisedEndpoint = canonicalizeEndpoint(config.transport.listen);
 
   const expectedPeers = config.peers.map((p, i) => {
     if (!p.endpoint) {
       throw new Error(`setup: peers[${i}].endpoint is required (post-Phase C bootstrap addresses peers by endpoint)`);
     }
-    return { advertisedEndpoint: canonicalizeEndpoint(p.endpoint) };
+    return { advertisedEndpoint: p.endpoint };
   });
 
   const identity = await loadOrGenerateIdentity(config);
@@ -85,12 +88,16 @@ export async function setupMember(configPath: string, masterUrl: string): Promis
     return;
   }
 
-  if (config.transport.kind !== 'peer-mesh' || !config.transport.listen) {
+  if (config.transport.kind !== 'peer-mesh') {
+    throw new Error('setup: bootstrap requires transport.kind = "peer-mesh"');
+  }
+  const selfAdvertisedEndpoint =
+    config.transport.advertisedEndpoint ?? config.transport.listen;
+  if (!selfAdvertisedEndpoint) {
     throw new Error(
-      'setup: bootstrap requires transport.kind = "peer-mesh" and transport.listen set (this node\'s reachable address)',
+      'setup: bootstrap requires transport.advertised_endpoint (or legacy transport.listen) set to this node\'s reachable address',
     );
   }
-  const selfAdvertisedEndpoint = canonicalizeEndpoint(config.transport.listen);
 
   const identity = await loadOrGenerateIdentity(config);
 

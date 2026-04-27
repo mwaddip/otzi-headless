@@ -1,7 +1,8 @@
 /**
- * Transport factory — reads the identity key file + pubkey book from disk,
- * derives the deterministic `ringId`, and constructs the right `Transport`
- * based on `DaemonConfig.transport.kind`.
+ * Transport factory — reads identity + pubkey book, identifies self by pubkey
+ * match in the book, validates that the local `[[peers]]` dial table agrees
+ * with the book on canonical endpoints (peer-mesh only), computes the
+ * deterministic ringId, and constructs the requested `Transport`.
  *
  * Identity file format (JSON):
  *   {
@@ -9,17 +10,17 @@
  *     "publicKeyHex": "<130-char hex uncompressed P-256>"
  *   }
  *
- * Pubkey book format: produced by bootstrap (phase 3c) — see
- * `src/bootstrap/pubkey-book.ts`.
+ * Pubkey book format: `src/bootstrap/pubkey-book.ts` (Phase B+ shape).
  *
  * Cross-validation:
- *   - Identity's public key must match self's entry in the pubkey book.
- *   - Every `config.peers[].partyId` must have a pubkey book entry.
- *   - Every peer's book `nodeId` must match `config.peers[].id`.
+ *   - Self entry = the book entry whose publicKeyHex matches loaded identity.
+ *   - For peer-mesh: every `[[peers]].endpoint` (canonical) must match a
+ *     non-self book entry's `advertisedEndpoint` (canonical), and vice versa.
+ *   - For relay: peer endpoint matching is skipped (relay routes by partyId).
  */
 
 import { readFile } from 'node:fs/promises';
-import { parseBook, type PubkeyBook } from '../bootstrap/pubkey-book';
+import { parseBook, type PubkeyBook, type PubkeyBookEntry } from '../bootstrap/pubkey-book';
 import type { Transport } from '../core/transport';
 import type { Logger } from '../orchestrator/types';
 import { PeerMeshTransport } from '../transport/peer-mesh/peer-mesh';
@@ -32,6 +33,10 @@ export interface TransportBundle {
   transport: Transport;
   identity: IdentityKeyPair;
   pubkeyBook: PubkeyBook;
+  /** Self's partyId, resolved from the book by pubkey match. Authoritative. */
+  selfPartyId: number;
+  /** Self's book entry. */
+  selfEntry: PubkeyBookEntry;
   /** SHA-256 hex of concatenated pubkeys — same on every peer. */
   ringId: string;
   start: () => Promise<void>;
@@ -55,56 +60,102 @@ export async function buildTransportFromFiles(
   const identity = await loadIdentityFile(config.node.identityKeyFile);
   const pubkeyBook = await loadPubkeyBook(config.node.pubkeyBookFile);
 
-  validateIdentityMatchesBook(identity, pubkeyBook, config.node.partyId, config.node.id);
-  validatePeersInBook(pubkeyBook, config.peers);
+  const selfEntry = resolveSelfFromBook(identity, pubkeyBook);
+  if (state.share && state.share.partyId !== selfEntry.partyId) {
+    throw new Error(
+      `buildTransport: share.partyId (${state.share.partyId}) does not match book self entry partyId (${selfEntry.partyId})`,
+    );
+  }
 
   const ringId = await computeRingId(pubkeyBook);
 
-  return buildFromState({ state, identity, pubkeyBook, ringId, options });
+  return buildFromState({
+    state,
+    identity,
+    pubkeyBook,
+    selfPartyId: selfEntry.partyId,
+    selfEntry,
+    ringId,
+    options,
+  });
 }
 
-/** Programmatic variant for tests — skips disk I/O, takes pre-built identity + book. */
+/** Programmatic variant for tests — skips disk I/O. */
 export async function buildTransportFromMemory(
   state: LoadedDaemonState,
   identity: IdentityKeyPair,
   pubkeyBook: PubkeyBook,
   options: BuildTransportOptions = {},
 ): Promise<TransportBundle> {
-  validateIdentityMatchesBook(identity, pubkeyBook, state.config.node.partyId, state.config.node.id);
-  validatePeersInBook(pubkeyBook, state.config.peers);
+  const selfEntry = resolveSelfFromBook(identity, pubkeyBook);
+  if (state.share && state.share.partyId !== selfEntry.partyId) {
+    throw new Error(
+      `buildTransport: share.partyId (${state.share.partyId}) does not match book self entry partyId (${selfEntry.partyId})`,
+    );
+  }
   const ringId = await computeRingId(pubkeyBook);
-  return buildFromState({ state, identity, pubkeyBook, ringId, options });
+  return buildFromState({
+    state,
+    identity,
+    pubkeyBook,
+    selfPartyId: selfEntry.partyId,
+    selfEntry,
+    ringId,
+    options,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Internals
 // ─────────────────────────────────────────────────────────────────────────
 
-async function buildFromState(args: {
+interface BuildFromStateArgs {
   state: LoadedDaemonState;
   identity: IdentityKeyPair;
   pubkeyBook: PubkeyBook;
+  selfPartyId: number;
+  selfEntry: PubkeyBookEntry;
   ringId: string;
   options: BuildTransportOptions;
-}): Promise<TransportBundle> {
-  const { state, identity, pubkeyBook, ringId, options } = args;
+}
+
+async function buildFromState(args: BuildFromStateArgs): Promise<TransportBundle> {
+  const { state, identity, pubkeyBook, selfPartyId, selfEntry, ringId, options } = args;
   const { config } = state;
 
+  // Filter book to non-self peers; this is the authoritative source for
+  // the partyId + publicKey of every peer.
+  const bookPeers = pubkeyBook.entries.filter((e) => e.partyId !== selfPartyId);
+
   if (config.transport.kind === 'peer-mesh') {
-    if (!config.transport.listen)
-      throw new Error('buildTransport: transport.listen required when transport.kind = "peer-mesh"');
-    const peers = config.peers.map((p) => {
-      const entry = pubkeyBook.entries.find((e) => e.partyId === p.partyId)!;
-      const peer: { partyId: number; publicKey: Uint8Array; endpoint?: string } = {
-        partyId: p.partyId,
-        publicKey: fromHex(entry.publicKeyHex),
+    const advertised =
+      config.transport.advertisedEndpoint ?? config.transport.listen;
+    if (!advertised) {
+      throw new Error(
+        'buildTransport: transport.advertised_endpoint required when transport.kind = "peer-mesh"',
+      );
+    }
+    validatePeersAgainstBook(pubkeyBook, config.peers, selfPartyId);
+
+    // peer-mesh expects ws:// URLs (PeerConnection.dial uses `new URL`).
+    // Book + config carry canonical host:port post-Phase-D; prepend ws://
+    // here so peer-mesh internals don't change. Phase F can revisit when
+    // [[peers]] is dropped.
+    const peers = bookPeers.map((e) => {
+      if (e.advertisedEndpoint === undefined) {
+        throw new Error(
+          `transport-factory: book entry partyId=${e.partyId} missing advertisedEndpoint — re-run 'otzi setup'`,
+        );
+      }
+      return {
+        partyId: e.partyId,
+        publicKey: fromHex(e.publicKeyHex),
+        endpoint: `ws://${e.advertisedEndpoint}`,
       };
-      if (p.endpoint !== undefined) peer.endpoint = p.endpoint;
-      return peer;
     });
     const transport = new PeerMeshTransport({
-      self: { partyId: config.node.partyId, identity },
-      listen: config.transport.listen,
+      self: { partyId: selfPartyId, identity },
+      listen: advertised,
       peers,
       logger: options.logger,
     });
@@ -112,6 +163,8 @@ async function buildFromState(args: {
       transport,
       identity,
       pubkeyBook,
+      selfPartyId,
+      selfEntry,
       ringId,
       start: () => transport.start(),
       stop: () => transport.stop(),
@@ -121,12 +174,12 @@ async function buildFromState(args: {
   if (config.transport.kind === 'relay') {
     if (!config.transport.url)
       throw new Error('buildTransport: transport.url required when transport.kind = "relay"');
-    const peers = config.peers.map((p) => {
-      const entry = pubkeyBook.entries.find((e) => e.partyId === p.partyId)!;
-      return { partyId: p.partyId, publicKey: fromHex(entry.publicKeyHex) };
-    });
+    const peers = bookPeers.map((e) => ({
+      partyId: e.partyId,
+      publicKey: fromHex(e.publicKeyHex),
+    }));
     const transport = new RelayTransport({
-      self: { partyId: config.node.partyId, identity },
+      self: { partyId: selfPartyId, identity },
       relayUrl: config.transport.url,
       ringId,
       peers,
@@ -136,6 +189,8 @@ async function buildFromState(args: {
       transport,
       identity,
       pubkeyBook,
+      selfPartyId,
+      selfEntry,
       ringId,
       start: () => transport.start(),
       stop: () => transport.stop(),
@@ -166,33 +221,53 @@ async function loadPubkeyBook(path: string): Promise<PubkeyBook> {
   return parseBook(text);
 }
 
-function validateIdentityMatchesBook(
-  identity: IdentityKeyPair,
-  book: PubkeyBook,
-  partyId: number,
-  nodeId: string,
-): void {
-  const selfEntry = book.entries.find((e) => e.partyId === partyId);
-  if (!selfEntry) throw new Error(`pubkey book missing entry for self (partyId=${partyId})`);
-  if (selfEntry.publicKeyHex.toLowerCase() !== toHex(identity.publicKeyRaw).toLowerCase())
-    throw new Error("identity pubkey does not match self's entry in pubkey book");
-  if (selfEntry.nodeId !== nodeId)
+function resolveSelfFromBook(identity: IdentityKeyPair, book: PubkeyBook): PubkeyBookEntry {
+  const selfPubkeyHex = toHex(identity.publicKeyRaw).toLowerCase();
+  const entry = book.entries.find((e) => e.publicKeyHex.toLowerCase() === selfPubkeyHex);
+  if (!entry) {
     throw new Error(
-      `pubkey book self entry nodeId='${selfEntry.nodeId}' does not match config node.id='${nodeId}'`,
+      `transport-factory: identity pubkey not found in pubkey book — re-run 'otzi setup' if the book is stale`,
     );
+  }
+  return entry;
 }
 
-function validatePeersInBook(
+function validatePeersAgainstBook(
   book: PubkeyBook,
-  peers: ReadonlyArray<{ id: string; partyId: number }>,
+  configPeers: ReadonlyArray<{ id: string; partyId: number; endpoint?: string }>,
+  selfPartyId: number,
 ): void {
-  for (const p of peers) {
-    const entry = book.entries.find((e) => e.partyId === p.partyId);
-    if (!entry) throw new Error(`pubkey book missing entry for peer partyId=${p.partyId}`);
-    if (entry.nodeId !== p.id)
+  const bookEndpoints = new Set<string>();
+  for (const e of book.entries) {
+    if (e.partyId === selfPartyId) continue;
+    if (e.advertisedEndpoint === undefined) {
       throw new Error(
-        `peer partyId=${p.partyId} book nodeId='${entry.nodeId}' != config '${p.id}'`,
+        `transport-factory: book entry partyId=${e.partyId} missing advertisedEndpoint — re-run 'otzi setup'`,
       );
+    }
+    bookEndpoints.add(e.advertisedEndpoint);
+  }
+  const configEndpoints = new Set<string>();
+  for (let i = 0; i < configPeers.length; i++) {
+    const p = configPeers[i]!;
+    if (p.endpoint === undefined) {
+      throw new Error(`transport-factory: peers[${i}].endpoint required (was: '${p.id}')`);
+    }
+    configEndpoints.add(p.endpoint);
+  }
+  for (const ep of configEndpoints) {
+    if (!bookEndpoints.has(ep)) {
+      throw new Error(
+        `transport-factory: [[peers]] endpoint '${ep}' not found in pubkey book`,
+      );
+    }
+  }
+  for (const ep of bookEndpoints) {
+    if (!configEndpoints.has(ep)) {
+      throw new Error(
+        `transport-factory: book peer endpoint '${ep}' not found in [[peers]] — config + book disagree`,
+      );
+    }
   }
 }
 

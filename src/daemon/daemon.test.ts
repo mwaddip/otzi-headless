@@ -113,6 +113,7 @@ async function buildDaemon(
   return new Daemon({
     state,
     transport,
+    selfPartyId: config.node.partyId,
     rng: SYSTEM_RNG,
     pullOpts: FAST_PULL,
   });
@@ -137,17 +138,11 @@ describe('buildStateFromShare — cross-validation', () => {
     expect(state.peersById.size).toBe(3);
   });
 
-  it('rejects partyId mismatch between config and share', () => {
-    const shares = dealerKeygen(2, 3);
-    const cfg = makeConfig({
-      nodeId: 'node-x',
-      partyId: 1, // share is partyId 0
-      peerIds: [{ id: 'node-y', partyId: 0 }, { id: 'node-z', partyId: 2 }],
-    });
-    expect(() => buildStateFromShare(cfg, shares[0]!)).toThrow(
-      /share\.partyId \(0\) does not match/,
-    );
-  });
+  // Removed: 'rejects partyId mismatch between config and share' — the check
+  // moved from config-merge.validateAlignment to
+  // transport-factory.resolveSelfFromBook, which compares share.partyId
+  // against the book entry resolved by pubkey match (the authoritative
+  // source). Phase F drops config.node.partyId outright.
 
   it('rejects peer-count mismatch', () => {
     const shares = dealerKeygen(2, 3);
@@ -409,6 +404,7 @@ describe('Daemon — lifecycle', () => {
       new Daemon({
         state: buildStateFromShare(cfg, ring.shares[0]!),
         transport: ring.transports.get(0)!,
+        selfPartyId: 0,
         rng: SYSTEM_RNG,
         pullOpts: FAST_PULL,
       }),

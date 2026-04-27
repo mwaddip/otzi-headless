@@ -59,6 +59,13 @@ import type { NetworkName } from '../config/types';
 export interface DaemonDeps {
   state: LoadedDaemonState;
   transport: Transport;
+  /**
+   * Self's partyId, resolved from the pubkey book by pubkey match. The
+   * authoritative runtime partyId — `state.config.node.partyId` is
+   * deprecated (Phase F removes it). Caller obtains this from
+   * `TransportBundle.selfPartyId`.
+   */
+  selfPartyId: number;
   rng: Rng;
   pullOpts: PullOpts;
   /** FROST key material, when the share was produced by a V3 combined DKG. */
@@ -138,7 +145,7 @@ export class Daemon {
       transport: deps.transport,
       runner,
       gate,
-      node: { id: deps.state.config.node.id, partyId: deps.state.config.node.partyId },
+      node: { id: deps.state.config.node.id, partyId: deps.selfPartyId },
       peersById: deps.state.peersById,
       share: deps.state.share,
       frostKeyPackage: deps.frostKeyPackage ?? deps.state.share?.frostKeyPackage,
@@ -156,7 +163,7 @@ export class Daemon {
     this.leader = new LeaderDispatcher({
       runner,
       gate,
-      node: { id: deps.state.config.node.id, partyId: deps.state.config.node.partyId },
+      node: { id: deps.state.config.node.id, partyId: deps.selfPartyId },
       peersById: deps.state.peersById,
       share: deps.state.share,
       frostKeyPackage: deps.frostKeyPackage ?? deps.state.share?.frostKeyPackage,
