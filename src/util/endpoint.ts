@@ -40,7 +40,6 @@ function splitHostPort(input: string, path: string): HostPort {
   const trimmed = input.trim();
   if (trimmed.length === 0) throw new EndpointParseError(path, 'empty input');
 
-  // Bracketed IPv6: [v6] or [v6]:port
   if (trimmed.startsWith('[')) {
     const close = trimmed.indexOf(']');
     if (close === -1) throw new EndpointParseError(path, 'missing closing bracket on IPv6 host');
@@ -53,14 +52,14 @@ function splitHostPort(input: string, path: string): HostPort {
     return { host, port: parsePort(rest.slice(1), path), isIPv6: true };
   }
 
-  // Any unbracketed input with 2+ colons is IPv6 (or ambiguous IPv6:port).
-  // Require brackets in all cases — reject before isIP can silently accept.
+  // Reject unbracketed multi-colon inputs before isIP can silently accept
+  // them — node:net.isIP('2a11:6c7::11:1044') returns 6 (valid IPv6), so
+  // a host:port form would be swallowed as a bare address.
   const colonCount = (trimmed.match(/:/g) ?? []).length;
   if (colonCount >= 2) {
     throw new EndpointParseError(path, `IPv6 address with port must be bracketed: '[host]:port' (got '${trimmed}')`);
   }
 
-  // host[:port] — IPv4 or hostname
   const colonIdx = trimmed.indexOf(':');
   const host = colonIdx === -1 ? trimmed : trimmed.slice(0, colonIdx);
   if (host.length === 0) throw new EndpointParseError(path, 'empty host');
@@ -83,7 +82,6 @@ function parsePort(s: string, path: string): number {
  */
 function canonicalizeIPv6(input: string): string {
   const lower = input.toLowerCase();
-  // Already-compressed forms (containing `::`) — expand to 8 groups, then re-compress canonically.
   let groups: string[];
   if (lower.includes('::')) {
     const [head, tail] = lower.split('::');
@@ -95,10 +93,8 @@ function canonicalizeIPv6(input: string): string {
   } else {
     groups = lower.split(':');
   }
-  // Strip leading zeros in each group.
   const stripped = groups.map((g) => g.replace(/^0+/, '') || '0');
 
-  // Find longest zero-run of length ≥ 2.
   let bestStart = -1;
   let bestLen = 0;
   let curStart = -1;
@@ -127,8 +123,6 @@ function canonicalizeIPv6(input: string): string {
 
 export function canonicalizeEndpoint(input: string): string {
   const path = `'${input}'`;
-  if (typeof input !== 'string') throw new EndpointParseError(path, 'must be a string');
-
   const { host, port, isIPv6 } = splitHostPort(input, path);
 
   if (WILDCARD_HOSTS.has(host)) {
@@ -143,12 +137,10 @@ export function canonicalizeEndpoint(input: string): string {
     return `[${canonical}]:${port}`;
   }
 
-  const ipKind = isIP(host);
-  if (ipKind === 4) {
+  if (isIP(host) === 4) {
     return `${host}:${port}`;
   }
 
-  // Hostname — lowercase. Reject wildcard glob.
   const lower = host.toLowerCase();
   if (lower.includes('*') || lower.length === 0) {
     throw new EndpointParseError(path, `invalid hostname: '${host}'`);
