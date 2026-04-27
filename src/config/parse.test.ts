@@ -80,13 +80,13 @@ url = "wss://relay.example.com"
 id = "bravo"
 party_id = 1
 wallet_address = "0xdeadbeef"
-endpoint = "wss://bravo.example:8443"
+endpoint = "bravo.example:8443"
 
 [[peers]]
 id = "charlie"
 party_id = 3
 wallet_address = "0xfeedface"
-endpoint = "wss://charlie.example:8443"
+endpoint = "charlie.example:8443"
 
 [gate]
 strategy = "policy"
@@ -112,7 +112,7 @@ schedule = "0 */6 * * *"
       id: 'bravo',
       partyId: 1,
       walletAddress: '0xdeadbeef',
-      endpoint: 'wss://bravo.example:8443',
+      endpoint: 'bravo.example:8443',
     });
     expect(cfg.gate.strategy).toBe('policy');
     expect(cfg.gate.params).toEqual({
@@ -390,5 +390,129 @@ describe('uds trigger params', () => {
         MINIMAL_TOML + '\n[[triggers]]\nkind = "uds"\npath = "otzi.sock"\n',
       ),
     ).toThrow(/path.*absolute/);
+  });
+});
+
+describe('parse — endpoint canonicalization', () => {
+  it('canonicalizes [[peers]].endpoint with default port', () => {
+    const text = `
+[share]
+path = "/x"
+password_env = "P"
+[node]
+id = "a"
+party_id = 0
+[network]
+name = "testnet"
+opnet_rpc = "https://testnet.opnet.org"
+[transport]
+kind = "peer-mesh"
+listen = "127.0.0.1:8800"
+[[peers]]
+id = "b"
+party_id = 1
+endpoint = "Node-B.example.com"
+[gate]
+strategy = "auto"
+`;
+    const cfg = parseDaemonConfigToml(text);
+    expect(cfg.peers[0]!.endpoint).toBe('node-b.example.com:8800');
+  });
+
+  it('accepts transport.advertised_endpoint and stores canonical in both fields', () => {
+    const text = `
+[share]
+path = "/x"
+password_env = "P"
+[node]
+id = "a"
+party_id = 0
+[network]
+name = "testnet"
+opnet_rpc = "https://testnet.opnet.org"
+[transport]
+kind = "peer-mesh"
+advertised_endpoint = "192.168.1.5"
+[[peers]]
+id = "b"
+party_id = 1
+[gate]
+strategy = "auto"
+`;
+    const cfg = parseDaemonConfigToml(text);
+    expect(cfg.transport.advertisedEndpoint).toBe('192.168.1.5:8800');
+    expect(cfg.transport.listen).toBe('192.168.1.5:8800');
+  });
+
+  it('accepts transport.listen (legacy) and stores canonical in both fields', () => {
+    const text = `
+[share]
+path = "/x"
+password_env = "P"
+[node]
+id = "a"
+party_id = 0
+[network]
+name = "testnet"
+opnet_rpc = "https://testnet.opnet.org"
+[transport]
+kind = "peer-mesh"
+listen = "192.168.1.5:1044"
+[[peers]]
+id = "b"
+party_id = 1
+[gate]
+strategy = "auto"
+`;
+    const cfg = parseDaemonConfigToml(text);
+    expect(cfg.transport.advertisedEndpoint).toBe('192.168.1.5:1044');
+    expect(cfg.transport.listen).toBe('192.168.1.5:1044');
+  });
+
+  it('rejects wildcard 0.0.0.0 in transport.advertised_endpoint', () => {
+    const text = `
+[share]
+path = "/x"
+password_env = "P"
+[node]
+id = "a"
+party_id = 0
+[network]
+name = "testnet"
+opnet_rpc = "https://testnet.opnet.org"
+[transport]
+kind = "peer-mesh"
+advertised_endpoint = "0.0.0.0:8800"
+[[peers]]
+id = "b"
+party_id = 1
+[gate]
+strategy = "auto"
+`;
+    expect(() => parseDaemonConfigToml(text)).toThrow(/wildcard/);
+  });
+
+  it('rejects wildcard in [[peers]].endpoint', () => {
+    const text = `
+[share]
+path = "/x"
+password_env = "P"
+[node]
+id = "a"
+party_id = 0
+[network]
+name = "testnet"
+opnet_rpc = "https://testnet.opnet.org"
+[transport]
+kind = "peer-mesh"
+listen = "127.0.0.1:8800"
+[[peers]]
+id = "b"
+party_id = 1
+endpoint = "0.0.0.0:8800"
+[gate]
+strategy = "auto"
+`;
+    expect(() => parseDaemonConfigToml(text)).toThrow(/wildcard/);
   });
 });

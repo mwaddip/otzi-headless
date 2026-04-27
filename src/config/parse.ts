@@ -7,6 +7,7 @@
  */
 
 import { parse as parseToml } from 'smol-toml';
+import { canonicalizeEndpoint, EndpointParseError } from '../util/endpoint';
 import {
   BootstrapConfig,
   BOOTSTRAP_ROLES,
@@ -133,26 +134,54 @@ function parseTransport(raw: unknown): TransportConfig {
       throw new ConfigError('transport.url', 'required when transport.kind = "relay"');
     return { kind, url: asString(o.url, 'transport.url') };
   }
-  // peer-mesh — `listen` is optional at parse time (in-memory tests omit it);
-  // consumer (transport factory) errors if missing at construction time.
+  // peer-mesh — accept `advertised_endpoint` (preferred) or `listen` (legacy).
+  // Both represent this node's reachable address. Either is canonicalized at
+  // parse time; result is stored in BOTH `advertisedEndpoint` and `listen`
+  // so transitional consumers can read either field.
   const out: TransportConfig = { kind };
-  if (o.listen !== undefined) out.listen = asString(o.listen, 'transport.listen');
+  const rawEndpoint = o.advertised_endpoint ?? o.listen;
+  if (rawEndpoint !== undefined) {
+    const fieldPath =
+      o.advertised_endpoint !== undefined ? 'transport.advertised_endpoint' : 'transport.listen';
+    const rawStr = asString(rawEndpoint, fieldPath);
+    let canonical: string;
+    try {
+      canonical = canonicalizeEndpoint(rawStr);
+    } catch (err) {
+      if (err instanceof EndpointParseError) {
+        throw new ConfigError(fieldPath, err.message);
+      }
+      throw err;
+    }
+    out.advertisedEndpoint = canonical;
+    out.listen = canonical; // mirror for transitional consumers
+  }
   return out;
 }
 
 function parsePeer(raw: unknown, i: number): PeerEntry {
   const path = `peers[${i}]`;
   const o = asObject(raw, path);
-  return {
+  const out: PeerEntry = {
     id: asString(o.id, `${path}.id`),
     partyId: asInteger(o.party_id, `${path}.party_id`, 0),
     walletAddress:
       o.wallet_address === undefined
         ? undefined
         : asString(o.wallet_address, `${path}.wallet_address`),
-    endpoint:
-      o.endpoint === undefined ? undefined : asString(o.endpoint, `${path}.endpoint`),
   };
+  if (o.endpoint !== undefined) {
+    const rawStr = asString(o.endpoint, `${path}.endpoint`);
+    try {
+      out.endpoint = canonicalizeEndpoint(rawStr);
+    } catch (err) {
+      if (err instanceof EndpointParseError) {
+        throw new ConfigError(`${path}.endpoint`, err.message);
+      }
+      throw err;
+    }
+  }
+  return out;
 }
 
 function parsePeers(raw: unknown): PeerEntry[] {

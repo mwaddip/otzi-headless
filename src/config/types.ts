@@ -60,7 +60,18 @@ export interface TransportConfig {
   kind: TransportKind;
   /** Relay URL when kind === 'relay'. E.g. `ws://relay.example:9000`. */
   url?: string;
-  /** Listen address when kind === 'peer-mesh'. E.g. `127.0.0.1:8800`. */
+  /**
+   * Peer-mesh: this node's reachable address (canonical `host:port` form).
+   * Phase E switches consumers to read this; Phase F drops `listen`.
+   * Operator may write either `advertised_endpoint` (preferred) or `listen`
+   * (legacy) in TOML — parser canonicalizes either into this field.
+   */
+  advertisedEndpoint?: string;
+  /**
+   * @deprecated — superseded by `advertisedEndpoint`. Phase F removes this.
+   * Phase D's parser accepts both keys but stores the canonical form here
+   * AND in `advertisedEndpoint` for transitional consumer compatibility.
+   */
   listen?: string;
 }
 
