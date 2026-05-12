@@ -137,10 +137,21 @@ debconf will prompt — answer the same way on each node:
 | Bitcoin network | `testnet` | `testnet` | `testnet` |
 | OPNet RPC URL | `https://testnet.opnet.org` | *same* | *same* |
 | Transport kind | `peer-mesh` | `peer-mesh` | `peer-mesh` |
-| Listen address | `0.0.0.0:8800` | `0.0.0.0:8800` | `0.0.0.0:8800` |
-| Bootstrap bind / leader URL | bind `0.0.0.0:7090` | leader `http://node-a:7090` | leader `http://node-a:7090` |
-| Peer hostnames | `node-b node-c` | `node-a node-c` | `node-a node-b` |
+| This node's reachable address | `node-a.example:8800` | `node-b.example:8800` | `node-c.example:8800` |
+| Other peers (comma-separated `host[:port]`) | `node-b.example,node-c.example` | `node-c.example` | `node-b.example` |
+| Bootstrap bind / leader URL | bind `0.0.0.0:7090` | leader `http://node-a.example:7090` | leader `http://node-a.example:7090` |
 | Node identifier | `node-a` | `node-b` | `node-c` |
+
+Two notes on the address prompts:
+
+- **"This node's reachable address"** is the address peers will dial to
+  reach this daemon. Wildcard binds (`0.0.0.0`, `::`) are rejected at
+  parse — use the host's routable IP or DNS name. Port defaults to 8800
+  if omitted.
+- **"Other peers"** is a comma-separated list of every OTHER node in the
+  ring. On a leaf, you do NOT need to retype the leader here — postinst
+  derives the leader-as-peer entry automatically from the Bootstrap
+  leader URL above. So leaves only list peers other than the leader.
 
 The bootstrap secret is short-lived: it lives at
 `/var/lib/otzi/bootstrap-secret` (mode 660 root:otzi) and is automatically
@@ -175,37 +186,23 @@ pubkey book. **Eyeball-compare the fingerprint across all three nodes.**
 If any node shows a different value, someone tampered with the exchange —
 delete `/var/lib/otzi/pubkeys.json` everywhere and start over.
 
-### 3. Complete the peer entries
+The pubkey book records each peer's partyId (assigned deterministically by
+sorted-pubkey-bytes order, identical on every node) and reachable address.
+No manual editing of `daemon.toml` is required — `[[peers]]` was populated
+from your debconf "Other peers" answer at install time.
 
-After `otzi setup` finishes, each node has a `pubkeys.json` but
-`/etc/otzi/daemon.toml`'s `[[peers]]` blocks are stubs. Edit them in,
-copying `wallet_address` from the freshly written `pubkeys.json`:
+### 3. Run DKG
 
-```toml
-[[peers]]
-id = "node-b"
-party_id = 1
-wallet_address = "0xabc..."
-endpoint = "ws://node-b.example:8800"
-
-[[peers]]
-id = "node-c"
-party_id = 2
-wallet_address = "0xdef..."
-endpoint = "ws://node-c.example:8800"
-```
-
-Same on every node, with each node's own block omitted. `party_id` values
-are assigned during bootstrap and recorded in `pubkeys.json`.
-
-### 4. Run DKG
-
-**On the leader only** (the daemon must already be reachable via systemd
-— start it now):
+**On every node**, bring the daemon up:
 
 ```bash
-sudo systemctl enable --now otzi    # on every node
-otzi generate /etc/otzi/daemon.toml # on the leader only
+sudo systemctl enable --now otzi
+```
+
+**On the leader only**, trigger the threshold-key generation:
+
+```bash
+otzi generate /etc/otzi/daemon.toml
 ```
 
 The leader derives `parties = 3` from its configured peer set and runs a
@@ -223,7 +220,7 @@ otzi generate: DKG complete (status=done)
   share path:        /var/lib/otzi/share.json
 ```
 
-### 5. Fund the vault
+### 4. Fund the vault
 
 Send testnet BTC (or OP20 tokens for an OPNet flow) to the printed vault
 addresses. Verify on a block explorer; the daemon does not watch chains.
@@ -233,7 +230,7 @@ otzi btc balance              # poll until you see your funding
 otzi op20 balance BHTT        # if your manifest defines OP20 tokens
 ```
 
-### 6. Install a manifest
+### 5. Install a manifest
 
 A manifest (`.otzi.json`) is a per-project file enumerating contract
 addresses, ABI shorthand (OP20 / OP20S / OP721 / Custom), and per-token
@@ -254,7 +251,7 @@ in [`docs/cli.md`](docs/cli.md) — HMAC-authenticated push to all peers
 in one call. After DKG, manifest distribution is operator-local
 (`otzi install` on each node).
 
-### 7. Sign your first transaction
+### 6. Sign your first transaction
 
 OPNet contract call:
 

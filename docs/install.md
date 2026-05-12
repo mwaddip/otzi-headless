@@ -33,10 +33,15 @@ follow up with `sudo apt -f install` to resolve.)
    - **Bootstrap secret** (shared passphrase, agreed out-of-band among
      operators before install).
    - **Bitcoin network** + **OPNet RPC URL** (per-network defaults provided).
-   - **Transport kind** + **listen address** (or **relay URL**).
+   - **Transport kind**:
+     - For `peer-mesh`: **This node's reachable address** (canonical
+       `host[:port]`, wildcards rejected) and **Other peers** (comma-
+       separated `host[:port]` list of every other node — on a leaf,
+       the leader is auto-derived from the bootstrap leader URL, so
+       you only list peers *other than* the leader).
+     - For `relay`: **Relay URL**.
    - **Bootstrap bind** (leader) or **leader URL** (leaf).
-   - **Peer hostnames** (optional, populates `[[peers]]` stubs).
-   - **Node identifier** (defaults to `hostname -s`).
+   - **Node identifier** (defaults to `hostname -s`; local logging label only).
 
 2. **Log out / log back in** (or `newgrp otzi`) so your shell picks up
    the new group membership.
@@ -46,31 +51,22 @@ follow up with `sudo apt -f install` to resolve.)
    sudo -u otzi otzi setup /etc/otzi/daemon.toml
    ```
    (Or, as a member of the `otzi` group, just `otzi setup
-   /etc/otzi/daemon.toml`.) Records identity pubkeys in
-   `/var/lib/otzi/pubkeys.json` and prints the 8-char SHA-256
-   fingerprint. **Verify the same fingerprint on every node** out-of-band.
+   /etc/otzi/daemon.toml`.) Records identity pubkeys + each peer's
+   reachable address in `/var/lib/otzi/pubkeys.json` and prints the
+   8-char SHA-256 fingerprint. **Verify the same fingerprint on every
+   node** out-of-band. partyIds are assigned deterministically by
+   sorted-pubkey-bytes order — every node observes the same mapping.
 
-4. **Edit `/etc/otzi/daemon.toml`** and complete `[[peers]]` from
-   `pubkeys.json`:
-
-```toml
-[[peers]]
-id = "node-b"
-party_id = 1
-wallet_address = "0xabc..."
-endpoint = "ws://node-b.example:8800"
-```
+4. **Enable + start the daemon:**
+   ```
+   sudo systemctl enable --now otzi
+   ```
 
 5. **Run `otzi generate`** on the leader to trigger DKG. Daemon writes
    the share file; the bootstrap-secret is wiped automatically once DKG
    completes:
    ```
    sudo -u otzi otzi generate /etc/otzi/daemon.toml
-   ```
-
-6. **Enable + start the daemon:**
-   ```
-   sudo systemctl enable --now otzi
    ```
 
 Logs: `journalctl -u otzi -f`.
