@@ -117,16 +117,15 @@ BANNER
       db_get otzi-headless/role || true;                  ROLE="$RET"
       db_get otzi-headless/network || true;               NETWORK="$RET"
       db_get otzi-headless/opnet-rpc || true;             OPNET_RPC="$RET"
-      db_get otzi-headless/peer-hostnames || true;        PEER_HOSTS="$RET"
       db_get otzi-headless/transport || true;             TRANSPORT="$RET"
-      db_get otzi-headless/listen || true;                LISTEN="$RET"
+      db_get otzi-headless/advertised-endpoint || true;   ADVERTISED="$RET"
+      db_get otzi-headless/peers || true;                 PEERS_CSV="$RET"
       db_get otzi-headless/relay-url || true;             RELAY_URL="$RET"
       db_get otzi-headless/bootstrap-bind || true;        BOOTSTRAP_BIND="$RET"
       db_get otzi-headless/bootstrap-leader-url || true;  BOOTSTRAP_LEADER_URL="$RET"
       db_get otzi-headless/node-id || true;               NODE_ID="$RET"
 
       [ -n "$NODE_ID" ]        || NODE_ID="$(hostname -s 2>/dev/null || hostname)"
-      [ -n "$LISTEN" ]         || LISTEN="0.0.0.0:8800"
       [ -n "$NETWORK" ]        || NETWORK="testnet"
       [ -n "$OPNET_RPC" ]      || OPNET_RPC="https://testnet.opnet.org"
       [ -n "$TRANSPORT" ]      || TRANSPORT="peer-mesh"
@@ -135,7 +134,7 @@ BANNER
 
       ENODE_ID="$(toml_escape "$NODE_ID")"
       EOPNET_RPC="$(toml_escape "$OPNET_RPC")"
-      ELISTEN="$(toml_escape "$LISTEN")"
+      EADVERTISED="$(toml_escape "$ADVERTISED")"
       ERELAY_URL="$(toml_escape "$RELAY_URL")"
       EBOOTSTRAP_BIND="$(toml_escape "$BOOTSTRAP_BIND")"
       EBOOTSTRAP_LEADER_URL="$(toml_escape "$BOOTSTRAP_LEADER_URL")"
@@ -152,7 +151,6 @@ password_env = "OTZI_SHARE_PASSWORD"
 
 [node]
 id = "$ENODE_ID"
-party_id = 0                          # set by bootstrap; override after \`otzi setup\`
 identity_key_file = "/var/lib/otzi/identity.json"
 pubkey_book_file = "/var/lib/otzi/pubkeys.json"
 
@@ -173,35 +171,51 @@ EOF
         cat >>/etc/otzi/daemon.toml <<EOF
 [transport]
 kind = "peer-mesh"
-listen = "$ELISTEN"
+advertised_endpoint = "$EADVERTISED"
 
 EOF
       fi
 
-      if [ -n "$PEER_HOSTS" ]; then
-        echo "# [[peers]] stubs — fill in id, party_id, wallet_address from /var/lib/otzi/pubkeys.json after \`otzi setup\`." >>/etc/otzi/daemon.toml
-        for HOST in $PEER_HOSTS; do
-          EHOST="$(toml_escape "$HOST")"
-          cat >>/etc/otzi/daemon.toml <<EOF
-# [[peers]]
-# id = "REPLACE-ME"
-# party_id = 0
-# wallet_address = "0x..."
-# endpoint = "ws://$EHOST:8800"
+      # [[peers]] rendering — operator-supplied CSV of `host[:port]`. For
+      # leaves, prepend an auto-derived entry for the leader (the operator
+      # already typed the leader URL; no need to retype the leader's host
+      # again under "Other peers"). All values are written verbatim — the
+      # daemon's TOML parser canonicalizes (default port, lowercase host,
+      # RFC 5952 IPv6 collapse) on startup.
+      if [ "$TRANSPORT" != "relay" ]; then
+        if [ "$ROLE" = "leaf" ] && [ -n "$BOOTSTRAP_LEADER_URL" ]; then
+          # Strip scheme + path + port: http://leader-host:7090/path → leader-host
+          LEADER_HOST=$(printf '%s' "$BOOTSTRAP_LEADER_URL" \
+            | sed -E 's#^[a-zA-Z]+://##; s#[/?#].*$##; s#:[0-9]+$##')
+          if [ -n "$LEADER_HOST" ]; then
+            ELEADER_HOST="$(toml_escape "$LEADER_HOST")"
+            cat >>/etc/otzi/daemon.toml <<EOF
+[[peers]]
+endpoint = "$ELEADER_HOST:8800"
 
 EOF
-        done
-      else
-        cat >>/etc/otzi/daemon.toml <<EOF
-# [[peers]] entries — populate after \`otzi setup\` completes the bootstrap.
-# Each peer's id, party_id, wallet_address come from /var/lib/otzi/pubkeys.json.
-# [[peers]]
-# id = "node-b"
-# party_id = 1
-# wallet_address = "0x..."
-# endpoint = "ws://node-b.example:8800"
+          fi
+        fi
+
+        if [ -n "$PEERS_CSV" ]; then
+          # CSV split on commas; trim whitespace; skip empties. POSIX sh
+          # avoids `read`-in-pipeline-subshell issues by iterating a saved
+          # IFS-split list.
+          OLD_IFS="$IFS"
+          IFS=','
+          for RAW_PEER in $PEERS_CSV; do
+            # Trim leading + trailing whitespace.
+            PEER=$(printf '%s' "$RAW_PEER" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -z "$PEER" ] && continue
+            EPEER="$(toml_escape "$PEER")"
+            cat >>/etc/otzi/daemon.toml <<EOF
+[[peers]]
+endpoint = "$EPEER"
 
 EOF
+          done
+          IFS="$OLD_IFS"
+        fi
       fi
 
       cat >>/etc/otzi/daemon.toml <<EOF
@@ -243,23 +257,10 @@ EOF
 otzi-headless installed. Next steps:
 
   1. Bootstrap pubkey exchange:
-EOF
-      if [ "$ROLE" = "leader" ]; then
-        cat <<EOF
        sudo -u otzi otzi setup /etc/otzi/daemon.toml
-EOF
-      else
-        cat <<EOF
-       sudo -u otzi otzi setup /etc/otzi/daemon.toml
-       (Edit /etc/otzi/daemon.toml first to set [bootstrap].leader_url
-        if the leader URL changed since install.)
-EOF
-      fi
-      cat <<EOF
-  2. Edit /etc/otzi/daemon.toml — fill in [[peers]] from /var/lib/otzi/pubkeys.json.
-  3. Generate the threshold share:
+  2. Generate the threshold share:
        sudo -u otzi otzi generate /etc/otzi/daemon.toml
-  4. Enable + start the daemon:
+  3. Enable + start the daemon:
        sudo systemctl enable --now otzi
 
 Operators (in 'otzi' group): $OPERATORS

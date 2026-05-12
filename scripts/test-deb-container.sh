@@ -8,9 +8,9 @@
 #   - /etc/otzi/daemon.toml is rendered with the expected fields
 #   - /lib/systemd/system/otzi.service is registered
 #   - otzi user/group exist
-#   - `otzi daemon` against the rendered config gets past load and errors
-#     on the expected "missing peer entries" validation (proves the bundle
-#     loads + the parser runs end-to-end).
+#   - `otzi daemon` against the rendered config gets past parse + transport
+#     init and errors on the missing OTZI_SHARE_PASSWORD env var (proves the
+#     bundle loads + the parser accepts the rendered TOML end-to-end).
 #
 # Usage: bash scripts/test-deb-container.sh
 set -euo pipefail
@@ -60,9 +60,9 @@ otzi-headless otzi-headless/operators string
 otzi-headless otzi-headless/bootstrap-secret password test-bootstrap-secret
 otzi-headless otzi-headless/network select testnet
 otzi-headless otzi-headless/opnet-rpc string https://testnet.opnet.org
-otzi-headless otzi-headless/peer-hostnames string node-b.example node-c.example
 otzi-headless otzi-headless/transport select peer-mesh
-otzi-headless otzi-headless/listen string 0.0.0.0:8800
+otzi-headless otzi-headless/advertised-endpoint string 192.0.2.1:8800
+otzi-headless otzi-headless/peers string 192.0.2.2:8800,192.0.2.3:8800
 otzi-headless otzi-headless/bootstrap-bind string 0.0.0.0:7090
 otzi-headless otzi-headless/node-id string testnode-a
 EOF
@@ -83,15 +83,21 @@ echo "OK: layout"
 
 echo ">> verifying daemon.toml carries our debconf answers"
 docker exec "$CONTAINER" bash -euo pipefail -c '
-grep -q "id = \"testnode-a\""              /etc/otzi/daemon.toml
-grep -q "name = \"testnet\""               /etc/otzi/daemon.toml
-grep -q "opnet_rpc = \"https://testnet"    /etc/otzi/daemon.toml
-grep -q "kind = \"peer-mesh\""             /etc/otzi/daemon.toml
-grep -q "listen = \"0.0.0.0:8800\""        /etc/otzi/daemon.toml
-grep -q "endpoint = \"ws://node-b.example" /etc/otzi/daemon.toml
-grep -q "^kind = \"uds\""                  /etc/otzi/daemon.toml
-grep -q "^role = "                         /etc/otzi/daemon.toml
-grep -q "^bind = \"0.0.0.0:7090\""         /etc/otzi/daemon.toml
+grep -q "id = \"testnode-a\""                      /etc/otzi/daemon.toml
+grep -q "name = \"testnet\""                       /etc/otzi/daemon.toml
+grep -q "opnet_rpc = \"https://testnet"            /etc/otzi/daemon.toml
+grep -q "kind = \"peer-mesh\""                     /etc/otzi/daemon.toml
+grep -q "advertised_endpoint = \"192.0.2.1:8800\"" /etc/otzi/daemon.toml
+grep -q "endpoint = \"192.0.2.2:8800\""            /etc/otzi/daemon.toml
+grep -q "endpoint = \"192.0.2.3:8800\""            /etc/otzi/daemon.toml
+grep -q "^kind = \"uds\""                          /etc/otzi/daemon.toml
+grep -q "^role = "                                 /etc/otzi/daemon.toml
+grep -q "^bind = \"0.0.0.0:7090\""                 /etc/otzi/daemon.toml
+
+# Phase F end-state: legacy fields MUST NOT appear in the rendered TOML.
+! grep -q "party_id"     /etc/otzi/daemon.toml || { echo "FAIL: legacy party_id present";     exit 1; }
+! grep -q "wallet_address" /etc/otzi/daemon.toml || { echo "FAIL: legacy wallet_address present"; exit 1; }
+! grep -qE "^listen = "  /etc/otzi/daemon.toml || { echo "FAIL: legacy listen = present";    exit 1; }
 echo "OK: rendered toml"
 '
 
@@ -109,23 +115,25 @@ echo "OK: phase 9a perms"
 echo ">> running otzi (usage banner)"
 docker exec "$CONTAINER" /usr/bin/otzi 2>&1 || true   # exits 1 when no subcommand — that's the usage path
 
-echo ">> running otzi daemon against the rendered (incomplete) config"
-# Expect failure with "peers" complaint — proves bundle + parser work.
+echo ">> running otzi daemon against the rendered config (no share password set)"
+# The rendered TOML is fully valid post-Phase-G; daemon load gets past the
+# parser and fails at the env-var check for OTZI_SHARE_PASSWORD. That's the
+# proof that the bundled JS + parser accept the rendered config end-to-end.
 set +e
 OUT=$(docker exec "$CONTAINER" /usr/bin/otzi daemon /etc/otzi/daemon.toml 2>&1)
 RC=$?
 set -e
 if [ $RC -eq 0 ]; then
-  echo "unexpected: otzi daemon succeeded with no peers" >&2
+  echo "unexpected: otzi daemon succeeded with no share password env var" >&2
   echo "$OUT" >&2
   exit 1
 fi
-if ! printf '%s\n' "$OUT" | grep -q "peers"; then
-  echo "unexpected error message — wanted /peers/, got:" >&2
+if ! printf '%s\n' "$OUT" | grep -q "OTZI_SHARE_PASSWORD"; then
+  echo "unexpected error message — wanted /OTZI_SHARE_PASSWORD/, got:" >&2
   printf '%s\n' "$OUT" >&2
   exit 1
 fi
-echo "OK: daemon rejects incomplete config with the expected 'peers' error"
+echo "OK: daemon rejects unset password env var (parse + load reached)"
 
 # ─────────────────────────────────────────────────────────────────────────
 # Second pass: restore-from-backup round-trip.

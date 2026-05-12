@@ -56,14 +56,6 @@ Description: OPNet RPC URL
  defaults: https://api.opnet.org (mainnet), https://testnet.opnet.org
  (testnet), http://127.0.0.1:9001 (regtest).
 
-Template: otzi-headless/peer-hostnames
-Type: string
-Description: Peer hostnames (space-separated, optional)
- List the hostnames or IPs of the other nodes in the ring (e.g.
- "node-b.example node-c.example"). Used to populate stub [[peers]]
- entries in the generated daemon.toml. Leave blank to fill in manually
- after bootstrap.
-
 Template: otzi-headless/transport
 Type: select
 Choices: peer-mesh, relay
@@ -73,11 +65,22 @@ Description: Transport kind
  for permanent federations with stable hostnames). "relay" — daemons
  connect through a central relay server.
 
-Template: otzi-headless/listen
+Template: otzi-headless/advertised-endpoint
 Type: string
-Default: 0.0.0.0:8800
-Description: Peer-mesh listen address (host:port)
- Address this node binds for inbound peer-mesh connections.
+Description: This node's reachable address (host[:port])
+ Address peers will dial to reach this daemon (e.g. 192.168.1.5:8800).
+ Wildcard binds (0.0.0.0, ::) are rejected at parse — use the host's
+ routable IP or DNS name. Port defaults to 8800 if omitted. Required
+ when transport is "peer-mesh".
+
+Template: otzi-headless/peers
+Type: string
+Description: Other peers (comma-separated host[:port])
+ Reachable addresses of every OTHER node in the ring (e.g.
+ "192.168.1.6:8800,node-c.example,[2a11:6c7::11]:1044"). Port defaults
+ to 8800 if omitted. The leader does NOT need to be re-typed here on
+ leaves — postinst auto-derives the leader-as-peer entry from the
+ Bootstrap leader URL.
 
 Template: otzi-headless/relay-url
 Type: string

@@ -46,7 +46,8 @@ TRANSPORT="$RET"
 if [ "$TRANSPORT" = "relay" ]; then
   db_input high otzi-headless/relay-url || true
 else
-  db_input medium otzi-headless/listen || true
+  db_input high otzi-headless/advertised-endpoint || true
+  db_input high otzi-headless/peers || true
 fi
 
 # Conditional sub-prompts based on role choice.
@@ -60,7 +61,6 @@ fi
 
 # Other medium-priority prompts.
 db_input medium otzi-headless/opnet-rpc || true
-db_input medium otzi-headless/peer-hostnames || true
 db_input medium otzi-headless/node-id || true
 
 db_go || true
