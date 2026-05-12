@@ -21,16 +21,19 @@
   - **Post:** Locates Ötzi-compatible share file and its decryption password source.
 
 - `NodeConfig` — interface
-  - **Pre:** `id` is logical identifier; `partyId` ∈ [0, n-1]; `identityKeyFile`, `pubkeyBookFile` optional (but required for real transports at construction time).
-  - **Post:** Identifies this node and its cryptographic keys. Files are absent in in-memory tests.
+  - **Pre:** `id` is a logical identifier (local logging label only); `identityKeyFile`, `pubkeyBookFile` optional (but required for real transports at construction time).
+  - **Post:** Identifies this node locally and points at its cryptographic key files. `id` is *not* a cross-node identity — peers can name node N anything they want; the pubkey book is the cross-node identity primitive. Files are absent in in-memory tests.
+  - **Phase F:** `partyId` removed — derived at startup from the pubkey book by pubkey match; see `facts/daemon.md::transport-factory.ts::resolveSelfFromBook`.
 
 - `TransportConfig` — interface
-  - **Pre:** `kind` ∈ `TRANSPORT_KINDS`. If `kind === 'relay'`, `url` present; if `kind === 'peer-mesh'`, `listen` optional at parse time (error deferred to transport factory).
-  - **Post:** Specifies peer communication channel.
+  - **Pre:** `kind` ∈ `TRANSPORT_KINDS`. If `kind === 'relay'`, `url` present. If `kind === 'peer-mesh'`, `advertisedEndpoint` is set (canonical `host:port` form post-parse); transport-factory hard-errors at startup if absent.
+  - **Post:** Specifies peer communication channel. `advertisedEndpoint` is the address peers dial to reach this daemon.
+  - **Phase F:** `listen` field removed; renamed to `advertisedEndpoint`. Parser strict-rejects the legacy key.
 
 - `PeerEntry` — interface
-  - **Pre:** `id` unique (validated later); `partyId` ∈ [0, n-1], unique; `walletAddress` optional, `endpoint` optional (required by phase 3).
-  - **Post:** Records one federation peer for announce/commit coordination.
+  - **Pre:** `endpoint` is a canonical `host:port` (post-parse, after `canonicalizeEndpoint`).
+  - **Post:** Records one peer's reachable address. Order does not matter — partyIds are derived from the pubkey book by sorted-pubkey-bytes order. `[[peers]]` is a typo-detection sanity check against the authoritative book (bidirectional endpoint match enforced in transport-factory).
+  - **Phase F:** `id`, `partyId`, `walletAddress` all removed — those identifiers live in the pubkey book. Parser strict-rejects all three legacy keys.
 
 - `GateConfig` — interface
   - **Pre:** `strategy` ∈ `GATE_STRATEGIES`; `params` opaque at this stage.
@@ -68,7 +71,7 @@
 
 **Notes / gotchas:**
 - `identityKeyFile`, `pubkeyBookFile` optional in types but required at transport factory time if not in-memory relay.
-- `walletAddress` in `PeerEntry` optional until phase 3.
+- `[[peers]]` post-Phase-F carries only `endpoint`; per-peer identifiers live in the pubkey book.
 
 ---
 
@@ -99,8 +102,9 @@
 
 - `parseShare`, `parseNode`, `parseNetwork`, `parseTransport`, `parsePeer(raw, i)`, `parsePeers`, `parseGate`, `parseDeadlines`, `parseTrigger(raw, i)`, `parseTriggers` — section-level parsers
   - **Pre:** Each receives raw section from TOML parse tree.
-  - **Post:** Typed section object (e.g., `ShareConfig`).
-  - **Throws:** `ConfigError` with key paths like "share.path", "node.party_id", "gate.strategy", etc.
+  - **Post:** Typed section object (e.g., `ShareConfig`). `parseTransport` and `parsePeer` apply `canonicalizeEndpoint` to every endpoint field; the resulting `DaemonConfig` always stores canonical form.
+  - **Throws:** `ConfigError` with key paths like "share.path", "transport.advertised_endpoint", "gate.strategy", etc.
+  - **Phase F legacy-key rejection:** `parseNode` rejects `party_id`; `parsePeer` rejects `id`, `party_id`, `wallet_address`; `parseTransport` rejects `listen`. Each error message points operators at the replacement key or `otzi setup`.
   - **UDS trigger params:** `params.path` is the absolute UDS socket path. No `bind`, no `auth_token_env`. Validated at parse time as a non-empty string starting with `/`.
 
 - `parseBootstrap(raw)` — section-level parser for `[bootstrap]`
@@ -111,14 +115,15 @@
 - `validateCoherence(cfg)` — function
   - **Pre:** Fully parsed `DaemonConfig`.
   - **Post:** None (checks only; no mutation).
-  - **Throws:** `ConfigError` if node id collides with peer id, or partyId collides, etc.
+  - **Phase F:** Body is currently a no-op. Pre-Phase-F it checked for duplicate node/peer `id` and `partyId`; both fields are gone post-Phase-F. Remaining cross-field constraints (endpoint matching) are enforced by `transport-factory.validatePeersAgainstBook` against the authoritative pubkey book.
 
 **Invariants:**
 - All section paths use snake_case (e.g., `share.password_env`); coerced to camelCase in types.
 - `gate.params` and `triggers[i].params` remain raw `Record<string, unknown>` here; narrowed in phases 5b/5d.
 - Deadlines default to 5min / 15min if section missing.
-- Transport.url required for relay; Transport.listen optional for peer-mesh (error deferred).
-- Peers must have at least one entry.
+- Transport.url required for relay; Transport.advertisedEndpoint optional at parse time for peer-mesh (transport-factory hard-errors if missing).
+- Peers must have at least one entry; each entry has a canonical `endpoint`.
+- Legacy fields (`node.party_id`, `[[peers]].{id,party_id,wallet_address}`, `transport.listen`) are strict-rejected with operator-friendly errors.
 - **HTTP trigger loopback enforcement.** When `kind = "http"`, `parseTrigger` validates that the bind host is `127.0.0.1`, `::1`, `localhost`, or a UDS-style absolute path. Any other host (e.g. `0.0.0.0`, external IP) is rejected with a clear error. Localhost binding is load-bearing for the security posture (CLI is THE operator surface; non-loopback HTTP would let external attackers forge ceremony triggers).
 
 **Cross-component contracts:**

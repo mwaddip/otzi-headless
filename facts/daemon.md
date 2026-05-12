@@ -5,39 +5,35 @@
 ## src/daemon/
 
 ### `config-merge.ts`
-**Purpose:** Loads daemon TOML config + optional share file, validates alignment, assembles `LoadedDaemonState` with peers + persistence sink.
+**Purpose:** Loads daemon TOML config + optional share file, assembles `LoadedDaemonState`, binds the post-DKG persistence sink.
 
 **Public surface:**
 - `LoadedDaemonState`
-  - **Pre:** Config loaded; share optionally decrypted; peers assembled.
-  - **Post:** Carries config, share (undefined in DKG-only mode), FROST public material, peersById (includes self), persistence sink.
-  - **Invariant:** `share` presence gates signing ceremonies; DKG-only mode has share == undefined.
+  - **Pre:** Config loaded; share optionally decrypted.
+  - **Post:** Carries config, share (undefined in DKG-only mode), FROST public material, optional `frostLegacySig`, persistence sink (when from `validateLoaded`), and optional `bootstrapSecret`.
+  - **Invariant:** `share` presence gates signing ceremonies; DKG-only mode has share == undefined. `peersById` was removed in Phase F — it lives on `TransportBundle.peersById` now, built from the pubkey book at startup.
 
 - `loadAndValidate(configPath, options): Promise<LoadedDaemonState>`
-  - **Pre:** Config file path is valid; share password is in env var.
-  - **Post:** Loads TOML, attempts to read share file, validates alignment, returns full state.
-  - **Throws:** `Error` on TOML parse, share JSON parse, share decrypt, alignment mismatch, missing password.
-  - **Share-missing branch:** If share file does not exist (ENOENT), enters DKG-only mode; build state without share but with persistence sink ready for post-DKG write.
+  - **Pre:** Config file path is valid; share password is in env var named by `[share].password_env`.
+  - **Post:** Loads TOML, attempts to read share file, returns full state.
+  - **Throws:** `Error` on TOML parse, share JSON parse, share decrypt, missing password env.
+  - **Share-missing branch:** If share file does not exist (ENOENT), enters DKG-only mode; builds state without share but with persistence sink ready for post-DKG write.
 
 - `validateLoaded(config, options): Promise<LoadedDaemonState>`
   - **Pre:** Config is already parsed `DaemonConfig`; password is in env var.
   - **Post:** Same as `loadAndValidate` (file read skipped).
 
 - `buildStateFromShare(config, share): LoadedDaemonState`
-  - **Pre:** `share` is decrypted; config was not yet validated against it.
-  - **Post:** Validates alignment (partyId match, peers count, contiguous partyIds); builds FROST public material if FROST key package is present; returns state WITHOUT persistence sink.
-  - **Throws:** `Error` on alignment violation.
-  - **Invariant:** Test-friendly (no disk I/O).
+  - **Pre:** `share` is decrypted.
+  - **Post:** Builds FROST public material if a FROST key package is present; returns state WITHOUT persistence sink.
+  - **Invariant:** Test-friendly (no disk I/O). No config-vs-share alignment check happens here — that moved to `transport-factory.resolveSelfFromBook` (which compares `share.partyId` against the authoritative `selfBookEntry.partyId`).
 
 - `buildStateNoShare(config): LoadedDaemonState`
   - **Pre:** Daemon has no share file (DKG-only mode).
-  - **Post:** Builds peers map from config; returns state without share, FROST material, or persistence sink.
+  - **Post:** Returns state without share, FROST material, or persistence sink.
 
-- **Validation invariants**
-  - **partyId alignment:** `share.partyId === config.node.partyId`.
-  - **Peers count:** `len(config.peers) + 1 === share.parties` (self + peers == share total).
-  - **Contiguous partyIds:** All partyIds in [0, share.parties) are present exactly once across config.
-  - **Range check:** All partyIds are in range [0, share.parties).
+- **Phase F note: validateAlignment removed**
+  - Previous validation invariants (share.partyId === config.node.partyId, peers-count match, contiguous partyIds spanning `[0, share.parties)`) all required operator-typed `partyId` fields that no longer exist in `DaemonConfig`. The single residual cross-check — that `share.partyId` matches the loaded identity's slot in the ring — is now enforced by `transport-factory.resolveSelfFromBook`, which looks up the identity in the book by pubkey and asserts `share.partyId === selfBookEntry.partyId`. The book is the authoritative source for partyId post-Phase-F.
 
 - **Frost legacy sig extraction** (from share file JSON)
   - **Pre:** Share file is parsed as JSON.
@@ -247,7 +243,7 @@
 
 **Public surface:**
 - `DaemonDeps`
-  - **Pre:** `state` is LoadedDaemonState (config + optional share + peersById + persistence sink); transport is injected; rng, pullOpts provided; logger optional.
+  - **Pre:** `state` is LoadedDaemonState (config + optional share + persistence sink); transport is injected; `selfPartyId` resolved from book by pubkey match (sourced from `TransportBundle.selfPartyId`); `peersById` is the logging-label map (sourced from `TransportBundle.peersById`); rng + pullOpts provided; logger optional.
   - **Post:** Passed to Daemon constructor.
 
 - `Daemon` (class)
@@ -281,15 +277,15 @@
   - **Throws:** `Error` on missing required params or missing cron handler.
 
 - **Default HTTP handler** (buildDefaultHttpHandler)
-  - **Pre:** POST requests to handler. Constructed with `(leader, network: NetworkName, state: LoadedDaemonState, controlPlane: ControlPlane, transport: Transport, logger)`.
+  - **Pre:** POST requests to handler. Constructed with `(leader, network: NetworkName, state: LoadedDaemonState, peersById: ReadonlyMap<PartyId, string>, controlPlane: ControlPlane, transport: Transport, logger)`.
   - **Post:** Discriminated dispatch on `req.body.op` field: 'vault-info', 'dkg-combined', 'dkg-mldsa', 'dkg-frost', 'sign', 'sync'.
-  - **vault-info (read):** Returns `{ partyIds, threshold, parties, network, btcAddress, opnetAddress }` from in-memory state. 409 if no share is loaded yet (`vault-info: no share loaded (run 'otzi generate' first)`).
-  - **dkg-combined:** Runs combined DKG; response carries `mldsaPublicKeyHex`, `frostVerifyingKeyHex`, plus operator-facing `btcAddress` + `opnetAddress` + `network` (computed via `deriveVaultAddresses`). The address triple matches what `vault-pubkey.json` will hold post-restart.
-  - **DKG ops (mldsa, frost):** Extract threshold, parties, level; invoke leader; return ceremony result + public keys.
+  - **vault-info (read):** Returns `{ partyIds, threshold, parties, network, btcAddress, opnetAddress }`. `partyIds` is sorted ascending from `peersById.keys()`. 409 if no share is loaded yet (`vault-info: no share loaded (run 'otzi generate' first)`).
+  - **dkg-combined:** Runs combined DKG; `parties` is `peersById.size` (= ring size = n; v0.1 is n-of-n by design, threshold == parties); level is fixed at 44. Response carries `mldsaPublicKeyHex`, `frostVerifyingKeyHex`, plus operator-facing `btcAddress` + `opnetAddress` + `network` (computed via `deriveVaultAddresses`). The address triple matches what `vault-pubkey.json` will hold post-restart.
+  - **DKG ops (mldsa, frost):** `parties` is `peersById.size`; threshold == parties (n-of-n); level 44. Response carries the resulting public material.
   - **sign op:** Discriminate on scheme + protocol; parse BTC/OPNet/opnet-params/raw-mldsa request; invoke leader.sign; return signatures + optional txid.
   - **sync op (Phase 9c):** Operator-facing manifest distribution endpoint.
     - **Pre:** Local `bootstrap-secret` exists; `manifest` is valid headless-manifest-v1 JSON; `hmac` matches HMAC-SHA-256(secret, manifest).
-    - **Post:** Local manifest atomically installed via `controlPlane.installPushedManifest`; `manifest-push` wire message broadcast to every peer via `transport.broadcast`; response carries `{ ceremonyId, status, peersNotified }`.
+    - **Post:** Local manifest atomically installed via `controlPlane.installPushedManifest`; `manifest-push` wire message broadcast to every peer via `transport.broadcast`; response carries `{ ceremonyId, status, peersNotified }` where `peersNotified = peersById.size - 1`.
     - **Status 410:** `{ error: 'control plane closed' }` when `bootstrap-secret` is missing (post-DKG).
     - **Status 400:** HMAC mismatch / schema failure / existing-non-identical-manifest (carries `kind` for the error class name).
     - **Status 502:** Manifest installed locally, but `transport.broadcast` failed.
@@ -321,17 +317,17 @@
 ---
 
 ### `transport-factory.ts`
-**Purpose:** Loads identity key file + pubkey book, validates alignment, derives deterministic ringId (SHA-256 of sorted pubkeys), and builds peer-mesh or relay transport.
+**Purpose:** Loads identity key file + pubkey book, identifies self via pubkey match, cross-checks `[[peers]]` against the book on canonical endpoints (peer-mesh only), derives the deterministic ringId (SHA-256 of sorted pubkeys), synthesizes the daemon-wide `peersById` logging-label map, and builds peer-mesh or relay transport.
 
 **Public surface:**
 - `TransportBundle`
   - **Pre:** Transport is built and validated.
-  - **Post:** Carries transport instance, identity keypair, pubkey book, ringId, and start/stop methods.
+  - **Post:** Carries `transport` instance, `identity` keypair, `pubkeyBook`, authoritative `selfPartyId` (from book lookup by pubkey), `selfEntry` (the matched book entry), `peersById` (synth `peer-${partyId}` labels for non-self; `config.node.id` for self), `ringId`, and `start`/`stop` methods.
 
 - `buildTransportFromFiles(state, options): Promise<TransportBundle>`
-  - **Pre:** config.node.identityKeyFile + pubkeyBookFile paths are set.
-  - **Post:** Loads files, validates identity matches book, validates all peers in book, derives ringId, returns bundle.
-  - **Throws:** `Error` on file read, JSON parse, validation mismatch, missing paths.
+  - **Pre:** `config.node.identityKeyFile` + `pubkeyBookFile` paths are set.
+  - **Post:** Loads identity + book from disk, runs `resolveSelfFromBook`, runs `validatePeersAgainstBook` for peer-mesh, derives ringId + peersById, returns bundle.
+  - **Throws:** `Error` on file read, JSON parse, identity-not-in-book, [[peers]]/book mismatch, missing paths, share/book partyId disagreement.
 
 - `buildTransportFromMemory(state, identity, book, options): Promise<TransportBundle>`
   - **Pre:** Identity + book are pre-built (test path).
@@ -342,37 +338,45 @@
   - PKCS#8 DER encoding, 130-char hex uncompressed P-256 public key.
 
 - **Pubkey book format**
-  - Produced by bootstrap (phase 3c); parsed by `parseBook`.
-  - Entries: partyId, nodeId, publicKeyHex (130-char).
+  - Produced by bootstrap (`runMasterBootstrap` / `runMemberRegister`); parsed by `parseBook`.
+  - Entries: `{ partyId, publicKeyHex (130-char), advertisedEndpoint (canonical host:port) }`. No `nodeId` (Phase F dropped it).
 
-- **Validation invariants**
-  - **Identity matches book:** Identity's public key === self entry's publicKeyHex (case-insensitive).
-  - **Self entry present:** Pubkey book has entry for config.node.partyId with matching nodeId.
-  - **All peers in book:** Every config.peers[].partyId has an entry; entry.nodeId === peer.id.
+- **`resolveSelfFromBook(identity, book)` (internal helper)**
+  - **Pre:** Identity is loaded; book is parsed.
+  - **Post:** Returns the book entry whose `publicKeyHex` (case-insensitive) matches the loaded identity. Plus a share-vs-book partyId check when a share file is present (`state.share.partyId === selfEntry.partyId`).
+  - **Throws:** `Error` if no book entry matches the identity pubkey (operator must re-run `otzi setup` if the book is stale) OR if `share.partyId` disagrees with `selfBookEntry.partyId` (config swap / stale share).
+
+- **`validatePeersAgainstBook(book, configPeers, selfPartyId)` (internal, peer-mesh only)**
+  - **Pre:** `configPeers` each carry a canonical `endpoint` (parser already canonicalized); book has canonical `advertisedEndpoint` for every entry.
+  - **Post:** Returns void if the set of non-self book `advertisedEndpoint` values equals the set of `[[peers]].endpoint` values (bidirectional). The book is authoritative for partyId + pubkey; `[[peers]]` is a typo-detection sanity check.
+  - **Throws:** `Error` if any `[[peers]] endpoint` is not in the book, or if any non-self book entry's `advertisedEndpoint` is not in `[[peers]]`.
 
 - **ringId derivation**
   - **Pre:** Pubkey book entries are present (at least self).
-  - **Post:** Concatenate all pubkeys in order (sorted by partyId), SHA-256 hash.
-  - **Invariant:** Same on every peer (deterministic, used for relay identity).
+  - **Post:** Concatenate all pubkeys in order (sorted by partyId), SHA-256 hash, hex-encoded.
+  - **Invariant:** Same on every peer (deterministic, used for relay routing + peer coordination).
 
 - **Transport branching**
-  - **peer-mesh:** Requires config.transport.listen; constructs PeerMeshTransport with self + peers + endpoints.
-  - **relay:** Requires config.transport.url; constructs RelayTransport with self + peers + relay URL.
+  - **peer-mesh:** Requires `config.transport.advertisedEndpoint`; runs `validatePeersAgainstBook`; constructs `PeerMeshTransport` with self + peers built from book entries (`endpoint: ws://${book.advertisedEndpoint}`). The `[[peers]]` array's only role is the sanity-check above — the peer dial table itself comes from the book.
+  - **relay:** Requires `config.transport.url`; constructs `RelayTransport` with self + peers (partyId + pubkey from book, no endpoint). Relay routes by partyId from each peer's `hello` frame; no L4 source-IP allowlist (cryptographic auth alone gates relay traffic).
 
 **Invariants:**
 - Identity file is loaded once at startup; private key never leaves daemon (only public key is broadcast in book).
 - Pubkey book is read-only at runtime (bootstrap produces it once; daemon consumes it).
+- Self identification is by raw-pubkey match into the book — operator-typed `partyId` is gone, derived authoritatively from the book.
 - ringId is deterministic across all peers (enables relay routing + peer coordination).
-- Transport.kind determines which transport is instantiated (peer-mesh vs relay).
+- For peer-mesh, the book is the authoritative dial table; `[[peers]]` only catches operator typos at startup.
+- `peersById` labels are local-only — `peer-${partyId}` for non-self, `config.node.id` for self. Operators do not need to agree on what they call peer N locally.
 
 **Cross-component contracts:**
-- Depends on: File I/O, bootstrap types (PubkeyBook, parseBook), identity crypto, transport implementations.
-- Used by: `entrypoint.ts` (buildTransportFromFiles).
+- Depends on: File I/O, bootstrap types (`PubkeyBook`, `parseBook`), identity crypto, transport implementations, `canonicalizeEndpoint` (via parser).
+- Used by: `entrypoint.ts` (`buildTransportFromFiles`); tests via `buildTransportFromMemory`.
 
 **Notes / gotchas:**
-- ringId is a SHA-256 hash of concatenated pubkeys; order is sorted by partyId.
-- Identity validation is strict; mismatch with pubkey book is a fatal startup error.
-- Peer endpoints are optional in config; presence is copied into peer list for peer-mesh.
+- ringId is a SHA-256 hash of concatenated raw pubkeys; order is sorted by partyId (which itself is sorted-pubkey-bytes order — so ringId is deterministic across the federation regardless of registration timing).
+- Identity-not-in-book is a fatal startup error; operator must regenerate the book via `otzi setup` if it's stale.
+- For peer-mesh, `book.advertisedEndpoint` is bare `host:port`; transport-factory prepends `ws://` before handing to `PeerMeshTransport` (which uses `new URL` and needs a scheme).
+- `peersById` is passed to the `Daemon` constructor via `DaemonDeps.peersById`; the daemon's `buildDefaultHttpHandler` consumes it for vault-info partyId enumeration and DKG `parties` count.
 
 ---
 

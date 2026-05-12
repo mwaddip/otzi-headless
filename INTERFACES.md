@@ -1,6 +1,6 @@
 # INTERFACES.md — otzi-headless contract reference
 
-Authoritative inventory of preconditions, postconditions, and invariants for every component in this repo. Last verified against the codebase: 2026-04-25.
+Authoritative inventory of preconditions, postconditions, and invariants for every component in this repo. Last verified against the codebase: 2026-05-12 (post identity-decoupling Phase G).
 
 ## How to use this doc
 
@@ -102,7 +102,14 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 ### ML-DSA-44 only
 - Pubkey 1312 bytes; signature 2592 bytes. Threshold sig is opaque to ML-DSA `/sign` (`scheme='mldsa', protocol='raw'`).
 - Address (`walletAddress`) = `0x + hex(SHA256(mldsaPubKey))`.
-- Identity model: `mldsaPubKey` is for auth; `walletAddress` is peer identity; `publicKey` / `tweakedPubKey` / `p2tr` is BTC wallet-only — never for auth.
+- Identity model: `mldsaPubKey` is for auth; `walletAddress` is the BTC-payment-style identity (`0x...`); `publicKey` / `tweakedPubKey` / `p2tr` is BTC wallet-only — never for auth.
+
+### Identity-decoupling (post-Phase-G)
+- **The raw pubkey is the only cross-node identity primitive.** Federation members agree on raw pubkeys (130-char hex) via bootstrap; everything else is derived or local.
+- **`partyId` is derived**, not configured. Bootstrap collects every peer's `(publicKey, advertisedEndpoint)` pair, sorts by raw pubkey bytes ascending, and assigns `partyId = index`. Every peer reproduces the same mapping from the same book. The daemon resolves its own `partyId` at startup by matching its loaded identity's pubkey to a book entry.
+- **`advertisedEndpoint` is the cross-node routing primitive.** Canonical `host:port` form (lowercase, default port 8800, RFC 5952 IPv6, no wildcards). All endpoints in pubkey-book entries and `[[peers]]` config are stored canonical post-parse; both sides must literally agree for transport-factory's `validatePeersAgainstBook` to pass.
+- **`node.id` is local-only.** A logging label for `peersById[selfPartyId]`; no two operators need to agree on what they call peer N. Non-self labels in `peersById` are synthesized as `peer-${partyId}` by transport-factory.
+- **Legacy fields strict-rejected.** Parser refuses `node.party_id`, `[[peers]].{id, party_id, wallet_address}`, and `transport.listen` with explicit "no longer supported" errors pointing at the replacement (`otzi setup` for book regeneration, `transport.advertised_endpoint` for transport, the book itself for peer identifiers). Pubkey-book files containing the legacy `nodeId` field are rejected at parse — operators must regenerate via `otzi setup`.
 
 ### Authentication of `from`
 - The `from` field in every `Transport` callback is cryptographically authenticated. Implementations MUST NOT forge it (InMemoryTransport respects this in tests).
