@@ -52,7 +52,7 @@ Gate parameters sit directly in the `[gate]` table, next to `strategy`:
 ```toml
 [gate]
 strategy         = "webhook"
-url              = "http://approver:8181/webhook"
+url              = "http://127.0.0.1:8181/webhook"   # the approver on this host
 timeout_sec      = 86400                       # 24h, enough time for human review
 bearer_token_env = "APPROVER_TOKEN"            # optional; env var on the daemon holding the token
 
@@ -60,6 +60,8 @@ bearer_token_env = "APPROVER_TOKEN"            # optional; env var on the daemon
 signing_ms = 86400000                          # every signer's decision must arrive within these
 dkg_ms     = 86400000
 ```
+
+The daemon accepts an `http://` URL only for a loopback host (`localhost`, `127.0.0.0/8`, `::1`); anything else must be `https://`. The decision is the node's security boundary and the Bearer token travels with every request, so neither may cross a network in clear. To run the approver on another host, put a TLS reverse proxy in front of it (see Exposure below) and set `url` to the proxy's `https://` URL, for example `url = "https://approver.example/webhook"`.
 
 Raise `[deadlines]` on every node to cover the slowest approver, and keep `timeout_sec` within it (see `docs/gates.md` § Operator-in-the-loop timeouts). `timeout_sec` is one deadline for the daemon's whole request. When it passes, or the daemon restarts, the daemon disconnects and the approver drops that pending entry.
 

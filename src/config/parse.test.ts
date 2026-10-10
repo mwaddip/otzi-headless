@@ -249,6 +249,23 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
     );
   });
 
+  it.each(['max_sats_per_tx = 100000', 'allowed_recipients = "address-book"', 'command = ["/bin/true"]', 'url = "https://x"'])(
+    'rejects a [gate] key the auto strategy does not use: %s',
+    (line) => {
+      const toml = MINIMAL_TOML.replace('strategy = "auto"', `strategy = "auto"\n${line}`);
+      const key = line.split(' ')[0]!;
+      let err: unknown;
+      try {
+        parseDaemonConfigToml(toml);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).path).toBe(`gate.${key}`);
+      expect((err as Error).message).toBe(`config gate.${key}: not used by strategy auto`);
+    },
+  );
+
   it('rejects negative deadlines', () => {
     const toml =
       MINIMAL_TOML + '\n[deadlines]\nsigning_ms = -1\ndkg_ms = 900000\n';

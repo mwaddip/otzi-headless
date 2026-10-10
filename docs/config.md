@@ -144,7 +144,9 @@ node stays silent and looks offline to its peers.
 
 ### `strategy = "auto"`
 
-No params.
+No params. Any other key in `[gate]` is refused at startup (`config gate.<key>:
+not used by strategy auto`), so policy keys left behind after switching to
+`auto` cannot look like rules that are enforced.
 
 ```toml
 [gate]
@@ -207,13 +209,15 @@ Details:
 | Key | Type | Notes |
 |---|---|---|
 | `command` | string[] | argv. `command[0]` is the executable. |
-| `timeout_sec` | number, 0 < n <= 2147483.647 | Hard cap on child lifetime (seconds). The upper bound is the longest timer Node.js can hold (2147483647 ms, about 24.8 days); a larger value is refused at startup. |
+| `timeout_sec` | number, 0 < n <= 2147483.647 | Hard cap on child lifetime (seconds): at the cap the ceremony is rejected and the child gets `SIGTERM`, then `SIGKILL` 5 s later if it is still running. The upper bound is the longest timer Node.js can hold (2147483647 ms, about 24.8 days); a larger value is refused at startup. |
 | `working_dir` | string, optional | cwd for the child. |
-| `env` | table, optional | Extra environment (added to the daemon's env). |
+| `env` | table, optional | Extra environment, added to the daemon's environment. The child never inherits the share password variable (`[share].password_env`). |
 
 The daemon writes the ceremony spec as one JSON line on the child's stdin and
 reads the first line of stdout as the decision (`approve`/`reject`). Anything
-else → reject. See `examples/gate-file-approver.sh` for a file-drop pattern.
+else → reject. The command does not have to read the spec; stdout and stderr are
+read up to 64 KiB each. See `examples/gate-file-approver.sh` for a file-drop
+pattern.
 
 ```toml
 [gate]
@@ -226,7 +230,7 @@ timeout_sec = 3600
 
 | Key | Type | Notes |
 |---|---|---|
-| `url` | string | Full POST URL. |
+| `url` | string | Full POST URL: `https://…`, or `http://…` to a loopback host only (`localhost`, `127.0.0.0/8`, `::1`). Any other `http://` URL is refused at startup: the decision is this node's security boundary and the Bearer token goes out with every request, so neither may cross a network in clear. For a remote approver, put a TLS reverse proxy in front of it and use its `https://` URL. |
 | `timeout_sec` | number, 0 < n <= 2147483.647 | One deadline (seconds) for the whole request: connect, response headers and the full response body. A response that starts early but does not finish in time is a reject. The upper bound is the longest timer Node.js can hold (2147483647 ms, about 24.8 days); a larger value is refused at startup. |
 | `bearer_token_env` | string, optional | Env var holding a Bearer token for outgoing auth. |
 

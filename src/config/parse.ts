@@ -216,6 +216,11 @@ function parseGate(raw: unknown): GateConfig {
   const o = asObject(raw, 'gate');
   const strategy = asEnum(o.strategy, 'gate.strategy', GATE_STRATEGIES);
   const { strategy: _, ...rest } = o;
+  if (strategy === 'auto') {
+    // A leftover rule under "auto" would read as enforced while nothing checks it.
+    const [key] = Object.keys(rest);
+    if (key !== undefined) throw new ConfigError(`gate.${key}`, 'not used by strategy auto');
+  }
   return {
     strategy,
     params: Object.keys(rest).length > 0 ? rest : undefined,

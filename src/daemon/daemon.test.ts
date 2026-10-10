@@ -523,6 +523,15 @@ describe('Daemon lifecycle', () => {
     await expect(daemons[0]!.stop()).resolves.toBeUndefined();
   });
 
+  it('logs the gate strategy at startup', async () => {
+    const c = await cluster({ gates: { 1: '[gate]\nstrategy = "policy"\nmax_sats_per_tx = 5000' } });
+    await c.boot();
+    const lines = c.transcript.filter(l => l.includes('gate strategy'));
+    expect(lines).toHaveLength(N);
+    expect(lines.filter(l => /^info daemon: gate strategy auto /.test(l))).toHaveLength(N - 1);
+    expect(lines.filter(l => /^info daemon: gate strategy policy /.test(l))).toHaveLength(1);
+  });
+
   it('throws when a cron trigger job_name has no registered handler', async () => {
     const c = await cluster({ triggers: '[[triggers]]\nkind = "cron"\nschedule = "0 0 * * *"\njob_name = "heartbeat"' });
     await expect(c.boot()).rejects.toThrow(/job_name='heartbeat' has no registered handler/);

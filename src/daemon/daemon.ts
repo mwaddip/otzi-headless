@@ -92,11 +92,15 @@ export class Daemon {
       loadAddressBook: async () =>
         (await readAddressBook(bookPath, network, { missing: 'error' })).map(e => e.address),
       logger: this.log,
+      // An exec gate's command never sees the share password.
+      secretEnv: [config.share.passwordEnv],
     });
+    this.log.info(`daemon: gate strategy ${config.gate.strategy}`, { strategy: config.gate.strategy });
     const node = { id: config.node.id, partyId: selfPartyId };
     const sharePath = config.share.path;
     const vaultExists = async () => state.share !== undefined || (await vaultFileExists(sharePath));
-    // The password reaches only the stager, which encrypts the share a DKG produces.
+    // The password reaches only the stager, which encrypts the share a DKG produces
+    // (an exec gate's command does not inherit its variable: `secretEnv` above).
     const createStager = () =>
       createShareStager({
         path: sharePath,

@@ -266,8 +266,8 @@
 
 - `class Daemon`
   - **`constructor(deps: DaemonDeps)`**
-    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook, logger })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath, logger })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(addressBookPath, network)` (`addressBookPath` = `deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH`); the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file with `readAddressBook(addressBookPath, network, { missing: 'error' })` and returns its addresses, so it throws when the file does not exist (ENOENT) as well as when it is invalid — where the `addressBook` labelling read returns `[]` on ENOENT — and `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
-    - **Invariant:** Does NOT start anything. The share password reaches only the share stager; it is never logged or returned.
+    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook, logger, secretEnv: [config.share.passwordEnv] })`, and one info line `daemon: gate strategy <strategy>`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath, logger })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(addressBookPath, network)` (`addressBookPath` = `deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH`); the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file with `readAddressBook(addressBookPath, network, { missing: 'error' })` and returns its addresses, so it throws when the file does not exist (ENOENT) as well as when it is invalid — where the `addressBook` labelling read returns `[]` on ENOENT — and `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
+    - **Invariant:** Does NOT start anything. The share password reaches only the share stager; it is never logged or returned, and an `exec` gate's command does not inherit its environment variable.
   - **`async start(): Promise<void>`** — starts the orchestrator and every trigger. Reentrant.
   - **`async stop(): Promise<void>`** — stops triggers, the orchestrator, and closes the blob server. Reentrant.
   - **`onCompleted(handler): Unsubscribe`** — forwards orchestrator outcomes.
@@ -305,6 +305,24 @@
 **Cross-component contracts:**
 - Depends on: all of `src/core`, `src/gate`, `src/orchestrator`, `src/triggers`, `src/address-book/store.ts`, `vault-share.ts`, `vault-pubkey.ts`, `api.ts`, `leader.ts`.
 - Used by: `entrypoint.ts` (after state and transport are ready).
+
+---
+
+### `console-logger.ts`
+**Purpose:** The daemon's `Logger`: one line per entry on stderr, which systemd hands to journald (and the fail2ban filter in `examples/fail2ban/otzi.conf` reads).
+
+**Public surface:**
+- `createConsoleLogger(opts?: { minLevel?: 'debug' | 'info' | 'warn' | 'error'; write?: (line: string) => void }): Logger`
+  - **Post:** Each call at or above `minLevel` (default `info`) writes exactly one line: `<LEVEL> <msg>` or `<LEVEL> <msg> <extra as compact JSON>`, then `\n`. Bigints in `extra` render as decimal strings.
+  - **Escaping:** every C0 control character (U+0000–U+001F), DEL, every C1 control character (U+0080–U+009F) and U+2028 / U+2029 in `msg` is written escaped — `\n`, `\r`, `\t`, otherwise `\u00XX` / `\u2028` — and in string values and keys of `extra` likewise (JSON escapes C0; the logger escapes the rest). A message can carry peer-controlled text (a `signoff-aborted` reason) and still never starts a second journal entry.
+
+**Invariants:**
+- One call, one line: a forged log line can only appear in the middle of a line, never at its start, so the fail2ban filter, anchored to the start of the logger's line, never matches peer-supplied text.
+- Stdout is never written (it carries CLI output).
+
+**Cross-component contracts:**
+- Used by: `entrypoint.ts` (`runDaemonCommand`; the CLI verbs keep `NOOP_LOGGER`).
+- `examples/fail2ban/otzi.conf` matches `WARN peer-allowlist: dropped connection from non-peer source {"ip":"<HOST>"…` at the start of the line (after journald's optional `<host> <ident>[<pid>]: ` prefix).
 
 ---
 

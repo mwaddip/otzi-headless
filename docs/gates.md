@@ -187,16 +187,19 @@ strategy    = "exec"
 command     = ["/etc/otzi/gate-file-approver.sh"]   # argv; command[0] is executable
 timeout_sec = 86400                                  # hard cap on child lifetime (24h)
 working_dir = "/var/otzi"                            # optional cwd
-env         = { FOO = "bar" }                        # optional env merged into process.env
+env         = { FOO = "bar" }                        # optional env, added to the daemon's
 ```
 
 The daemon writes the spec JSON as one line on the command's stdin. The command
 must exit 0 with the first line of stdout being either `approve` or `reject`.
 Any other output, non-zero exit or timeout rejects the ceremony (a participant
-drops it silently; the leader returns `403`).
+drops it silently; the leader returns `403`). The command need not read the
+spec; stdout and stderr are read up to 64 KiB each. Its environment is the
+daemon's plus `env`, without the share password variable (`[share].password_env`).
 
 `timeout_sec` is at most 2147483.647 (about 24.8 days), the longest timer Node.js can
-hold; a larger value is refused at startup (`gate.timeout_sec`).
+hold; a larger value is refused at startup (`gate.timeout_sec`). At the timeout the
+command gets `SIGTERM`, and `SIGKILL` 5 s later if it is still running.
 
 The promise only resolves when the command exits — ideal for human-in-the-loop
 setups where the operator's script blocks (e.g. `inotifywait` on a decision file,
@@ -241,6 +244,13 @@ url              = "https://approver.internal/otzi"
 timeout_sec      = 86400
 bearer_token_env = "APPROVER_TOKEN"    # optional: env var carrying bearer token
 ```
+
+`url` is `https://…`, or `http://…` to a loopback host only (`localhost`,
+`127.0.0.0/8`, `::1`); any other `http://` URL is refused at startup
+(`gate.url`). The decision is this node's security boundary and the Bearer token
+travels with every request, so neither may cross a network in clear. For an
+approver on another host, terminate TLS in front of it (a reverse proxy) and use
+the `https://` URL.
 
 The daemon POSTs the spec JSON to `url`. The approver endpoint must respond with
 `200 OK` and a JSON body `{"decision": "approve" | "reject"}`. The request holds

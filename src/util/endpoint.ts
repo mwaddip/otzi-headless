@@ -1,4 +1,4 @@
-import { isIP } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 
 /**
  * Canonical endpoint form used everywhere endpoints cross peers (bootstrap
@@ -146,4 +146,26 @@ export function canonicalizeEndpoint(input: string): string {
     throw new EndpointParseError(path, `invalid hostname: '${host}'`);
   }
   return `${lower}:${port}`;
+}
+
+const LOOPBACK = (() => {
+  const list = new BlockList();
+  list.addSubnet('127.0.0.0', 8, 'ipv4');
+  list.addAddress('::1', 'ipv6');
+  return list;
+})();
+
+/**
+ * True iff `host` names this machine only: `localhost` (any case, optional
+ * trailing dot), an IPv4 address in 127.0.0.0/8, or any spelling of `::1`
+ * (bracketed or not, an IPv6 zone id ignored). Anything else, a hostname that
+ * merely starts with `localhost` or `127.` included, is false.
+ */
+export function isLoopbackHost(host: string): boolean {
+  let h = host.trim().toLowerCase();
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  h = h.split('%')[0]!; // an IPv6 zone id
+  if (h === 'localhost' || h === 'localhost.') return true;
+  const family = isIP(h);
+  return family !== 0 && LOOPBACK.check(h, family === 4 ? 'ipv4' : 'ipv6');
 }

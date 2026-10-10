@@ -19,7 +19,7 @@
 //
 //   [gate]
 //   strategy         = "webhook"
-//   url              = "http://approver:8181/webhook"
+//   url              = "http://127.0.0.1:8181/webhook"   # https:// for a remote approver
 //   timeout_sec      = 86400
 //   bearer_token_env = "APPROVER_TOKEN"     # optional
 //

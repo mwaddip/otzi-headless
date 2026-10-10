@@ -1,3 +1,4 @@
+import { ConfigError } from '../config/parse';
 import type { GateConfig } from '../config/types';
 import type { Logger } from '../orchestrator/types';
 import { ExecGate, parseExecParams } from './exec';
@@ -14,22 +15,27 @@ export class AutoGate implements ApprovalGate {
 /**
  * `deps.loadAddressBook` returns this node's address book addresses for
  * `allowed_recipients = "address-book"` (rejecting when there is no usable
- * book); `deps.logger` receives the policy gate's warnings.
+ * book); `deps.logger` receives the policy gate's warnings; `deps.secretEnv`
+ * names variables an `exec` command must not inherit (the share password's).
  */
 export function createGate(
   config: GateConfig,
-  deps: { loadAddressBook?: () => Promise<string[]>; logger?: Logger } = {},
+  deps: { loadAddressBook?: () => Promise<string[]>; logger?: Logger; secretEnv?: readonly string[] } = {},
 ): ApprovalGate {
   switch (config.strategy) {
-    case 'auto':
+    case 'auto': {
+      const [key] = Object.keys(config.params ?? {});
+      // A leftover rule under "auto" would read as enforced while nothing checks it.
+      if (key !== undefined) throw new ConfigError(`gate.${key}`, 'not used by strategy auto');
       return new AutoGate();
+    }
     case 'policy':
       return new PolicyGate(parsePolicyParams(config.params ?? {}), {
         loadAddressBook: deps.loadAddressBook,
         logger: deps.logger,
       });
     case 'exec':
-      return new ExecGate(parseExecParams(config.params ?? {}));
+      return new ExecGate({ ...parseExecParams(config.params ?? {}), omitEnv: deps.secretEnv });
     case 'webhook':
       return new WebhookGate(parseWebhookParams(config.params ?? {}));
     default: {

@@ -152,7 +152,9 @@
     - `command` non-empty array of strings; `command[0]` is executable.
     - `timeoutSec` positive number, at most 2147483.647 (`MAX_GATE_TIMEOUT_SEC`, the longest Node timer in seconds).
     - `workingDir` optional absolute path.
-    - `env` optional key-value table (merged into `process.env`).
+    - `env` optional key-value table (merged into the inherited environment).
+    - `omitEnv` optional list of variable names removed from the inherited `process.env` (the daemon passes `[share].password_env`); `env` is applied after it.
+    - `killGraceMs` optional, default 5000: how long after the timeout's SIGTERM the child gets before SIGKILL.
   - **Post:** Configuration for subprocess spawning.
 
 - `ExecGate` — class implements `ApprovalGate`
@@ -164,10 +166,10 @@
   - **Pre:** `spec` is fully populated.
   - **Post:** Returns `Promise<Decision>`.
   - **Process:**
-    1. Spawn `command[0]` with args `command[1..]`.
-    2. Write `serializeSpec(spec) + '\n'` to stdin.
-    3. Capture stdout/stderr.
-    4. Wait for exit with `timeoutSec` hard cap (SIGTERM on timeout).
+    1. Spawn `command[0]` with args `command[1..]`, environment = `process.env` without the `omitEnv` names, plus `env`.
+    2. Write `serializeSpec(spec) + '\n'` to stdin. A stdin error (EPIPE, `ERR_STREAM_DESTROYED`: the command exited without reading a spec larger than the pipe buffer) is ignored; the exit decides.
+    3. Capture stdout and stderr, each up to 64 KiB (65 536 bytes); anything beyond is ignored.
+    4. Wait for exit with `timeoutSec` hard cap: on timeout the call throws at once and the child gets SIGTERM, then SIGKILL after `killGraceMs` if it is still running.
     5. Parse first line of stdout: `'approve'` or `'reject'` (case-insensitive).
     6. Non-zero exit → throw. Unexpected output → throw.
   - **Returns:**
@@ -175,7 +177,8 @@
     - `'reject'` if exit code 0 and first stdout line is "reject".
   - **Throws:** Error when exit code ≠ 0, timeout, spawn failure, or unexpected output.
   - **Note:** Thrown errors are caught by the orchestrator and treated as `reject` at a participant (silent), or as `GateRejection` at the leader.
-  - **Timeout:** Hard cap via `setTimeout` → `SIGTERM`. Timer cleared on success.
+  - **Timeout:** Hard cap via `setTimeout` → `SIGTERM`, then `SIGKILL` after `killGraceMs`. Both timers cleared when the child exits.
+  - **Never crashes the daemon:** no stream error of the child (stdin, stdout, stderr) is left without a listener.
 
 - `serializeSpec(spec)` — function
   - **Pre:** `spec` is `CeremonySpec` (SigningSpec or DkgSpec).
@@ -190,9 +193,11 @@
     - `timeout_sec` must be a positive number and at most 2147483.647 (`parseGateTimeoutSec`); a larger value is a `ConfigError` naming `gate.timeout_sec`, because a `setTimeout` delay above 2147483647 ms fires at once.
     - `working_dir` optional string.
     - `env` optional key-value table (all values must be strings).
+  - `omitEnv` and `killGraceMs` are not `[gate]` keys: `createGate` supplies `omitEnv` from its deps.
 
 **Invariants:**
 - Spec is JSON-serialized on stdin (one line, newline-terminated).
+- The share password never reaches the command: its variable is removed from the inherited environment.
 - stdout first line determines decision (case-insensitive, trimmed).
 - stderr is captured but not parsed (logged for debugging).
 - If command returns multiple lines, only first is used.
@@ -206,8 +211,8 @@
 **Notes / gotchas:**
 - Command is spawned every time `approve()` is called (no caching; idempotency is delegate's responsibility).
 - Working directory defaults to daemon's cwd if omitted.
-- Environment is merged (not replaced); delegate sees `process.env` + the `[gate]` table's `env`.
-- Timeout is hard wall (SIGTERM); no grace period for cleanup.
+- Environment is merged (not replaced); delegate sees `process.env` minus the share password variable, plus the `[gate]` table's `env`.
+- Timeout is a hard wall: SIGTERM, then SIGKILL after a 5 s grace; the decision is a throw at the timeout either way.
 - stderr truncated to 500 chars in error message for readability.
 
 ---
@@ -218,7 +223,7 @@
 **Public surface:**
 - `WebhookGateConfig` — interface
   - **Pre:**
-    - `url` non-empty string (HTTP endpoint).
+    - `url` an `https:` URL, or an `http:` URL whose host is loopback (`localhost`, `127.0.0.0/8`, `::1`).
     - `timeoutSec` positive number, at most 2147483.647 (`MAX_GATE_TIMEOUT_SEC`).
     - `bearerTokenEnv` optional env var name (for `Authorization: Bearer` header).
   - **Post:** Configuration for HTTP approval request.
@@ -245,9 +250,11 @@
   - **Pre:** The `params` of `GateConfig`: every key of the `[gate]` table except `strategy`.
   - **Post:** Validated `WebhookGateConfig`.
   - **Throws:** `ConfigError` for invalid url, missing or out-of-range timeout_sec (above 2147483.647, as for `ExecGate`), bad bearer_token_env, etc.
+  - **URL rule:** `url` must parse as a URL with a host. `https:` is accepted for any host; `http:` only when the host is loopback (`isLoopbackHost`, `src/util/endpoint.ts`: `localhost`, an IPv4 address in `127.0.0.0/8`, or any spelling of `::1`). Anything else is `ConfigError('gate.url', 'must be https, or http to a loopback host (localhost, 127.0.0.0/8, ::1) — <url> … put a TLS reverse proxy in front of a remote approver')`. The gate decision is this node's security boundary and the Bearer token travels with every request, so neither crosses a network in clear.
 
 **Invariants:**
 - POST body is the JSON-serialized spec (`serializeSpec`, as with `ExecGate`).
+- Requests go only to an `https:` URL or a loopback `http:` URL (checked at startup by `parseWebhookParams`).
 - Response is expected to be JSON with `{"decision": "approve" | "reject"}`.
 - Bearer token is read from env at request time (not at config time); throws if env var is missing/empty when set.
 - Non-OK HTTP status (not 2xx) throws before parsing response body.
@@ -284,13 +291,13 @@
   - **Post:** Returns `Promise<'approve'>`.
   - **Throws:** Never.
 
-- `createGate(config: GateConfig, deps?: { loadAddressBook?: () => Promise<string[]>; logger?: Logger }): ApprovalGate`
-  - **Pre:** `config` is validated `GateConfig` with strategy ∈ `GATE_STRATEGIES`.
+- `createGate(config: GateConfig, deps?: { loadAddressBook?: () => Promise<string[]>; logger?: Logger; secretEnv?: readonly string[] }): ApprovalGate`
+  - **Pre:** `config` is validated `GateConfig` with strategy ∈ `GATE_STRATEGIES`. `deps.secretEnv` names environment variables a gate command must not inherit (the daemon passes `[config.share.passwordEnv]`).
   - **Post:** Returns `ApprovalGate` (one of AutoGate, PolicyGate, ExecGate, WebhookGate).
   - **Dispatch table:**
-    - `'auto'` → `new AutoGate()`.
+    - `'auto'` → `new AutoGate()`; any param → `ConfigError('gate.<key>', 'not used by strategy auto')` (the config parser already refuses them).
     - `'policy'` → `new PolicyGate(parsePolicyParams(config.params ?? {}), { loadAddressBook: deps?.loadAddressBook, logger: deps?.logger })`.
-    - `'exec'` → `new ExecGate(parseExecParams(config.params ?? {}))`.
+    - `'exec'` → `new ExecGate({ ...parseExecParams(config.params ?? {}), omitEnv: deps?.secretEnv })`.
     - `'webhook'` → `new WebhookGate(parseWebhookParams(config.params ?? {}))`.
     - Fallback → Throw "unreachable" (exhaustive check via TypeScript `never`).
   - **Throws:** ConfigError from parse* helpers if params are invalid.

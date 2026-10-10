@@ -5,9 +5,14 @@ import { ConfigError } from '../config/parse';
 import { buildDkgSpec, buildSigningSpec, resolveLeaderId } from '../orchestrator/spec-builder';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 import type { ProposalAnalysis } from '../otzi/lib/bitcoin';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ExecGate, serializeSpec } from './exec';
 import { AutoGate, createGate } from './factory';
 import { parsePolicyParams, PolicyGate } from './policy';
 import type { CeremonyRole, DkgSpec, SigningSpec, SpecOutput } from './types';
+import { parseWebhookParams } from './webhook';
 
 /** A real local HTTP server for the webhook gate tests; `close()` drops open connections. */
 async function serve(
@@ -1038,11 +1043,11 @@ describe('createGate', () => {
   it('ExecGate and WebhookGate accept timeout_sec up to the longest Node timer and refuse more', () => {
     const max = 2_147_483.647;
     expect(() => createGate({ strategy: 'exec', params: { command: ['/bin/true'], timeout_sec: max } })).not.toThrow();
-    expect(() => createGate({ strategy: 'webhook', params: { url: 'http://x', timeout_sec: max } })).not.toThrow();
+    expect(() => createGate({ strategy: 'webhook', params: { url: 'https://x', timeout_sec: max } })).not.toThrow();
     for (const timeout_sec of [2_147_483.648, 86_400 * 365, Number.MAX_SAFE_INTEGER]) {
       expect(() => createGate({ strategy: 'exec', params: { command: ['/bin/true'], timeout_sec } }), `exec ${timeout_sec}`)
         .toThrow(/gate\.timeout_sec.*<= 2147483\.647.*longest Node\.js timer/);
-      expect(() => createGate({ strategy: 'webhook', params: { url: 'http://x', timeout_sec } }), `webhook ${timeout_sec}`)
+      expect(() => createGate({ strategy: 'webhook', params: { url: 'https://x', timeout_sec } }), `webhook ${timeout_sec}`)
         .toThrow(/gate\.timeout_sec.*<= 2147483\.647.*longest Node\.js timer/);
     }
   });
@@ -1303,9 +1308,134 @@ describe('createGate', () => {
   it('WebhookGate rejects invalid params at construction', () => {
     expect(() => createGate({ strategy: 'webhook', params: { timeout_sec: 5 } }))
       .toThrow(/gate\.url/);
-    expect(() => createGate({ strategy: 'webhook', params: { url: 'http://x', timeout_sec: 0 } }))
+    expect(() => createGate({ strategy: 'webhook', params: { url: 'https://x', timeout_sec: 0 } }))
       .toThrow(/gate\.timeout_sec/);
-    expect(() => createGate({ strategy: 'webhook', params: { url: 'http://x', timeout_sec: 5, bogus: true } }))
+    expect(() => createGate({ strategy: 'webhook', params: { url: 'https://x', timeout_sec: 5, bogus: true } }))
       .toThrow(/gate\.bogus/);
   });
 });
+
+describe('parseWebhookParams — url scheme', () => {
+  it.each([
+    'https://approver.example/otzi',
+    'https://10.0.0.5:8443/decide',
+    'http://127.0.0.1:8080/otzi',
+    'http://127.12.0.9/otzi',
+    'http://localhost:9000/',
+    'http://LOCALHOST/',
+    'http://[::1]:8080/otzi',
+  ])('accepts %s', (url) => {
+    expect(parseWebhookParams({ url, timeout_sec: 5 }).url).toBe(url);
+  });
+
+  it.each([
+    'http://approver.example/otzi',
+    'http://10.0.0.5:8080/decide',
+    'http://192.168.1.10/',
+    'http://[fe80::1]/',
+    'http://localhost.evil.example/',
+    'http://127.0.0.1.nip.io/',
+  ])('refuses plain http to a non-loopback host: %s', (url) => {
+    let err: unknown;
+    try {
+      parseWebhookParams({ url, timeout_sec: 5 });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ConfigError);
+    expect((err as ConfigError).path).toBe('gate.url');
+    expect((err as Error).message).toMatch(/https/);
+    expect((err as Error).message).toMatch(/loopback/);
+  });
+
+  it.each(['ftp://approver.example/', 'file:///tmp/x', 'not a url', 'https://'])('refuses %s', (url) => {
+    expect(() => parseWebhookParams({ url, timeout_sec: 5 })).toThrow(/gate\.url/);
+  });
+});
+
+describe('ExecGate — child process handling', () => {
+  /** A signing spec whose JSON is well past a pipe buffer (64 KiB). */
+  function hugeSpec(): SigningSpec {
+    const outputs: SpecOutput[] = Array.from({ length: 800 }, (_, i) => ({
+      address: `bc1q${String(i).padStart(38, '0')}`,
+      amount: 1_000 + i,
+      isChange: false,
+      label: 'x'.repeat(40),
+    }));
+    return signing({ outputs });
+  }
+
+  it('a command that exits without reading a large spec decides; the daemon does not crash', async () => {
+    expect(serializeSpec(hugeSpec()).length).toBeGreaterThan(64 * 1024);
+    const escaped: unknown[] = [];
+    const onEscape = (err: unknown) => escaped.push(err);
+    process.on('uncaughtException', onEscape);
+    process.on('unhandledRejection', onEscape);
+    try {
+      const gate = createGate({ strategy: 'exec', params: { command: ['sh', '-c', 'echo reject; exit 0'], timeout_sec: 10 } });
+      for (let i = 0; i < 5; i++) await expect(gate.approve(hugeSpec())).resolves.toBe('reject');
+      const approver = createGate({ strategy: 'exec', params: { command: ['sh', '-c', 'echo approve'], timeout_sec: 10 } });
+      await expect(approver.approve(hugeSpec())).resolves.toBe('approve');
+      await new Promise((r) => setTimeout(r, 50));
+      expect(escaped).toEqual([]);
+    } finally {
+      process.off('uncaughtException', onEscape);
+      process.off('unhandledRejection', onEscape);
+    }
+  }, 20_000);
+
+  it("the command's environment lacks the share password variable", async () => {
+    const name = 'OTZI_TEST_SHARE_PASSWORD';
+    process.env[name] = 'pw-must-not-leak';
+    try {
+      const probe = `if [ -n "\${${name}+x}" ]; then echo reject; else echo approve; fi`;
+      const gate = createGate(
+        { strategy: 'exec', params: { command: ['sh', '-c', probe], timeout_sec: 10, env: { OTZI_TEST_OTHER: '1' } } },
+        { secretEnv: [name] },
+      );
+      await expect(gate.approve(signing())).resolves.toBe('approve');
+      // Other variables still reach it: the daemon environment and gate.env.
+      const other = createGate(
+        { strategy: 'exec', params: { command: ['sh', '-c', 'if [ "$OTZI_TEST_OTHER" = 1 ] && [ -n "$PATH" ]; then echo approve; else echo reject; fi'], timeout_sec: 10, env: { OTZI_TEST_OTHER: '1' } } },
+        { secretEnv: [name] },
+      );
+      await expect(other.approve(signing())).resolves.toBe('approve');
+    } finally {
+      delete process.env[name];
+    }
+  }, 20_000);
+
+  it('a command that ignores SIGTERM is killed after the grace period', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'exec-gate-'));
+    try {
+      const pidFile = join(dir, 'pid');
+      const gate = new ExecGate({
+        command: ['sh', '-c', `trap "" TERM; echo $$ > ${pidFile}; exec sleep 60`],
+        timeoutSec: 0.3,
+        killGraceMs: 200,
+      });
+      await expect(gate.approve(signing())).rejects.toThrow(/timed out after 0\.3s/);
+      const pid = Number((await readFile(pidFile, 'utf8')).trim());
+      await vi.waitFor(() => expect(isAlive(pid)).toBe(false), { timeout: 10_000, interval: 25 });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('a decision followed by a flood of output is read from the first line', async () => {
+    const gate = createGate({
+      strategy: 'exec',
+      params: { command: ['sh', '-c', 'echo approve; head -c 3000000 /dev/zero | tr "\\0" x'], timeout_sec: 20 },
+    });
+    await expect(gate.approve(signing())).resolves.toBe('approve');
+  }, 20_000);
+});
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

@@ -8,6 +8,9 @@
  * outlast it. For human-in-the-loop the approver endpoint is expected to hold
  * the connection open until the operator responds.
  *
+ * `url` is `https:`, or `http:` to a loopback host only: the decision is this
+ * node's security boundary, and the Bearer token goes out with every request.
+ *
  * TOML shape (under `[gate]`, parameters sit directly next to `strategy`):
  *   strategy = "webhook"
  *   url = "https://approver.internal/otzi"
@@ -23,6 +26,7 @@
 import { request as httpRequest, type ClientRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { ConfigError } from '../config/parse';
+import { isLoopbackHost } from '../util/endpoint';
 import { serializeSpec } from './exec';
 import { parseGateTimeoutSec } from './timeout';
 import type { ApprovalGate, CeremonySpec, Decision } from './types';
@@ -172,6 +176,7 @@ export function parseWebhookParams(params: Record<string, unknown>): WebhookGate
 
   if (typeof params.url !== 'string' || params.url.length === 0)
     throw new ConfigError('gate.url', 'must be a non-empty string');
+  checkWebhookUrl(params.url);
   const out: WebhookGateConfig = {
     url: params.url,
     timeoutSec: parseGateTimeoutSec(params.timeout_sec),
@@ -182,4 +187,26 @@ export function parseWebhookParams(params: Record<string, unknown>): WebhookGate
     out.bearerTokenEnv = params.bearer_token_env;
   }
   return out;
+}
+
+/**
+ * `https:` anywhere; `http:` only to a loopback host. Plain http across a
+ * network would let anyone on the path read the Bearer token and forge the
+ * decision this node's signature depends on.
+ */
+function checkWebhookUrl(raw: string): void {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new ConfigError('gate.url', `must be a URL (got '${raw}')`);
+  }
+  if (url.hostname === '') throw new ConfigError('gate.url', `must name a host (got '${raw}')`);
+  if (url.protocol === 'https:') return;
+  if (url.protocol === 'http:' && isLoopbackHost(url.hostname)) return;
+  throw new ConfigError(
+    'gate.url',
+    `must be https, or http to a loopback host (localhost, 127.0.0.0/8, ::1) — got '${raw}'. ` +
+      'For a remote approver, put a TLS reverse proxy in front of it and use its https URL.',
+  );
 }
