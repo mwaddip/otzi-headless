@@ -104,6 +104,7 @@ export class Daemon {
         network,
         partyId: selfPartyId,
         vaultPubkeyPath: deps.vaultPubkeyPath,
+        logger: this.log,
       });
     const shared = {
       io,

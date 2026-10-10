@@ -35,7 +35,9 @@ through Esplora.
 - `otzi setup <config.toml>` — bootstrap pubkey exchange. Reads `[bootstrap].role` from the config and runs the leader or leaf flow. Prints the 96-bit fingerprint of the resulting pubkey book as `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx`. **Compare it out of band with every other operator before any DKG.** Re-running on a node that already has a pubkey book re-prints the fingerprint.
 - `otzi generate [--config <path>] [--ceremony-id <id>]` — run the run-once DKG through the local daemon (the `dkg` op). Run it on exactly one node; every other daemon in the ring must be running. The vault is n-of-n: `parties` is the ring size and `threshold = parties`. The banner prints the vault address, the network, the share path, and the instruction to **restart every daemon** so each loads its new share.
 
-  Fails with `409` when this node already holds a vault, `403` when this node's gate rejects, `500` when the ceremony fails or times out. A DKG that fails before every node has confirmed leaves no share at the share path on any node and can be re-run.
+  Fails with `409` when this node already holds a vault, `403` when this node's gate rejects, `500` when the ceremony fails or times out. A DKG that fails before any node commits leaves no share at the share path on any node and can be re-run; a staged `<share path>.pending` left behind is overwritten by the next DKG.
+
+  A DKG can also fail on one node after another node has committed the vault (for example when a node loses its connection during the last exchange). A node that had already published its confirmation therefore never deletes its staged share: it keeps `<share path>.pending`, and the error (in the `500` reply when it is this node, in the daemon log otherwise) names the file and the vault address. Run `otzi vault` on the other nodes. If any of them shows that address, rename the `.pending` file to the share path on this node (`sudo mv <share path>.pending <share path>`) and restart its daemon. If none does, the vault was never created: remove the `.pending` files and run `otzi generate` again.
 
 ### Vault
 

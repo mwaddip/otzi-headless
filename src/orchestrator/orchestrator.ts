@@ -24,7 +24,7 @@ import { EventEmitter } from 'node:events';
 import { verifySignature } from '@mwaddip/frots';
 import { BLOB_RETENTION_MS, scheduleClear } from '../core/blob-retention';
 import type { CeremonyIo } from '../core/ceremony-io';
-import { runDkgCeremony, type ShareStager } from '../core/dkg-ceremony';
+import { DkgShareKeptError, runDkgCeremony, type ShareStager } from '../core/dkg-ceremony';
 import {
   MAX_INPUTS,
   parseMessage,
@@ -321,7 +321,19 @@ export class Orchestrator {
           }
           this.settle(t, { status: 'done', address });
         },
-        err => this.settle(t, { status: 'aborted', reason: errorMessage(err) }),
+        err => {
+          if (!(err instanceof DkgShareKeptError)) {
+            this.settle(t, { status: 'aborted', reason: errorMessage(err) });
+            return;
+          }
+          // This node had published its confirmation: its staged share was kept, and the
+          // operator must check the other nodes. Said at error level, settled or not.
+          if (t.settled) {
+            this.log.error(`orchestrator: dkg ${ceremonyId}: ${err.message}`, { ceremonyId, path: err.stagedPath });
+            return;
+          }
+          this.settle(t, { status: 'aborted', reason: err.message, level: 'error' });
+        },
       )
       .catch(err => this.unexpected(err, t));
     // The DKG slot stays held until the ceremony has unwound, discard or commit included.

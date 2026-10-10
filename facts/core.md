@@ -504,9 +504,21 @@ export type CeremonyMessage = AnnounceDkg | AnnounceSign | SignoffDone | Signoff
 ```ts
 export const DKG_ROUNDS = { r1: 'dkg-r1', r2: 'dkg-r2', verifyR1: 'dkg-verify-r1', verifyR2: 'dkg-verify-r2', verified: 'dkg-verified' } as const;
 export interface DkgCeremonyResult { keyPackage: KeyPackage; publicKeyPackage: PublicKeyPackage }
-export interface ShareStager { stage(r: DkgCeremonyResult): Promise<void>; commit(): Promise<void>; discard(): Promise<void> }
+export interface ShareStager {
+  readonly sharePath: string;   // where commit() puts the share
+  readonly stagedPath: string;  // where stage() writes it (the daemon's `<share path>.pending`)
+  stage(r: DkgCeremonyResult): Promise<void>;
+  commit(): Promise<void>;
+  discard(): Promise<void>;
+}
 export interface DkgCeremonySpec { ceremonyId: string; sessionId: Uint8Array; threshold: number; parties: number; network: NetworkName; rng: Rng }
+export class DkgShareKeptError extends Error { readonly reason: string; readonly keptNote: string; readonly stagedPath: string }
+export function keptShareNote(stager: Pick<ShareStager, 'sharePath' | 'stagedPath'>, address: string): string
 ```
+
+- `ShareStager` contract (what `runDkgCeremony` relies on): `stage` resolves only once the share is durable at `stagedPath`; `commit` resolves once the share is at `sharePath` and never replaces a file that exists there; `discard` removes the staged share.
+- `keptShareNote(stager, address)` → `this node published its confirmation of vault <address>, so its staged share was kept at <stagedPath>: run 'otzi vault' on the other nodes; if any of them shows <address>, rename <stagedPath> to <sharePath> and restart this daemon, otherwise remove <stagedPath>`.
+- `DkgShareKeptError(reason, keptNote, stagedPath, options?)` — `message` = `DKG aborted: <reason>; <keptNote>`; `name` = `'DkgShareKeptError'`. Thrown by a DKG that failed after this node published its `dkg-verified`; `LeaderDispatcher` rebuilds it with its deadline reason.
 
 - `async runDkgCeremony(io: CeremonyIo, spec: DkgCeremonySpec, stager: ShareStager, signal?: AbortSignal) → Promise<DkgCeremonyResult>`
   - **Pre:** `announce-dkg` for this ceremony was broadcast (leader) or accepted (participant) — announcing is the caller's job; this node holds no vault; `spec.parties === io.transport.peers.length`; `2 ≤ threshold ≤ parties`; `sessionId` is 32 bytes; `ceremonyId` satisfies `isCeremonyId`.
@@ -515,22 +527,24 @@ export interface DkgCeremonySpec { ceremonyId: string; sessionId: Uint8Array; th
     2. **Round 2.** `round2`; put one `{round: 'dkg-r2', from: self, to: peer}` per peer; pull the N−1 `{round: 'dkg-r2', from: peer, to: self}`; `addBlob(..., 'r2', from)`; `finalize`.
     3. **Verify.** `M = dkgVerifyMessage(sessionId, network, publicKeyPackage)` from this node's own result. Signing session with `sighashes = [{ hash: M, tweaked: true }]`, `activeSigners` = all parties, `sessionId = spec.sessionId`. Put `dkg-verify-r1`, pull from all others, `addBlob(..., 1, from)`; `round2` (nonces dropped), put `dkg-verify-r2`, pull from all others, `addBlob(..., 2, from)`; `aggregate` with the full `publicKeyPackage`; check `verifySignature(sig, M, publicKeyPackage.verifyingKey)`.
     4. **Stage.** `stager.stage({ keyPackage, publicKeyPackage })`.
-    5. **Confirm.** Put `dkg-verified` = the raw 64-byte aggregate signature. Pull `dkg-verified` from all N−1 others; each must be 64 bytes and pass `verifySignature(theirs, M, publicKeyPackage.verifyingKey)`.
-    6. **Complete.** `stager.commit()`.
+    5. **Confirm.** Put `dkg-verified` = the raw 64-byte aggregate signature (this node has now *published its confirmation*). Pull `dkg-verified` from all N−1 others; each must be 64 bytes and pass `verifySignature(theirs, M, publicKeyPackage.verifyingKey)`.
+    6. **Complete.** `stager.commit()` — once all N−1 confirmations have verified, the node commits whatever `signal` says.
   - **Post (failure, any step):**
-    1. `await stager.discard()`;
-    2. unless `signal?.aborted`, broadcast `signoff-aborted {ceremonyId, reason}`;
-    3. throw `Error('DKG aborted: <reason>')`.
-  - **Abort:** `signal` aborting stops every pull (`Error('aborted')`) and takes the failure path without broadcasting.
+    1. Before this node published its confirmation: `await stager.discard()`. No node can have committed, because every commit needs this node's confirmation.
+    2. From the put of its own `dkg-verified` on — a confirmation pull that fails or times out, a confirmation that does not verify, an aborted `signal`, a failed `commit` — `discard` is never called: another node may already have committed this vault, so the staged share stays at `stagedPath`.
+    3. Unless `signal?.aborted`, broadcast `signoff-aborted {ceremonyId, reason}` (in both cases: nodes that have not confirmed must stop).
+    4. Throw `Error('DKG aborted: <reason>')` before the confirmation, and `DkgShareKeptError(reason, keptShareNote(stager, address))` after it, where `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address`. The callers log it at error level (see orchestrator.md, daemon.md `leader.ts`).
+  - **Abort:** `signal` aborting stops every pull (`Error('aborted')`) and takes the failure path without broadcasting. `signal` is checked before each step up to the put of `dkg-verified`, and not after the confirmations verified.
 
 **Invariants:**
-- **Guarantee:** a node completes only when every node has produced a signature under the same vault key over the same transcript and has staged its share to disk.
+- **Guarantee:** a node completes only when every node has produced a signature under the same vault key over the same transcript and has staged its share durably to disk.
+- **No lost share:** a node that published its confirmation never deletes its staged share. Once any node commits, every other node holds the vault's share either at its share path or at its staged path, where the `DkgShareKeptError` (and the startup warning, `warnOnPendingShare`) tells the operator how to put it in place.
 - An equivocating node (different `dkg-r1` per puller) makes the verification signature or a confirmation fail; no node completes.
 - Sessions are destroyed on every exit path.
 
 **Cross-component contracts:**
-- Depends on: `frost-dkg-session.ts`, `frost-sign-session.ts`, `messages.ts` (`encodeMessage`), `dkgVerifyMessage` (`src/otzi/lib/dkg.ts`), frots `verifySignature`, `CeremonyIo`.
-- Used by: `LeaderDispatcher.runDkg`, `Orchestrator` (`announce-dkg`).
+- Depends on: `frost-dkg-session.ts`, `frost-sign-session.ts`, `messages.ts` (`encodeMessage`), `dkgVerifyMessage` / `toVaultKey` (`src/otzi/lib/dkg.ts`), `vaultPayment` (`src/otzi/lib/bitcoin.ts`), frots `verifySignature`, `CeremonyIo`.
+- Used by: `LeaderDispatcher.runDkg` (also `DkgShareKeptError`), `Orchestrator` (`announce-dkg`; `DkgShareKeptError`).
 - `ShareStager` implemented by: `createShareStager` (`src/daemon/vault-share.ts`).
 
 ---
@@ -613,7 +627,7 @@ Test helpers; never imported by runtime code.
 - Transport null: retryable (BlobPuller backoff).
 - BlobStore conflict: protocol violation, ceremony-fatal.
 - `addBlob` → `{ ok: false }`: ceremony-fatal; the abort reason names the sender.
-- DKG failure: `signoff-aborted` from the failing node (unless aborted by signal), `.pending` discarded.
+- DKG failure: `signoff-aborted` from the failing node (unless aborted by signal); `.pending` discarded before this node published its `dkg-verified`, kept after it (`DkgShareKeptError`).
 - Signing failure after announce: the leader dispatcher broadcasts `signoff-aborted`.
 
 **Contracts (formal):**
@@ -629,7 +643,7 @@ Test helpers; never imported by runtime code.
 | FrostDkgSession.addBlob(s, blob, round, from) | `from` authenticated | stored, or `{ok:false}` naming `from` | Never |
 | FrostSignSession.addBlob(s, blob, round, from) | `from` authenticated | stored, or `{ok:false}` naming `from` | Never |
 | FrostSignSession.round2(s) | all commitments collected; not started | shares blob; `myNonces === null` | already started / missing commitments |
-| runDkgCeremony(io, spec, stager, signal?) | announced; no vault | share committed, result returned | `DKG aborted: <reason>` |
+| runDkgCeremony(io, spec, stager, signal?) | announced; no vault | share committed, result returned | `DKG aborted: <reason>`; `DkgShareKeptError` after its confirmation |
 | leadSigning(io, spec, proposal, signal?) | analysed + gated by caller | verified signatures, input order | on any failure / `aborted` |
 | participateInSigning(io, spec, signal?) | participant checks passed | `sign-r1`, `sign-r2` produced | on any failure / `aborted` |
 

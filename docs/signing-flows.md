@@ -91,13 +91,13 @@ inconsistent setup fail loudly. Once a vault exists, no DKG can touch it.
  · each node aggregates with the full public key package and verifies
 
  ⑤ STAGE
- share (Ötzi v4) → <share path>.pending, mode 0600
+ share (Ötzi v4) → <share path>.pending, mode 0600, synced to disk
 
  ⑥ CONFIRM
  dkg-verified ◄═══ each node pulls the other N−1 signatures and verifies ═►
 
  ⑦ COMPLETE
- rename .pending → share path · write vault-pubkey.json · settle done
+ link .pending → share path (never replaces) · unlink .pending · write vault-pubkey.json · settle done
 ```
 
 ### Steps
@@ -123,20 +123,29 @@ inconsistent setup fail loudly. Once a vault exists, no DKG can touch it.
    share, the signature fails and no node proceeds.
 5. **Stage.** The node writes its Ötzi v4 share, encrypted with the share
    password, to `<share path>.pending` (mode 0600), replacing any earlier
-   `.pending`.
+   `.pending`, and syncs the file and its directory to disk.
 6. **Confirm.** Each node publishes the aggregate signature as `dkg-verified`,
    pulls the other N−1, and checks each against `M` and its own vault key.
-7. **Complete.** The node renames `.pending` to the share path (refused if a file
-   appeared there meanwhile), writes `vault-pubkey.json`, and settles as done.
+7. **Complete.** Once all N−1 confirmations verify, the node commits even if the
+   ceremony is aborted meanwhile: it links `.pending` to the share path (refused
+   if anything exists there, so a vault is never replaced), removes `.pending`,
+   writes `vault-pubkey.json` (a failed write is only a warning; startup rewrites
+   it), and settles as done.
 
 A node completes only when every node has produced a signature under the same
-vault key over the same transcript and has staged its share to disk.
+vault key over the same transcript and has staged its share durably to disk.
 
 **Failure at any step.** The failing node broadcasts `signoff-aborted
-{ceremonyId, reason}`, deletes its `.pending` file and settles as aborted. Because
-the DKG is symmetric, a node accepts a DKG `signoff-aborted` from any ring member
-and stops. A `.pending` file found at startup is logged at warn level and never
-loaded; the next DKG overwrites it.
+{ceremonyId, reason}` and settles as aborted. Because the DKG is symmetric, a node
+accepts a DKG `signoff-aborted` from any ring member and stops. A node that had
+not yet published its `dkg-verified` deletes its `.pending` file: no node can have
+committed without its confirmation. A node that had published it keeps the file,
+because another node may already have committed the vault, and logs an error
+naming the file, the vault address and the recovery: run `otzi vault` on the
+other nodes; if any shows that address, rename `.pending` to the share path and
+restart the daemon, otherwise remove it. A `.pending` file found at startup is
+logged at warn level with the same recovery and never loaded; the next DKG
+overwrites it.
 
 **After the DKG.** The new share is on disk but not loaded. Restart every daemon
 so each loads its share; until then `sign` returns `409`. Replacing an existing
@@ -269,7 +278,7 @@ A participant stays live until the leader's sign-off or its signing deadline.
 | Each signature verified against the vault output key | Leader per input; `finalizeSend` again under BIP340 | Leader `500` |
 | `signoff-done` signatures against own sighashes and output key | Participant | `invalid-signoff` |
 | Sign-offs accepted only from the pinned leader (signing); aborts from any ring member (DKG) | Participant | Ignored |
-| DKG verification signature, then all-N confirmation | Every node | `signoff-aborted`, `.pending` deleted on every node |
+| DKG verification signature, then all-N confirmation | Every node | `signoff-aborted`; `.pending` deleted on a node that had not confirmed, kept (with the recovery logged) on one that had |
 | Startup: the share decrypts, its network matches `[network].name`, `partyId` and `parties` match the pubkey book | Each daemon | Refuses to start |
 | Input count, confirmed UTXOs, recipient resolution | `otzi btc send` | Error before any daemon call |
 | Prevout amounts and scripts | Bitcoin consensus: sighashes commit to every input amount and script | Signatures from false prevout data are invalid on chain |

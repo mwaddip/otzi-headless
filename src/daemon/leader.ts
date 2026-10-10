@@ -21,7 +21,7 @@
 import type { Rng } from '@mwaddip/frots';
 import { BLOB_RETENTION_MS, scheduleClear } from '../core/blob-retention';
 import type { CeremonyIo } from '../core/ceremony-io';
-import { runDkgCeremony, type ShareStager } from '../core/dkg-ceremony';
+import { DkgShareKeptError, runDkgCeremony, type ShareStager } from '../core/dkg-ceremony';
 import { encodeMessage, type CeremonyMessage } from '../core/messages';
 import { leadSigning } from '../core/sign-ceremony';
 import type { PartyId } from '../core/types';
@@ -162,9 +162,17 @@ export class LeaderDispatcher {
           // The ceremony stops silently on its signal; nobody else has announced this abort.
           const reason = deadlineReason(deadline);
           await this.broadcastBestEffort({ v: 2, kind: 'signoff-aborted', ceremonyId, reason });
-          failure = new Error(`DKG aborted: ${reason}`, { cause: err });
+          failure =
+            err instanceof DkgShareKeptError
+              ? new DkgShareKeptError(reason, err.keptNote, err.stagedPath, { cause: err })
+              : new Error(`DKG aborted: ${reason}`, { cause: err });
         }
-        this.log.warn(`leader: dkg ${ceremonyId} failed: ${errorMessage(failure)}`, { ceremonyId });
+        if (failure instanceof DkgShareKeptError) {
+          // This node's staged share was kept: the operator must check the other nodes.
+          this.log.error(`leader: dkg ${ceremonyId} failed: ${failure.message}`, { ceremonyId, path: failure.stagedPath });
+        } else {
+          this.log.warn(`leader: dkg ${ceremonyId} failed: ${errorMessage(failure)}`, { ceremonyId });
+        }
         throw failure;
       } finally {
         deadline.clear();

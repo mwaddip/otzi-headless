@@ -131,7 +131,7 @@ Every announce first passes the duplicate checks: no tracker exists for the `cer
   6. `await deps.vaultExists()` is `false` (a throw is a drop) — a `.pending` file does not count;
   7. the gate approves `buildDkgSpec({ ceremonyId, leader: resolveLeaderId(from), role: 'participant' }, { threshold, parties, network, peerIds })`, with `peerIds` = every `peersById` label in party order.
 
-  Before step 6 the orchestrator creates the tracker (leader pinned = sender, which also takes the DKG slot) and starts the `dkgMs` deadline; a drop at step 6 removes the tracker without an outcome. Then: run `runDkgCeremony(io, { ceremonyId, sessionId, threshold, parties, network, rng }, createStager(), signal)` with the tracker's `AbortController` signal. Success settles `done` with `address` (`vaultPayment(toVaultKey(publicKeyPackage), network).address`); a failure settles `aborted` with the reason. `createStager` is called only here.
+  Before step 6 the orchestrator creates the tracker (leader pinned = sender, which also takes the DKG slot) and starts the `dkgMs` deadline; a drop at step 6 removes the tracker without an outcome. Then: run `runDkgCeremony(io, { ceremonyId, sessionId, threshold, parties, network, rng }, createStager(), signal)` with the tracker's `AbortController` signal. Success settles `done` with `address` (`vaultPayment(toVaultKey(publicKeyPackage), network).address`); a failure settles `aborted` with the reason. A `DkgShareKeptError` (the ceremony failed after this node published its `dkg-verified`, so its staged share was kept) settles `aborted` at error level; when the tracker had already settled (a ring member's `signoff-aborted`, the deadline, `stop()`), it is logged at error level on its own line. Either way the line carries the kept path and the recovery. `createStager` is called only here.
 
 - **`announce-sign`** — drop unless all of these hold, in this order:
   1. the duplicate checks — the sender of the first announce is pinned as leader;
@@ -174,7 +174,7 @@ Every announce first passes the duplicate checks: no tracker exists for the `cer
 
 **Notes / gotchas:**
 - A node that completes a DKG keeps running without the new vault loaded; signing on it starts after a daemon restart. Its `vaultExists()` is true from the commit on, so a second DKG is refused.
-- A DKG that commits after its tracker settled (an abort raced the commit) logs a warn line: the share is on disk although the outcome is not `done`.
+- A DKG that commits after its tracker settled (an abort raced the commit) logs a warn line: the share is on disk although the outcome is not `done`. A node that has verified all N−1 confirmations commits even when its tracker was aborted meanwhile (core.md, `runDkgCeremony`).
 - The ceremony deadline is the safety net for a crashed leader or a lost signoff.
 - `waitFor` is used by tests; runtime code reacts through `onCompleted`.
 

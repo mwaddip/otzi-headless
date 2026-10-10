@@ -10,18 +10,22 @@
  *   2. Round 2  — `dkg-r2` addressed blobs, then finalize.
  *   3. Verify   — all N nodes FROST-sign M = dkgVerifyMessage(...) under the new
  *                 key (`dkg-verify-r1` / `dkg-verify-r2`); every node aggregates.
- *   4. Stage    — the share goes to `.pending`.
+ *   4. Stage    — the share goes durably to `.pending`.
  *   5. Confirm  — `dkg-verified` = the raw 64-byte signature, pulled from all N−1
  *                 others and checked against this node's own M and key.
- *   6. Complete — commit.
+ *   6. Complete — commit, whatever the signal says once every confirmation verified.
  *
- * Announcing is the caller's job. On any failure the staged share is
- * discarded and, unless `signal` aborted (someone else already announced the
- * abort), `signoff-aborted` is broadcast.
+ * Announcing is the caller's job. On any failure, unless `signal` aborted
+ * (someone else already announced the abort), `signoff-aborted` is broadcast.
+ * The staged share is discarded only while this node has not published its
+ * own `dkg-verified`: no node can commit without that confirmation. After it,
+ * another node may already have committed the vault, so the staged share is
+ * kept and the error (`DkgShareKeptError`) names it and the recovery.
  */
 
 import { verifySignature, type KeyPackage, type PublicKeyPackage, type Rng } from '@mwaddip/frots';
-import { dkgVerifyMessage } from '../otzi/lib/dkg';
+import { vaultPayment } from '../otzi/lib/bitcoin';
+import { dkgVerifyMessage, toVaultKey } from '../otzi/lib/dkg';
 import type { NetworkName } from '../otzi/lib/vault-types';
 import type { CeremonyIo } from './ceremony-io';
 import * as dkgSession from './frost-dkg-session';
@@ -43,7 +47,13 @@ export interface DkgCeremonyResult {
 }
 
 export interface ShareStager {
+  /** Where `commit` puts the share. */
+  readonly sharePath: string;
+  /** Where `stage` writes it. */
+  readonly stagedPath: string;
+  /** Resolves once the share is durable at `stagedPath`. */
   stage(r: DkgCeremonyResult): Promise<void>;
+  /** Resolves once the share is at `sharePath`; never replaces an entry there. */
   commit(): Promise<void>;
   discard(): Promise<void>;
 }
@@ -55,6 +65,34 @@ export interface DkgCeremonySpec {
   parties: number;
   network: NetworkName;
   rng: Rng;
+}
+
+/** Where a confirmed node's staged share was kept, and what the operator does with it. */
+export function keptShareNote(stager: Pick<ShareStager, 'sharePath' | 'stagedPath'>, address: string): string {
+  const { sharePath, stagedPath } = stager;
+  return (
+    `this node published its confirmation of vault ${address}, so its staged share was kept at ${stagedPath}: ` +
+    `run 'otzi vault' on the other nodes; if any of them shows ${address}, rename ${stagedPath} to ${sharePath} ` +
+    `and restart this daemon, otherwise remove ${stagedPath}`
+  );
+}
+
+/**
+ * A DKG that failed after this node published its `dkg-verified`: another node
+ * may have committed the vault, so this node's staged share was kept.
+ */
+export class DkgShareKeptError extends Error {
+  constructor(
+    /** Why the ceremony failed. */
+    readonly reason: string,
+    /** `keptShareNote(...)`: where the share is and the recovery. */
+    readonly keptNote: string,
+    readonly stagedPath: string,
+    options?: ErrorOptions,
+  ) {
+    super(`DKG aborted: ${reason}; ${keptNote}`, options);
+    this.name = 'DkgShareKeptError';
+  }
 }
 
 /** Longest `reason` a `signoff-aborted` may carry (messages.ts parser rule). */
@@ -78,6 +116,8 @@ export async function runDkgCeremony(
   const others = all.filter(p => p !== me);
   let dkg: dkgSession.FrostDkgSession | null = null;
   let sign: signSession.FrostSigningSession | null = null;
+  /** Set once this node's `dkg-verified` is in its store, i.e. servable to the others. */
+  let confirmedVault: string | null = null;
 
   const put = (key: BlobKey, blob: Uint8Array) => io.store.put(key, blob);
   const broadcastKeys = (round: string): BlobKey[] => others.map(from => ({ ceremonyId, round, from }));
@@ -155,8 +195,11 @@ export async function runDkgCeremony(
     throwIfAborted(signal);
     await stager.stage(result);
 
-    // 5. Confirm: every other node signed the same M under the same key.
+    // 5. Confirm: every other node signed the same M under the same key. From
+    // the put on, any node may complete with this node's confirmation, so this
+    // node never discards its staged share again.
     throwIfAborted(signal);
+    confirmedVault = vaultPayment(toVaultKey(publicKeyPackage), spec.network).address;
     put({ ceremonyId, round: DKG_ROUNDS.verified, from: me }, signature);
     const confirmations = broadcastKeys(DKG_ROUNDS.verified);
     await io.puller.pullAll(confirmations, io.pullOpts, signal);
@@ -171,17 +214,19 @@ export async function runDkgCeremony(
       }
     }
 
-    // 6. Complete.
-    throwIfAborted(signal);
+    // 6. Complete. Every confirmation verified: the others may be committing
+    // now, so an abort that arrives from here on does not stop this node.
     await stager.commit();
     return result;
   } catch (err) {
     const reason = errorMessage(err);
     let note = '';
-    try {
-      await stager.discard();
-    } catch (discardErr) {
-      note = ` (discard failed: ${errorMessage(discardErr)})`;
+    if (confirmedVault === null) {
+      try {
+        await stager.discard();
+      } catch (discardErr) {
+        note = ` (discard failed: ${errorMessage(discardErr)})`;
+      }
     }
     if (!signal?.aborted) {
       try {
@@ -191,6 +236,9 @@ export async function runDkgCeremony(
       } catch {
         // Best effort: peers still stop on their own pull failures or deadline.
       }
+    }
+    if (confirmedVault !== null) {
+      throw new DkgShareKeptError(reason, keptShareNote(stager, confirmedVault), stager.stagedPath, { cause: err });
     }
     throw new Error(`DKG aborted: ${reason}${note}`);
   } finally {

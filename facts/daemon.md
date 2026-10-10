@@ -51,28 +51,31 @@
   - **Invariant:** the password is never logged and never part of an error message.
 
 - `async warnOnPendingShare(path: string, log: Logger): Promise<void>`
-  - **Post:** When `pendingPath(path)` exists, logs one warn line naming it: it is left over from an unfinished DKG, is not loaded, and the next DKG overwrites it. Otherwise does nothing.
+  - **Post:** When `pendingPath(path)` exists, logs one warn line naming it: it is left over from an unfinished DKG and is not loaded; it may be this node's share of a vault the other nodes committed — when `otzi vault` on another node shows that vault, rename it to `path` and restart; otherwise the next DKG overwrites it. When the file's plaintext header (`network`, `internalKey`) reads, the line names the vault address (`vaultPaymentFromInternalKey`); the file is never decrypted. Otherwise does nothing.
 
-- `interface ShareStagerOptions { path: string; password: string; network: NetworkName; partyId: PartyId; vaultPubkeyPath?: string }`
+- `interface ShareStagerOptions { path: string; password: string; network: NetworkName; partyId: PartyId; vaultPubkeyPath?: string; logger?: Logger }`
+  - `logger` (default `NOOP_LOGGER`) receives the warnings `commit` logs once the share is in place.
 
 - `createShareStager(opts: ShareStagerOptions): ShareStager`
-  - **`stage(r)`:** writes `JSON.stringify(await encryptShareFile(r.keyPackage, r.publicKeyPackage, network, partyId, password))` to `pendingPath(path)` with mode 0600, creating the parent directory and overwriting any earlier `.pending`.
+  - **`sharePath`** = `path`; **`stagedPath`** = `pendingPath(path)`.
+  - **`stage(r)`:** writes `JSON.stringify(await encryptShareFile(r.keyPackage, r.publicKeyPackage, network, partyId, password))` to `pendingPath(path)` with mode 0600, creating the parent directory and overwriting any earlier `.pending`; then fsyncs the file and its directory. It resolves only once the staged share is durable, because the DKG publishes this node's confirmation right after it.
   - **`commit()`:**
     - **Pre:** `stage` resolved.
-    - **Post:** `pendingPath(path)` renamed to `path`; then `writeVaultPubkeyFile(vaultPubkeyFromPackage(r.publicKeyPackage, network), vaultPubkeyPath)`.
-    - **Throws:**
-      - `Error('share path already exists: <path>')` when a file exists at `path` (nothing renamed);
-      - `Error('commit called before stage')` when `stage` has not resolved (nothing renamed);
-      - `Error('share was committed to <path> but vault-pubkey.json was not written to <vaultPubkeyPath>: <reason>; …', { cause })` when the `vault-pubkey.json` write fails after the rename. The share is in place; the caller's abort path (`discard`, `signoff-aborted`) must not be read as "nothing was kept", so the message says so. The daemon rewrites `vault-pubkey.json` on its next start.
-  - **`discard()`:** removes `pendingPath(path)`; ENOENT is ignored.
+    - **Post:** `link(pendingPath(path), path)` — no-clobber: a link never replaces an existing entry — then `unlink(pendingPath(path))`, fsync of the directory, and `writeVaultPubkeyFile(vaultPubkeyFromPackage(r.publicKeyPackage, network), vaultPubkeyPath)`. Once the link succeeded the share is in place and `commit` resolves: a failure to unlink the staging file, to fsync the directory or to write `vault-pubkey.json` is logged at warn level naming the path (the daemon rewrites `vault-pubkey.json` on its next start; a leftover `.pending` is the same file as the share).
+    - **Throws:** (nothing placed at `path` in each case)
+      - `Error('share path already exists: <path>')` when an entry exists at `path` (EEXIST from the link, a dangling symlink included);
+      - `Error('commit called before stage')` when `stage` has not resolved;
+      - any other `link` error.
+  - **`discard()`:** removes `pendingPath(path)`; ENOENT is ignored. `runDkgCeremony` calls it only before this node published its `dkg-verified`.
 
 **Invariants:**
-- A share reaches `path` only through `commit`, i.e. only after the DKG's all-N confirmation.
-- Share files are mode 0600 from the first byte written (`.pending` and after the rename).
+- A share reaches `path` only through `commit`, i.e. only after the DKG's all-N confirmation, and `commit` never replaces an entry at `path`.
+- Share files are mode 0600 from the first byte written (`.pending` and after the commit).
+- The staged share is synced to disk before the node's confirmation is published, and the directory is synced after the commit.
 - Share files are byte-compatible with web Ötzi in both directions.
 
 **Cross-component contracts:**
-- Depends on: `encryptShareFile`, `decryptShareFile`, `assertShareMatchesVault` (`src/otzi/lib/share-file.ts`), `vault-pubkey.ts`.
+- Depends on: `encryptShareFile`, `decryptShareFile`, `assertShareMatchesVault` (`src/otzi/lib/share-file.ts`), `vaultPaymentFromInternalKey` (`src/otzi/lib/bitcoin.ts`), `vault-pubkey.ts`.
 - Used by: `config-merge.ts` (`loadVaultShare`, `warnOnPendingShare`), `Daemon` (`vaultFileExists`, `createShareStager` for orchestrator and leader).
 
 ---
@@ -103,7 +106,7 @@
   - **Throws:** Never.
 
 - `async writeVaultPubkeyFile(file: VaultPubkeyFile, outputPath?: string): Promise<void>`
-  - **Post:** Creates the parent directory; writes pretty-printed JSON at `outputPath` (default `DEFAULT_VAULT_PUBKEY_PATH`) with mode 0644 (chmod applied after write).
+  - **Post:** Creates the parent directory; writes pretty-printed JSON to a temporary file beside `outputPath` (default `DEFAULT_VAULT_PUBKEY_PATH`) with mode 0644 (chmod applied after write), fsyncs it and renames it over `outputPath`. A reader sees the old file or the new one, never a partial one, and an existing file is replaced whatever its owner or mode. On failure the temporary file is removed.
 
 - `async readVaultPubkeyFile(path?: string): Promise<VaultPubkeyFile>`
   - **Post:** Parsed file at `path` (default `DEFAULT_VAULT_PUBKEY_PATH`).
@@ -113,7 +116,7 @@
 - Every value is public; mode 0644 lets `otzi` group members and other users run read-only CLI commands.
 - Written:
   - at daemon startup whenever a share is loaded (`loadAndValidate`, at its `vaultPubkeyPath` option; best-effort — a write failure is logged and does not stop startup);
-  - by the share stager's `commit()` after a DKG completes.
+  - by the share stager's `commit()` after a DKG completes (best-effort: a write failure is logged at warn level, the share is in place).
 
 **Cross-component contracts:**
 - Depends on: `toVaultKey`, `vaultPayment` (`src/otzi/lib`).
@@ -206,7 +209,7 @@
 
 - **Ceremony deadline:** each ceremony the leader runs is bounded as a whole. From the ceremony start (just before the announce) an `AbortController` is aborted after `ceremonyDeadlines.signingMs` / `dkgMs`; its timer is cleared in a `finally`.
   - Signing: the controller's signal is `leadSigning`'s `signal`. A deadline abort fails the request with `Error('ceremony deadline of <ms> ms passed')` (500), and `signoff-aborted` carries that reason.
-  - DKG: the controller's signal is combined with the slot signal (`AbortSignal.any`) for `runDkgCeremony`, which takes its abort path (stager `discard`, no broadcast of its own). When the deadline, not the slot, aborted it, the leader broadcasts `signoff-aborted {ceremonyId, reason: 'ceremony deadline of <ms> ms passed'}` and the request fails with `DKG aborted: ceremony deadline of <ms> ms passed` (500).
+  - DKG: the controller's signal is combined with the slot signal (`AbortSignal.any`) for `runDkgCeremony`, which takes its abort path (stager `discard` before this node's confirmation, the staged share kept after it; no broadcast of its own). When the deadline, not the slot, aborted it, the leader broadcasts `signoff-aborted {ceremonyId, reason: 'ceremony deadline of <ms> ms passed'}` and the request fails with `DKG aborted: ceremony deadline of <ms> ms passed` (500) — or, when this node had published its confirmation, with `DkgShareKeptError('ceremony deadline of <ms> ms passed', keptNote)`, so the message still says where the staged share was kept and to check the other nodes.
 - **Leader pulls:** each ceremony the leader runs uses `{ ...io, pullOpts: { ...io.pullOpts, deadlineMs, maxAttempts: Number.MAX_SAFE_INTEGER } }` with `deadlineMs` = `ceremonyDeadlines.signingMs` or `ceremonyDeadlines.dkgMs` — pulls retry with backoff until the ceremony deadline, as on participants; `io.pullOpts` supplies only the backoff (`initialDelayMs`, `maxDelayMs`).
 
 - `class LeaderDispatcher`
@@ -220,7 +223,7 @@
     5. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })` (`peerIds` = every `peersById` label in party order); non-approve → `GateRejection`.
     6. `createStager()`; random 32-byte session ID from `rng`; start the ceremony deadline; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, stager, AbortSignal.any([slot.signal, deadline]))`.
     7. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
-    - **Throws:** `RequestError`, `GateRejection`, the deadline error above, or the `runDkgCeremony` error (which already broadcast `signoff-aborted`, unless its signal aborted it).
+    - **Throws:** `RequestError`, `GateRejection`, the deadline error above, or the `runDkgCeremony` error (which already broadcast `signoff-aborted`, unless its signal aborted it). A failure is logged at warn level, or at error level for a `DkgShareKeptError`: the 500 body's `error` then says the staged share was kept at `<share path>.pending` and to check the other nodes with `otzi vault`.
     - **Post:** From the announce on, success and failure both `scheduleClear` the ceremony with the DKG retention. The new vault is on disk but not loaded; signing on it needs a daemon restart.
 
   - **`sign(req: LeaderSignRequest): Promise<{ ceremonyId: string; txid: string; signedTxHex: string; signaturesHex: string[] }>`** — in this order:
@@ -263,7 +266,7 @@
 
 - `class Daemon`
   - **`constructor(deps: DaemonDeps)`**
-    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook, logger })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(addressBookPath, network)` (`addressBookPath` = `deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH`); the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file with `readAddressBook(addressBookPath, network, { missing: 'error' })` and returns its addresses, so it throws when the file does not exist (ENOENT) as well as when it is invalid — where the `addressBook` labelling read returns `[]` on ENOENT — and `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
+    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook, logger })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath, logger })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(addressBookPath, network)` (`addressBookPath` = `deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH`); the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file with `readAddressBook(addressBookPath, network, { missing: 'error' })` and returns its addresses, so it throws when the file does not exist (ENOENT) as well as when it is invalid — where the `addressBook` labelling read returns `[]` on ENOENT — and `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
     - **Invariant:** Does NOT start anything. The share password reaches only the share stager; it is never logged or returned.
   - **`async start(): Promise<void>`** — starts the orchestrator and every trigger. Reentrant.
   - **`async stop(): Promise<void>`** — stops triggers, the orchestrator, and closes the blob server. Reentrant.
@@ -442,7 +445,7 @@
 - **HTTP listener binding:** `HttpTrigger` binds loopback only (parser-enforced). Localhost binding is load-bearing: it is why the API needs no mTLS.
 - **Verify-before-gate:** leader (`LeaderDispatcher.sign`) and participants (`Orchestrator`) both run `analyzeProposal` against their own key before the gate; specs are built from that analysis.
 - **Leadership:** the leader is the node whose trigger fired. For signing it announces, aggregates, finalizes and sends the signoff; for DKG it only generates the session ID and announces.
-- **Share persistence:** leader and participants persist a DKG result through the same `ShareStager`: stage to `.pending`, commit after all-N confirmation. A failure discards `.pending` on every node.
+- **Share persistence:** leader and participants persist a DKG result through the same `ShareStager`: stage to `.pending` (synced), commit after all-N confirmation. A failure discards `.pending` on a node that had not yet published its `dkg-verified`; a node that had keeps it and logs an error naming it and the recovery (core.md, `runDkgCeremony`).
 - **No chain access:** the daemon returns signed transactions; the CLI broadcasts.
 
 ---

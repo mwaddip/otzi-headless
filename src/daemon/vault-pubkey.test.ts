@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -100,6 +100,27 @@ describe('vault-pubkey.json', () => {
       await writeVaultPubkeyFile(vaultPubkeyFromPackage(pkp, 'testnet4'), out);
       await writeVaultPubkeyFile(vaultPubkeyFromPackage(pkp, 'mainnet'), out);
       expect((await readVaultPubkeyFile(out)).network).toBe('mainnet');
+    });
+
+    it('replaces the file by rename, never by writing into the old file', async () => {
+      const out = join(dir, 'vault.json');
+      await writeVaultPubkeyFile(vaultPubkeyFromPackage(pkp, 'testnet4'), out);
+      // A second name for the old file: an in-place write would change it too.
+      const oldInode = join(dir, 'old-inode.json');
+      await link(out, oldInode);
+      await writeVaultPubkeyFile(vaultPubkeyFromPackage(pkp, 'mainnet'), out);
+      expect((await readVaultPubkeyFile(out)).network).toBe('mainnet');
+      expect((await readVaultPubkeyFile(oldInode)).network).toBe('testnet4');
+      expect((await stat(out)).mode & 0o777).toBe(0o644);
+      // No temporary file is left beside it.
+      expect((await readdir(dir)).sort()).toEqual(['old-inode.json', 'vault.json']);
+    });
+
+    it('removes its temporary file when the rename fails', async () => {
+      const out = join(dir, 'vault.json');
+      await mkdir(out); // a directory where the file should be: rename(file, dir) fails
+      await expect(writeVaultPubkeyFile(vaultPubkeyFromPackage(pkp, 'testnet4'), out)).rejects.toThrow();
+      expect(await readdir(dir)).toEqual(['vault.json']);
     });
 
     it('points the operator at `otzi generate` when the file is missing', async () => {

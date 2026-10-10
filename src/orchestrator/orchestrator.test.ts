@@ -65,6 +65,8 @@ interface RecordingStager extends ShareStager {
 
 function recordingStager(failStage?: string): RecordingStager {
   const s: RecordingStager = {
+    sharePath: '/test/share.json',
+    stagedPath: '/test/share.json.pending',
     calls: [],
     async stage() {
       s.calls.push('stage');
@@ -314,9 +316,40 @@ describe('Orchestrator: DKG participation', () => {
     expect(o2).toMatchObject({ ceremonyId: id, kind: 'dkg', status: 'aborted' });
     expect(o2.reason).toContain('disk full');
 
-    await eventually(() => expect(p1.stagers[0]!.calls).toContain('discard'));
+    // Node 1 discards its staged share unless it had already published its confirmation.
+    const confirmed = ring[1]!.io.store.has({ ceremonyId: id, round: 'dkg-verified', from: 1 });
+    if (confirmed) {
+      await eventually(() => expect(p1.log.lines.some(l => l.level === 'error' && l.msg.includes(id))).toBe(true));
+      expect(p1.stagers[0]!.calls).toEqual(['stage']);
+    } else {
+      await eventually(() => expect(p1.stagers[0]!.calls).toContain('discard'));
+    }
     expect(p1.stagers[0]!.calls).not.toContain('commit');
     expect(failing.calls).toEqual(['stage', 'discard']);
+  });
+
+  it('keeps the staged share and logs an error when a ring member aborts after its confirmation', async () => {
+    const id = 'dkg-kept';
+    const p1 = participant(ring[1]!);
+    participant(ring[2]!);
+    // Node 1 never gets node 2's confirmation.
+    const pull = ring[1]!.io.transport.pull.bind(ring[1]!.io.transport);
+    ring[1]!.io.transport.pull = async key => (key.round === 'dkg-verified' && key.from === 2 ? null : pull(key));
+
+    const led = leadDkg(ring, 0, id).catch(() => undefined);
+    await vi.waitFor(() => expect(ring[1]!.io.store.has({ ceremonyId: id, round: 'dkg-verified', from: 1 })).toBe(true), {
+      timeout: WAIT_MS,
+      interval: 5,
+    });
+    await broadcastFrom(ring, 2, { v: 2, kind: 'signoff-aborted', ceremonyId: id, reason: 'operator abort' });
+
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'aborted', reason: 'operator abort' });
+    await eventually(() => expect(p1.log.about(id).filter(l => l.level === 'error')).toHaveLength(1));
+    const line = p1.log.about(id).find(l => l.level === 'error')!;
+    expect(line.msg).toMatch(/so its staged share was kept at \/test\/share\.json\.pending/);
+    expect(line.msg).toMatch(/run 'otzi vault' on the other nodes/);
+    expect(p1.stagers[0]!.calls).toEqual(['stage']);
+    await led;
   });
 
   it('settles timeout when the DKG deadline passes', async () => {

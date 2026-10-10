@@ -145,7 +145,7 @@ sudo dpkg-reconfigure otzi-headless
 | `/var/lib/otzi/identity.json` | ECDH identity | written 660 |
 | `/var/lib/otzi/pubkeys.json` | pubkey book from bootstrap | otzi:otzi 644 |
 | `/var/lib/otzi/share.json` | encrypted Ötzi v4 share | otzi:otzi 600 |
-| `/var/lib/otzi/share.json.pending` | DKG staging file; exists only while a DKG runs | otzi:otzi 600 |
+| `/var/lib/otzi/share.json.pending` | DKG staging file; exists while a DKG runs, or after a DKG that failed once this node had confirmed | otzi:otzi 600 |
 | `/var/lib/otzi/vault-pubkey.json` | public vault metadata | otzi:otzi 644 |
 | `/var/run/otzi/otzi.sock` | UDS socket for operator CLI | otzi:otzi 660 |
 
@@ -188,7 +188,11 @@ or ship logs to an external collector (rsyslog, Loki, Vector, etc.).
   in memory and start empty.
 
 A leftover `/var/lib/otzi/share.json.pending` from an interrupted DKG is logged
-at warn level on startup and never loaded; the next DKG overwrites it.
+at warn level on startup and never loaded. It may be this node's share of a
+vault the other nodes committed: if `otzi vault` on another node shows the
+address the warning names, `sudo mv /var/lib/otzi/share.json.pending
+/var/lib/otzi/share.json` and restart the daemon. Otherwise the next DKG
+overwrites it.
 
 ### Address book
 

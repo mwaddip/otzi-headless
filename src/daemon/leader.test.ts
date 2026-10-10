@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { ShareStager } from '../core/dkg-ceremony';
+import { DkgShareKeptError, type ShareStager } from '../core/dkg-ceremony';
 import { parseMessage, type CeremonyMessage } from '../core/messages';
 import type { BlobKey, PartyId } from '../core/types';
 import { AutoGate } from '../gate/factory';
@@ -123,6 +123,8 @@ class FixedGate implements ApprovalGate {
 function recordingStager(): ShareStager & { calls: string[] } {
   const calls: string[] = [];
   return {
+    sharePath: '/test/share.json',
+    stagedPath: '/test/share.json.pending',
     calls,
     async stage() {
       calls.push('stage');
@@ -483,6 +485,35 @@ describe('LeaderDispatcher ceremony deadline', () => {
         reason: `ceremony deadline of ${CEREMONY_MS} ms passed`,
       });
     }
+  });
+});
+
+describe('LeaderDispatcher: a DKG that fails after its confirmation', () => {
+  it('fails at the deadline saying where the staged share was kept, and keeps it', async () => {
+    const ring = makeRing(3);
+    const [c1, c2] = [cosigner(ring[1]!), cosigner(ring[2]!)];
+    const stager = recordingStager();
+    const lines: string[] = [];
+    const leader = leaderOn(ring[0]!, {
+      vault: undefined,
+      slots: fakeSlots().slots,
+      createStager: () => stager,
+      ceremonyDeadlines: { signingMs: 1_000, dkgMs: 1_000 },
+      logger: { debug: () => {}, info: () => {}, warn: () => {}, error: msg => lines.push(msg) },
+    });
+    // The leader never gets party 1's confirmation; the co-signers get every one and commit.
+    const pull = ring[0]!.io.transport.pull.bind(ring[0]!.io.transport);
+    ring[0]!.io.transport.pull = async key => (key.round === 'dkg-verified' && key.from === 1 ? null : pull(key));
+
+    const err = await rejection(leader.runDkg({ ceremonyId: 'gen-kept' }));
+
+    expect(err).toBeInstanceOf(DkgShareKeptError);
+    expect((err as Error).message).toMatch(
+      /^DKG aborted: ceremony deadline of 1000 ms passed; this node published its confirmation of vault tb1p[0-9a-z]+, so its staged share was kept at \/test\/share\.json\.pending: run 'otzi vault' on the other nodes/,
+    );
+    expect(stager.calls).toEqual(['stage']);
+    expect(lines).toEqual([`leader: dkg gen-kept failed: ${(err as Error).message}`]);
+    for (const c of [c1, c2]) expect(await c.waitFor('gen-kept', 5_000)).toMatchObject({ status: 'done' });
   });
 });
 

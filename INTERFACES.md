@@ -73,8 +73,9 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 
 ### No DKG while a vault exists
 - A node with a share loaded, or any file at the share path, never runs a DKG: participants drop `announce-dkg`, and the `dkg` op returns 409 before announcing.
-- The DKG stages the new share at `<share path>.pending` (mode 0600) and renames it to the share path only after all-N confirmation. The rename is refused if a file appeared at the share path meanwhile.
-- Any DKG failure deletes the `.pending` file. A `.pending` file found at startup is logged at warn level and never loaded; the next DKG overwrites it.
+- The DKG stages the new share at `<share path>.pending` (mode 0600, synced to disk before this node publishes its `dkg-verified`) and moves it to the share path only after all-N confirmation, by `link` then `unlink`: the commit never replaces an entry at the share path.
+- A DKG failure before this node published its `dkg-verified` deletes the `.pending` file (no node can have committed without that confirmation). After it, the file is kept: another node may have committed the vault. The error names the file, the vault address and the recovery — run `otzi vault` on the other nodes; if any shows that address, rename `.pending` to the share path and restart, otherwise remove it. A node that has verified all N−1 confirmations commits even when its ceremony was aborted meanwhile.
+- A `.pending` file found at startup is logged at warn level (with the same recovery) and never loaded; the next DKG overwrites it.
 - Replacing a vault is an operator action: move the share file away and restart the daemon.
 
 ### Ceremony messages
@@ -133,7 +134,7 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 - Don't give the daemon chain access; chain reads and broadcast belong to the CLI.
 - Don't trust a leader's view of the vault: no leader-supplied keys, addresses, change outputs or sighashes. Analyse against this node's own key.
 - Don't serve an addressed blob to anyone but its recipient.
-- Don't run a DKG on a node that holds a vault, and don't load a `.pending` share.
+- Don't run a DKG on a node that holds a vault, and don't load a `.pending` share. Don't delete a `.pending` share once this node has published its `dkg-verified`.
 - Don't keep FROST nonces past `signRound2`, and don't run round 2 twice in one session.
 - Don't move proposal analysis into the gate. Analysis runs before the gate on every node; the gate decides on the analysed spec.
 - Don't put decision logic (message-signature verification, SSO, wallet auth) in the daemon's gate layer. Thin delegators only (`exec`/`webhook`); opinionated auth ships under `examples/`.

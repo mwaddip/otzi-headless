@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -154,28 +154,62 @@ describe('vault-share', () => {
       expect(existsSync(vaultPubkeyPath)).toBe(false);
     });
 
-    it('commit reports a share that is in place when vault-pubkey.json cannot be written', async () => {
+    it('commit succeeds with a warning when vault-pubkey.json cannot be written', async () => {
       // The parent of the vault-pubkey path is a regular file, so mkdir fails.
       await writeFile(join(dir, 'blocker'), 'x');
       const blocked = join(dir, 'blocker', 'vault-pubkey.json');
-      const stager = createShareStager({ path, password: 'pw-secret-9d3f', network: 'testnet4', partyId: 0, vaultPubkeyPath: blocked });
+      const { logger, lines } = capturingLogger();
+      const stager = createShareStager({
+        path,
+        password: 'pw-secret-9d3f',
+        network: 'testnet4',
+        partyId: 0,
+        vaultPubkeyPath: blocked,
+        logger,
+      });
       await stager.stage({ keyPackage: vault.keyPackages[0]!, publicKeyPackage: vault.publicKeyPackage });
-      const err = await stager.commit().then(
-        () => undefined,
-        (e: unknown) => e as Error,
-      );
-      expect(err).toBeInstanceOf(Error);
-      expect(err!.message).toMatch(/share was committed to .*share\.json but vault-pubkey\.json was not written/);
-      expect(err!.message).toContain(blocked);
-      expect(err!.cause).toBeInstanceOf(Error);
-      expect(err!.message).not.toContain('pw-secret-9d3f');
-      // The share is in place and decryptable even though commit threw.
+      await expect(stager.commit()).resolves.toBeUndefined();
+      // The share is in place and decryptable.
       expect(existsSync(pendingPath(path))).toBe(false);
       const share = await decryptShareFile(JSON.parse(readFileSync(path, 'utf8')), 'pw-secret-9d3f');
       expect(share.partyId).toBe(0);
-      // Abort-path discard after such a failure is harmless and leaves the share alone.
-      await stager.discard();
-      expect(existsSync(path)).toBe(true);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]!.level).toBe('warn');
+      expect(lines[0]!.msg).toMatch(/share committed to .*share\.json, but vault-pubkey\.json was not written/);
+      expect(lines[0]!.msg).toContain(blocked);
+      expect(lines[0]!.msg).toMatch(/rewrites it on its next start/);
+      expect(lines[0]!.msg).not.toContain('pw-secret-9d3f');
+    });
+
+    it('commit never replaces an entry at the share path, a dangling symlink included', async () => {
+      await mkdir(join(dir, 'state'), { recursive: true });
+      await symlink(join(dir, 'nowhere.json'), path);
+      const stager = createShareStager({ path, password: 'pw', network: 'testnet4', partyId: 0, vaultPubkeyPath });
+      await stager.stage({ keyPackage: vault.keyPackages[0]!, publicKeyPackage: vault.publicKeyPackage });
+      await expect(stager.commit()).rejects.toThrow(`share path already exists: ${path}`);
+      expect(lstatSync(path).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(dir, 'nowhere.json'))).toBe(false);
+      expect(existsSync(pendingPath(path))).toBe(true);
+      expect(existsSync(vaultPubkeyPath)).toBe(false);
+    });
+
+    it('names its share and staging paths', () => {
+      const stager = createShareStager({ path, password: 'pw', network: 'testnet4', partyId: 0, vaultPubkeyPath });
+      expect(stager.sharePath).toBe(path);
+      expect(stager.stagedPath).toBe(pendingPath(path));
+    });
+
+    it('commit leaves one file at the share path and none at the staging path', async () => {
+      const stager = createShareStager({ path, password: 'pw', network: 'testnet4', partyId: 0, vaultPubkeyPath });
+      await stager.stage({ keyPackage: vault.keyPackages[0]!, publicKeyPackage: vault.publicKeyPackage });
+      const staged = statSync(pendingPath(path));
+      await stager.commit();
+      const committed = statSync(path);
+      // The same file, moved: one link, same inode, mode 0600.
+      expect(committed.ino).toBe(staged.ino);
+      expect(committed.nlink).toBe(1);
+      expect(committed.mode & 0o777).toBe(0o600);
+      expect(await readdir(join(dir, 'state'))).toEqual(['share.json']);
     });
 
     it('discard removes the pending file', async () => {
@@ -318,9 +352,25 @@ describe('vault-share', () => {
       expect(lines[0]!.msg).toMatch(/unfinished DKG/);
       expect(lines[0]!.msg).toMatch(/not loaded/);
       expect(lines[0]!.msg).toMatch(/next DKG overwrites/);
+      // The recovery: check the other nodes, then move the file into place.
+      expect(lines[0]!.msg).toMatch(/otzi vault/);
+      expect(lines[0]!.msg).toContain(`rename ${pendingPath(path)} to ${path}`);
+      // The vault comes from the file's plaintext header; the file is not decrypted.
+      const address = vaultPayment(toVaultKey(vault.publicKeyPackage), 'testnet4').address;
+      expect(lines[0]!.msg).toContain(address);
       // It neither loads nor removes the file.
       expect(existsSync(pendingPath(path))).toBe(true);
       expect(existsSync(path)).toBe(false);
+    });
+
+    it('still warns when the pending file does not read as a share file', async () => {
+      await mkdir(join(dir, 'state'), { recursive: true });
+      await writeFile(pendingPath(path), 'not json', { mode: 0o600 });
+      const { logger, lines } = capturingLogger();
+      await warnOnPendingShare(path, logger);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]!.msg).toContain(pendingPath(path));
+      expect(lines[0]!.msg).toMatch(/next DKG overwrites/);
     });
 
     it('does nothing when there is no pending file', async () => {

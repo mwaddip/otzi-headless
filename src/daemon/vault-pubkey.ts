@@ -10,8 +10,9 @@
  */
 
 import type { PublicKeyPackage } from '@mwaddip/frots';
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import type { NetworkName } from '../config/types';
 import { NETWORK_NAMES } from '../config/types';
 import { vaultPayment } from '../otzi/lib/bitcoin';
@@ -52,15 +53,34 @@ export function vaultPubkeyFromPackage(
   };
 }
 
+/**
+ * Write the file atomically: a temporary file beside `outputPath`, synced, then
+ * renamed over it. A reader sees the old file or the new one, and an existing
+ * file is replaced whatever its owner or mode.
+ */
 export async function writeVaultPubkeyFile(
   file: VaultPubkeyFile,
   outputPath: string = DEFAULT_VAULT_PUBKEY_PATH,
 ): Promise<void> {
-  await mkdir(dirname(outputPath), { recursive: true });
-  await writeFile(outputPath, JSON.stringify(file, null, 2), { mode: 0o644 });
-  // Explicit chmod: the file may already exist with other permissions, and the
-  // umask may have narrowed the creation mode.
-  await chmod(outputPath, 0o644);
+  const dir = dirname(outputPath);
+  await mkdir(dir, { recursive: true });
+  const temp = join(dir, `.${basename(outputPath)}.${randomBytes(6).toString('hex')}.tmp`);
+  try {
+    const handle = await open(temp, 'wx', 0o644);
+    try {
+      await handle.writeFile(JSON.stringify(file, null, 2));
+      // The umask may have narrowed the creation mode.
+      await handle.chmod(0o644);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temp, outputPath);
+  } catch (err) {
+    // A failed cleanup must not hide the failure that caused it.
+    await rm(temp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 export async function readVaultPubkeyFile(

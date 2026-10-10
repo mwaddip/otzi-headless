@@ -148,8 +148,14 @@ Preconditions and failures:
   part in another DKG, or (`ceremony id <id> is already in use on this node`)
   for an ID used here within the last 15 minutes; nothing is announced.
 - `403` when the receiving node's gate does not approve the DKG spec.
-- `500` when the ceremony fails or times out (`[deadlines].dkg_ms`). Every node
-  deletes its staged `<share path>.pending` file.
+- `500` when the ceremony fails or times out (`[deadlines].dkg_ms`). A node
+  deletes its staged `<share path>.pending` file only if it had not yet
+  published its confirmation (`dkg-verified`); no node can have committed
+  without it. A node that had published it keeps the file, because another node
+  may have committed the vault: the `error` then names the file, the vault
+  address and the recovery (run `otzi vault` on the other nodes; if any shows
+  that address, rename the file to the share path and restart the daemon,
+  otherwise remove it). See [`cli.md`](./cli.md) § `otzi generate`.
 
 ## `op: "sign"`
 

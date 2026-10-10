@@ -65,13 +65,15 @@ canonicalization happens once at parse and is stored normalized in
 
 | Key | Type | Notes |
 |---|---|---|
-| `path` | string | Absolute path to the Ötzi v4 encrypted share JSON file (mode `0600`). A share written here opens in web Ötzi, and a web Ötzi share can be placed here. While a DKG runs, the new share is staged at `<path>.pending` and renamed to `path` only after every node confirmed. No file at startup → the daemon runs in setup mode: no vault is loaded, `sign` returns `409`, and `otzi generate` can run the DKG. |
+| `path` | string | Absolute path to the Ötzi v4 encrypted share JSON file (mode `0600`). A share written here opens in web Ötzi, and a web Ötzi share can be placed here. While a DKG runs, the new share is staged at `<path>.pending` and moved to `path` only after every node confirmed; a file at `path` is never replaced. No file at startup → the daemon runs in setup mode: no vault is loaded, `sign` returns `409`, and `otzi generate` can run the DKG. |
 | `password_env` | string | Name of the env var holding the share-file password. The password itself is never stored in the config. The variable must be set in the daemon's environment even on a node that holds no vault yet, because the DKG encrypts the new share with it. On a .deb install, the unit loads `/etc/otzi/otzi.env` (`root:root`, mode `0600`, one line `OTZI_SHARE_PASSWORD=…`). |
 
 At startup the daemon decrypts the share, checks it against `[network].name`,
 and checks its `partyId` and `parties` against the pubkey book. Any mismatch
 refuses to start; a share that fails a check is never treated as "no vault". A
-leftover `<path>.pending` file is logged at warn level and never loaded.
+leftover `<path>.pending` file is logged at warn level and never loaded: it may
+be this node's share of a vault the other nodes committed (see
+[`cli.md`](./cli.md) § `otzi generate`), otherwise the next DKG overwrites it.
 
 ## `[node]` (required)
 

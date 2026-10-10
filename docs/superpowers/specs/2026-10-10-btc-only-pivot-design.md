@@ -207,20 +207,37 @@ no DKG can touch it.
    pull from all others. Each node aggregates with its full `publicKeyPackage` and
    checks `verifySignature(sig, M, verifyingKey)`.
 5. **Stage.** Write the v4 share file (`encryptShareFile`) to `<share path>.pending`,
-   mode 0600, replacing any earlier `.pending`.
+   mode 0600, replacing any earlier `.pending`; fsync the file and its directory.
 6. **Confirm.** Store `dkg-verified` (the raw 64-byte aggregate signature). Pull
    `dkg-verified` from all N−1 others; each must verify against `M` and this node's
    `verifyingKey`.
-7. **Complete.** Rename `.pending` to the share path (refused if a file appeared at
-   the share path meanwhile), write `vault-pubkey.json`, settle as done.
+7. **Complete.** Once all N−1 confirmations verify, commit whatever the abort signal
+   says: `link` `.pending` to the share path (refused if an entry exists there, so a
+   vault is never replaced), `unlink` `.pending`, fsync the directory, write
+   `vault-pubkey.json` (atomically; a failed write is a warning, startup rewrites it),
+   settle as done.
 
-Failure at any step: broadcast `signoff-aborted {ceremonyId, reason}`, delete the
-`.pending` file, settle as aborted. Because the DKG is symmetric, a node accepts a DKG
-`signoff-aborted` from any ring member of that ceremony and stops. A `.pending` file
-found at startup is logged at warn level and not loaded; the next DKG overwrites it.
+Failure at any step: broadcast `signoff-aborted {ceremonyId, reason}` and settle as
+aborted. Because the DKG is symmetric, a node accepts a DKG `signoff-aborted` from any
+ring member of that ceremony and stops. What happens to `.pending` depends on whether
+this node has published its `dkg-verified`:
+
+- Before: delete `.pending`. No node can have committed, because every commit needs
+  this node's confirmation.
+- After (a confirmation pull that fails, an abort, a failed commit): keep `.pending`.
+  Another node may already have committed the vault, so deleting this node's share
+  could leave an n-of-n vault without a full set of shares. The node logs an error
+  naming the file, the vault address and the recovery: run `otzi vault` on the other
+  nodes; if any of them shows that address, rename `.pending` to the share path and
+  restart the daemon; otherwise remove it.
+
+A `.pending` file found at startup is logged at warn level with the same recovery and
+not loaded; the next DKG overwrites it.
 
 Guarantee: a node completes only when every node has produced a signature under the
-same vault key over the same transcript and has staged its share to disk.
+same vault key over the same transcript and has staged its share durably to disk; once
+any node completes, every node holds the vault's share at its share path or at
+`.pending`.
 
 ### 5.4 Signing
 
@@ -425,7 +442,7 @@ password_env = "OTZI_SHARE_PASSWORD"
 | Leader, before announce | 400 / 403; peers see nothing. |
 | Leader, after announce | `signoff-aborted` with reason; 500. frots cheater identification names the signer when available. |
 | Participant | Silent; structured log with reason; local outcome `rejected`, `invalid-signoff`, `aborted` or `timeout`. |
-| DKG | `signoff-aborted` from the failing node; every node deletes `.pending`. |
+| DKG | `signoff-aborted` from the failing node; a node deletes `.pending` only if it had not yet published its `dkg-verified`, and otherwise keeps it and logs the recovery (§5.3). |
 | Deadlines | Config-driven as today (`auto`/`policy`: 5 min signing, 15 min DKG; `exec`/`webhook`: operator cap). |
 | Startup | Share, network, party and ring mismatches refuse to start with a specific error. |
 | CLI / Esplora | Non-2xx shows status and body (otzi `request`); failed broadcast prints the signed hex. |
