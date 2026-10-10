@@ -3,6 +3,7 @@ import type { ShareStager } from '../core/dkg-ceremony';
 import { parseMessage, type CeremonyMessage } from '../core/messages';
 import type { BlobKey, PartyId } from '../core/types';
 import { AutoGate } from '../gate/factory';
+import { PolicyGate } from '../gate/policy';
 import type { ApprovalGate, CeremonySpec, Decision } from '../gate/types';
 import { Orchestrator } from '../orchestrator/orchestrator';
 import { rng } from '../otzi/lib/dkg.fixture';
@@ -12,6 +13,19 @@ import { makeProposal, testVault, type TestVault } from '../testing/proposal';
 import { makeRing, type RingNode } from '../testing/ring';
 import { NO_VAULT_MESSAGE, RequestError } from './api';
 import { GateRejection, LeaderDispatcher, type LeaderDeps, type LocalCeremonySlots } from './leader';
+
+// Records blob-clear scheduling next to slot ends, to pin their order.
+const order = vi.hoisted(() => ({ events: [] as string[] }));
+vi.mock('../core/blob-retention', async importOriginal => {
+  const actual = await importOriginal<typeof import('../core/blob-retention')>();
+  return {
+    ...actual,
+    scheduleClear: (...args: Parameters<typeof actual.scheduleClear>) => {
+      order.events.push(`clear ${args[1]}`);
+      actual.scheduleClear(...args);
+    },
+  };
+});
 
 const NET: NetworkName = 'testnet4';
 const peersById: ReadonlyMap<PartyId, string> = new Map([
@@ -64,16 +78,37 @@ function fakeSlots(opts: { dkg?: 'busy' | AbortSignal; signing?: 'busy'; inUse?:
         r.dkgIds.push(id);
         if (opts.dkg === 'busy') return null;
         const signal = opts.dkg ?? new AbortController().signal;
-        return { signal, end: () => void r.dkgEnds++ };
+        return {
+          signal,
+          end: () => {
+            r.dkgEnds++;
+            order.events.push(`end ${id}`);
+          },
+        };
       },
       beginLocalSigning(id) {
         r.signingIds.push(id);
         if (opts.signing === 'busy') return null;
-        return { end: () => void r.signingEnds++ };
+        return {
+          end: () => {
+            r.signingEnds++;
+            order.events.push(`end ${id}`);
+          },
+        };
       },
     },
   };
   return r;
+}
+
+/** Records every spec, then defers to `inner`. */
+class RecordingGate implements ApprovalGate {
+  readonly specs: CeremonySpec[] = [];
+  constructor(private readonly inner: ApprovalGate) {}
+  approve(spec: CeremonySpec): Promise<Decision> {
+    this.specs.push(spec);
+    return this.inner.approve(spec);
+  }
 }
 
 class FixedGate implements ApprovalGate {
@@ -129,6 +164,30 @@ function leaderOn(node: RingNode, over: Partial<LeaderDeps> = {}): LeaderDispatc
   });
 }
 
+const cosigners: Orchestrator[] = [];
+afterEach(() => {
+  for (const o of cosigners.splice(0)) o.stop();
+});
+
+/** A real participant orchestrator on `node` (for the leader's own node: its ceremony slots). */
+function cosigner(node: RingNode, vault?: DecryptedShare): Orchestrator {
+  const orch = new Orchestrator({
+    io: node.io,
+    gate: new AutoGate(),
+    node: { id: peersById.get(node.partyId)!, partyId: node.partyId },
+    peersById,
+    network: NET,
+    vault,
+    vaultExists: async () => false,
+    createStager: () => recordingStager(),
+    rng,
+    ceremonyDeadlines: { signingMs: 10_000, dkgMs: 10_000 },
+  });
+  orch.start();
+  cosigners.push(orch);
+  return orch;
+}
+
 async function rejection(p: Promise<unknown>): Promise<unknown> {
   try {
     await p;
@@ -172,7 +231,24 @@ describe('LeaderDispatcher.sign', () => {
     expect(ring[0]!.io.store.list('pay-1')).toEqual([]);
   });
 
-  it('refuses a ceremony id already in use on this node, before announcing', async () => {
+  it('refuses a ceremony id in use before analysis and the gate', async () => {
+    const ring = makeRing(3);
+    const seen = inbox(ring[1]!);
+    const slots = fakeSlots({ inUse: ['pay-used'] });
+    const gate = new RecordingGate(new AutoGate());
+    const foreign = makeProposal(tv.vaultKey, NET, { inputs: [{ amount: 100_000, script: `5120${'11'.repeat(32)}` }] });
+    // Even a proposal that analysis would reject is refused for its id first.
+    const err = await rejection(
+      leaderOn(ring[0]!, { gate, slots: slots.slots }).sign({ ceremonyId: 'pay-used', signers: [0, 1, 2], proposal: foreign }),
+    );
+    expect(err).toBeInstanceOf(RequestError);
+    expect(err).toMatchObject({ status: 409, message: 'ceremony id pay-used is already in use on this node' });
+    expect(gate.specs).toEqual([]);
+    expect(slots.signingIds).toEqual([]);
+    expect(seen).toEqual([]);
+  });
+
+  it('refuses a ceremony id taken while the gate deliberated, before announcing', async () => {
     const ring = makeRing(3);
     const seen = inbox(ring[1]!);
     const slots = fakeSlots({ signing: 'busy' });
@@ -209,6 +285,8 @@ describe('LeaderDispatcher.sign', () => {
     expect(aborted).toMatchObject({ ceremonyId: 'pay-3', reason: (err as Error).message });
     expect(slots.signingEnds).toBe(1);
 
+    // The clear is scheduled before the slot ends, so the id never comes free first.
+    expect(order.events.filter(e => e.endsWith(' pay-3'))).toEqual(['clear pay-3', 'end pay-3']);
     // The leader's own sign-r1 is kept for the retention period, then cleared.
     expect(ring[0]!.io.store.list('pay-3').map(b => b.key.round)).toEqual(['sign-r1']);
     await vi.waitFor(() => expect(ring[0]!.io.store.list('pay-3')).toEqual([]), { timeout: 2_000, interval: 10 });
@@ -325,6 +403,7 @@ describe('LeaderDispatcher.runDkg', () => {
     expect(seen.map(m => m.kind)).toEqual(['announce-dkg', 'signoff-aborted']);
     expect(seen[1]).toMatchObject({ ceremonyId: 'gen-6', reason: `ceremony deadline of ${DEADLINE_MS} ms passed` });
     expect(slots.dkgEnds).toBe(1);
+    expect(order.events.filter(e => e.endsWith(' gen-6'))).toEqual(['clear gen-6', 'end gen-6']);
     expect(ring[0]!.io.store.list('gen-6').map(b => b.key.round)).toEqual(['dkg-r1']);
     await vi.waitFor(() => expect(ring[0]!.io.store.list('gen-6')).toEqual([]), { timeout: 2_000, interval: 10 });
   });
@@ -336,29 +415,6 @@ describe('LeaderDispatcher ceremony deadline', () => {
   const CEREMONY_MS = 1_000;
   /** Node 1's round-1 blob reaches the leader this late; per-pull deadlines alone would fail at ≥ 1 700 ms. */
   const LATE_MS = 700;
-  const cosigners: Orchestrator[] = [];
-  afterEach(() => {
-    for (const o of cosigners.splice(0)) o.stop();
-  });
-
-  function cosigner(node: RingNode, vault?: DecryptedShare): Orchestrator {
-    const orch = new Orchestrator({
-      io: node.io,
-      gate: new AutoGate(),
-      node: { id: peersById.get(node.partyId)!, partyId: node.partyId },
-      peersById,
-      network: NET,
-      vault,
-      vaultExists: async () => false,
-      createStager: () => recordingStager(),
-      rng,
-      ceremonyDeadlines: { signingMs: 10_000, dkgMs: 10_000 },
-    });
-    orch.start();
-    cosigners.push(orch);
-    return orch;
-  }
-
   /** The leader does not get `held` blobs from its peers while `held` says so. */
   function holdBack(node: RingNode, held: (key: BlobKey) => boolean): void {
     const pull = node.io.transport.pull.bind(node.io.transport);
@@ -427,5 +483,25 @@ describe('LeaderDispatcher ceremony deadline', () => {
         reason: `ceremony deadline of ${CEREMONY_MS} ms passed`,
       });
     }
+  });
+});
+
+describe('LeaderDispatcher with this node\'s orchestrator as its slots', () => {
+  it('a reused ceremony id never reaches the gate: no rate-window approval is consumed', async () => {
+    const ring = makeRing(3);
+    const own = cosigner(ring[0]!, shareOf(0));
+    const [c1, c2] = [cosigner(ring[1]!, shareOf(1)), cosigner(ring[2]!, shareOf(2))];
+    const gate = new RecordingGate(new PolicyGate({ maxCeremoniesPerHour: 1 }));
+    const leader = leaderOn(ring[0]!, { gate, slots: own, ceremonyDeadlines: { signingMs: 10_000, dkgMs: 10_000 } });
+    const req = () => ({ ceremonyId: 'pay-once', signers: [0, 1, 2], proposal: makeProposal(tv.vaultKey, NET) });
+
+    const first = await leader.sign(req());
+    expect(first.txid).toMatch(/^[0-9a-f]{64}$/);
+    for (const c of [c1, c2]) expect(await c.waitFor('pay-once', 5_000)).toMatchObject({ status: 'done' });
+
+    const again = await rejection(leader.sign(req()));
+    expect(again).toBeInstanceOf(RequestError);
+    expect(again).toMatchObject({ status: 409, message: 'ceremony id pay-once is already in use on this node' });
+    expect(gate.specs).toHaveLength(1);
   });
 });

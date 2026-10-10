@@ -249,8 +249,11 @@ deadline fails the ceremony.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `signing_ms` | integer ≥ 1 | `300_000` (5 min) | Signing ceremony deadline. |
-| `dkg_ms` | integer ≥ 1 | `900_000` (15 min) | DKG ceremony deadline. |
+| `signing_ms` | integer, 1 to 2147483647 | `300_000` (5 min) | Signing ceremony deadline. |
+| `dkg_ms` | integer, 1 to 2147483647 | `900_000` (15 min) | DKG ceremony deadline. |
+
+The upper bound, 2147483647 ms (about 24.8 days), is the longest timer Node.js
+can set; the daemon refuses to start with a larger value.
 
 The defaults suit `auto` and `policy` gates (machine-only; phantom ceremonies
 should not linger). With `exec` and `webhook` gates, every signer's decision must

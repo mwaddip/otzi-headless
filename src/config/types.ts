@@ -111,3 +111,5 @@ export interface DaemonConfig {
 
 export const DEFAULT_SIGNING_DEADLINE_MS = 300_000;
 export const DEFAULT_DKG_DEADLINE_MS = 900_000;
+/** The largest `signing_ms` / `dkg_ms`: Node's `setTimeout` maximum (2^31 − 1 ms, about 24.8 days). */
+export const MAX_DEADLINE_MS = 2_147_483_647;

@@ -221,8 +221,9 @@ commit to every input amount and script, so a proposal with false prevout data
 produces signatures that are invalid on chain.
 
 On the leader a rejected proposal is a `400` and nothing is announced. A
-`ceremonyId` that a live ceremony on the leader already uses is a `409`, also
-before the announce. On a
+`ceremonyId` already in use on the leader (live, or used there within its
+retention period) is a `409` before analysis and the gate, so it consumes no
+gate approval. On a
 participant it is a silent drop with a log line; to the leader the participant
 is indistinguishable from an offline node, and the leader's ceremony fails (`500`).
 

@@ -26,6 +26,7 @@ import {
   TRIGGER_KINDS,
   DEFAULT_DKG_DEADLINE_MS,
   DEFAULT_SIGNING_DEADLINE_MS,
+  MAX_DEADLINE_MS,
 } from './types';
 
 export class ConfigError extends Error {
@@ -230,12 +231,24 @@ function parseDeadlines(raw: unknown): DeadlineConfig {
     signingMs:
       o.signing_ms === undefined
         ? DEFAULT_SIGNING_DEADLINE_MS
-        : asInteger(o.signing_ms, 'deadlines.signing_ms', 1),
+        : asDeadline(o.signing_ms, 'deadlines.signing_ms'),
     dkgMs:
       o.dkg_ms === undefined
         ? DEFAULT_DKG_DEADLINE_MS
-        : asInteger(o.dkg_ms, 'deadlines.dkg_ms', 1),
+        : asDeadline(o.dkg_ms, 'deadlines.dkg_ms'),
   };
+}
+
+/** A deadline every timer can hold: a longer `setTimeout` delay fires at once. */
+function asDeadline(v: unknown, path: string): number {
+  if (typeof v === 'bigint' && v > BigInt(MAX_DEADLINE_MS)) {
+    throw new ConfigError(path, `must be <= ${MAX_DEADLINE_MS} (the longest Node.js timer; got ${v})`);
+  }
+  const ms = asInteger(v, path, 1);
+  if (ms > MAX_DEADLINE_MS) {
+    throw new ConfigError(path, `must be <= ${MAX_DEADLINE_MS} (the longest Node.js timer; got ${ms})`);
+  }
+  return ms;
 }
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);

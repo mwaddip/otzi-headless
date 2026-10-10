@@ -220,13 +220,14 @@
 
   - **`sign(req: LeaderSignRequest): Promise<{ ceremonyId: string; txid: string; signedTxHex: string; signaturesHex: string[] }>`** — in this order:
     1. No vault → `RequestError(409, NO_VAULT_MESSAGE)`.
-    2. `analysis = analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), network)`; a throw → `RequestError(400, <message>)`.
-    3. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)` (labels from `addressBook` when present; a rejected `addressBook()` means no labels and one warn line); non-approve → `GateRejection`.
-    4. `slots.beginLocalSigning(ceremonyId)`; `null` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. From here on, `end()` and `scheduleClear` (signing retention) run in a `finally`.
-    5. Start the ceremony deadline; `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal, deadline)` — this broadcasts `announce-sign`.
-    6. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` (`src/otzi/backend/bitcoin.ts`) → signed hex and txid.
-    7. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`. A failed `signoff-done` broadcast is logged at warn and the signed transaction is still returned (participants settle `timeout` at their deadline).
-    - **Failure in steps 5–6:** broadcast `signoff-aborted {ceremonyId, reason}` (`reason` = the error message — `ceremony deadline of <ms> ms passed` when the deadline aborted it — at most 1024 characters; the broadcast is best-effort) and rethrow (handler → 500).
+    2. `slots.ceremonyIdInUse(ceremonyId)` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. A reused id never reaches the gate: no policy rate-window approval is consumed and no exec / webhook approver is asked.
+    3. `analysis = analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), network)`; a throw → `RequestError(400, <message>)`.
+    4. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)` (labels from `addressBook` when present; a rejected `addressBook()` means no labels and one warn line); non-approve → `GateRejection`.
+    5. `slots.beginLocalSigning(ceremonyId)` — the authoritative reservation (an id taken while the gate deliberated is caught here); `null` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. From here on, a `finally` clears the deadline timer, schedules the blob clear (signing retention) and then calls `end()` — the orchestrator's settle order (clear, then record), so the id never comes free before its blobs' clear is scheduled.
+    6. Start the ceremony deadline; `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal, deadline)` — this broadcasts `announce-sign`.
+    7. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` (`src/otzi/backend/bitcoin.ts`) → signed hex and txid.
+    8. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`. A failed `signoff-done` broadcast is logged at warn and the signed transaction is still returned (participants settle `timeout` at their deadline).
+    - **Failure in steps 6–7:** broadcast `signoff-aborted {ceremonyId, reason}` (`reason` = the error message — `ceremony deadline of <ms> ms passed` when the deadline aborted it — at most 1024 characters; the broadcast is best-effort) and rethrow (handler → 500).
 
 **Invariants:**
 - Nothing is announced unless the leader's own analysis and gate passed (400 / 403 leave peers untouched) and this node holds the ceremony's slot (409 otherwise).

@@ -39,7 +39,7 @@
   - **Post:** Gate activation and raw strategy-specific fields, narrowed by the gate's `parse*Params` (see [gate.md](gate.md)).
 
 - `DeadlineConfig` — `{ signingMs: number; dkgMs: number }`
-  - **Pre:** Positive integers.
+  - **Pre:** Integers from 1 to 2 147 483 647 (`MAX_DEADLINE_MS`, Node's `setTimeout` maximum, about 24.8 days). The parser rejects a value outside that range at `deadlines.signing_ms` / `deadlines.dkg_ms` with a `ConfigError` that names the limit; a larger value would make every deadline timer fire at once.
   - **Post:** Ceremony deadlines.
 
 - `BootstrapConfig` — `{ role: 'leader' | 'leaf'; bind?: string; leaderUrl?: string }`
@@ -53,6 +53,7 @@
   - **Post:** Complete daemon startup configuration. The share file is not read here.
 
 - `DEFAULT_SIGNING_DEADLINE_MS`, `DEFAULT_DKG_DEADLINE_MS` — `300_000` (5 min) and `900_000` (15 min), used when `[deadlines]` is absent.
+- `MAX_DEADLINE_MS` — `2_147_483_647`, the largest accepted `signing_ms` / `dkg_ms`.
 
 **Invariants:**
 - `DaemonConfig` is separate from Ötzi's `VaultConfig`; the share file stays Ötzi-compatible JSON.

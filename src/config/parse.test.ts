@@ -257,6 +257,20 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
     );
   });
 
+  it('accepts deadlines up to the setTimeout maximum and rejects larger ones', () => {
+    const max = 2_147_483_647;
+    const at = (signing: number, dkg: number) =>
+      parseDaemonConfigToml(MINIMAL_TOML + `\n[deadlines]\nsigning_ms = ${signing}\ndkg_ms = ${dkg}\n`);
+    expect(at(max, max).deadlines).toEqual({ signingMs: max, dkgMs: max });
+    expect(() => at(max + 1, 900_000)).toThrow(
+      /deadlines\.signing_ms.*must be <= 2147483647 \(the longest Node\.js timer; got 2147483648\)/,
+    );
+    expect(() => at(300_000, max + 1)).toThrow(
+      /deadlines\.dkg_ms.*must be <= 2147483647 \(the longest Node\.js timer; got 2147483648\)/,
+    );
+    expect(() => at(300_000, 10_000_000_000_000)).toThrow(/deadlines\.dkg_ms.*must be <= 2147483647/);
+  });
+
   it('rejects unknown trigger.kind', () => {
     const toml =
       MINIMAL_TOML + '\n[[triggers]]\nkind = "carrier-pigeon"\n';

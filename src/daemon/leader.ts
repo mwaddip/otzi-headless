@@ -179,6 +179,8 @@ export class LeaderDispatcher {
     const { ceremonyId, signers, proposal } = req;
     const { vault, network } = this.deps;
     if (!vault) throw new RequestError(409, NO_VAULT_MESSAGE);
+    // A reused id never reaches the gate: no approval is consumed for a request refused anyway.
+    if (this.deps.slots.ceremonyIdInUse(ceremonyId)) throw new RequestError(409, idInUse(ceremonyId));
 
     const vaultKey = toVaultKey(vault.publicKeyPackage);
     let analysis: ProposalAnalysis;
@@ -190,6 +192,7 @@ export class LeaderDispatcher {
     const label = await this.labeler(ceremonyId);
     await this.approve(buildSigningSpec(analysis, this.specBase(ceremonyId), network, label));
 
+    // The authoritative reservation: the id may have been taken while the gate deliberated.
     const slot = this.deps.slots.beginLocalSigning(ceremonyId);
     if (!slot) throw new RequestError(409, idInUse(ceremonyId));
     const deadline = this.startDeadline('signing');
@@ -229,8 +232,9 @@ export class LeaderDispatcher {
       return result;
     } finally {
       deadline.clear();
-      slot.end();
+      // Clear first, then release: the id never comes free before its blobs' clear is scheduled.
       this.clearLater(ceremonyId, 'signing');
+      slot.end();
     }
   }
 
