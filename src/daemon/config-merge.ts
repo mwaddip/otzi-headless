@@ -1,187 +1,83 @@
 /**
- * Loads + merges the daemon TOML config with the Ötzi-compatible share file.
+ * Loads the daemon TOML config, the share password and the v4 share (if
+ * present) into `LoadedDaemonState` (facts/daemon.md, `config-merge.ts`).
  *
  * Two startup modes:
- *  - **Share present** (normal operation). The file is read + decrypted; full
- *    cross-field invariants are enforced (partyId match, peers count alignment,
- *    contiguous partyIds spanning `[0, share.parties)`). Daemon can sign + DKG.
- *  - **Share missing** (first-time DKG / "DKG-only" mode). The configured path
- *    has no file (`ENOENT`); daemon comes up with `state.share = undefined`,
- *    can run DKG ceremonies, and persists the result to the configured path.
- *    Signing is rejected (LeaderDispatcher throws; orchestrator drops + logs).
- *    Operator restarts after DKG to enter signing-capable mode.
+ *  - **Share present.** The file is decrypted and checked against the
+ *    configured network; the daemon can sign. `vault-pubkey.json` is
+ *    rewritten from it so the CLI always reads what the loaded share says.
+ *  - **No share** (no file at `[share].path`). The daemon comes up without a
+ *    vault and can run the run-once DKG; signing is refused until the
+ *    operator restarts after `otzi generate`.
  *
- * Both modes require the share-password env var to be set so the daemon can
- * decrypt an existing share *or* encrypt a freshly-DKG'd one.
+ * Both modes need the password env var: it decrypts an existing share or
+ * encrypts the one a DKG produces. A share that fails any check refuses
+ * startup; it is never treated as "no vault".
  */
 
-import type { PublicKeyPackage } from '@mwaddip/frots';
-import { readFile } from 'node:fs/promises';
 import { loadDaemonConfig } from '../config/load';
 import type { DaemonConfig } from '../config/types';
-import type { DkgPersistenceSink } from '../orchestrator/types';
-import { buildFrostPublicKeyPackage } from '../wire/frost-reconstruct';
-import { fromHex } from '../wire/hex';
-import { decryptShareFile, type DecryptedShare, type ShareFile } from '../wire/share-crypto';
-import { persistCombinedDkgShare } from './share-persistence';
-import { writeVaultPubkeyFile } from './vault-pubkey';
-
-export type ShareDecryptor = (file: ShareFile, password: string) => Promise<DecryptedShare>;
+import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
+import type { DecryptedShare } from '../otzi/lib/share-file';
+import {
+  DEFAULT_VAULT_PUBKEY_PATH,
+  vaultPubkeyFromPackage,
+  writeVaultPubkeyFile,
+} from './vault-pubkey';
+import { loadVaultShare, warnOnPendingShare } from './vault-share';
 
 export interface LoadedDaemonState {
   config: DaemonConfig;
-  /** Decrypted share. Undefined when the daemon is in DKG-only mode (no share file at startup). */
+  /** The decrypted v4 share; undefined on a node without a vault. */
   share?: DecryptedShare;
-  /** Derived from `share.frostKeyPackage` when present (see `buildFrostPublicKeyPackage`). */
-  frostPublicKeyPackage?: PublicKeyPackage;
-  /**
-   * V3 share envelope carries `frostLegacySig` as an extra top-level hex
-   * field (piggy-backed by `share-persistence.ts` — outside Ötzi's canonical
-   * V3 byte format but tolerated). Extracted here from the raw share-file
-   * JSON (not via `decryptShareFile`, which is one of the lifted Ötzi
-   * byte-compat files). Consumed by `opnet-params` capture verification.
-   */
-  frostLegacySig?: Uint8Array;
-  /** Pre-bound persistence sink. Present after `validateLoaded`; absent for `buildStateFromShare` / `buildStateNoShare`. */
-  persistDkgShare?: DkgPersistenceSink;
+  /** Kept in memory so a DKG on this node can encrypt its new share with it. */
+  password: string;
 }
 
 export interface LoadOptions {
-  /** Override the share-decryption function (tests inject a pre-built `DecryptedShare`). */
-  shareDecryptor?: ShareDecryptor;
-  /** Env source for password resolution. Defaults to `process.env`. */
+  /** Env source for the password. Defaults to `process.env`. */
   env?: Readonly<Record<string, string | undefined>>;
+  /** Where `vault-pubkey.json` is rewritten. Defaults to `DEFAULT_VAULT_PUBKEY_PATH`. */
+  vaultPubkeyPath?: string;
+  /** Receives the stale-`.pending` warning and a failed `vault-pubkey.json` write. Defaults to `NOOP_LOGGER`. */
+  logger?: Logger;
 }
 
 export async function loadAndValidate(
   configPath: string,
   options: LoadOptions = {},
 ): Promise<LoadedDaemonState> {
-  const config = await loadDaemonConfig(configPath);
-  return validateLoaded(config, options);
-}
-
-/** Variant that accepts an already-parsed `DaemonConfig` — useful for tests. */
-export async function validateLoaded(
-  config: DaemonConfig,
-  options: LoadOptions = {},
-): Promise<LoadedDaemonState> {
   const env = options.env ?? process.env;
+  const vaultPubkeyPath = options.vaultPubkeyPath ?? DEFAULT_VAULT_PUBKEY_PATH;
+  const logger = options.logger ?? NOOP_LOGGER;
+
+  const config = await loadDaemonConfig(configPath);
   const password = env[config.share.passwordEnv];
   if (!password)
     throw new Error(
-      `daemon: env var '${config.share.passwordEnv}' not set — must be set for both share decryption (when share file exists) and DKG-output encryption (when in DKG-only mode)`,
+      `daemon: env var '${config.share.passwordEnv}' not set — it must be set both to decrypt an existing share and to encrypt the share a DKG produces`,
     );
 
-  let shareText: string | undefined;
-  try {
-    shareText = await readFile(config.share.path, 'utf8');
-  } catch (err) {
-    if (isFileNotFound(err)) {
-      // DKG-only mode: no share to decrypt; build state without share but
-      // with a persist sink ready for the post-DKG write.
-      const base = buildStateNoShare(config);
-      const persistDkgShare = makePersistSink(config, password);
-      return { ...base, persistDkgShare };
-    }
-    throw err;
-  }
+  const share = await loadVaultShare(config.share.path, password, config.network.name);
 
-  let shareFile: ShareFile;
-  try {
-    shareFile = JSON.parse(shareText) as ShareFile;
-  } catch (err) {
-    throw new Error(
-      `daemon: share file at '${config.share.path}' is not valid JSON: ${errMsg(err)}`,
-    );
-  }
-
-  const decryptor = options.shareDecryptor ?? decryptShareFile;
-  const share = await decryptor(shareFile, password);
-  const base = buildStateFromShare(config, share);
-  const frostLegacySig = extractFrostLegacySig(shareFile, config.share.path);
-  const persistDkgShare = makePersistSink(config, password);
-
-  // Refresh the operator-facing vault metadata cache on every startup so the
-  // CLI always reads addresses that match the currently-loaded share. Wrap
-  // in try/catch — the daemon must not fail to start if /var/lib/otzi/ isn't
-  // writable; CLI commands that need the file will tell the operator how to
-  // recover.
-  if (share.frostKeyPackage) {
+  if (share) {
+    // Best-effort: the daemon must start even when the metadata directory is
+    // not writable. CLI verbs that need the file tell the operator how to
+    // recover.
     try {
-      await writeVaultPubkeyFile({
-        network: config.network.name,
-        frostUntweakedPubKey: share.frostKeyPackage.untweakedVerifyingKey,
-        frostTweakedPubKey: share.frostKeyPackage.verifyingKey,
-        mldsaPubKey: fromHex(share.publicKey),
-      });
-    } catch (err) {
-      console.error(
-        `daemon: failed to refresh vault-pubkey cache: ${(err as Error).message}`,
+      await writeVaultPubkeyFile(
+        vaultPubkeyFromPackage(share.publicKeyPackage, config.network.name),
+        vaultPubkeyPath,
       );
+    } catch (err) {
+      logger.warn(`failed to write vault-pubkey.json to ${vaultPubkeyPath}; continuing without it`, {
+        path: vaultPubkeyPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
-  return {
-    ...base,
-    ...(frostLegacySig ? { frostLegacySig } : {}),
-    persistDkgShare,
-  };
-}
+  await warnOnPendingShare(config.share.path, logger);
 
-function extractFrostLegacySig(shareFile: ShareFile, path: string): Uint8Array | undefined {
-  const raw = (shareFile as ShareFile & { frostLegacySig?: unknown }).frostLegacySig;
-  if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== 'string' || !/^[0-9a-fA-F]+$/.test(raw) || raw.length === 0) {
-    throw new Error(`daemon: share file at '${path}' has invalid frostLegacySig (must be hex)`);
-  }
-  return new Uint8Array(Buffer.from(raw, 'hex'));
-}
-
-/**
- * Pure validation from an already-decrypted share. The file-read/decrypt
- * path is skipped entirely — tests pass a share from `dealerKeygen` or an
- * in-memory DKG, production calls `validateLoaded` via `loadAndValidate`.
- */
-export function buildStateFromShare(
-  config: DaemonConfig,
-  share: DecryptedShare,
-): LoadedDaemonState {
-  const frostPublicKeyPackage = share.frostKeyPackage
-    ? buildFrostPublicKeyPackage(share.frostKeyPackage)
-    : undefined;
-  return { config, share, frostPublicKeyPackage };
-}
-
-/**
- * Build state for a daemon that has no share yet (first-time DKG flow).
- * No share-vs-config alignment check possible.
- */
-export function buildStateNoShare(config: DaemonConfig): LoadedDaemonState {
-  return { config };
-}
-
-function makePersistSink(config: DaemonConfig, password: string): DkgPersistenceSink {
-  return (result, meta) =>
-    persistCombinedDkgShare({
-      result,
-      threshold: meta.threshold,
-      parties: meta.parties,
-      level: meta.level,
-      path: config.share.path,
-      password,
-      network: config.network.name,
-    });
-}
-
-function isFileNotFound(err: unknown): boolean {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    (err as { code?: string }).code === 'ENOENT'
-  );
-}
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return { config, ...(share ? { share } : {}), password };
 }

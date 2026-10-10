@@ -1,12 +1,13 @@
 /**
  * Daemon runtime configuration.
  *
- * Loaded from TOML at startup. Separate from Ötzi's `VaultConfig` — share
- * file stays Ötzi-compatible and unchanged; daemon-specific settings live
- * here. Phase 5a defines the top-level shape; strategy-specific sub-fields
- * for gate / triggers are stored raw in `params` and narrowed by later
- * sub-phases (5b for gate strategies, 5d for trigger kinds).
+ * Loaded from TOML at startup. Separate from Ötzi's `VaultConfig` — the v4
+ * share file stays Ötzi-compatible and unchanged; daemon-specific settings
+ * live here. Strategy-specific sub-fields for gate / triggers are stored raw
+ * in `params` and narrowed by the gate and trigger builders.
  */
+
+import type { NetworkName } from '../otzi/backend/types';
 
 export const TRANSPORT_KINDS = ['peer-mesh', 'relay'] as const;
 export type TransportKind = (typeof TRANSPORT_KINDS)[number];
@@ -28,14 +29,21 @@ export interface BootstrapConfig {
   leaderUrl?: string;
 }
 
-export const NETWORK_NAMES = ['mainnet', 'testnet', 'regtest'] as const;
-export type NetworkName = (typeof NETWORK_NAMES)[number];
+export { NETWORK_NAMES } from '../otzi/backend/types';
+export type { NetworkName };
 
 export interface NetworkConfig {
-  /** Bitcoin network the federation operates on. */
+  /**
+   * The vault's Bitcoin network: the share, every `announce-dkg` and every
+   * proposal must match it.
+   */
   name: NetworkName;
-  /** OPNet RPC URL — operator-side broadcast paths default to this. */
-  opnetRpc: string;
+  /**
+   * Esplora base URL (`http://` or `https://`). Used by the CLI only; the
+   * daemon never reads it. When unset the CLI uses Ötzi's per-network default
+   * (`chainApiUrl`).
+   */
+  esploraUrl?: string;
 }
 
 export interface ShareConfig {

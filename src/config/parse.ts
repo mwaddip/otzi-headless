@@ -122,12 +122,33 @@ function parseNode(raw: unknown): NodeConfig {
   return out;
 }
 
+function parseEsploraUrl(raw: unknown): string {
+  const s = asString(raw, 'network.esplora_url');
+  let url: URL | undefined;
+  try {
+    url = new URL(s);
+  } catch {
+    url = undefined;
+  }
+  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:') || url.hostname === '')
+    throw new ConfigError('network.esplora_url', `must be an http:// or https:// URL (got '${s}')`);
+  return s;
+}
+
 function parseNetwork(raw: unknown): NetworkConfig {
   const o = asObject(raw, 'network');
-  return {
-    name: asEnum(o.name, 'network.name', NETWORK_NAMES),
-    opnetRpc: asString(o.opnet_rpc, 'network.opnet_rpc'),
-  };
+  if ('opnet_rpc' in o)
+    throw new ConfigError(
+      'network.opnet_rpc',
+      'no longer supported — remove it; the CLI reaches the chain through network.esplora_url',
+    );
+  // Reject the retired names explicitly before the enum check so the operator
+  // gets a migration hint instead of the generic "must be one of" message.
+  if (o.name === 'testnet') throw new ConfigError('network.name', 'use testnet4 or signet');
+  if (o.name === 'regtest') throw new ConfigError('network.name', 'not supported');
+  const out: NetworkConfig = { name: asEnum(o.name, 'network.name', NETWORK_NAMES) };
+  if (o.esplora_url !== undefined) out.esploraUrl = parseEsploraUrl(o.esplora_url);
+  return out;
 }
 
 function parseTransport(raw: unknown): TransportConfig {

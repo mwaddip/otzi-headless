@@ -44,9 +44,11 @@
 - `async loadVaultShare(path: string, password: string, network: NetworkName): Promise<DecryptedShare | undefined>`
   - **Post:** Reads the JSON at `path`, `decryptShareFile(raw, password)`, `assertShareMatchesVault(share, network)`; returns the share. Returns `undefined` when `path` does not exist (ENOENT).
   - **Throws:**
-    - wrong password → `Error('cannot decrypt share file <path>: wrong password or corrupted file')`;
+    - invalid JSON → `Error('share file <path> is not valid JSON', { cause })`;
+    - any `decryptShareFile` failure other than otzi's own messages (`Unsupported share file version`, `Share file is corrupted`, `This share file belongs to a different vault`), i.e. a wrong password or ciphertext that does not decode → `Error('cannot decrypt share file <path>: wrong password or corrupted file', { cause })`; otzi's own messages pass through unchanged;
     - network mismatch → `assertShareMatchesVault`'s `Error('This share file belongs to a different vault')`;
-    - other read, JSON or `decryptShareFile` validation errors.
+    - other read errors (anything but ENOENT).
+  - **Invariant:** the password is never logged and never part of an error message.
 
 - `async warnOnPendingShare(path: string, log: Logger): Promise<void>`
   - **Post:** When `pendingPath(path)` exists, logs one warn line naming it: it is left over from an unfinished DKG, is not loaded, and the next DKG overwrites it. Otherwise does nothing.
@@ -58,7 +60,10 @@
   - **`commit()`:**
     - **Pre:** `stage` resolved.
     - **Post:** `pendingPath(path)` renamed to `path`; then `writeVaultPubkeyFile(vaultPubkeyFromPackage(r.publicKeyPackage, network), vaultPubkeyPath)`.
-    - **Throws:** `Error('share path already exists: <path>')` when a file exists at `path` (nothing renamed).
+    - **Throws:**
+      - `Error('share path already exists: <path>')` when a file exists at `path` (nothing renamed);
+      - `Error('commit called before stage')` when `stage` has not resolved (nothing renamed);
+      - `Error('share was committed to <path> but vault-pubkey.json was not written to <vaultPubkeyPath>: <reason>; …', { cause })` when the `vault-pubkey.json` write fails after the rename. The share is in place; the caller's abort path (`discard`, `signoff-aborted`) must not be read as "nothing was kept", so the message says so. The daemon rewrites `vault-pubkey.json` on its next start.
   - **`discard()`:** removes `pendingPath(path)`; ENOENT is ignored.
 
 **Invariants:**

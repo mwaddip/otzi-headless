@@ -14,8 +14,7 @@ password_env = "OTZI_SHARE_PASSWORD"
 id = "node-a"
 
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 
 [transport]
 kind = "peer-mesh"
@@ -39,10 +38,7 @@ describe('parseDaemonConfigToml — happy paths', () => {
       passwordEnv: 'OTZI_SHARE_PASSWORD',
     });
     expect(cfg.node).toEqual({ id: 'node-a' });
-    expect(cfg.network).toEqual({
-      name: 'testnet',
-      opnetRpc: 'https://testnet.opnet.org',
-    });
+    expect(cfg.network).toEqual({ name: 'testnet4' });
     expect(cfg.transport).toEqual({
       kind: 'peer-mesh',
       advertisedEndpoint: '127.0.0.1:8800',
@@ -70,7 +66,6 @@ id = "alpha"
 
 [network]
 name = "mainnet"
-opnet_rpc = "https://api.opnet.org"
 
 [transport]
 kind = "relay"
@@ -121,6 +116,76 @@ schedule = "0 */6 * * *"
   });
 });
 
+describe('parseDaemonConfigToml — [network]', () => {
+  const NETWORK_SECTION = '[network]\nname = "testnet4"\n';
+
+  it.each(['mainnet', 'testnet4', 'signet'] as const)('accepts network.name = %s', (name) => {
+    const toml = MINIMAL_TOML.replace('name = "testnet4"', `name = "${name}"`);
+    expect(parseDaemonConfigToml(toml).network).toEqual({ name });
+  });
+
+  it('accepts an optional esplora_url', () => {
+    for (const url of ['https://mempool.example/api', 'http://127.0.0.1:3002']) {
+      const toml = MINIMAL_TOML.replace(NETWORK_SECTION, `${NETWORK_SECTION}esplora_url = "${url}"\n`);
+      expect(parseDaemonConfigToml(toml).network).toEqual({ name: 'testnet4', esploraUrl: url });
+    }
+  });
+
+  it('leaves esploraUrl absent when esplora_url is not set', () => {
+    expect('esploraUrl' in parseDaemonConfigToml(MINIMAL_TOML).network).toBe(false);
+  });
+
+  it('rejects an esplora_url that is not an http(s) URL', () => {
+    for (const bad of ['mempool.example/api', 'ftp://mempool.example', 'ws://mempool.example', 'https://', 'not a url']) {
+      const toml = MINIMAL_TOML.replace(NETWORK_SECTION, `${NETWORK_SECTION}esplora_url = "${bad}"\n`);
+      expect(() => parseDaemonConfigToml(toml), bad).toThrow(/network\.esplora_url.*http:\/\/ or https:\/\/ URL/);
+    }
+  });
+
+  it('rejects a non-string esplora_url', () => {
+    const toml = MINIMAL_TOML.replace(NETWORK_SECTION, `${NETWORK_SECTION}esplora_url = 42\n`);
+    expect(() => parseDaemonConfigToml(toml)).toThrow(/network\.esplora_url.*must be a string/);
+  });
+
+  it('rejects network.opnet_rpc, testnet and regtest with explicit messages', () => {
+    const withRpc = MINIMAL_TOML.replace(
+      NETWORK_SECTION,
+      `${NETWORK_SECTION}opnet_rpc = "https://testnet.opnet.org"\n`,
+    );
+    expect(() => parseDaemonConfigToml(withRpc)).toThrow(
+      new ConfigError(
+        'network.opnet_rpc',
+        'no longer supported — remove it; the CLI reaches the chain through network.esplora_url',
+      ),
+    );
+    const testnet = MINIMAL_TOML.replace('name = "testnet4"', 'name = "testnet"');
+    expect(() => parseDaemonConfigToml(testnet)).toThrow(
+      new ConfigError('network.name', 'use testnet4 or signet'),
+    );
+    const regtest = MINIMAL_TOML.replace('name = "testnet4"', 'name = "regtest"');
+    expect(() => parseDaemonConfigToml(regtest)).toThrow(
+      new ConfigError('network.name', 'not supported'),
+    );
+  });
+
+  it('reports opnet_rpc before a bad network name', () => {
+    const toml = MINIMAL_TOML.replace(
+      NETWORK_SECTION,
+      '[network]\nname = "regtest"\nopnet_rpc = "http://x"\n',
+    );
+    expect(() => parseDaemonConfigToml(toml)).toThrow(/network\.opnet_rpc/);
+  });
+
+  it('carries the offending key path on the ConfigError', () => {
+    try {
+      parseDaemonConfigToml(MINIMAL_TOML.replace('name = "testnet4"', 'name = "regtest"'));
+      expect.fail('should have thrown');
+    } catch (err) {
+      expect((err as ConfigError).path).toBe('network.name');
+    }
+  });
+});
+
 describe('parseDaemonConfigToml — missing required tables', () => {
   it('rejects missing [share]', () => {
     const toml = MINIMAL_TOML.replace(/\[share\][\s\S]*?(?=\n\[node\])/, '');
@@ -162,9 +227,9 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
   });
 
   it('rejects unknown network.name', () => {
-    const toml = MINIMAL_TOML.replace('name = "testnet"', 'name = "moonnet"');
+    const toml = MINIMAL_TOML.replace('name = "testnet4"', 'name = "moonnet"');
     expect(() => parseDaemonConfigToml(toml)).toThrow(
-      /network\.name.*must be one of mainnet \| testnet \| regtest/,
+      /network\.name.*must be one of mainnet \| testnet4 \| signet/,
     );
   });
 
@@ -213,8 +278,7 @@ password_env = "P"
 id = "a"
 
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 
 [transport]
 kind = "peer-mesh"
@@ -408,8 +472,7 @@ password_env = "P"
 [node]
 id = "a"
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "127.0.0.1:8800"
@@ -430,8 +493,7 @@ password_env = "P"
 [node]
 id = "a"
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "192.168.1.5"
@@ -452,8 +514,7 @@ password_env = "P"
 [node]
 id = "a"
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "0.0.0.0:8800"
@@ -473,8 +534,7 @@ password_env = "P"
 [node]
 id = "a"
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "127.0.0.1:8800"

@@ -17,6 +17,8 @@
  *   - For peer-mesh: every `[[peers]].endpoint` (canonical) must match a
  *     non-self book entry's `advertisedEndpoint` (canonical), and vice versa.
  *   - For relay: peer endpoint matching is skipped (relay routes by partyId).
+ *   - A loaded share must have the self entry's partyId and the book's party
+ *     count (`assertShareMatchesBook`).
  */
 
 import { readFile } from 'node:fs/promises';
@@ -27,7 +29,8 @@ import type { Logger } from '../orchestrator/types';
 import { PeerMeshTransport } from '../transport/peer-mesh/peer-mesh';
 import { RelayTransport } from '../transport/relay/relay-transport';
 import { importIdentity, type IdentityKeyPair } from '../transport/identity';
-import { fromHex, toHex } from '../wire/hex';
+import { fromHex, toHex } from '../otzi/lib/hex';
+import type { DecryptedShare } from '../otzi/lib/share-file';
 import type { LoadedDaemonState } from './config-merge';
 
 export interface TransportBundle {
@@ -68,11 +71,7 @@ export async function buildTransportFromFiles(
   const pubkeyBook = await loadPubkeyBook(config.node.pubkeyBookFile);
 
   const selfEntry = resolveSelfFromBook(identity, pubkeyBook);
-  if (state.share && state.share.partyId !== selfEntry.partyId) {
-    throw new Error(
-      `buildTransport: share.partyId (${state.share.partyId}) does not match book self entry partyId (${selfEntry.partyId})`,
-    );
-  }
+  if (state.share) assertShareMatchesBook(state.share, selfEntry, pubkeyBook);
 
   const ringId = await computeRingId(pubkeyBook);
 
@@ -95,11 +94,7 @@ export async function buildTransportFromMemory(
   options: BuildTransportOptions = {},
 ): Promise<TransportBundle> {
   const selfEntry = resolveSelfFromBook(identity, pubkeyBook);
-  if (state.share && state.share.partyId !== selfEntry.partyId) {
-    throw new Error(
-      `buildTransport: share.partyId (${state.share.partyId}) does not match book self entry partyId (${selfEntry.partyId})`,
-    );
-  }
+  if (state.share) assertShareMatchesBook(state.share, selfEntry, pubkeyBook);
   const ringId = await computeRingId(pubkeyBook);
   return buildFromState({
     state,
@@ -241,6 +236,24 @@ function resolveSelfFromBook(identity: IdentityKeyPair, book: PubkeyBook): Pubke
     );
   }
   return entry;
+}
+
+/** A loaded share must belong to this book's ring: same partyId, same party count. */
+function assertShareMatchesBook(
+  share: DecryptedShare,
+  selfEntry: PubkeyBookEntry,
+  book: PubkeyBook,
+): void {
+  if (share.partyId !== selfEntry.partyId) {
+    throw new Error(
+      `buildTransport: share.partyId (${share.partyId}) does not match book self entry partyId (${selfEntry.partyId})`,
+    );
+  }
+  if (share.parties !== book.entries.length) {
+    throw new Error(
+      `share is for ${share.parties} parties but the pubkey book has ${book.entries.length}`,
+    );
+  }
 }
 
 function validatePeersAgainstBook(
