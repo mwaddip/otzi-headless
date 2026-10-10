@@ -23,8 +23,9 @@ export interface PullOpts {
  * puller, push delivery).
  *
  * Resolves when every expected key is in the store. Rejects on the first
- * unrecoverable error (transport throw, attempts exhausted) or when the
- * wall-clock deadline fires.
+ * unrecoverable error (transport throw, attempts exhausted), when the
+ * wall-clock deadline fires, or with `Error('aborted')` when `signal` aborts.
+ * Once the call settles, every worker stops.
  */
 export class BlobPuller {
   constructor(
@@ -32,32 +33,39 @@ export class BlobPuller {
     private readonly store: BlobStore,
   ) {}
 
-  async pullAll(expected: readonly BlobKey[], opts: PullOpts): Promise<void> {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), opts.deadlineMs);
+  async pullAll(expected: readonly BlobKey[], opts: PullOpts, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new Error('aborted');
+    // One stop signal for every worker: the deadline, the caller's signal, or
+    // the call settling (so no worker outlives it).
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(DEADLINE), opts.deadlineMs);
+    const onAbort = () => stop.abort(ABORTED);
+    signal?.addEventListener('abort', onAbort, { once: true });
     try {
-      await Promise.all(expected.map(key => this.pullOne(key, opts, ac.signal)));
+      await Promise.all(expected.map(key => this.pullOne(key, opts, stop.signal)));
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      stop.abort(SETTLED);
     }
   }
 
-  private async pullOne(key: BlobKey, opts: PullOpts, signal: AbortSignal): Promise<void> {
+  private async pullOne(key: BlobKey, opts: PullOpts, stop: AbortSignal): Promise<void> {
     const keyStr = blobKeyToString(key);
-    const onDeadline = abortedPromise(signal, keyStr);
+    const onStop = stoppedPromise(stop, keyStr);
     let delay = opts.initialDelayMs;
 
     for (let attempt = 0; attempt < opts.maxAttempts; attempt++) {
       if (this.store.has(key)) return;
 
-      const blob = await Promise.race([this.transport.pull(key), onDeadline]);
+      const blob = await Promise.race([this.transport.pull(key), onStop]);
       if (blob) {
         if (!this.store.has(key)) this.store.put(key, blob);
         return;
       }
 
       if (attempt < opts.maxAttempts - 1) {
-        await Promise.race([sleep(delay), onDeadline]);
+        await Promise.race([sleep(delay), onStop]);
         delay = Math.min(delay * 2, opts.maxDelayMs);
       }
     }
@@ -67,12 +75,25 @@ export class BlobPuller {
   }
 }
 
-function abortedPromise(signal: AbortSignal, keyStr: string): Promise<never> {
-  return new Promise<never>((_, reject) => {
-    const fail = () => reject(new Error(`Deadline exceeded while pulling ${keyStr}`));
-    if (signal.aborted) fail();
-    else signal.addEventListener('abort', fail, { once: true });
+const DEADLINE = 'deadline';
+const ABORTED = 'aborted';
+const SETTLED = 'settled';
+
+/** Rejects when `stop` aborts: `aborted` for the caller's signal, the deadline error otherwise. */
+function stoppedPromise(stop: AbortSignal, keyStr: string): Promise<never> {
+  const p = new Promise<never>((_, reject) => {
+    const fail = () =>
+      reject(
+        stop.reason === ABORTED
+          ? new Error('aborted')
+          : new Error(`Deadline exceeded while pulling ${keyStr}`),
+      );
+    if (stop.aborted) fail();
+    else stop.addEventListener('abort', fail, { once: true });
   });
+  // A worker that returns early never awaits this; its later rejection is expected.
+  p.catch(() => {});
+  return p;
 }
 
 function sleep(ms: number): Promise<void> {
