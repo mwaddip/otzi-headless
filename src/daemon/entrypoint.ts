@@ -33,6 +33,7 @@ import { createConsoleLogger } from './console-logger';
 import { Daemon } from './daemon';
 import { setupMaster, setupMember } from './setup';
 import { buildTransportFromFiles } from './transport-factory';
+import { displayText } from '../util/text';
 
 const DEFAULT_DAEMON_CONFIG_PATH = '/etc/otzi/daemon.toml';
 
@@ -455,6 +456,9 @@ async function runRestoreCommand(args: string[]): Promise<void> {
     archivePath,
     ...(passwordStdin ? { passwordStdin: true } : {}),
   });
+  for (const entry of result.skippedEntries) {
+    console.error(`warning: skipped archive entry ${displayText(entry)}: not part of an otzi backup`);
+  }
   console.log('Restored files:');
   for (const f of result.restoredFiles) {
     console.log(`  ${f.path} (mode 0${f.mode.toString(8).padStart(3, '0')})`);

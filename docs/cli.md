@@ -97,15 +97,19 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
 
 - `otzi restore <archive-path> [--password-stdin]` — decrypt an `otzi-backup` archive and restore files to their canonical paths with canonical modes. Without `--password-stdin`, the CLI prompts for the password interactively (TTY-masked). With `--password-stdin`, it reads the password from stdin until newline — used by debconf during fresh installs and by scripted runs.
 
+  Restore only creates files. It writes the vault's own files — `daemon.toml`, the address book, `vault-pubkey.json`, and the share, identity and pubkey book at the paths the archived `daemon.toml` names — and only under `/etc/otzi` and `/var/lib/otzi`. Any other entry in the archive is skipped with a warning. If it fails part-way, it removes the files it created; nothing that existed before is touched.
+
   Refuses (exit 1) if:
-  - `/etc/otzi/daemon.toml` already exists. Run `sudo rm /etc/otzi/daemon.toml` first.
+  - `/etc/otzi/daemon.toml` already exists. Move it aside first (`sudo mv /etc/otzi/daemon.toml /root/`).
   - `systemctl is-active otzi` returns 0. Run `sudo systemctl stop otzi` first.
   - The archive magic isn't `OTZI-BACKUP-V1`.
   - Decryption fails — wrong password or tampered archive (same error; it doesn't say which).
+  - Any file it would write already exists. The error lists them; move them aside (don't delete a share — it is key material) and run restore again.
+  - The archive's `daemon.toml` puts the share, identity or pubkey book outside `/etc/otzi` and `/var/lib/otzi`, or the archive holds a symlink, hardlink, device, FIFO, `..` or absolute entry, a directory where a file belongs, or a file twice.
 
   ```bash
   sudo systemctl stop otzi
-  sudo rm /etc/otzi/daemon.toml
+  sudo mv /etc/otzi/daemon.toml /root/
   sudo otzi restore ~/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
 
   # Or scripted:

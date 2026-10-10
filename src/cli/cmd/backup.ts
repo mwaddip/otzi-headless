@@ -116,6 +116,13 @@ export interface BackupOptions {
     vaultPubkey?: string;
     addressBook?: string;
   };
+  /**
+   * Test seam, the counterpart of `RestoreOptions.rootOverride`: every
+   * absolute path backup reads — `configPath`'s default, the paths daemon.toml
+   * names and the fixed defaults — is read under this directory. Tar paths are
+   * unchanged (`stripLeadingSlash` of the path daemon.toml names).
+   */
+  rootOverride?: string;
 }
 
 export interface BackupResult {
@@ -128,7 +135,8 @@ export interface BackupResult {
 }
 
 export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult> {
-  const configPath = opts.configPath ?? DEFAULT_DAEMON_CONFIG_PATH;
+  const onHost = (p: string): string => (opts.rootOverride ? join(opts.rootOverride, p) : p);
+  const configPath = opts.configPath ?? onHost(DEFAULT_DAEMON_CONFIG_PATH);
   const outputDir = opts.outputDir ?? homedir();
   const now = (opts.now ?? (() => new Date()))();
 
@@ -164,24 +172,24 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
       : DEFAULT_PUBKEY_BOOK_PATH;
 
   const vaultPubkeySource =
-    opts.pathOverrides?.vaultPubkey ?? DEFAULT_VAULT_PUBKEY_PATH;
+    opts.pathOverrides?.vaultPubkey ?? onHost(DEFAULT_VAULT_PUBKEY_PATH);
   const addressBookSource =
-    opts.pathOverrides?.addressBook ?? DEFAULT_ADDRESS_BOOK_PATH;
+    opts.pathOverrides?.addressBook ?? onHost(DEFAULT_ADDRESS_BOOK_PATH);
 
   // --- Step 2: assemble the file table. Tar paths are RELATIVE (no leading
   // slash) so restore can `chroot`-style place them back at the corresponding
   // absolute paths.
   const fileSet: FileEntry[] = [
     { tarPath: 'etc/otzi/daemon.toml', sourcePath: configPath, required: true },
-    { tarPath: stripLeadingSlash(sharePath), sourcePath: sharePath, required: true },
+    { tarPath: stripLeadingSlash(sharePath), sourcePath: onHost(sharePath), required: true },
     {
       tarPath: stripLeadingSlash(pubkeyBookPath),
-      sourcePath: pubkeyBookPath,
+      sourcePath: onHost(pubkeyBookPath),
       required: true,
     },
     {
       tarPath: stripLeadingSlash(identityPath),
-      sourcePath: identityPath,
+      sourcePath: onHost(identityPath),
       required: true,
     },
     {
@@ -215,7 +223,7 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
   // at restore time. Falls back to undefined on malformed share.
   let partyId: number | undefined;
   try {
-    const shareRaw = JSON.parse(await readFile(sharePath, 'utf8')) as {
+    const shareRaw = JSON.parse(await readFile(onHost(sharePath), 'utf8')) as {
       partyId?: unknown;
     };
     if (typeof shareRaw.partyId === 'number') partyId = shareRaw.partyId;

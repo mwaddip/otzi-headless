@@ -582,6 +582,7 @@
   - `passwordOverride?: string` — bypasses the generated 32-char base62 password. Production callers MUST NOT set this; tests use it for determinism.
   - `now?: () => Date` — clock seam for the filename timestamp.
   - `pathOverrides?: { vaultPubkey?: string; addressBook?: string }` — test seam for the fixed paths not derived from daemon.toml (`vault-pubkey.json`, the address book).
+  - `rootOverride?: string` — test seam, the counterpart of `RestoreOptions.rootOverride`: every absolute path backup reads (the default `configPath`, the paths daemon.toml names, the fixed defaults) is read under this directory; tar paths are unchanged.
 
 - `BackupResult`
   - `path: string` — absolute path to the written archive.
@@ -600,7 +601,7 @@
 - Exports the wire-format constants `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_SALT_LEN`, `BACKUP_IV_LEN`, `BACKUP_TAG_LEN`, `BACKUP_HEADER_LEN`, `BACKUP_PBKDF2_ITERATIONS`, the default file paths and `stripLeadingSlash` — `restore.ts` consumes all of these.
 
 ### `restore.ts`
-**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, untar it into a tmpdir, validate, then place each file at its canonical absolute path with the mode the daemon expects. Usable as a CLI verb and as the engine the debconf postinst pipes the password into via stdin.
+**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, read its tar members in memory, validate every member and every target path, then create each file at its canonical absolute path with the mode the daemon expects. Usable as a CLI verb and as the engine the debconf postinst pipes the password into via stdin. Restore runs as root, so it writes only the vault's own files, only under `/etc/otzi` and `/var/lib/otzi`, and never replaces or follows anything already there.
 
 **Public surface:**
 - `runRestore(opts: RestoreOptions): Promise<RestoreResult>`
@@ -608,38 +609,48 @@
     1. Magic byte check on the archive (cheap precheck before decryption).
     2. Existing `/etc/otzi/daemon.toml` MUST NOT exist (refuses to clobber).
     3. `systemctl is-active otzi` MUST report inactive (refuses while daemon is running).
-  - **Post:** All tar entries placed at canonical (or `rootOverride`-prefixed) absolute paths; each file `chmod`'d to its mode (see "Restored file modes"). `meta.json` is read into the result but NEVER written to disk. Returns `{ restoredFiles: { path, mode }[], metaPartyId?, metaCreatedAt?, metaHostname? }`.
+  - **Validation (after decryption, before anything is written; each failure throws and writes nothing):**
+    1. Every tar member name is relative and has no `..` segment (`archive entry <name>: absolute path refused` / `… '..' refused`).
+    2. Every member is a regular file, or a directory that is not a target path (skipped). A symlink, hardlink, character or block device or FIFO anywhere, and a directory at a target path, is refused (`archive entry <name>: <symlink|hardlink|character device|block device|FIFO|directory where a regular file is expected> refused`). A file named twice is refused.
+    3. The targets are the fixed tar paths `etc/otzi/daemon.toml` (required), `etc/otzi/address-book.otzi.json`, `var/lib/otzi/vault-pubkey.json`, plus the three paths the archived daemon.toml names (`[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file`, loose-parsed; the backup defaults when absent). Each of those three must be absolute and resolve (`path.posix.resolve`) strictly inside `/etc/otzi/` or `/var/lib/otzi/`, else `daemon.toml in the archive: <key> = <path> is outside /etc/otzi and /var/lib/otzi; refused`; no two targets may be the same path.
+    4. Every other member (and `meta.json`, read for the result) is not written: it is skipped and listed in `skippedEntries`.
+    5. No existing directory between `<root>/etc/otzi` or `<root>/var/lib/otzi` and a target is a symlink or a non-directory (`refusing to restore through a symlink at <path>` / `… <path> is not a directory`).
+    6. **No target exists** (`lstat`; a symlink, dangling or not, counts): otherwise `restore would replace existing files: <path>, …; move them aside and run restore again`, listing every one.
+  - **Placement:** in archive order, each target is created with `open(path, 'wx', mode)` (fails if anything appeared there meanwhile; never follows a symlink at the final component), written, `chmod`'d to its mode and synced; parent directories are created as needed.
+  - **Post:** Every target in the archive exists at its canonical (or `rootOverride`-prefixed) absolute path with its mode (see "Restored file modes"). `meta.json` is read into the result but NEVER written to disk. Returns `{ restoredFiles: { path, mode }[], skippedEntries: string[], metaPartyId?, metaCreatedAt?, metaHostname? }`.
   - **Throws:**
     - Bad magic → `Error('not an otzi backup archive (magic mismatch)')`.
     - Existing daemon.toml → `Error('config already present at <path>; remove it first')`.
     - Daemon running → `Error('daemon is running; stop it with \`systemctl stop otzi\` first')`.
     - Wrong password OR tampered ciphertext → BOTH surface as `Error('wrong password or corrupted archive')`. Distinguishing the two would give an attacker an oracle.
-    - Mid-extract failure → every file already placed is `rm`'d in LIFO order; the original error is rethrown. Parent directories are NOT rolled back.
+    - The validation errors above.
+    - A failure during placement → every file this call created is removed (LIFO); the original error is rethrown. Files that existed before the call are never touched (none is a target, by step 6), and parent directories are NOT rolled back.
 
 - `RestoreOptions`
   - `archivePath: string` — required positional CLI arg.
   - `password?: string` — explicit password (test path or `--password` flag; the flag leaks via `/proc/<pid>/cmdline`, docs steer operators to stdin).
   - `passwordStdin?: boolean` — read password from stdin until newline (postinst path).
-  - `rootOverride?: string` — chroot-style prefix for all extraction targets (test seam; default `/`).
+  - `rootOverride?: string` — chroot-style prefix for all extraction targets (test seam; default `/`). The allowed directories become `<rootOverride>/etc/otzi` and `<rootOverride>/var/lib/otzi`; the paths daemon.toml names are still checked as production paths.
   - `daemonStatusCheck?: () => Promise<boolean>` — override the `systemctl is-active otzi` probe (test seam).
   - `configExistsCheck?: () => Promise<boolean>` — override the daemon.toml-exists probe (test seam).
   - `stdinStream?: Readable` — alternate stream for the `passwordStdin` path (test seam).
 
 - `RestoreResult`
   - `restoredFiles: { path: string; mode: number }[]`.
+  - `skippedEntries: string[]` — tar member names that are not part of a backup and were not written (the CLI prints one warning line per entry).
   - `metaPartyId?: number`, `metaCreatedAt?: string`, `metaHostname?: string` — from in-archive `meta.json`; missing/malformed meta is non-fatal.
 
 **Invariants:**
 - Pre-flights run in the order listed above.
 - Wrong-password and tampered-archive surface IDENTICALLY.
-- Extraction is staged-then-placed: `tar.extract` lands files in a tmpdir, modes are computed by parsing the staged daemon.toml, then files are copied to their real destinations. A throw mid-place triggers LIFO rollback of placed files only.
-- `meta.json` is the only entry never written to disk.
-- Unrecognized tar entries fall back to the most-restrictive mode (0600).
+- Members are parsed in memory (`tar` `Parser`); nothing from the archive is extracted to disk before validation, and nothing is ever written outside the target list.
+- Restore only creates files: it never replaces, truncates, deletes or writes through an existing file system entry. A throw mid-place removes only the files this call created.
+- `meta.json` and unknown members are never written to disk; unknown members are reported in `skippedEntries`.
 - Password resolution precedence: explicit `password` → `passwordStdin` → interactive readline prompt on stderr.
 - `runRestore` is pure-ish: filesystem I/O + crypto + `systemctl` exec only; a single `console.error` on rollback.
 
 **Cross-component contracts:**
-- Depends on: `node:crypto`, `tar`, `smol-toml`, `node:child_process`, constants from `backup.ts`.
+- Depends on: `node:crypto`, `tar` (`Parser`), `smol-toml`, `node:child_process`, constants from `backup.ts`.
 - Used by: `entrypoint.ts`, debconf postinst (via `--password-stdin`).
 
 ---
@@ -689,7 +700,7 @@ Constants exported by `backup.ts`: `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_S
 
 ## Restored file modes (invariant)
 
-`restore.ts` applies these modes after extraction. They match what the `.deb` postinst sets up (chmod-only; ownership inherits from `/etc/otzi` and `/var/lib/otzi` setgid bits).
+`restore.ts` creates each file with these modes. They match what the `.deb` postinst sets up (chmod-only; ownership inherits from `/etc/otzi` and `/var/lib/otzi` setgid bits).
 
 | Path | Mode |
 |---|---|
@@ -700,6 +711,6 @@ Constants exported by `backup.ts`: `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_S
 | pubkey-book file | 0644 |
 | `/var/lib/otzi/vault-pubkey.json` | 0644 |
 
-Operator-configurable paths (share / identity / pubkeys per `[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file` in daemon.toml) are resolved at restore time by loose-parsing the staged daemon.toml. Unrecognized tar entries fall back to 0600 (most restrictive default).
+Operator-configurable paths (share / identity / pubkeys per `[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file` in daemon.toml) are resolved at restore time by loose-parsing the archived daemon.toml, and must lie inside `/etc/otzi` or `/var/lib/otzi`. Unrecognized tar entries are not written; `otzi restore` prints `warning: skipped archive entry <name>: not part of an otzi backup` to stderr for each.
 
 ---

@@ -287,14 +287,28 @@ Decline restore this time, OR provide a valid backup + password.
 **2. Manual via `otzi restore`.**
 
 If you've already done a fresh install (or the daemon is in a
-half-state), stop the daemon, remove the existing config, then run
-restore manually:
+half-state), stop the daemon, move the existing node files aside, then
+run restore manually. Restore never overwrites anything: it refuses
+while `/etc/otzi/daemon.toml` exists, and it refuses (listing them) if
+any file it would write — the share, identity, pubkey book,
+`vault-pubkey.json` or the address book — already exists. Move them,
+don't delete them: a share file is key material.
 
 ```
 sudo systemctl stop otzi
-sudo rm /etc/otzi/daemon.toml
+sudo mkdir -p /root/otzi-aside
+sudo mv /etc/otzi/daemon.toml /root/otzi-aside/
+# and every file `otzi restore` lists as existing, e.g.:
+# sudo mv /var/lib/otzi/share.json /root/otzi-aside/
 sudo otzi restore ~/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
 ```
+
+Restore writes only the vault's own files under `/etc/otzi` and
+`/var/lib/otzi`. It refuses an archive whose daemon.toml points the
+share, identity or pubkey book anywhere else, and an archive with a
+symlink, hardlink, device, `..` or absolute entry; any other unknown
+entry is skipped with a warning. If it fails part-way, it removes the
+files it created and leaves everything else as it was.
 
 The CLI prompts for the password interactively. Use
 `--password-stdin` for scripted runs.
@@ -316,13 +330,18 @@ share.
 
 **Restore refuses if:**
 
-- `/etc/otzi/daemon.toml` already exists — operator must remove it first
-  (loud failure beats silent overwrite).
+- `/etc/otzi/daemon.toml` already exists — operator must move it aside
+  first (loud failure beats silent overwrite).
 - `systemctl is-active otzi` returns 0 — operator must `systemctl stop
   otzi` first.
 - Archive magic doesn't match `OTZI-BACKUP-V1`.
 - Decryption fails — wrong password OR tampered archive (same error
   message; the daemon doesn't leak which one).
+- Any file it would write already exists (all of them are listed) —
+  move them aside and run restore again.
+- The archive's `daemon.toml` puts the share, identity or pubkey book
+  outside `/etc/otzi` and `/var/lib/otzi`, or the archive holds a
+  symlink, hardlink, device, FIFO, `..` or absolute entry.
 
 #### What the archive does NOT contain
 
