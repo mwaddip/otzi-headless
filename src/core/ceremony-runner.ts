@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   createSession,
   round1,
@@ -96,6 +97,11 @@ function randomSessionId(): Uint8Array {
   const buf = new Uint8Array(32);
   crypto.getRandomValues(buf);
   return buf;
+}
+
+/** FROST signing session tag derived from the ceremony id, identical on every peer. */
+function frostSessionId(ceremonyId: string): Uint8Array {
+  return new Uint8Array(createHash('sha256').update(ceremonyId).digest());
 }
 
 function partiesOtherThan(parties: number, me: PartyId): PartyId[] {
@@ -323,7 +329,7 @@ export class CeremonyRunner {
         sighashes: spec.sighashes,
         activeSigners: spec.signers,
         rng: spec.rng,
-        ceremonyId: spec.ceremonyId,
+        sessionId: frostSessionId(spec.ceremonyId),
       });
       try {
         this.produceOwnFrost(session, frostRound1, ROUND_FROST_R1, spec);
@@ -358,7 +364,7 @@ export class CeremonyRunner {
       sighashes: spec.sighashes,
       activeSigners: spec.signers,
       rng: spec.rng,
-      ceremonyId: spec.ceremonyId,
+      sessionId: frostSessionId(spec.ceremonyId),
     });
     try {
       this.produceOwnFrost(session, frostRound1, ROUND_FROST_R1, spec);
@@ -618,7 +624,7 @@ export class CeremonyRunner {
       const bytes = this.store.get(key);
       if (!bytes) throw new Error(`Missing ${roundName} blob from party ${key.from}`);
       const blobStr = new TextDecoder().decode(bytes);
-      const result = frostAddBlob(session, blobStr, addBlobRound);
+      const result = frostAddBlob(session, blobStr, addBlobRound, key.from);
       if (!result.ok) {
         throw new Error(`Rejected ${roundName} blob from party ${key.from}: ${result.error}`);
       }
@@ -739,7 +745,7 @@ export class CeremonyRunner {
     ceremonyId: string,
     expectedSenders: readonly PartyId[],
     opts: PullOpts,
-    addBlob: (blob: string) => { ok: boolean; error?: string },
+    addBlob: (blob: string, from: PartyId) => { ok: boolean; error?: string },
   ): Promise<void> {
     const me = this.transport.partyId;
     const expected: BlobKey[] = expectedSenders.map(from => ({
@@ -753,7 +759,7 @@ export class CeremonyRunner {
       const bytes = this.store.get(key);
       if (!bytes) throw new Error(`Missing ${roundName} blob from party ${key.from}`);
       const blobStr = new TextDecoder().decode(bytes);
-      const result = addBlob(blobStr);
+      const result = addBlob(blobStr, key.from);
       if (!result.ok) {
         throw new Error(`Rejected ${roundName} blob from party ${key.from}: ${result.error}`);
       }
@@ -778,8 +784,8 @@ export class CeremonyRunner {
     try {
       // Round 1 — broadcast commitment + proof of knowledge.
       this.produceFrostDkgBroadcast(session, frostDkgRound1, ROUND_FROST_DKG_R1, spec.ceremonyId);
-      await this.pullFrostDkgBroadcast(ROUND_FROST_DKG_R1, spec, opts, blob =>
-        frostDkgAddBlob(session, blob, 'r1'),
+      await this.pullFrostDkgBroadcast(ROUND_FROST_DKG_R1, spec, opts, (blob, from) =>
+        frostDkgAddBlob(session, blob, 'r1', from),
       );
 
       // Round 2 — local compute, then targeted share per other party.
@@ -797,7 +803,7 @@ export class CeremonyRunner {
         spec.ceremonyId,
         partiesOtherThan(spec.parties, me),
         opts,
-        blob => frostDkgAddBlob(session, blob, 'r2'),
+        (blob, from) => frostDkgAddBlob(session, blob, 'r2', from),
       );
 
       return frostDkgFinalize(session);
@@ -822,7 +828,7 @@ export class CeremonyRunner {
     roundName: string,
     spec: FrostDkgSpec,
     opts: PullOpts,
-    addBlob: (blob: string) => { ok: boolean; error?: string },
+    addBlob: (blob: string, from: PartyId) => { ok: boolean; error?: string },
   ): Promise<void> {
     const me = this.transport.partyId;
     const expected = partiesOtherThan(spec.parties, me).map(from => ({
@@ -835,7 +841,7 @@ export class CeremonyRunner {
       const bytes = this.store.get(key);
       if (!bytes) throw new Error(`Missing ${roundName} blob from party ${key.from}`);
       const blobStr = new TextDecoder().decode(bytes);
-      const result = addBlob(blobStr);
+      const result = addBlob(blobStr, key.from);
       if (!result.ok) {
         throw new Error(`Rejected ${roundName} blob from party ${key.from}: ${result.error}`);
       }
@@ -915,7 +921,7 @@ export class CeremonyRunner {
       sighashes,
       activeSigners: signers,
       rng: spec.rng,
-      ceremonyId: spec.ceremonyId,
+      sessionId: frostSessionId(spec.ceremonyId),
     });
     try {
       this.produceOwnFrost(session, frostRound1, ROUND_FROST_KEYLINK_R1, frostSpec);

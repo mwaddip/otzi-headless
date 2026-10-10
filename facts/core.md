@@ -445,7 +445,7 @@ export type CeremonyMessage = AnnounceDkg | AnnounceSign | SignoffDone | Signoff
 - `function createSession(input: CreateFrostSessionInput) → FrostSigningSession`
   - **Pre:** `1 ≤ sighashes.length ≤ 255`; `partyId ∈ activeSigners`; `activeSigners` has no duplicates; `keyPackage` and `publicKeyPackage` are from the same vault.
   - **Post:** Session initialized; `round2Started = false`; all state null/empty.
-  - **Throws:** On empty sighashes or `partyId` not in `activeSigners`.
+  - **Throws:** On empty sighashes, `partyId` not in `activeSigners`, or `sessionId` not 32 bytes.
 
 - `function round1(session) → string`
   - **Pre:** Session live; round 1 not run.
@@ -455,7 +455,7 @@ export type CeremonyMessage = AnnounceDkg | AnnounceSign | SignoffDone | Signoff
 - `function round2(session) → string`
   - **Pre:** Round 1 run; `round2Started === false`; one commitment set collected for every signer in `activeSigners`.
   - **Post:** Sets `round2Started = true` before any work; takes exactly one commitment set per active signer, frozen at that moment; for each sighash calls frots `signRound2(keyPackage, nonces, hash, commitments sorted by identifier, { tweaked })`; sets `myNonces = null`; adds own shares to `collectedR2`; returns the `encodeFrostSignR2` blob (Ötzi `frost-sign-r2`).
-  - **Throws:** If round 2 already started, round 1 not run, or a commitment set is missing. `myNonces` is `null` once `round2` returns.
+  - **Throws:** If round 2 already started (checked first), round 1 not run, or a commitment set is missing. Past those first two checks `myNonces` is `null` once `round2` exits, by return or by throw; a throw there leaves the session unable to run round 2 again.
 
 - `function aggregate(session) → Uint8Array[]`
   - **Pre:** Round 2 run; one share set collected for every active signer. Leader only (and every node in DKG verification).
@@ -467,7 +467,7 @@ export type CeremonyMessage = AnnounceDkg | AnnounceSign | SignoffDone | Signoff
   - **Post:** On `ok: true` the decoded set is stored under `from`.
   - **Rejects (`ok: false`, error names `from`):**
     - `from === partyId` or `from ∉ activeSigners`;
-    - the blob does not decode (`decodeFrostSignR1` / `decodeFrostSignR2` → null);
+    - the blob does not decode (`decodeFrostSignR1` / `decodeFrostSignR2` → null, or the decoder throws on a truncated payload);
     - **sender binding:** the partyId inside the blob ≠ `from`, or any entry's FROST identifier ≠ `from + 1`;
     - entry count ≠ `sighashes.length`;
     - a second set from the same `from` for the round;
