@@ -2,7 +2,7 @@
 
 The daemon exposes a single endpoint, `POST /`, that dispatches on the request
 body's `op` field. There are three ops: `vault-info`, `dkg` and `sign`. The
-`otzi` CLI wraps all three (`otzi vault`, `otzi generate`, `otzi btc send` /
+`otzi` CLI wraps `dkg` (`otzi generate`) and `sign` (`otzi btc send` /
 `otzi btc sign`); operator backends call `sign` directly. Ceremonies always run
 across every node in the ring; an op only fires one from *this* node as leader.
 
@@ -33,7 +33,7 @@ with `{ "error": "unauthorized" }`. UDS triggers do not use Bearer auth
 (filesystem permissions are the auth model).
 
 ```bash
-# Debugging example; operators use `otzi vault`.
+# Debugging example.
 curl --unix-socket /var/run/otzi/otzi.sock -X POST http://localhost/ \
   -H 'content-type: application/json' -d '{"op":"vault-info"}'
 ```
@@ -72,8 +72,9 @@ a fresh one.
 
 ## `op: "vault-info"`
 
-Read-only vault metadata. Used by the CLI to show the vault and to discover the
-ring's party IDs.
+Read-only vault metadata for operator backends and tooling: the vault address and
+keys, the network, the threshold and the ring's party IDs. `otzi vault` does not
+call it; it reads `vault-pubkey.json`.
 
 Request:
 
