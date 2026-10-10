@@ -548,13 +548,22 @@ export interface SignCeremonySpec { ceremonyId: string; signers: readonly PartyI
 - `async leadSigning(io: CeremonyIo, spec: SignCeremonySpec, proposal: SendProposal) → Promise<Uint8Array[]>`
   - **Pre:** The caller analysed `proposal` against this node's own key and network and its gate approved; `spec.signers` contains this node, has no duplicates, contains only ring members, and has at least `publicKeyPackage.minSigners` entries.
   - **Post:** Broadcasts `announce-sign {ceremonyId, signers, proposal}`; signing session with `sessionId = sighashes[0]` and `tweaked: true` for every sighash; puts `sign-r1`, pulls `sign-r1` from every other signer, `addBlob(..., 1, from)`; `round2`, puts `sign-r2`, pulls `sign-r2` from every other signer, `addBlob(..., 2, from)`; `aggregate` with the full `publicKeyPackage`; checks `verifySignature(sig, sighash, publicKeyPackage.verifyingKey)` for every input. Returns one 64-byte signature per input, in input order.
-  - **Throws:** On any pull failure, rejected blob (error names the sender), aggregation failure (frots names the cheating signer) or failed verification.
+  - **Throws:** Before announcing or storing anything, on a spec that breaks the checks listed under *Spec validation* below. Later, on any pull failure, rejected blob (`Rejected <round> blob from party <from>: <reason>` names the sender), aggregation failure (frots names the cheating signer) or failed verification (`signature for input <i> does not verify`).
   - **Notes:** Does not broadcast a signoff; `LeaderDispatcher` broadcasts `signoff-done` / `signoff-aborted`.
 
 - `async participateInSigning(io: CeremonyIo, spec: SignCeremonySpec, signal?: AbortSignal) → Promise<void>`
   - **Pre:** The `announce-sign` passed the participant checks, `analyzeProposal` against this node's own key, and the gate (see [orchestrator.md](orchestrator.md)).
   - **Post:** Signing session as above; puts `sign-r1`, pulls `sign-r1` from every other signer, `addBlob(..., 1, from)`; `round2` (nonces dropped), puts `sign-r2`; resolves. Does not pull `sign-r2` and does not aggregate.
-  - **Throws:** On any pull failure, rejected blob, or `signal` abort (`Error('aborted')`).
+  - **Throws:** Before producing anything, on a spec that breaks the checks listed under *Spec validation* below. Later, on any pull failure, rejected blob (`Rejected <round> blob from party <from>: <reason>`), or `signal` abort (`Error('aborted')`).
+
+- **Spec validation** (both functions, first thing, in this order; the error texts are exact, and nothing is announced, stored or created when one throws). For `leadSigning` this node is the leader, so "this node is not in `signers`" is the leader-missing case.
+  - `sighashes.length` not in 1..255 → `sighashes must have 1 to 255 entries, got <n>`
+  - a sighash not 32 bytes → `sighash <i> is <len> bytes, expected 32`
+  - `signers` empty → `signers must not be empty`
+  - duplicate signer → `signers must be unique`
+  - this node (`transport.partyId`) not in `signers` → `party <id> is not in signers`
+  - a signer not in `transport.peers` → `signer <id> is not in the ring`
+  - fewer signers than `publicKeyPackage.minSigners` → `signers needs at least <minSigners> entries, got <n>`
 
 **Invariants:**
 - Sighashes never leave the node; each signer derives them from the proposal.
