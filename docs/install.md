@@ -37,8 +37,9 @@ follow up with `sudo apt -f install` to resolve.)
    - **Operator usernames** (space-separated) — each gets `usermod -aG otzi`.
    - **Bitcoin network** — `mainnet`, `testnet4` or `signet`. Every node in the
      ring must use the same network.
-   - **Esplora URL** (optional) — the chain API the `otzi btc *` verbs use. Leave
-     it blank for the mempool.space default of the network.
+   - **Esplora URL** (optional) — the chain API the `otzi btc *` verbs use. It must
+     start with `http://` or `https://`; a value without the scheme is ignored with a
+     warning. Leave it blank for the mempool.space default of the network.
    - **Transport kind**:
      - For `peer-mesh`: **This node's reachable address** (canonical
        `host[:port]`, wildcards rejected) and **Other peers** (comma-

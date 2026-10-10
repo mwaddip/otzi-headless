@@ -90,6 +90,10 @@ case "$1" in
 
   Verify the restored config:
     sudo cat /etc/otzi/daemon.toml
+  Create /etc/otzi/otzi.env (owner root:root, mode 600) with one line;
+  the backup does not contain it, and the daemon refuses to start without
+  the password:
+    OTZI_SHARE_PASSWORD=<this node's share password>
   Then start the daemon:
     sudo systemctl enable --now otzi
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -129,6 +133,16 @@ BANNER
       # Optional: a blank (or whitespace-only) answer leaves esplora_url out, and
       # the CLI uses the mempool.space default of the network.
       ESPLORA_URL="$(printf '%s' "$ESPLORA_URL" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      # The daemon refuses to start on an esplora_url that is not an http(s) URL, so a
+      # value without the scheme is left out of the config rather than written into it.
+      case "$ESPLORA_URL" in
+        ""|http://?*|https://?*) ;;
+        *)
+          echo "otzi-headless: WARNING — ignoring Esplora URL '$ESPLORA_URL': it must start with http:// or https://." >&2
+          echo "otzi-headless: the CLI will use the mempool.space default; set esplora_url under [network] in /etc/otzi/daemon.toml to change it." >&2
+          ESPLORA_URL=""
+          ;;
+      esac
 
       ENODE_ID="$(toml_escape "$NODE_ID")"
       EESPLORA_URL="$(toml_escape "$ESPLORA_URL")"

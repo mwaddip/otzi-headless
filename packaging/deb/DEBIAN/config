@@ -23,6 +23,17 @@ fi
 db_get otzi-headless/node-id || true
 [ -z "$RET" ] && db_set otzi-headless/node-id "$(hostname -s 2>/dev/null || hostname)"
 
+# A network answer kept from an earlier release, naming a network that is no longer
+# offered, would render a config the daemon refuses. Reset it to the default and ask again.
+db_get otzi-headless/network || true
+case "$RET" in
+  mainnet|testnet4|signet|"") ;;
+  *)
+    db_reset otzi-headless/network || true
+    db_fset otzi-headless/network seen false || true
+    ;;
+esac
+
 # Ask high-priority prompts in order.
 db_input high otzi-headless/role || true
 db_input high otzi-headless/operators || true

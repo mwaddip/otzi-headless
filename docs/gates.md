@@ -200,10 +200,14 @@ setups where the operator's script blocks (e.g. `inotifywait` on a decision file
 polling a queue) until the operator responds.
 
 **Worked example:** `examples/gate-file-approver.sh` implements the file-drop
-pattern. The script writes the spec to `/var/otzi/pending/<ceremonyId>.json` and
-blocks until the operator drops a decision file at
-`/var/otzi/decisions/<ceremonyId>` with content `approve` or `reject`. A web UI
-is just a directory listing over `/var/otzi/pending/` with buttons that write to
+pattern. The script names the request `<key>` = `<ceremonyId>.<first 16 hex of the
+spec's SHA-256>`, writes the spec to `/var/otzi/pending/<key>.json` and blocks until
+the operator drops a decision file at `/var/otzi/decisions/<key>` (the pending
+file's name without `.json`) with content `approve` or `reject`. The digest makes a
+decision apply only to the exact spec it was made for: a decision file left over
+from an earlier ceremony with the same id does not match a new spec. The script
+deletes the decision file when it uses it, so a decision applies once. A web UI is
+just a directory listing over `/var/otzi/pending/` with buttons that write to
 `/var/otzi/decisions/`.
 
 ### `webhook` — POST spec to an HTTP endpoint

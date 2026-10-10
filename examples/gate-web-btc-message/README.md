@@ -42,7 +42,7 @@ npx tsx examples/gate-web-btc-message/approver.ts
 | Variable | Meaning |
 |---|---|
 | `APPROVER_ADDRESS` | The one address whose signatures count. Mainnet or test-network address of any type the verifier accepts (below). The approver refuses to start if it is not a valid address. |
-| `APPROVER_LISTEN` | `host:port` to listen on, default `127.0.0.1:8181`. IPv6 as `[::1]:8181`. |
+| `APPROVER_LISTEN` | `host:port` to listen on, default `127.0.0.1:8181`. IPv6 as `[::1]:8181`. A loopback host turns on the `Host` check described under Exposure. |
 | `APPROVER_TOKEN` | When set, `POST /webhook` requires `Authorization: Bearer <token>`. Set it together with `bearer_token_env` in the daemon's `[gate]` table. |
 
 ## Configure the daemon
@@ -85,18 +85,25 @@ Paste the signature as base64, as wallets print it. Message signing in Bitcoin C
 - **Nonce per request.** 16 random bytes per held webhook request, deleted when its decision lands, so a nonce works once. A wrong signature does not consume it.
 - **Decision and ceremony in the message.** An approve signature does not verify as a reject, and a signature for one ceremony does not verify for another.
 - **Fail closed.** A malformed spec, an unknown spec `kind`, a wrong bearer token, a full queue (100 pending) or a shutting-down approver all answer with an HTTP error, which the daemon's gate counts as a reject.
-- **Exposure.** `/webhook` is only reachable with the bearer token when `APPROVER_TOKEN` is set. `GET /pending` shows the specs (addresses, amounts, labels) to anyone who can reach the listener, and a signature is all `/decide` needs. The default listener is loopback; for a remote operator, put the approver behind a TLS reverse proxy with the access control your site uses.
+- **Exposure.** `/webhook` is only reachable with the bearer token when `APPROVER_TOKEN` is set. `GET /pending` shows the specs (addresses, amounts, labels) to anyone who can reach the listener, and a signature is all `/decide` needs. Two checks keep a web page in the operator's browser away from a loopback listener:
+  - **`Host` check (loopback binds only).** A request whose `Host` header is not `localhost`, `127.0.0.1` or `[::1]` with the listener's port is refused with `403`. Without it, a hostile site could point its own DNS name at `127.0.0.1` ("DNS rebinding") and read `GET /pending` as if it were the page.
+  - **`Origin` check (every bind).** A request that carries an `Origin` header must carry the approver's own: the `Origin` host has to equal the `Host` header. The daemon sends no `Origin`; the operator page's same-origin requests send theirs. Without it, another site could make the operator's browser POST a `text/plain` body to `/webhook` or `/decide`.
+
+  To expose the approver to a remote operator, bind the address a reverse proxy reaches (`APPROVER_LISTEN=10.0.0.5:8181`; the `Host` check is off on non-loopback binds), set `APPROVER_TOKEN` and `bearer_token_env` so only the daemon can file requests, and let the proxy terminate TLS with the access control your site uses. The proxy must pass the original `Host` header (nginx: `proxy_set_header Host $host;`), because the browser's `Origin` is compared with it. A loopback bind behind a proxy that rewrites `Host` is refused by design.
 - **Page rendering.** `index.html` writes every spec-derived string (labels come from address books) as text, never as markup, and the page is served with a restrictive `Content-Security-Policy`.
 
 ## Customizing
 
 - **Change the UI.** Edit `index.html`. It is a plain static page: no build step, no external scripts. The approver reads it at startup.
-- **Change the message format.** Edit `decision.ts`. `decisionMessage` and `verifyDecision` are the only code that knows the format; `decision.test.ts` covers them (`npx vitest run examples`).
+- **Change the message format.** Edit `decision.ts`. `decisionMessage` and `verifyDecision` are the only code that knows the format; `decision.test.ts` covers them (`npx vitest run examples`). `verifyDecision` returns false unless the decision is `approve` or `reject` and the nonce is 32 lowercase hex characters, which keeps the message unambiguous; keep that if you change the format.
 - **Swap the auth scheme entirely.** Fork `approver.ts`, keep the webhook contract (accept the POST, hold the response, eventually answer `{ "decision": "approve" | "reject" }`), and implement whatever auth you want: SSO, a hardware token, a Slack bot, a manual CLI. The daemon does not care how you decide.
 
 ## Files
 
-- `approver.ts` — Node.js service: the webhook endpoint, the pending list and `/decide`.
+- `approver.ts` — Node.js service: the webhook endpoint, the pending list and `/decide`. It exports `createApprover(...)`, which builds the server without listening; running the file starts it from the environment.
+- `approver.test.ts` — vitest tests for the approver: held requests, signatures, replay, the browser boundary. They drive it with the real webhook gate and real message signatures.
 - `decision.ts` — `decisionMessage` and `verifyDecision`, the two pure functions around the signed message.
 - `decision.test.ts` — vitest test for them.
 - `index.html` — the operator page the approver serves at `GET /`.
+
+`npm run typecheck` also typechecks this directory (`tsconfig.examples.json`).

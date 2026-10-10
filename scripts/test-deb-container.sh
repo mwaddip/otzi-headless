@@ -117,10 +117,11 @@ echo ">> verifying postinst removes files earlier releases left behind"
 docker exec "$CONTAINER" bash -euo pipefail -c '
 export DEBIAN_FRONTEND=noninteractive
 touch /var/lib/otzi/bootstrap-secret /etc/otzi/manifest.otzi.json
+CONFIG_SUM=$(sha256sum /etc/otzi/daemon.toml | cut -d" " -f1)
 dpkg-reconfigure otzi-headless >/dev/null
 ! test -e /var/lib/otzi/bootstrap-secret || { echo "FAIL: bootstrap-secret not removed";    exit 1; }
 ! test -e /etc/otzi/manifest.otzi.json   || { echo "FAIL: manifest.otzi.json not removed"; exit 1; }
-grep -q "id = \"testnode-a\"" /etc/otzi/daemon.toml || { echo "FAIL: reconfigure rewrote daemon.toml"; exit 1; }
+[ "$(sha256sum /etc/otzi/daemon.toml | cut -d" " -f1)" = "$CONFIG_SUM" ] || { echo "FAIL: reconfigure rewrote daemon.toml"; exit 1; }
 echo "OK: leftovers removed, daemon.toml kept"
 '
 

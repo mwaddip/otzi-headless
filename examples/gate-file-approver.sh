@@ -12,15 +12,23 @@
 # (gate parameters sit directly under [gate], next to `strategy`) and spawns this
 # script per ceremony, writing the CeremonySpec JSON on our stdin. We:
 #
-#   1. Parse the ceremonyId out of the spec.
-#   2. Drop the spec as /var/otzi/pending/<ceremonyId>.json for the operator
+#   1. Parse the ceremonyId out of the spec and take the first 16 hex characters
+#      of the SHA-256 of the spec text as its digest. Together they name this
+#      request: <key> = <ceremonyId>.<digest>
+#   2. Drop the spec as /var/otzi/pending/<key>.json for the operator
 #      (web UI, email-on-poll, whatever) to display.
-#   3. Block on inotifywait until the operator drops a decision file at
-#      /var/otzi/decisions/<ceremonyId> with content "approve" or "reject".
-#   4. Echo the decision to stdout (first line) and exit 0.
+#   3. Wait until the operator drops a decision file named exactly
+#      /var/otzi/decisions/<key> with content "approve" or "reject". The name is
+#      the pending file's name without ".json"; copy it from there. Create the
+#      file under another name outside decisions/ and `mv` it in, so it appears whole.
+#   4. Remove the decision file, echo the decision to stdout (first line) and exit 0.
+#      The pending file is removed on the way out.
 #
-# Clean-up: the pending file is removed after the decision is read. The
-# decision file is left in place for audit.
+# A decision applies to the exact spec it was made for, and only once. The digest
+# ties the file name to the spec content, so a decision file left over from an
+# earlier ceremony with the same ceremonyId (ids can recur once the nodes have
+# forgotten them) does not match a new spec, and a decision is deleted when it is
+# used, so it cannot approve the same spec a second time.
 #
 # What the operator sees in the pending file. The node built the spec from its own
 # analysis of the proposal, so none of it is the leader's say-so (facts/gate.md):
@@ -39,16 +47,16 @@
 #
 # Review the outputs, not just `amount`. For example:
 #
-#   jq -r '.outputs[] | "\(.address)  \(.amount) sats  \(.label // "(no label)")  \(if .isChange then "change" else "" end)"' pending/<ceremonyId>.json
-#   jq '{txid, amount, fee, feeRate}' pending/<ceremonyId>.json
+#   jq -r '.outputs[] | "\(.address)  \(.amount) sats  \(.label // "(no label)")  \(if .isChange then "change" else "" end)"' pending/<key>.json
+#   jq '{txid, amount, fee, feeRate}' pending/<key>.json
 #
 # Under the packaged systemd unit the daemon (and so this script) can write only
 # under /var/lib/otzi. Point both directories there with the gate's `env`:
 #
 #   env = { OTZI_GATE_PENDING_DIR = "/var/lib/otzi/gate/pending", OTZI_GATE_DECISIONS_DIR = "/var/lib/otzi/gate/decisions" }
 #
-# Requirements on the host: bash, jq, inotify-tools. If inotifywait is
-# unavailable, replace the block with a polling loop (`while ! test -f "$DECISION"; do sleep 2; done`).
+# Requirements on the host: bash, jq, coreutils (sha256sum). inotify-tools makes the
+# wait event-driven; without it the script polls every 2 s.
 
 set -euo pipefail
 
@@ -60,15 +68,18 @@ mkdir -p "$PENDING_DIR" "$DECISIONS_DIR"
 # Read the full CeremonySpec JSON from stdin.
 spec="$(cat)"
 
-# Extract ceremonyId. `jq -r` = raw output (no quotes).
-ceremony_id="$(printf '%s' "$spec" | jq -r '.ceremonyId')"
-if [[ -z "$ceremony_id" || "$ceremony_id" == "null" ]]; then
-  echo "gate-file-approver: spec missing ceremonyId" >&2
+# Extract ceremonyId. `jq -r` = raw output (no quotes). The id becomes part of a
+# file name, so only the characters ceremony ids may contain are accepted.
+ceremony_id="$(printf '%s' "$spec" | jq -r 'if (.ceremonyId | type) == "string" then .ceremonyId else empty end')"
+if [[ ! "$ceremony_id" =~ ^[A-Za-z0-9._:-]{1,128}$ ]]; then
+  echo "gate-file-approver: spec has a missing or malformed ceremonyId" >&2
   exit 2
 fi
 
-pending_file="$PENDING_DIR/${ceremony_id}.json"
-decision_file="$DECISIONS_DIR/${ceremony_id}"
+digest="$(printf '%s' "$spec" | sha256sum | cut -c1-16)"
+key="${ceremony_id}.${digest}"
+pending_file="$PENDING_DIR/${key}.json"
+decision_file="$DECISIONS_DIR/${key}"
 
 # Drop the spec for the operator to pick up.
 printf '%s\n' "$spec" > "$pending_file"
@@ -78,21 +89,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Block until the decision file appears.
-while [[ ! -f "$decision_file" ]]; do
-  # -e create,moved_to: triggered on new file creation or atomic mv-in.
-  # -t: seconds until return without event (0 = infinite).
-  inotifywait -qq -e create,moved_to -t 0 "$DECISIONS_DIR" >/dev/null 2>&1 || true
+# Block until the decision file appears (and has content).
+while [[ ! -s "$decision_file" ]]; do
+  if command -v inotifywait >/dev/null 2>&1; then
+    # -e create,moved_to: triggered on new file creation or atomic mv-in.
+    # -t 5: look again after 5 s even without an event, so a file that landed
+    # between the test above and the watch starting is not missed.
+    inotifywait -qq -e create,moved_to -t 5 "$DECISIONS_DIR" >/dev/null 2>&1 || true
+  else
+    sleep 2
+  fi
 done
 
-# Normalize to approve/reject.
+# The decision is used up as it is read.
 decision="$(tr -d '[:space:]' < "$decision_file")"
+rm -f "$decision_file"
+
+# Normalize to approve/reject.
 case "$decision" in
   approve|reject)
     printf '%s\n' "$decision"
     ;;
   *)
-    echo "gate-file-approver: unexpected decision in $decision_file: '$decision'" >&2
+    echo "gate-file-approver: unexpected decision for $key: '$decision'" >&2
     exit 3
     ;;
 esac

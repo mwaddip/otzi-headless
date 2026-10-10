@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Headless daemon variant of Ötzi: a FROST threshold-signing Bitcoin vault for automated and federated systems.",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json",
     "test": "vitest run && npm run test:otzi",
     "test:otzi": "node --import tsx --test src/otzi/lib/*.test.ts src/otzi/backend/*.test.ts",
     "test:watch": "vitest",

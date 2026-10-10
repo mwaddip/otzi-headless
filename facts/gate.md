@@ -303,9 +303,11 @@
 - `decisionMessage(decision: 'approve' | 'reject', ceremonyId: string, nonce: string): string`
   - **Post:** `` `otzi-gate:${decision}:${ceremonyId}:${nonce}` ``.
 - `verifyDecision(p: { address: string; decision: 'approve' | 'reject'; ceremonyId: string; nonce: string; signature: string }): boolean`
-  - **Post:** `verifyBitcoinMessage(p.address, decisionMessage(p.decision, p.ceremonyId, p.nonce), p.signature)` — BIP-322 simple for P2WPKH / P2TR, legacy / BIP-137 for older types. Never throws.
+  - **Post:** `false` unless `p.decision` is `'approve'` or `'reject'` and `p.nonce` is 32 lowercase hex characters; otherwise `verifyBitcoinMessage(p.address, decisionMessage(p.decision, p.ceremonyId, p.nonce), p.signature)` — BIP-322 simple for P2WPKH / P2TR, legacy / BIP-137 for older types. Never throws.
+  - The decision and the nonce occupy fixed positions of the message, so two different `(decision, ceremonyId, nonce)` triples never produce the same message, even for a fork that skips the approver's own input checks.
 
 **Approver (`approver.ts`):**
+- `createApprover({ address, token?, host?, html?, log? }): { server, shutdown() }` builds the HTTP server without listening (it throws if `address` fails `isValidSignInAddress`); `shutdown()` answers every held request with `503` and closes the server. Running the file directly calls it with the environment below.
 - Environment: `APPROVER_ADDRESS` (required; must satisfy `isValidSignInAddress`, otherwise the approver exits 1), `APPROVER_LISTEN` (`host:port`, default `127.0.0.1:8181`), `APPROVER_TOKEN` (optional; when set, `POST /webhook` requires `Authorization: Bearer <token>`).
 - `POST /webhook` is the daemon's webhook gate. The body is the spec JSON; `ceremonyId` must match `^[A-Za-z0-9._:-]{1,128}$` and `kind` must be `signing` or `dkg`, else `400`. The request is held, with no response bytes sent, under a fresh random 16-byte hex nonce until `/decide` answers it with `200 {"decision": …}`, the daemon disconnects (its `timeout_sec` passed or it restarted; the entry is dropped), or shutdown answers `503`.
 - `GET /pending` returns `{ address, pending: [{ nonce, ceremonyId, receivedAt, spec, messages: { approve, reject } }] }`, where `messages` holds the `decisionMessage` text for each decision.
@@ -313,8 +315,16 @@
 
 **Invariants:**
 - The signed message binds the decision to one ceremony and one approver-issued nonce, so a signature cannot be replayed for another ceremony or the other decision.
+- Browser boundary: the daemon sends no `Origin` header, and the operator page's same-origin requests send their own. A request that carries an `Origin` whose host is not its `Host` header is refused with `403` on every route (blocks cross-site `text/plain` POSTs to `/webhook` and `/decide`). When the server is bound to a loopback host (`localhost`, `127.0.0.0/8`, `::1`; the default), a request whose `Host` header is not `localhost`, `127.0.0.1` or `[::1]` with the server's port is refused with `403` (blocks DNS rebinding of `GET /pending`). On any other bind address the `Host` header is not checked; use `APPROVER_TOKEN` and a reverse proxy.
+- A request target that is not a URL answers `400`; an unexpected error in a handler answers `500`; neither stops the server.
 - A nonce is deleted when its decision lands, so it works once. Requests are keyed by nonce, so two nodes holding the same `ceremonyId` do not collide.
 - The approver imports the lifted `src/otzi/backend/btc-message.ts`; the daemon never does. The daemon sees only `{"decision": …}` from the webhook.
 
 ### `examples/gate-file-approver.sh`
-**Purpose:** File-drop `exec` approver. Reads the spec JSON from stdin, writes it to `<pending dir>/<ceremonyId>.json` for the operator, waits for a decision file `<decisions dir>/<ceremonyId>` containing `approve` or `reject`, and prints that decision. Every spec field it reads is a field of the Bitcoin `SigningSpec` / `DkgSpec` above.
+**Purpose:** File-drop `exec` approver. Reads the spec JSON from stdin, derives `<key>` = `<ceremonyId>.<first 16 hex of sha256(spec text)>`, writes the spec to `<pending dir>/<key>.json` for the operator, waits for a non-empty decision file `<decisions dir>/<key>` containing `approve` or `reject`, deletes the decision file, and prints that decision. Every spec field it reads is a field of the Bitcoin `SigningSpec` / `DkgSpec` above.
+
+**Invariants:**
+- A decision applies to the exact spec it was made for: the digest in the file name ties the decision to the spec text, so a leftover decision for an earlier ceremony with the same `ceremonyId` does not match a new spec.
+- A decision applies once: the script deletes the decision file as it reads it (valid or not) and the pending file on exit.
+- `ceremonyId` must be a string matching `^[A-Za-z0-9._:-]{1,128}$` (it becomes part of a file name); otherwise the script exits 2 (the gate rejects).
+- Without `inotifywait` the script polls every 2 s; with it, it re-checks every 5 s at most.

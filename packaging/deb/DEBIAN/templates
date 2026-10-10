@@ -46,8 +46,10 @@ Template: otzi-headless/esplora-url
 Type: string
 Description: Esplora REST API URL (optional)
  Base URL of the Esplora API that the `otzi btc` commands use to read
- balances and UTXOs and to broadcast. Leave blank to use the mempool.space
- default for the network. The daemon itself never contacts it.
+ balances and UTXOs and to broadcast. It must start with http:// or
+ https:// (for example https://mempool.space/testnet4/api); a value without
+ that scheme is ignored. Leave blank to use the mempool.space default for
+ the network. The daemon itself never contacts it.
 
 Template: otzi-headless/transport
 Type: select
