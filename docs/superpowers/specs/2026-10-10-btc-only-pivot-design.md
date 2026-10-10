@@ -254,7 +254,7 @@ unless all of the following hold:
 - the gate approves the spec built from that analysis.
 
 It then produces `sign-r1`, pulls `sign-r1` from every other signer, produces
-`sign-r2`, pulls `sign-r2` from every other signer, and stops (no aggregation).
+`sign-r2`, and stops: it pulls no `sign-r2` and never aggregates.
 
 **Nonce rules** (both roles)
 - Round 2 runs at most once per session; the guard is set before any work.
@@ -390,6 +390,9 @@ password_env = "OTZI_SHARE_PASSWORD"
 - Startup: read the share JSON, `decryptShareFile`, `assertShareMatchesVault` against
   the configured network, check `partyId` against the pubkey book and `parties`
   against the ring size. Any mismatch refuses to start.
+  The daemon rewrites `vault-pubkey.json` at startup whenever a share is loaded
+  (best-effort: a write failure is logged and does not stop startup), in addition to
+  the write on DKG commit.
 - `vault-pubkey.json` (0644): `{ network, address, internalKey, outputKey, threshold, parties, vaultKey }`,
   where `vaultKey` is otzi's public `VaultKey` (needed by `buildSend` in the CLI).
 - Backup archive: `daemon.toml`, share, identity key, pubkey book, address book (if

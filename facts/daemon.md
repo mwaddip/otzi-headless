@@ -14,15 +14,16 @@
 
 - `async loadAndValidate(configPath: string, options?: { env?: Readonly<Record<string, string | undefined>> }): Promise<LoadedDaemonState>`
   - **Pre:** `configPath` is a readable `daemon.toml`. The share password is in the env var named by `[share].password_env` (`options.env`, default `process.env`).
-  - **Post:** Config parsed (`parseDaemonConfigToml`); `share = await loadVaultShare(config.share.path, password, config.network.name)`; a `.pending` file next to the share path is reported through `warnOnPendingShare` and never loaded.
+  - **Post:** Config parsed (`parseDaemonConfigToml`); `share = await loadVaultShare(config.share.path, password, config.network.name)`; a `.pending` file next to the share path is reported through `warnOnPendingShare` and never loaded. Whenever a share is loaded, `vault-pubkey.json` is rewritten from it (`writeVaultPubkeyFile(vaultPubkeyFromPackage(share.publicKeyPackage, network))`), in addition to the write on DKG commit. The rewrite is best-effort: a write failure is logged and does not stop startup.
   - **Throws:** `ConfigError` / TOML errors; `Error` naming the env var when the password is missing or empty; every `loadVaultShare` error (wrong password, network mismatch, corrupted file).
 
 **Invariants:**
 - The password env var MUST be set even without a share (the DKG encrypts the new share with it).
 - No partial state: a share that fails any check refuses startup; it is never treated as "no vault".
+- A node with a loaded share always has a current `vault-pubkey.json` after startup (barring a logged write failure), including a node whose share came from web Ötzi or a restore.
 
 **Cross-component contracts:**
-- Depends on: `loadDaemonConfig` / `parseDaemonConfigToml`, `vault-share.ts`.
+- Depends on: `loadDaemonConfig` / `parseDaemonConfigToml`, `vault-share.ts`, `vault-pubkey.ts`.
 - Used by: `entrypoint.ts` (`runDaemonCommand`), tests.
 
 ---
@@ -103,10 +104,13 @@
 
 **Invariants:**
 - Every value is public; mode 0644 lets `otzi` group members and other users run read-only CLI commands.
-- Written by the share stager's `commit()` after a DKG completes.
+- Written:
+  - at daemon startup whenever a share is loaded (`loadAndValidate`; best-effort — a write failure is logged and does not stop startup);
+  - by the share stager's `commit()` after a DKG completes.
 
 **Cross-component contracts:**
 - Depends on: `toVaultKey`, `vaultPayment` (`src/otzi/lib`).
+- Written by: `config-merge.ts` (startup), `vault-share.ts` (`createShareStager().commit()`).
 - Consumed by: `otzi vault`, `otzi btc balance|send|sign` (read-only).
 
 ---
