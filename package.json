@@ -6,7 +6,8 @@
   "description": "Headless daemon variant of Ötzi for automated threshold-signing (ML-DSA + FROST over OPNet Bitcoin L1).",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:otzi",
+    "test:otzi": "node --import tsx --test src/otzi/lib/*.test.ts src/otzi/backend/*.test.ts",
     "test:watch": "vitest",
     "otzi": "tsx src/daemon/entrypoint.ts",
     "daemon": "tsx src/daemon/entrypoint.ts daemon",
@@ -34,6 +35,8 @@
     "@mwaddip/frots": "^0.1.1",
     "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
+    "@scure/base": "2.4.0",
+    "@scure/btc-signer": "2.4.1",
     "ajv": "^8.20.0",
     "croner": "^10.0.1",
     "opnet": "1.8.13",

@@ -35,7 +35,7 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Run tests
-        run: npx vitest run
+        run: npm test
 
       - name: Build .deb
         run: npm run build:deb
