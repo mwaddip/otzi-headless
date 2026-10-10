@@ -1,15 +1,15 @@
-# Daemon HTTP API
+# Daemon API
 
-The daemon exposes a single HTTP endpoint — `POST /` — that dispatches on the
-request body's `op` field. Used by the operator's trigger infrastructure
-(local CLI, cron, watchers) to initiate ceremonies against this daemon's
-share. Ceremonies always run across every peer in the ring; this endpoint
-only fires them from *this* node as leader.
+The daemon exposes a single endpoint, `POST /`, that dispatches on the request
+body's `op` field. There are three ops: `vault-info`, `dkg` and `sign`. The
+`otzi` CLI wraps all three (`otzi vault`, `otzi generate`, `otzi btc send` /
+`otzi btc sign`); operator backends call `sign` directly. Ceremonies always run
+across every node in the ring; an op only fires one from *this* node as leader.
 
-This is the shape served by the default handler built by `buildDefaultHttpHandler`
-and wired by the `[[triggers]]` of kind `http` in `daemon.toml`. Per-daemon
-configuration (bind address, auth, gate strategy) is documented in
-[`config.md`](./config.md).
+The daemon has no chain access. `sign` takes a Bitcoin transaction proposal and
+returns the signed transaction; the caller reads UTXOs, picks the fee rate and
+broadcasts. Per-daemon configuration (triggers, gate strategy, deadlines) is
+documented in [`config.md`](./config.md).
 
 ## Transport + auth
 
@@ -19,89 +19,61 @@ The operator API listens on a Unix domain socket by default:
 - **Auth:** filesystem permissions. The socket is `chmod 660 root:otzi`. Any user in the `otzi` group can connect; nobody else.
 - **Wire shape:** HTTP/1.1 over the UDS, identical to TCP HTTP. Use Node's `http.request({ socketPath })` or `curl --unix-socket`.
 - **Method:** `POST`. Anything else → `405`.
-- **Content-Type:** JSON body, max 1 MB.
+- **Content-Type:** JSON body, max 1 MB. A `sign` request (one proposal of at most 255 inputs) fits well inside the cap.
 
-Optionally, `[[triggers]] kind="http"` can be opted into for a TCP listener — but the parser enforces loopback (`127.0.0.1`, `::1`, `localhost`) only. External binds are rejected at startup with a `ConfigError`. This is load-bearing for the security posture: the daemon is reachable only via the local CLI.
+`[[triggers]] kind="http"` opts into a TCP listener. The parser enforces a
+loopback bind (`127.0.0.1`, `::1`, `localhost`); external binds are rejected at
+startup with a `ConfigError`. Loopback-only binding is what makes mTLS
+unnecessary: the daemon is reachable only from the local machine.
 
-When `[[triggers]] kind="http" auth_token_env="…"` is set, the daemon reads the token from that env var at startup and requires matching `Authorization: Bearer <token>` on every request. Missing/mismatched → `401` with `{ "error": "unauthorized" }`. UDS triggers do NOT use Bearer auth (filesystem permissions are the auth model).
+When `[[triggers]] kind="http" auth_token_env="…"` is set, the daemon reads the
+token from that env var at startup and requires a matching
+`Authorization: Bearer <token>` on every request. Missing or mismatched → `401`
+with `{ "error": "unauthorized" }`. UDS triggers do not use Bearer auth
+(filesystem permissions are the auth model).
 
-## Common fields
+```bash
+# Debugging example; operators use `otzi vault`.
+curl --unix-socket /var/run/otzi/otzi.sock -X POST http://localhost/ \
+  -H 'content-type: application/json' -d '{"op":"vault-info"}'
+```
 
-Every request body is a JSON object. All ceremony requests accept:
+## Common rules
+
+Every request body is a JSON object with an `op`. Unknown top-level fields are
+rejected with `400`, as are unknown ops.
 
 | Field | Type | Notes |
 |---|---|---|
-| `op` | string, required | One of `dkg-combined`, `dkg-mldsa`, `dkg-frost`, `sign`, `vault-info`, `sync`. |
-| `ceremonyId` | string, optional | Operator-supplied. When omitted, the daemon generates `"<op>-<uuid>"`. Must not contain `#` (reserved for ML-DSA retry suffixes). |
+| `op` | string, required | `vault-info`, `dkg` or `sign`. |
+| `ceremonyId` | string, optional (`dkg`, `sign`) | Matches `^[A-Za-z0-9._:-]{1,128}$`. When omitted, the daemon generates `"<op>-<uuid>"`. |
 
-Every successful response body includes:
+A `ceremonyId` must not repeat within the blob retention window (5 minutes
+after a signing ceremony ends on a node, 15 minutes after a DKG). Omit it to get
+a fresh one.
+
+`dkg` and `sign` success bodies include:
 
 | Field | Type | Notes |
 |---|---|---|
-| `ceremonyId` | string | Echoes back the request ID. |
-| `status` | `"done"` | Success marker. Failures are surfaced as non-2xx. |
+| `ceremonyId` | string | The request's ID, or the generated one. |
+| `status` | `"done"` | Success marker. Failures are non-2xx. |
 
 ## Error shapes
 
 | Status | Body | Cause |
 |---|---|---|
-| `400` | `{ "error": "<detail>" }` | Malformed body, missing required field, or unknown enum value. |
-| `401` | `{ "error": "unauthorized" }` | Auth token required but missing/wrong. |
-| `403` | `{ "error": "gate rejected", "decision": "reject"\|"pending", "ceremonyId": "…" }` | This daemon's gate refused the ceremony. See [`gates.md`](./gates.md). |
+| `400` | `{ "error": "<detail>" }` | Malformed body, unknown op, unknown top-level field, invalid `ceremonyId` / `signers` / `proposal`, or a proposal this node's analysis rejects (the message comes from `analyzeProposal`). Nothing was announced to peers. |
+| `401` | `{ "error": "unauthorized" }` | HTTP trigger with `auth_token_env`, token missing or wrong. |
+| `403` | `{ "error": "gate rejected", "decision": "reject"\|"pending", "ceremonyId": "…" }` | This daemon's own gate did not approve. Nothing was announced to peers. See [`gates.md`](./gates.md). |
 | `405` | `{ "error": "method not allowed" }` | Non-POST method. |
-| `500` | `{ "error": "<detail>" }` | Protocol failure (peer dropped, timeout, crypto error). Check logs. |
-
-## `op: "dkg-combined"`
-
-Combined ML-DSA + FROST DKG under a single `sessionId`. Produces a V3-compatible
-encrypted share on **every peer** at the configured path. When the daemon's
-`[network].name` is `mainnet` or `testnet`, a final n-of-n FROST sign over
-`computeKeyLinkHash(...)` also runs as part of the ceremony, and the resulting
-`frostLegacySig` is persisted alongside the share — required for OPNet contract
-calls against the resulting vault (the SDK replays it via `withFrostLegacySig`
-during tx construction). Regtest skips the keylink phase; OPNet contract
-calls against such a vault will fail at capture.
-
-`parties` is derived by the leader from its own configured peer set
-(`peers.length + 1`); `threshold = parties` (v0.1 is n-of-n by design — see
-`INTERFACES.md` § Trust model); `level = 44` (only level supported on OPNet).
-The CLI doesn't pass any of these; the request body is just `op` + optional
-`ceremonyId`.
-
-Request:
-
-```jsonc
-{
-  "op": "dkg-combined",
-  "ceremonyId": "..."   // optional; daemon auto-generates if absent
-}
-```
-
-Response:
-
-```jsonc
-{
-  "ceremonyId": "dkg-combined-…",
-  "status": "done",
-  "mldsaPublicKeyHex": "…",           // 1312B hex at level 44
-  "frostVerifyingKeyHex": "…",        // 33B SEC1 compressed, tweaked aggregate key
-  "btcAddress": "tb1p…",              // bech32m P2TR — fund here for BTC
-  "opnetAddress": "0x…",              // 0x + sha256(mldsaPubKey) — send OP20 / contract calls here
-  "network": "testnet"                // mirrors [network].name
-}
-```
-
-The `btcAddress` / `opnetAddress` / `network` fields match what
-`/var/lib/otzi/vault-pubkey.json` will hold once the daemon is restarted.
-`otzi generate` prints them in its banner so the operator doesn't have to
-read the cache file separately.
+| `409` | `{ "error": "<detail>" }` | `vault-info` / `sign`: no vault is loaded. `dkg`: this node already holds a vault. |
+| `500` | `{ "error": "<detail>", "ceremonyId": "…" }` | Ceremony failure after the announce: a peer dropped, rejected or timed out, a blob failed sender binding, a signature failed verification. Check the daemon logs; the cause names the offending party where one is known. |
 
 ## `op: "vault-info"`
 
-Read-only metadata for the vault. Used by the CLI (`otzi sign`, `otzi btc send`)
-to discover the signer set + threshold without reading the share file. Returns
-the same `btcAddress` / `opnetAddress` as `dkg-combined` so callers can verify
-they're talking to the right vault.
+Read-only vault metadata. Used by the CLI to show the vault and to discover the
+ring's party IDs.
 
 Request:
 
@@ -113,261 +85,36 @@ Response (`200`):
 
 ```jsonc
 {
-  "partyIds": [0, 1, 2],
-  "threshold": 2,
+  "partyIds": [0, 1, 2],             // every ring member, ascending
+  "threshold": 3,
   "parties": 3,
-  "network": "testnet",
-  "btcAddress": "tb1p…",
-  "opnetAddress": "0x…"
+  "network": "testnet4",
+  "address": "tb1p…",                // bech32m key-path-only P2TR — fund here
+  "internalKey": "02…",              // 33-byte SEC1 hex, the untweaked group key
+  "outputKey": "…"                   // 32-byte x-only hex, the BIP341 output key
 }
 ```
 
-If the daemon has no share loaded (DKG hasn't run yet), responds `409`:
-`{ "error": "vault-info: no share loaded (run `otzi generate` first)" }`.
+`409` when no share is loaded (no DKG has run, or the daemon was not restarted
+after `dkg`).
 
-## `op: "dkg-mldsa"`
+## `op: "dkg"`
 
-Pure ML-DSA DKG. Produces an ML-DSA key share only — no FROST, no
-`frostLegacySig`. Useful when the federation isn't using FROST (signing
-arbitrary bytes via `scheme='mldsa'`). Same parameter-derivation rules as
-`dkg-combined`: parties derived from configured peers, threshold = parties,
-level = 44.
+Runs the run-once distributed key generation across the whole ring. The node
+that receives the call generates the 32-byte session ID and announces; every
+node plays the same role in the protocol (see
+[`signing-flows.md`](./signing-flows.md)).
 
-Request:
-
-```jsonc
-{ "op": "dkg-mldsa", "ceremonyId": "..." }   // ceremonyId optional
-```
-
-Response:
-
-```jsonc
-{ "ceremonyId": "…", "status": "done", "mldsaPublicKeyHex": "…" }
-```
-
-## `op: "dkg-frost"`
-
-Pure FROST DKG (secp256k1). Produces a FROST key share only — no ML-DSA.
-Same parameter-derivation rules as `dkg-combined`.
-
-Request:
-
-```jsonc
-{ "op": "dkg-frost", "ceremonyId": "..." }   // ceremonyId optional
-```
-
-Response:
-
-```jsonc
-{ "ceremonyId": "…", "status": "done", "frostVerifyingKeyHex": "…" }
-```
-
-## `op: "sign"`
-
-Dispatches to the FROST or ML-DSA signing runner. Request shape is
-discriminated by `(scheme, protocol)`.
-
-Common fields for every `sign` variant:
-
-| Field | Type | Notes |
-|---|---|---|
-| `scheme` | `"frost"` \| `"mldsa"` | Required. |
-| `protocol` | `"btc"` \| `"opnet"` \| `"opnet-params"` \| `"raw"` | See variant-specific rules below. |
-| `signers` | `number[]` | Active signer partyIds. Must include this daemon's own `partyId` (it's the leader). |
-
-### `scheme: "frost", protocol: "btc"`
-
-BTC construction parameters. The leader deterministically builds the tx via
-`buildBtcTxFromParams`, and every participant rebuilds the same tx locally
-and verifies sighashes before signing. See `SESSION_CONTEXT.md` § BTC
-construction-params.
+`parties` is the ring size (the number of entries in the pubkey book) and
+`threshold = parties`: the vault is n-of-n. The request carries no parameters
+besides an optional `ceremonyId`.
 
 Request:
 
 ```jsonc
 {
-  "op": "sign",
-  "scheme": "frost",
-  "protocol": "btc",
-  "signers": [0, 1],
-  "btc": {
-    "to": "bc1p…",                      // destination bech32
-    "amountSat": "50000",               // decimal string (u64-safe)
-    "feeRate": 5,                       // sat/vB
-    "network": "mainnet",               // or "testnet" — matches opnetTestnet
-    "frostP2tr": "bc1p…",               // vault P2TR (= untweaked FROST aggregate key's P2TR)
-    "frostUntweakedPubKeyHex": "…",     // 33B SEC1 compressed
-    "utxos": [
-      {
-        "transactionId": "…64 hex chars…",
-        "outputIndex": 0,
-        "valueSat": "100000"            // decimal string
-      }
-    ]
-  }
-}
-```
-
-If the leader lies about UTXOs (fake, inflated, wrong script), Bitcoin
-consensus rejects the tx at broadcast time — BIP-341 sighashes commit to
-real prevout scripts + values. Worst case is wasted ceremony (DoS); never
-theft. Matches the federation-trust model.
-
-Response:
-
-```jsonc
-{
-  "ceremonyId": "…",
-  "status": "done",
-  "scheme": "frost",
-  "signaturesHex": ["…64-byte BIP340 hex…"]
-}
-```
-
-One sig per input; the caller broadcasts the tx. `btc.ts`'s `broadcastBtcTx`
-is the standard path — it injects the sigs as witness elements and does a
-BIP340 verify under the tweaked aggregate key before submitting.
-
-### `scheme: "frost", protocol: "opnet"` — DEPRECATED (returns 400)
-
-The raw unsigned-tx path has been deprecated as of phase 9a. Participants
-cannot independently verify the announced contract/method/amount against
-the operator-supplied bytes (`hints` are advisory only); gate policy
-evaluates untrusted fields. A rogue leader can sign something other than
-what the operator intended.
-
-Use `protocol: 'opnet-params'` (Phase 8) instead — every node rebuilds the
-tx independently from construction params and sighash-checks before
-signing.
-
-The underlying broadcast helpers in `src/broadcast/opnet-capture.ts` and
-`opnet-broadcast.ts` are still in the binary (still imported by the
-`opnet-params` flow internally); only the public HTTP entry point is
-gated off. Re-enable in `src/daemon/daemon.ts::buildDefaultHttpHandler`
-only if you accept the unverifiability and have a use case the SDK
-can't reach via construction params.
-
-### `scheme: "frost", protocol: "opnet-params"`
-
-OPNet construction parameters — the construction-params equivalent of the
-`btc` protocol for OPNet contract calls. The leader fetches UTXOs + challenge
-from the OPNet provider, generates a 32-byte random seed, runs the full
-deterministic capture (see SESSION_CONTEXT § Deterministic OPNet capture) to
-produce the template txs + sighashes, asserts all three on-wire. Participants
-re-run the identical capture from asserted inputs and verify the sighashes
-match before signing — policy rules evaluate **structurally verified**
-`contractAddress` + `method`, not advisory hints. The daemon owns the OPNet
-`captureContext` and broadcasts the tx internally after the FROST ceremony —
-the operator does not broadcast externally.
-
-Operator pre-computes `mldsaThresholdSignatureHex` via a prior
-`op: "sign", scheme: "mldsa", protocol: "raw"` ceremony over
-`sha256(calldata)` (calldata is produced by the OP-20 encoder in
-`opnet-calldata.ts`). The daemon knows only OP-20 ABI — custom-ABI contracts
-stay on the `protocol: "opnet"` (raw-tx) path.
-
-Request:
-
-```jsonc
-{
-  "op": "sign",
-  "scheme": "frost",
-  "protocol": "opnet-params",
-  "signers": [0, 1],
-  "contractAddress": "opt1…",              // OP-20 contract (bech32 or 0x hex)
-  "method": "transfer",
-  "params": ["0x…32-byte address hex…", "1000000"],   // positional args, JSON-safe
-  "paramTypes": ["address", "u256"],        // optional; defaults OP-20 ABI inference
-  "mldsaThresholdSignatureHex": "…",        // outer ML-DSA sig over sha256(calldata)
-  "feeRate": 10,                            // sat/vB; optional, default 10
-  "priorityFeeSat": "1000",                 // decimal string; optional, default "1000"
-  "maxSatToSpendSat": "100000",             // decimal string; optional, default "100000"
-  "hints": {                                // optional; advisory — amount stays unverified
-    "amountTokenAtomic": "1000000"
-  }
-}
-```
-
-Notes:
-
-- `contractAddress` and `method` land on the `CeremonySpec` as
-  structurally-verified fields — use `allowed_contracts` + `method_allowlist`
-  gate policy rules against trusted data. `amountTokenAtomic` remains
-  advisory (daemon stays ABI-agnostic for amounts).
-- The daemon derives the vault refund address (P2TR of the untweaked FROST
-  aggregate key) locally per-peer. Operator cannot override — a bogus refund
-  would be change-theft, not DoS.
-- If the leader lies about UTXOs / challenge / random seed, participants'
-  rebuilt sighashes differ → silent drop → ceremony aborts (DoS, not theft).
-  Matches federation-trust.
-- Requires a V3 share (combined DKG with `[network]` set to mainnet/testnet
-  → `frostLegacySig` persisted). Regtest daemons cannot run `opnet-params`.
-
-Response:
-
-```jsonc
-{
-  "ceremonyId": "…",
-  "status": "done",
-  "scheme": "frost",
-  "signaturesHex": ["…", "…"],              // one per captured sighash
-  "transactionId": "…"                      // daemon-broadcasted OPNet txid
-}
-```
-
-### `scheme: "mldsa", protocol: "raw"`
-
-Opaque ML-DSA signing over operator-supplied bytes.
-
-Request:
-
-```jsonc
-{
-  "op": "sign",
-  "scheme": "mldsa",
-  "protocol": "raw",
-  "signers": [0, 1],
-  "messageHex": "…arbitrary hex bytes…"
-}
-```
-
-Response:
-
-```jsonc
-{
-  "ceremonyId": "…",
-  "status": "done",
-  "scheme": "mldsa",
-  "signatureHex": "…"                   // 2420 B at level 44
-}
-```
-
-No protocol-level decoding or policy-gate field population beyond the
-generic `operation: 'generic'` marker — gate rules targeting `allowed_btc_recipients`
-or `allowed_contracts` don't apply.
-
-## `op: "sync"`
-
-Distribute a manifest to all peers in the federation. Bootstrap-window-only
-— returns `410` once the local daemon has wiped its `bootstrap-secret`
-post-DKG.
-
-The local daemon installs the manifest first (atomic write to
-`/etc/otzi/manifest.otzi.json`), then broadcasts a `manifest-push` wire
-message to every peer. Each peer's daemon re-verifies the HMAC, validates
-the manifest against `headless-manifest-v1`, and atomically installs to
-its own `/etc/otzi/manifest.otzi.json`. Per-peer success/failure is NOT
-exposed in the response (the underlying transport surface is broadcast,
-not unicast); operators verify peer state via `otzi list` on each node or
-via daemon logs.
-
-Request:
-
-```jsonc
-{
-  "op": "sync",
-  "manifest": "<.otzi.json contents as a UTF-8 string — verbatim, no canonicalization>",
-  "hmac": "<hex HMAC-SHA-256(bootstrap_secret, manifest_text)>"
+  "op": "dkg",
+  "ceremonyId": "setup-2026-10-10"   // optional; daemon auto-generates if absent
 }
 ```
 
@@ -375,52 +122,126 @@ Response (`200`):
 
 ```jsonc
 {
-  "ceremonyId": "sync-…",
+  "ceremonyId": "setup-2026-10-10",
   "status": "done",
-  "peersNotified": 2
+  "address": "tb1p…",
+  "internalKey": "02…",              // 33-byte SEC1 hex
+  "network": "testnet4"              // mirrors [network].name
 }
 ```
 
-Error responses:
+The call returns after every node has confirmed the same vault key. By then
+each node has written its Ötzi v4 share (`0600`) to `[share].path` and
+`vault-pubkey.json` to `/var/lib/otzi/`. A running daemon does not load the new
+share until it restarts: restart every daemon before the first `sign`.
 
-| Status | Cause |
-|---|---|
-| `400` | HMAC mismatch, schema validation failure, JSON parse error, or a different manifest already installed locally (run `otzi uninstall` first). |
-| `410` | `/var/lib/otzi/bootstrap-secret` is absent on this daemon (post-DKG, control plane closed). Use `otzi install` on each node instead. |
-| `502` | Manifest installed locally, but transport.broadcast to peers failed. |
+Preconditions and failures:
 
-### Wire opcodes (peer-to-peer)
+- Every node in the ring is running and holds no vault (no share loaded, no file
+  at the share path). A node that holds one drops the announce, so the ceremony
+  cannot complete.
+- `409` (`this node already holds a vault`) when the receiving node itself holds
+  a vault; nothing is announced. Replacing a vault is an operator action: move
+  the share file away and restart the daemon.
+- `403` when the receiving node's gate does not approve the DKG spec.
+- `500` when the ceremony fails or times out (`[deadlines].dkg_ms`). Every node
+  deletes its staged `<share path>.pending` file.
 
-#### `manifest-push`
+## `op: "sign"`
 
-The wire message broadcast by the local daemon on `op:'sync'`. Carries the
-operator's manifest text + HMAC to every peer in the ring. Bootstrap-window-only;
-receivers drop with a logged warning post-DKG (their bootstrap-secret has
-been wiped).
+Signs a Bitcoin transaction proposal with the vault key. Every node in the
+signer set analyses the proposal against its own key and network and evaluates
+its own gate before it signs; the leader finalizes the signed transaction and
+returns it.
+
+Request:
 
 ```jsonc
 {
-  "v": 1,
-  "kind": "manifest-push",
-  "manifest": "<.otzi.json contents>",
-  "hmac": "<hex HMAC-SHA-256>"
+  "op": "sign",
+  "ceremonyId": "withdrawal-0042",     // optional
+  "signers": [0, 1, 2],                // optional; default: every ring member
+  "proposal": {
+    "network": "testnet4",
+    "tx": "0200000001…",               // unsigned transaction, hex
+    "prevouts": [
+      { "txid": "9f1c…e2", "vout": 0, "amount": 100000, "script": "5120…" }
+    ]
+  }
 }
 ```
 
-The transport's `from` field already authenticates the sender as a peer in
-the ring; the HMAC is additive — it proves the sender knows the
-*operator-typed* shared secret, not just any peer.
+Response (`200`):
 
-## Identity of fields that look similar
+```jsonc
+{
+  "ceremonyId": "withdrawal-0042",
+  "status": "done",
+  "txid": "4d2a…",
+  "signedTxHex": "02000000000101…",    // witnesses in place, ready to broadcast
+  "signaturesHex": ["…"]               // one 64-byte BIP340 signature per input, input order
+}
+```
 
-Keep these straight. OPNet vaults use multiple pubkeys of different types:
+The daemon does not broadcast. `otzi btc send` posts `signedTxHex` to Esplora;
+a backend does the same with its own broadcaster.
+
+### Input rules
+
+| Field | Rule |
+|---|---|
+| `signers` | Unique ring party IDs, including this node, at least the share's threshold. Defaults to every ring member. A vault created by `otzi generate` has `threshold = parties`, so every node signs. |
+| `proposal` | An object with a string `tx` and an array `prevouts` of 1 to 255 entries. Hex fields (`tx`, `prevouts[].txid`, `prevouts[].script`) are normalized to lowercase. |
+| `prevouts[]` | `{ txid, vout, amount, script }`: `txid` 64 hex characters, `vout` and `amount` (sats) non-negative safe integers, `script` the prevout's scriptPubKey hex. |
+
+At most 255 inputs fit in one ceremony. The CLI refuses a larger send before
+calling the daemon; consolidate UTXOs first.
+
+### What every node checks
+
+After the shape checks above, each node runs `analyzeProposal` against the
+public key package in its own share and its own configured network. The proposal
+is rejected unless all of these hold:
+
+| Rule | Why |
+|---|---|
+| `proposal.network` equals this node's network. | A leader cannot sign for a different chain. |
+| Input `i` spends `prevouts[i]`, and input and prevout counts match. | Prevout data binds the sighashes. |
+| Every prevout script is this vault's output script (`OP_1 <outputKey>`). | The vault signs only its own coins. |
+| Every input sequence is `0xfffffffd`; `lockTime` is `0`. | Fixed transaction shape. |
+| There is at least one output, every output has a standard address, and `fee ≥ 0`. | Sane transactions only. |
+
+Change is any output paying this vault's own script. Sighashes are never sent
+over the wire: each node computes them from the proposal. BIP341 sighashes
+commit to every input amount and script, so a proposal with false prevout data
+produces signatures that are invalid on chain.
+
+On the leader a rejected proposal is a `400` and nothing is announced. On a
+participant it is a silent drop with a log line; to the leader the participant
+is indistinguishable from an offline node, and the leader's ceremony fails (`500`).
+
+### Gate
+
+After analysis, the node's gate sees a signing spec built from that analysis
+(outputs with `isChange`, amount, fee, fee rate, labels from the node's own
+address book). A leader whose gate does not approve returns `403`. See
+[`gates.md`](./gates.md).
+
+### Failure after the announce
+
+The leader broadcasts `signoff-aborted` and returns `500`. Participants settle
+as aborted and release their state. A retry uses a new `ceremonyId`; every
+session draws fresh nonces.
+
+## Vault key fields
+
+Keep these apart. The transport identity is never a vault key.
 
 | Field | What | Used for |
 |---|---|---|
-| `mldsaPublicKeyHex` | Raw ML-DSA aggregate pubkey (1312 B at level 44) | ML-DSA verify + outer OPNet auth |
-| `frostVerifyingKeyHex` | 33 B SEC1 compressed — **tweaked** FROST aggregate | BIP340 verify for key-path P2TR spends |
-| `frostUntweakedPubKeyHex` | 33 B SEC1 compressed — untweaked FROST aggregate | P2TR internal key (derives the vault address) |
-| `walletAddress` (config) | `0x` + hex(SHA256(mldsaPubKey)) | Peer identity, auth |
-| `frostP2tr` | bech32 P2TR encoding of the vault | Source of UTXOs + change address |
+| `address` | bech32m key-path-only P2TR (`bc1p…` mainnet, `tb1p…` testnet4 and signet) | Receiving funds; the only script the vault signs for |
+| `internalKey` | 33-byte SEC1 hex, the untweaked FROST group key | P2TR internal key; derives `address` |
+| `outputKey` | 32-byte x-only hex, the BIP341 tweaked key | The key every signature verifies against |
+| `publicKeyHex` (pubkey book) | 65-byte uncompressed P-256 key, 130 hex characters | Transport authentication and `partyId` only |
 
 `CLAUDE.md` § Identity Model is the authoritative cheat sheet.

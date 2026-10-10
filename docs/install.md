@@ -10,6 +10,9 @@
   open the bootstrap-server port temporarily (default `7090`) during initial
   pubkey exchange. The operator API is local-only over a UDS at
   `/var/run/otzi/otzi.sock` — no operator-facing port is exposed.
+- Outbound HTTPS from the host where you run `otzi btc *` to the Esplora API
+  (mempool.space for the configured network, or your `esplora_url`). The daemon
+  itself makes no chain requests.
 
 ## Install
 
@@ -28,11 +31,14 @@ follow up with `sudo apt -f install` to resolve.)
    sudo apt install ./otzi-headless_<version>_<arch>.deb
    ```
    debconf will prompt for:
+   - **Restore from a backup?** — `Yes` skips every other prompt and restores the
+     node from an archive (see § Backup + recovery).
    - **Node role** (`leader` / `leaf`) — leader hosts bootstrap, leaves connect to it.
    - **Operator usernames** (space-separated) — each gets `usermod -aG otzi`.
-   - **Bootstrap secret** (shared passphrase, agreed out-of-band among
-     operators before install).
-   - **Bitcoin network** + **OPNet RPC URL** (per-network defaults provided).
+   - **Bitcoin network** — `mainnet`, `testnet4` or `signet`. Every node in the
+     ring must use the same network.
+   - **Esplora URL** (optional) — the chain API the `otzi btc *` verbs use. Leave
+     it blank for the mempool.space default of the network.
    - **Transport kind**:
      - For `peer-mesh`: **This node's reachable address** (canonical
        `host[:port]`, wildcards rejected) and **Other peers** (comma-
@@ -46,28 +52,58 @@ follow up with `sudo apt -f install` to resolve.)
 2. **Log out / log back in** (or `newgrp otzi`) so your shell picks up
    the new group membership.
 
-3. **Run `otzi setup`** on every node:
+3. **Run `otzi setup`** on every node, leader first:
    ```
    sudo -u otzi otzi setup /etc/otzi/daemon.toml
    ```
    (Or, as a member of the `otzi` group, just `otzi setup
    /etc/otzi/daemon.toml`.) Records identity pubkeys + each peer's
    reachable address in `/var/lib/otzi/pubkeys.json` and prints the
-   8-char SHA-256 fingerprint. **Verify the same fingerprint on every
-   node** out-of-band. partyIds are assigned deterministically by
-   sorted-pubkey-bytes order — every node observes the same mapping.
+   96-bit SHA-256 fingerprint of the pubkey book, formatted
+   `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx`. **Compare the fingerprint on every node
+   out of band before going further.** A mismatch means someone tampered with the
+   exchange: delete `/var/lib/otzi/pubkeys.json` on every node and redo setup.
+   partyIds are assigned deterministically by sorted-pubkey-bytes order — every
+   node observes the same mapping.
 
-4. **Enable + start the daemon:**
+4. **Enable + start the daemon** on every node:
    ```
    sudo systemctl enable --now otzi
    ```
+   The daemon reads the share password from the environment variable named by
+   `[share].password_env` (default `OTZI_SHARE_PASSWORD`) and refuses to start
+   without it, even before a vault exists. Provide it to the unit before the first
+   start, for example with a root-only `EnvironmentFile=` in a drop-in created by
+   `sudo systemctl edit otzi`. The password encrypts this node's share file; each
+   node picks its own, and web Ötzi asks for it when it opens the share.
 
-5. **Run `otzi generate`** on the leader to trigger DKG. Daemon writes
-   the share file; the bootstrap-secret is wiped automatically once DKG
-   completes:
+   A node with no share starts in **setup mode**: it joins ceremonies and runs the
+   DKG, but `sign` returns `409`.
+
+5. **Run `otzi generate`** on one node to run the DKG. Every other daemon must be
+   running and hold no vault. Each node writes its share (mode 0600) to
+   `/var/lib/otzi/share.json` and the public vault metadata to
+   `/var/lib/otzi/vault-pubkey.json`:
    ```
-   sudo -u otzi otzi generate /etc/otzi/daemon.toml
+   otzi generate
    ```
+   The banner prints the vault address, the network, the share path, and the
+   reminder to restart every daemon. The vault is n-of-n: `threshold` equals the
+   number of nodes.
+
+6. **Restart every daemon** so each loads its new share:
+   ```
+   sudo systemctl restart otzi
+   ```
+   Until then `sign` returns `409` with a restart hint.
+
+7. **Check the vault** on every node:
+   ```
+   otzi vault
+   ```
+   The address and `<threshold>-of-<parties>` must be identical on all nodes.
+   Fund the address, then `otzi btc balance` and `otzi btc send` (see
+   [`cli.md`](./cli.md)).
 
 Logs: `journalctl -u otzi -f`.
 
@@ -95,13 +131,15 @@ sudo dpkg-reconfigure otzi-headless
 | `/usr/bin/otzi` | CLI wrapper | root:root 755 |
 | `/usr/lib/otzi/entrypoint.mjs` | esbuild bundle | root:root 644 |
 | `/lib/systemd/system/otzi.service` | systemd unit | root:root 644 |
-| `/etc/otzi/` | config dir (setgid; group otzi can edit) | root:otzi 2770 |
+| `/etc/otzi/` | config dir (setgid) | root:otzi 2770 |
 | `/etc/otzi/daemon.toml` | rendered config (preserved across upgrades) | root:otzi 640 |
+| `/etc/otzi/address-book.otzi.json` | this node's address book (optional) | root:otzi 640 |
 | `/var/lib/otzi/` | data dir (setgid; group otzi can write) | root:otzi 2770 |
 | `/var/lib/otzi/identity.json` | ECDH identity | written 660 |
 | `/var/lib/otzi/pubkeys.json` | pubkey book from bootstrap | otzi:otzi 644 |
-| `/var/lib/otzi/share.json` | encrypted DKG share | otzi:otzi 600 |
-| `/var/lib/otzi/bootstrap-secret` | shared passphrase, wiped after DKG | root:otzi 660 |
+| `/var/lib/otzi/share.json` | encrypted Ötzi v4 share | otzi:otzi 600 |
+| `/var/lib/otzi/share.json.pending` | DKG staging file; exists only while a DKG runs | otzi:otzi 600 |
+| `/var/lib/otzi/vault-pubkey.json` | public vault metadata | otzi:otzi 644 |
 | `/var/run/otzi/otzi.sock` | UDS socket for operator CLI | otzi:otzi 660 |
 
 ## Operations
@@ -134,17 +172,44 @@ or ship logs to an external collector (rsyslog, Loki, Vector, etc.).
 `systemctl restart otzi` is safe to run at any time:
 
 - Orchestrator state is in-memory; restart drops it cleanly.
-- In-flight ceremonies will NOT resume. The trigger source (operator HTTP
-  call, cron) re-fires them.
-- Persistent state (share, identity, pubkey book) is reloaded from disk
-  on startup.
+- In-flight ceremonies will NOT resume. The trigger source (operator API
+  call, cron) re-fires them with a new `ceremonyId`.
+- Persistent state (share, identity, pubkey book, address book) is reloaded from
+  disk on startup. A restart is also how a daemon picks up a share created by
+  `otzi generate`.
+- Policy-gate rate windows (`max_sats_per_24h`, `max_ceremonies_per_hour`) are
+  in memory and start empty.
+
+A leftover `/var/lib/otzi/share.json.pending` from an interrupted DKG is logged
+at warn level on startup and never loaded; the next DKG overwrites it.
+
+### Address book
+
+Each node keeps its own address book at `/etc/otzi/address-book.otzi.json`. It
+labels recipients and can serve as the policy recipient allowlist
+(`allowed_recipients = "address-book"`). Reading needs `otzi` group membership;
+writing needs root, because the book can widen a policy allowlist:
+
+```
+sudo otzi book add treasury tb1p… --note "cold storage"
+otzi book list
+otzi book export ./book.otzi.json     # copy to the other nodes
+sudo otzi book import ./book.otzi.json
+```
+
+The daemon reads the book at each use, so edits take effect without a restart.
+The book's network must equal `[network].name`. See [`cli.md`](./cli.md) § Address
+book.
 
 ### Backup + recovery
 
 #### Backup
 
-Run `otzi backup` after every config change, every peer change, and after
-initial DKG completes. Beyond that, cadence is per-operator risk tolerance.
+Run `otzi backup` after every config change, after `otzi generate` completes,
+and after address-book changes. Beyond that, cadence is per-operator risk
+tolerance. **Back up every node:** the vault is n-of-n, so every share is
+required to sign, and losing one share without a backup makes the funds
+unspendable.
 
 ```
 otzi backup
@@ -153,26 +218,27 @@ otzi backup
 Output: a single password-protected archive in your home directory:
 
 ```
-~/otzi-backup-2026-04-26T12-34-56Z.otzi-backup    # mode 0600
+~/otzi-backup-2026-10-10T12-34-56Z.otzi-backup    # mode 0600
 ```
 
 The archive contains:
 
-- `etc/otzi/daemon.toml` — daemon config.
-- `etc/otzi/share.json` — encrypted DKG share.
-- `etc/otzi/pubkey-book.json` — peer pubkey book from bootstrap.
-- `var/lib/otzi/identity.json` — Noise-KK identity keypair.
-- `etc/otzi/manifest.otzi.json` — installed manifest (if any).
-- `var/lib/otzi/vault-pubkey.json` — derived addresses cache (if present).
-- `var/lib/otzi/bootstrap-secret` — shared passphrase (only pre-DKG; wiped after).
+- `/etc/otzi/daemon.toml` — daemon config.
+- The share file (`[share].path`) — encrypted Ötzi v4 share.
+- The identity key file (`[node].identity_key_file`) — Noise-KK identity keypair.
+- The pubkey book file (`[node].pubkey_book_file`) — peer pubkey book from bootstrap.
+- `/var/lib/otzi/vault-pubkey.json` — public vault metadata (if present).
+- `/etc/otzi/address-book.otzi.json` — the address book (if present).
 - `meta.json` — `{ version, createdAt, hostname, partyId }`.
+
+(Inside the archive, paths are stored without the leading slash.)
 
 The password is auto-generated (32 chars from `[A-Za-z0-9]`, ~190 bits
 entropy) and printed once to stdout:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Backup written: /home/operator/otzi-backup-2026-04-26T12-34-56Z.otzi-backup
+  Backup written: /home/operator/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
   Password:       a8K2zP4mQ9xR7sN3vL5jB6tH1wF0gY9c
 
   WRITE THIS DOWN. There is no recovery path if you lose this password.
@@ -184,7 +250,7 @@ entropy) and printed once to stdout:
 there is no recovery path. Store the archive and the password in physically
 separate locations: e.g., archive in cloud storage, password in a password
 manager OR a sealed envelope in a different room. An attacker who gets both
-can sign as your slot in the federation.
+(and the share password) can sign as your slot in the federation.
 
 #### Recovery
 
@@ -196,8 +262,7 @@ When installing the .deb on a new host, answer `Yes` to "Restore from a
 backup?". debconf prompts for the archive path and password; postinst
 pipes the password via stdin to `otzi restore --password-stdin`. If
 restore succeeds, the rest of the install prompts (network, role,
-peers, bootstrap-secret, etc.) are skipped — config came from the
-backup.
+peers, etc.) are skipped — config came from the backup.
 
 If restore fails (wrong password, corrupted archive, missing file),
 dpkg flags the package as half-installed. Retry via:
@@ -217,11 +282,25 @@ restore manually:
 ```
 sudo systemctl stop otzi
 sudo rm /etc/otzi/daemon.toml
-sudo otzi restore ~/otzi-backup-2026-04-26T12-34-56Z.otzi-backup
+sudo otzi restore ~/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
 ```
 
 The CLI prompts for the password interactively. Use
 `--password-stdin` for scripted runs.
+
+Restore places each file at its canonical path with these modes:
+
+| Path | Mode |
+|---|---|
+| `/etc/otzi/daemon.toml` | 0640 |
+| `/etc/otzi/address-book.otzi.json` | 0640 |
+| share file (`[share].path`) | 0600 |
+| identity file | 0660 |
+| pubkey-book file | 0644 |
+| `/var/lib/otzi/vault-pubkey.json` | 0644 |
+
+Set the share password in the daemon's environment as in the walkthrough, then
+start the daemon; it loads the restored share.
 
 **Restore refuses if:**
 
@@ -236,8 +315,6 @@ The CLI prompts for the password interactively. Use
 #### What the archive does NOT contain
 
 - Other federation members' shares — you can only sign for your own slot.
-- The federation's threshold-key public material — recoverable from any
-  peer via re-bootstrap.
 - Blockchain state — vault funds live on-chain, not in the backup.
 - The `.deb` package itself — download from releases for the install.
 
@@ -248,10 +325,9 @@ sudo apt remove otzi-headless    # keeps /etc/otzi/ and /var/lib/otzi/
 sudo apt purge otzi-headless     # ALSO removes the share + config + user
 ```
 
-> **Warning:** `purge` deletes `/var/lib/otzi/share.json`. Without backups
-> across the threshold, losing more than `n − t` shares makes the federation
-> unrecoverable. Back up `/var/lib/otzi/` before purging if you might
-> reinstall.
+> **Warning:** `purge` deletes `/var/lib/otzi/share.json`. The vault is n-of-n:
+> losing any one share without a backup makes the funds unspendable. Run
+> `otzi backup` on every node before purging if you might reinstall.
 
 ## Container smoke test
 
