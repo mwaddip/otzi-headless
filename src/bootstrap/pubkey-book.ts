@@ -12,7 +12,7 @@
  */
 
 import type { PartyId } from '../core/types';
-import { fromHex, toHex } from '../wire/hex';
+import { fromHex, toHex } from '../otzi/lib/hex';
 
 export interface PubkeyBookEntry {
   partyId: PartyId;

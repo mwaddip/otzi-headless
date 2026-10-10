@@ -4,8 +4,8 @@ import type { BlobKey, PartyId, Unsubscribe } from './types';
  * Pull-based transport for ceremony communication between ring peers.
  *
  * Implementations MUST provide peer-authenticated, E2E-encrypted channels
- * (hybrid KEM: ECDH P-256 + ML-KEM-768, AES-256-GCM, ML-DSA-signed handshake
- * — see CLAUDE.md § Transport). Callers trust that `from: PartyId` in every
+ * (Noise-KK-style P-256 ECDH handshake against the pubkey book, AES-256-GCM
+ * records — see facts/transport.md). Callers trust that `from: PartyId` in every
  * incoming callback is authenticated.
  *
  * Test transports (e.g. InMemoryTransport) may bypass encryption but MUST

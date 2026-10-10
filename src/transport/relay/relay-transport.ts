@@ -39,7 +39,7 @@ import {
   type AppMessage,
 } from '../peer-mesh/wire';
 import { NOOP_LOGGER, type Logger } from '../../orchestrator/types';
-import { fromHex, toHex } from '../../wire/hex';
+import { fromHex, toHex } from '../../otzi/lib/hex';
 import {
   encodeClientMsg,
   parseServerMsg,

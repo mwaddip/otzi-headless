@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.2.0",
   "type": "module",
-  "description": "Headless daemon variant of Ötzi for automated threshold-signing (ML-DSA + FROST over OPNet Bitcoin L1).",
+  "description": "Headless daemon variant of Ötzi: a FROST threshold-signing Bitcoin vault for automated and federated systems.",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run && npm run test:otzi",
@@ -23,22 +23,16 @@
   "files": [
     "src",
     "bin",
-    "vendor",
     "tsconfig.json",
     "README.md"
   ],
   "dependencies": {
-    "@btc-vision/bip32": "7.1.2",
-    "@btc-vision/bitcoin": "7.0.0",
-    "@btc-vision/post-quantum": "file:vendor/post-quantum",
-    "@btc-vision/transaction": "1.8.6",
     "@mwaddip/frots": "^0.1.1",
     "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
     "@scure/base": "2.4.0",
     "@scure/btc-signer": "2.4.1",
     "croner": "^10.0.1",
-    "opnet": "1.8.13",
     "smol-toml": "^1.6.1",
     "tar": "^7.5.13",
     "tsx": "^4.19.0",

@@ -142,12 +142,17 @@
   - **Post:** Allowed keys: `op`, `ceremonyId`. `ceremonyId` must satisfy `isCeremonyId` when present; `defaultCeremonyId('dkg')` when absent.
   - **Throws:** `RequestError(400, …)` on any other key or an invalid `ceremonyId` (texts below).
 
+- `parseProposal(raw: unknown): SendProposal`
+  - **Post:** The `proposal` rules of `parseSignRequest` on their own: an object with string `tx` and array `prevouts` of at most `MAX_INPUTS`; `tx`, `prevouts[].txid` and `prevouts[].script` lowercased into a new object (the input is not mutated); the result passes `isProposalShape`.
+  - **Throws:** `RequestError(400, <reason>)`, with the proposal rows of the error table below.
+  - **Notes:** Also used by `otzi btc sign`, so the CLI refuses exactly what the daemon refuses.
+
 - `parseSignRequest(body: Record<string, unknown>, ring: { partyIds: readonly PartyId[]; self: PartyId; minSigners: number }): LeaderSignRequest`
   - **Pre:** `body` is the JSON request object (`op === 'sign'`); `ring.partyIds` = every ring member; `ring.minSigners` = the loaded share's threshold.
   - **Post:** Allowed keys: `op`, `ceremonyId`, `signers`, `proposal`.
     - `ceremonyId`: `isCeremonyId` when present; `defaultCeremonyId('sign')` when absent.
     - `signers`: defaults to all of `ring.partyIds` (ascending); otherwise an array of safe integers, unique, each in `ring.partyIds`, containing `ring.self`, with at least `ring.minSigners` entries.
-    - `proposal`: an object with string `tx` and array `prevouts` of at most `MAX_INPUTS` (255) entries; hex fields (`tx`, `prevouts[].txid`, `prevouts[].script`) that are strings are lowercased into a new object (the request body is not mutated), then the result must pass `isProposalShape` (1–255 prevouts).
+    - `proposal`: `parseProposal(body.proposal)`.
   - **Throws:** `RequestError(400, <reason>)` on any violation.
   - **Notes:** Shape and ring rules only; `analyzeProposal` runs in `LeaderDispatcher.sign`.
 
@@ -168,7 +173,7 @@
 
 **Cross-component contracts:**
 - Depends on: `isCeremonyId`, `isProposalShape`, `MAX_INPUTS` (`src/core/messages.ts`).
-- Used by: `buildDefaultHttpHandler`, `LeaderDispatcher` (`RequestError`, `NO_VAULT_MESSAGE`).
+- Used by: `buildDefaultHttpHandler`, `LeaderDispatcher` (`RequestError`, `NO_VAULT_MESSAGE`), `src/cli/cmd/btc.ts` (`parseProposal`).
 
 ---
 
@@ -373,8 +378,12 @@
 | `otzi backup` / `otzi restore <archive> [--password-stdin]` | Archive and restore node state. |
 
 - `--config` defaults to `/etc/otzi/daemon.toml`.
-- CLI verbs other than `daemon` keep `NOOP_LOGGER` and write machine output to stdout only; banners and errors go to stderr.
-- `BroadcastFailedError` → the signed transaction hex is printed to stderr (so the operator can broadcast it by other means) and the process exits 1. Any other error → message on stderr, exit 1.
+- CLI verbs other than `daemon` keep `NOOP_LOGGER` and write machine output to stdout only; banners, summaries and errors go to stderr. Stdout per verb: `vault` the text or JSON; `btc balance` the two balance lines; `btc send` the txid, then the explorer URL; `btc sign` the txid, then the signed hex, then (with `--broadcast`) the explorer URL. `generate` prints only to stderr.
+- `parseVerbArgs(args, { values?, booleans? }): { positional: string[]; flags: Map<string, string> }` — positionals and `--flags` in any order. A `values` flag takes the next argument (`flag '--x' needs a value` when it is missing or starts with `--`); a `booleans` flag takes none (so `btc sign --broadcast <file>` works); any other `--flag` is `unknown flag '--x'`, so a typo never falls back to a default.
+- `reportCliError(err, write?)` — the message on stderr. A `BroadcastFailedError` also prints a line naming the txid and saying the transaction is signed but not broadcast, then the signed transaction hex as the last line, so the operator can broadcast it by other means. The process exits 1 on any error.
+- `otzi generate` takes no positional argument; a positional (the pre-0.3 `otzi generate <config.toml>`) fails with a hint to use `--config`. Its banner (stderr) prints the ceremony ID, network, vault address, share path and `Restart every daemon to load its share before signing.`
+- `otzi btc sign` prints the analysis summary to stderr, with a note that nothing was broadcast unless `--broadcast` is given.
+- `--fee-rate` must be a positive number; `--unit` one of `sats`, `btc`, `mbtc`, `ubtc`.
 
 - **`runDaemonCommand`**
   - **Post:** `loadAndValidate(configPath, { logger })` → `buildTransportFromFiles` → `Daemon` → `start`; SIGINT/SIGTERM stop the daemon and the transport, then exit 0. The startup line names the mode: signing (vault loaded) or setup (no vault). In setup mode it states that signing requests are rejected until the DKG runs (`otzi generate`) and every daemon restarts to load its share. The ceremony pull backoff comes from `pullOpts` (`initialDelayMs` 100, `maxDelayMs` 2 000); orchestrator and leader replace its `deadlineMs` and `maxAttempts` with the ceremony deadlines. The stale-`.pending` warning and the `vault-pubkey.json` rewrite come from `loadAndValidate` (through the logger passed in); `runDaemonCommand` does not warn a second time.
@@ -461,7 +470,7 @@
 - `parseBtcAmount(input: string): { sats: bigint; unit: BtcUnit; raw: string }`
   - **Post:** `<number>[sats|btc|mbtc|ubtc]` (default sats) converted to integer sats without floating point.
   - **Throws:** On empty input, an unknown unit, a fractional sat, or a negative amount.
-- `formatSats(sats: bigint, unit?: BtcUnit): string` — decimal string in `unit` (default sats), trailing zeros trimmed.
+- `formatSats(sats: bigint, unit?: BtcUnit): string` — decimal string in `unit` (default sats), trailing zeros trimmed; a negative amount (an unconfirmed balance can fall when a spend is in the mempool) is `-` plus the formatted magnitude.
 
 ---
 
@@ -473,14 +482,14 @@
 - `generate(opts: { configPath: string; ceremonyId?: string }, deps?: CliDeps): Promise<{ ceremonyId: string; address: string; network: NetworkName }>`
   - **Pre:** The daemon on this node is running and holds no vault; every other daemon in the ring is running and holds no vault.
   - **Post:** Sends `{ op: 'dkg', ceremonyId? }` through `deps.client` or `DaemonClient.fromConfig(configPath)`; returns the response's `ceremonyId`, `address`, `network`.
-  - **Throws:** `DaemonClientError` (409 when the node already holds a vault, 403 gate reject, 500 ceremony failure).
-  - **Banner (entrypoint):** vault address, network, share path, and the instruction to restart every daemon to load the new share.
+  - **Throws:** `DaemonClientError` (409 when the node already holds a vault, 403 gate reject, 500 ceremony failure); `Error` when the reply lacks `ceremonyId`, `address` or `network`.
+  - **Banner (entrypoint):** ceremony ID, network, vault address, share path, and the instruction to restart every daemon to load the new share.
 
 ### `vault.ts`
 **Purpose:** `otzi vault [--json]` — print the vault metadata from `vault-pubkey.json`.
 
 - `vault(opts?: { vaultPath?: string; json?: boolean }): Promise<string>`
-  - **Post:** Reads `readVaultPubkeyFile(opts.vaultPath)`. Default output: address, network, `threshold`-of-`parties`. With `json`: the whole file as pretty JSON (keys and `vaultKey` included).
+  - **Post:** Reads `readVaultPubkeyFile(opts.vaultPath)`. Default output, three lines: `network:   <network>`, `address:   <address>`, `threshold: <threshold>-of-<parties>`. With `json`: the whole file as pretty JSON (keys and `vaultKey` included).
   - **Throws:** `readVaultPubkeyFile` errors (missing file points at `otzi generate`).
 
 ### `btc.ts`
@@ -490,24 +499,28 @@
 - `interface CliDeps { client?: { request<T>(body: unknown): Promise<T> } }`
 - `class BroadcastFailedError extends Error { constructor(message: string, readonly txid: string, readonly signedTxHex: string) }`
 
+- **Context (all three verbs):** `readVaultPubkeyFile(vaultPath)` and `loadDaemonConfig(configPath)`; `base = chainApiUrl({ network: vault.network, esploraUrl: config.network.esploraUrl })`. A config whose `[network].name` differs from the vault file's network is an `Error` naming both (it would query the wrong chain).
+- **Esplora errors:** every Esplora call is wrapped as `Error('Esplora <base>: <reason>')`, where `<reason>` is the HTTP status and body for a non-2xx answer, or the connection error (`connect ECONNREFUSED …`) when Esplora is unreachable.
+
 - `btcBalance(opts: { configPath: string; vaultPath?: string; unit?: BtcUnit }): Promise<string>`
-  - **Post:** `getBalance(base, address)` with `base = config.network.esploraUrl` or `chainApiUrl({ network })`; returns `"confirmed: X\nunconfirmed: Y"` formatted in `unit` (default sats).
+  - **Post:** `getBalance(base, vault.address)`; returns `"confirmed: X\nunconfirmed: Y"` formatted in `unit` (default sats).
 
 - `btcSend(opts: { configPath: string; vaultPath?: string; to: string; amount: string; feeRate?: number }, deps?: CliDeps): Promise<{ txid: string; explorerUrl: string }>`
   1. Read `vault-pubkey.json` and the config (Esplora base: `esplora_url` or the `chainApiUrl` default).
-  2. Resolve `to` with `resolveRecipient(readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network), to, network)`.
-  3. `getUtxos`, keeping confirmed ones only.
-  4. `amount` is `'max'` or `parseBtcAmount(amount).sats`; fee rate is `feeRate` or `getFeeRates(base).normal`.
-  5. `buildSend({ utxos, vault: vaultKey, network, to, amount, feeRate })`.
+  2. Resolve `to` with `resolveRecipient(readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network), to, network)`. Until the address book lands, `to` must be an address valid for the vault's network: otherwise `Error("'<to>' is not a valid <network> address")`.
+  3. Local checks, before Esplora or the daemon is touched: `amount` is `'max'` (case-insensitive) or `parseBtcAmount(amount).sats`, and a sats amount below `MIN_SEND_SATS` (546) is `Error('amount <n> sats is below the minimum send of 546 sats')`; a given `feeRate` must be finite and greater than 0 (`Error('fee rate must be a positive number of sat/vB (got <n>)')`); the daemon connection is built from the config (`deps.client` or `DaemonClient.fromParsed`).
+  4. `getUtxos`, keeping confirmed ones only; fee rate is `feeRate` or `getFeeRates(base).normal`.
+  5. `buildSend({ utxos, vault: vaultKey, network, to, amount, feeRate })`. `InsufficientFundsError` becomes `Error('insufficient funds: <available> sats (<btc> BTC) confirmed, <needed> sats (<btc> BTC) needed at <rate> sat/vB')`, plus `; a further <n> sats (<btc> BTC) is unconfirmed and is not spent until it confirms` when unconfirmed coins exist.
   6. More than 255 prevouts → `Error('this send needs <k> inputs; at most 255 fit in one transaction — consolidate first')` before any daemon call.
-  7. Daemon `{ op: 'sign', proposal: { network, tx, prevouts } }`.
-  8. `broadcastTx(base, signedTxHex)`; on failure throw `BroadcastFailedError(message, txid, signedTxHex)`.
-  - **Post:** Returns the txid and `explorerTxUrl(base, txid)`.
-  - **Throws:** recipient, UTXO, `InsufficientFundsError`, input-limit, daemon (`DaemonClientError`) and broadcast errors.
+  7. Daemon `{ op: 'sign', proposal: { network, tx, prevouts } }`; a reply without a string `txid` and hex `signedTxHex` is `Error("daemon reply to 'sign' has no signed transaction (txid, signedTxHex)")`.
+  8. `broadcastTx(base, signedTxHex)`; on failure throw `BroadcastFailedError('broadcast failed — Esplora <base>: <reason>', txid, signedTxHex)`.
+  - **Post:** Returns the daemon's txid and `explorerTxUrl(base, txid)`.
+  - **Throws:** recipient, amount, fee-rate, Esplora, `InsufficientFundsError` (as above), input-limit, daemon (`DaemonClientError`) and broadcast errors.
 
 - `btcSign(opts: { configPath: string; vaultPath?: string; proposalPath: string; broadcast: boolean }, deps?: CliDeps): Promise<{ txid: string; signedTxHex: string; summary: string; explorerUrl?: string }>`
-  - **Post:** Reads a `SendProposal` JSON file; refuses more than 255 prevouts; `analyzeProposal` against `vault-pubkey.json`'s `vaultKey` and network gives `summary` (outputs with labels, change, fee, fee rate); daemon `{ op: 'sign', proposal }`; broadcasts only when `broadcast` is true (`explorerUrl` then set; a failure throws `BroadcastFailedError`).
-  - **Throws:** file / JSON errors, analysis errors (before any daemon call), daemon errors, `BroadcastFailedError`.
+  - **Post:** Reads a `SendProposal` JSON file and checks it with `parseProposal` (so more than 255 prevouts is refused with the daemon's text); `analyzeProposal` against `vault-pubkey.json`'s `vaultKey` and network gives `summary`; daemon `{ op: 'sign', proposal }`; broadcasts only when `broadcast` is true (`explorerUrl` then set; a failure throws `BroadcastFailedError`).
+  - **`summary`:** `network: <n>`, `inputs: <k>, <sats> sats (<btc> BTC)`, `outputs:` and one line per output (`<address>  <sats> sats (<btc> BTC)`, `  change` appended for a change output), `fee: <sats> sats (<btc> BTC), <rate> sat/vB`. Address-book labels join the output lines with the address book.
+  - **Throws:** file errors (`cannot read proposal file <path>: …`), `proposal file <path> is not valid JSON`, shape errors (`proposal file <path>: <parseProposal message>`), analysis errors (`proposal refused: <analyzeProposal message>`, before any daemon call), daemon errors, `BroadcastFailedError`.
 
 **Invariants:**
 - The CLI is the only component that talks to the chain.

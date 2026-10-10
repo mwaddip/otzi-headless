@@ -166,7 +166,7 @@ strategy = "auto"
   });
 
   it('surfaces config errors', async () => {
-    await writeFile(configPath, toml({ extra: 'opnet_rpc = "https://x"' }));
+    await writeFile(configPath, toml({ extra: 'esplora_url = "ftp://x"' }));
     await expect(loadAndValidate(configPath, { env, vaultPubkeyPath })).rejects.toBeInstanceOf(ConfigError);
   });
 

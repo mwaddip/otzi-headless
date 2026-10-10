@@ -74,8 +74,7 @@ identity_key_file = "${identityPath}"
 pubkey_book_file = "${pubkeyBookPath}"
 
 [network]
-name = "regtest"
-opnet_rpc = "https://example/rpc"
+name = "testnet4"
 
 [transport]
 kind = "peer-mesh"
@@ -225,9 +224,9 @@ describe('runBackup', () => {
   });
 
   it('exports default paths only for the files the vault actually has', () => {
-    // facts/daemon.md "Backup file set": the OPNet contract file and the
-    // bootstrap-window token are gone from the file set, so no default path
-    // constant for them is left for `runBackup` or `runRestore` to reference.
+    // facts/daemon.md "Backup file set": neither a manifest nor a
+    // bootstrap-window token is in the file set, so no default path constant
+    // for them exists for `runBackup` or `runRestore` to reference.
     const pathConstants = Object.keys(backupModule).filter((k) =>
       k.startsWith('DEFAULT_'),
     );

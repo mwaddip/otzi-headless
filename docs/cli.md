@@ -51,9 +51,9 @@ through Esplora.
   - `<amount[unit]>`: a number with an optional unit, `sats` (default), `btc`, `mbtc` or `ubtc` (`50000`, `0.001btc`). Fractional sats are rejected. `max` spends every confirmed UTXO with no change.
   - `--fee-rate N`: sat/vB. Default: Esplora's `normal` estimate.
 
-  The steps: resolve the recipient, fetch **confirmed** UTXOs, build the proposal (largest UTXOs first; change under 330 sats goes to the fee; a `max` send below 546 sats is refused), refuse a send that needs more than 255 inputs (consolidate UTXOs first), call the daemon's `sign` op, broadcast the signed transaction. The node you run it on is the ceremony leader.
+  The steps: resolve the recipient, fetch **confirmed** UTXOs, build the proposal (largest UTXOs first; change under 330 sats goes to the fee; a send below 546 sats is refused), refuse a send that needs more than 255 inputs (consolidate UTXOs first), call the daemon's `sign` op, broadcast the signed transaction. The node you run it on is the ceremony leader.
 
-- `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` — sign a proposal someone else built. `proposal.json` holds `{ "network", "tx", "prevouts" }` (see [`api.md`](./api.md) § `op: "sign"`). Prints an analysis summary (outputs with their address-book labels, change, fee, fee rate), the txid and the signed hex. Analysis runs locally first, so a proposal this vault would not sign fails before any daemon call. Without `--broadcast` nothing is posted; with it, the CLI posts the transaction and prints the explorer URL.
+- `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` — sign a proposal someone else built. `proposal.json` holds `{ "network", "tx", "prevouts" }` (see [`api.md`](./api.md) § `op: "sign"`). Analysis runs locally first, so a proposal this vault would not sign fails before any daemon call. The analysis summary (outputs with their address-book labels, change, fee, fee rate) goes to stderr; stdout gets the txid and the signed hex. Without `--broadcast` nothing is posted; with it, the CLI posts the transaction and prints the explorer URL as a third stdout line.
 
 Every node in the signer set analyses the proposal against its own key and runs its own gate. If a node declines, the leader's ceremony fails and the command exits with the daemon's `500` error.
 

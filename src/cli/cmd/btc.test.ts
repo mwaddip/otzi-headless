@@ -1,140 +1,69 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+/**
+ * `otzi btc balance|send|sign` against an in-process mock Esplora and a fake
+ * daemon that signs with a known dealer-generated vault key
+ * (facts/daemon.md, `btc.ts`).
+ */
+
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { initEccLib, networks, payments, toXOnly } from '@btc-vision/bitcoin';
-import { createNobleBackend } from '@btc-vision/ecpair';
+import { hex } from '@scure/base';
+import * as btc from '@scure/btc-signer';
 import { schnorr } from '@noble/curves/secp256k1.js';
+import { DaemonClientError } from '../daemon-client';
+import { vaultPubkeyFromPackage, writeVaultPubkeyFile } from '../../daemon/vault-pubkey';
+import { finalizeSend, vaultPayment } from '../../otzi/backend/bitcoin';
+import { makeTestVault } from '../../otzi/backend/test-vault.fixture';
+import { analyzeProposal } from '../../otzi/lib/bitcoin';
+import { fromVaultKey } from '../../otzi/lib/dkg';
+import type { SendProposal } from '../../otzi/lib/vault-types';
+import { startMockEsplora, type MockEsplora } from '../../testing/mock-esplora';
+import { makeProposal } from '../../testing/proposal';
+import { BroadcastFailedError, btcBalance, btcSend, btcSign } from './btc';
 
-// Stub the OPNet provider so tests don't touch the network. The chain RPC
-// is also stubbed; broadcast goes through provider.sendRawTransaction.
-const provider = {
-  utxoManager: {
-    getUTXOs: vi.fn(async () => [
-      { transactionId: '01'.repeat(32), outputIndex: 0, value: 1_000_000n },
-      { transactionId: '02'.repeat(32), outputIndex: 1, value: 500_000n },
-    ]),
-  },
-  sendRawTransaction: vi.fn(async () => ({ success: true, result: 'tx-mocked' })),
-};
-vi.mock('../../node/opnet-client', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../node/opnet-client')>();
-  return { ...actual, getProvider: () => provider };
-});
+const NETWORK = 'testnet4' as const;
+const DEST = 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx';
+const MAINNET_DEST = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4';
 
-// Stub fetchBtcFees so we don't hit mempool.space in tests.
-vi.mock('../../broadcast/btc-fees', () => ({
-  fetchBtcFees: async () => ({ low: 1, normal: 5, high: 20 }),
-}));
+const { vault, tweakedSecret } = makeTestVault(2, 3);
+const outputKey = vaultPayment(vault, NETWORK).outputKey;
 
-initEccLib(createNobleBackend());
+/** Stands in for the daemon's `sign` op: analyses, signs every sighash with the vault key, finalizes. */
+class FakeDaemon {
+  requests: Array<{ op: string; proposal: SendProposal }> = [];
+  fail: Error | null = null;
+  reply: unknown = undefined;
 
-import { UdsTrigger } from '../../triggers/uds';
-import { btcSend, btcBalance } from './btc';
+  get lastProposal(): SendProposal {
+    return this.requests[this.requests.length - 1]!.proposal;
+  }
 
-/**
- * Vault values we control: derive a real curve point so buildBtcTxFromParams
- * doesn't fail "Invalid internal pubkey", produce a valid tweaked pubkey for
- * the broadcast verify step, and sign each sighash with that key so the
- * daemon's BIP340-verify in broadcastBtcTx accepts them.
- */
-const sk = new Uint8Array(32);
-sk[31] = 7;
-const xOnly = schnorr.getPublicKey(sk);
-const compressedUntweaked = new Uint8Array(33);
-compressedUntweaked[0] = 0x02;
-compressedUntweaked.set(xOnly, 1);
-const compressedTweaked = compressedUntweaked; // same key, simplest
-
-const internalXOnly = toXOnly(Buffer.from(compressedUntweaked) as never);
-const testnetVaultAddr = payments.p2tr({
-  internalPubkey: internalXOnly as never,
-  // OPNet's 'testnet' = networks.opnetTestnet (bech32 prefix 'opt'); see
-  // node/opnet-client.getNetwork. Real production daemons funded on signet
-  // resolve to addresses under this prefix too.
-  network: (networks as unknown as { opnetTestnet: typeof networks.testnet }).opnetTestnet,
-}).address!;
-
-function vaultJson(network: string, btcAddr = testnetVaultAddr): string {
-  return JSON.stringify({
-    network,
-    btcAddress: btcAddr,
-    opnetAddress: '0x' + 'aa'.repeat(32),
-    frostUntweakedPubKey: Buffer.from(compressedUntweaked).toString('hex'),
-    frostTweakedPubKey: Buffer.from(compressedTweaked).toString('hex'),
-    mldsaPubKeyHex: 'cc'.repeat(1312),
-  });
+  async request<T>(body: unknown): Promise<T> {
+    const req = body as { op: string; proposal: SendProposal };
+    this.requests.push(req);
+    if (this.fail) throw this.fail;
+    if (this.reply !== undefined) return this.reply as T;
+    const analysis = analyzeProposal(req.proposal, vault, NETWORK);
+    const signatures = analysis.sighashes.map(s => ({
+      index: s.index,
+      signature: hex.encode(schnorr.sign(hex.decode(s.hash), tweakedSecret)),
+    }));
+    const { hex: signedTxHex, txid } = finalizeSend(req.proposal.tx, req.proposal.prevouts, signatures, outputKey);
+    return { ceremonyId: 'sign-test', status: 'done', txid, signedTxHex, signaturesHex: signatures.map(s => s.signature) } as T;
+  }
 }
 
-describe('btcBalance', () => {
-  let tmp: string;
-  let vaultPath: string;
-
-  beforeEach(async () => {
-    tmp = await mkdtemp(join(tmpdir(), 'otzi-btc-test-'));
-    vaultPath = join(tmp, 'vault.json');
-    await writeFile(vaultPath, vaultJson('testnet'));
-    provider.utxoManager.getUTXOs.mockClear();
-  });
-
-  afterEach(async () => {
-    await rm(tmp, { recursive: true, force: true });
-  });
-
-  it('sums vault UTXOs in sats', async () => {
-    const out = await btcBalance({ vaultPath });
-    expect(out).toBe('1500000');
-  });
-
-  it('formats in btc when --unit btc', async () => {
-    const out = await btcBalance({ vaultPath, unit: 'btc' });
-    expect(out).toBe('0.015');
-  });
-
-  it('errors on regtest', async () => {
-    await writeFile(vaultPath, vaultJson('regtest'));
-    await expect(btcBalance({ vaultPath })).rejects.toThrow(
-      /not supported.*BTC chain/,
-    );
-  });
-
-  it('errors when no vault metadata', async () => {
-    await rm(vaultPath);
-    await expect(btcBalance({ vaultPath })).rejects.toThrow(/no vault metadata/);
-  });
-});
-
-describe('btcSend', () => {
-  let tmp: string;
-  let vaultPath: string;
-  let configPath: string;
-  let socketPath: string;
-  let trigger: UdsTrigger;
-  let received: Array<Record<string, unknown>>;
-  // Capture sighashes from buildBtcTxFromParams so the test can sign them
-  // with the same scalar that produced the vault pubkey.
-  let capturedSighashes: Uint8Array[];
-
-  beforeEach(async () => {
-    tmp = await mkdtemp(join(tmpdir(), 'otzi-btc-send-test-'));
-    vaultPath = join(tmp, 'vault.json');
-    configPath = join(tmp, 'daemon.toml');
-    socketPath = join(tmp, 'sock');
-    received = [];
-    capturedSighashes = [];
-
-    await writeFile(vaultPath, vaultJson('testnet'));
-    await writeFile(
-      configPath,
-      `
+function configToml(esploraUrl: string, network = 'testnet4'): string {
+  return `
 [share]
-path = "/tmp/x"
-password_env = "X"
+path = "/tmp/otzi-test-share.json"
+password_env = "OTZI_TEST_PASSWORD"
 [node]
 id = "a"
 [network]
-name = "testnet"
-opnet_rpc = "http://x"
+name = "${network}"
+esplora_url = "${esploraUrl}"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "127.0.0.1:8800"
@@ -144,100 +73,319 @@ endpoint = "127.0.0.1:8801"
 strategy = "auto"
 [[triggers]]
 kind = "uds"
-path = "${socketPath}"
-`,
-    );
+path = "/tmp/otzi-test.sock"
+`;
+}
 
-    trigger = new UdsTrigger({
-      path: socketPath,
-      handler: async (req) => {
-        const body = req.body as Record<string, unknown>;
-        received.push(body);
-        if (body.op === 'vault-info') {
-          return {
-            status: 200,
-            body: {
-              partyIds: [0, 1],
-              threshold: 2,
-              parties: 2,
-              network: 'testnet',
-              btcAddress: 'tb1pmocked',
-              opnetAddress: '0x' + 'aa'.repeat(32),
-            },
-          };
-        }
-        if (body.op === 'sign' && body.scheme === 'frost' && body.protocol === 'btc') {
-          // Rebuild the sighashes from the construction params + utxos and
-          // sign each with our test scalar. The CLI will BIP340-verify these
-          // before broadcasting, so they have to actually verify under the
-          // tweaked pubkey.
-          const btc = body.btc as {
-            to: string;
-            amountSat: string;
-            feeRate: number;
-            network: 'mainnet' | 'testnet';
-            frostP2tr: string;
-            frostUntweakedPubKeyHex: string;
-            utxos: Array<{ transactionId: string; outputIndex: number; valueSat: string }>;
-          };
-          const { buildBtcTxFromParams } = await import('../../broadcast/btc-vault');
-          const built = buildBtcTxFromParams({
-            to: btc.to,
-            amountSat: BigInt(btc.amountSat),
-            feeRate: btc.feeRate,
-            network: btc.network,
-            frostP2tr: btc.frostP2tr,
-            frostUntweakedPubKey: Buffer.from(btc.frostUntweakedPubKeyHex, 'hex'),
-            utxos: btc.utxos.map((u) => ({
-              transactionId: u.transactionId,
-              outputIndex: u.outputIndex,
-              value: BigInt(u.valueSat),
-            })),
-          });
-          const signaturesHex = built.sighashes.map((s) => {
-            capturedSighashes.push(s.hash);
-            const sig = schnorr.sign(s.hash, sk);
-            return Buffer.from(sig).toString('hex');
-          });
-          return { status: 200, body: { signaturesHex } };
-        }
-        return { status: 400, body: { error: `unhandled ${String(body.op)}` } };
-      },
-    });
-    await trigger.start();
-    provider.utxoManager.getUTXOs.mockClear();
-    provider.sendRawTransaction.mockClear();
+describe('otzi btc', () => {
+  let tmp: string;
+  let configPath: string;
+  let vaultPath: string;
+  let address: string;
+  let esplora: MockEsplora;
+  let client: FakeDaemon;
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), 'otzi-btc-test-'));
+    configPath = join(tmp, 'daemon.toml');
+    vaultPath = join(tmp, 'vault-pubkey.json');
+    const file = vaultPubkeyFromPackage(fromVaultKey(vault), NETWORK);
+    address = file.address;
+    await writeVaultPubkeyFile(file, vaultPath);
+    esplora = await startMockEsplora();
+    await writeFile(configPath, configToml(esplora.url));
+    client = new FakeDaemon();
   });
 
   afterEach(async () => {
-    await trigger.stop();
+    await esplora.close();
     await rm(tmp, { recursive: true, force: true });
   });
 
-  it('runs the full BTC send flow and returns the txid', async () => {
-    const result = await btcSend({
-      configPath,
-      vaultPath,
-      toAddress: testnetVaultAddr, // any valid testnet bech32; toOutputScript will accept
-      amount: '100000sats',
+  describe('btcBalance', () => {
+    it('reports confirmed and unconfirmed sats', async () => {
+      esplora.fund(address, 80_000);
+      esplora.fund(address, 20_000);
+      esplora.fund(address, 30_000, { confirmed: false });
+      expect(await btcBalance({ configPath, vaultPath })).toBe('confirmed: 100000\nunconfirmed: 30000');
     });
-    // Mock provider returns 'tx-mocked' from sendRawTransaction.
-    expect(result.transactionId).toBe('tx-mocked');
-    expect(provider.sendRawTransaction).toHaveBeenCalledTimes(1);
-    expect(received[0]!.op).toBe('vault-info');
-    expect(received[1]!.op).toBe('sign');
+
+    it('formats in the requested unit', async () => {
+      esplora.fund(address, 150_000);
+      expect(await btcBalance({ configPath, vaultPath, unit: 'btc' })).toBe('confirmed: 0.0015\nunconfirmed: 0');
+    });
+
+    it('fails with the Esplora URL when Esplora is unreachable', async () => {
+      const dead = await startMockEsplora();
+      await dead.close();
+      await writeFile(configPath, configToml(dead.url));
+      await expect(btcBalance({ configPath, vaultPath })).rejects.toThrow(new RegExp(`Esplora ${dead.url}`));
+    });
+
+    it('points at otzi generate when there is no vault metadata', async () => {
+      await expect(btcBalance({ configPath, vaultPath: join(tmp, 'absent.json') })).rejects.toThrow(/otzi generate/);
+    });
+
+    it('refuses a config whose network differs from the vault', async () => {
+      await writeFile(configPath, configToml(esplora.url, 'signet'));
+      await expect(btcBalance({ configPath, vaultPath })).rejects.toThrow(/testnet4.*signet|signet.*testnet4/);
+    });
   });
 
-  it('rejects zero amount', async () => {
-    await expect(
-      btcSend({ configPath, vaultPath, toAddress: testnetVaultAddr, amount: '0sats' }),
-    ).rejects.toThrow(/> 0 sats/);
+  describe('btcSend', () => {
+    it('send builds a proposal from confirmed UTXOs, signs and broadcasts', async () => {
+      esplora.fund(address, 80_000);
+      esplora.fund(address, 30_000, { confirmed: false });
+
+      const r = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client });
+
+      expect(esplora.broadcasts).toHaveLength(1);
+      expect(client.requests).toHaveLength(1);
+      expect(client.requests[0]!.op).toBe('sign');
+      expect(client.lastProposal.network).toBe(NETWORK);
+      expect(client.lastProposal.prevouts).toHaveLength(1); // the unconfirmed coin is not spent
+      expect(client.lastProposal.prevouts[0]!.amount).toBe(80_000);
+      expect(r.txid).toMatch(/^[0-9a-f]{64}$/);
+      expect(r.explorerUrl).toBe(`${esplora.url}/tx/${r.txid}`);
+      expect(btc.Transaction.fromRaw(hex.decode(esplora.broadcasts[0]!)).id).toBe(r.txid);
+
+      const analysis = analyzeProposal(client.lastProposal, vault, NETWORK);
+      expect(analysis.outputs.find(o => !o.isChange)).toMatchObject({ address: DEST, amount: 50_000 });
+      expect(analysis.outputs.filter(o => o.isChange)).toHaveLength(1);
+    });
+
+    it('uses the Esplora normal fee rate by default and --fee-rate when given', async () => {
+      esplora.fund(address, 500_000);
+      await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client });
+      const normal = analyzeProposal(client.lastProposal, vault, NETWORK).feeRate;
+      expect(normal).toBeGreaterThanOrEqual(5);
+      expect(normal).toBeLessThan(5.5);
+
+      await btcSend({ configPath, vaultPath, to: DEST, amount: '50000', feeRate: 20 }, { client });
+      const custom = analyzeProposal(client.lastProposal, vault, NETWORK).feeRate;
+      expect(custom).toBeGreaterThanOrEqual(20);
+      expect(custom).toBeLessThan(20.5);
+    });
+
+    it('takes amounts with units', async () => {
+      esplora.fund(address, 500_000);
+      await btcSend({ configPath, vaultPath, to: DEST, amount: '0.0005btc' }, { client });
+      const analysis = analyzeProposal(client.lastProposal, vault, NETWORK);
+      expect(analysis.outputs.find(o => !o.isChange)!.amount).toBe(50_000);
+    });
+
+    it('max spends every confirmed UTXO with no change', async () => {
+      esplora.fund(address, 80_000);
+      esplora.fund(address, 40_000);
+      esplora.fund(address, 30_000, { confirmed: false });
+
+      await btcSend({ configPath, vaultPath, to: DEST, amount: 'max' }, { client });
+
+      const analysis = analyzeProposal(client.lastProposal, vault, NETWORK);
+      expect(analysis.inputs).toHaveLength(2);
+      expect(analysis.outputs).toHaveLength(1);
+      expect(analysis.outputs[0]).toMatchObject({ address: DEST, isChange: false });
+      expect(esplora.broadcasts).toHaveLength(1);
+    });
+
+    it('send refuses before signing when more than 255 inputs are needed', async () => {
+      for (let i = 0; i < 300; i++) esplora.fund(address, 1_000);
+
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: 'max' }, { client })).rejects.toThrow(
+        'this send needs 300 inputs; at most 255 fit in one transaction — consolidate first',
+      );
+      expect(client.requests).toHaveLength(0);
+      expect(esplora.broadcasts).toHaveLength(0);
+    });
+
+    it('send fails before signing when Esplora is unreachable', async () => {
+      const dead = await startMockEsplora();
+      await dead.close();
+      await writeFile(configPath, configToml(dead.url));
+
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client })).rejects.toThrow(
+        new RegExp(`Esplora ${dead.url}`),
+      );
+      expect(client.requests).toHaveLength(0);
+    });
+
+    it('a rejected broadcast surfaces the signed transaction hex', async () => {
+      esplora.fund(address, 80_000);
+      esplora.rejectBroadcasts('bad-txns-inputs-missingorspent');
+
+      const err = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(BroadcastFailedError);
+      const failed = err as BroadcastFailedError;
+      expect(failed.message).toContain('bad-txns-inputs-missingorspent');
+      expect(failed.signedTxHex).toMatch(/^[0-9a-f]+$/);
+      const signed = btc.Transaction.fromRaw(hex.decode(failed.signedTxHex));
+      expect(signed.id).toBe(failed.txid);
+      expect(signed.getInput(0).finalScriptWitness).toHaveLength(1); // the signature is in place
+      expect(client.requests).toHaveLength(1);
+      expect(esplora.broadcasts).toHaveLength(0);
+    });
+
+    it('reports insufficient funds in sats and BTC, before any daemon call', async () => {
+      esplora.fund(address, 1_000);
+      esplora.fund(address, 90_000, { confirmed: false });
+
+      const err = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client }).then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.message).toMatch(/insufficient funds/i);
+      expect(err!.message).toContain('1000 sats (0.00001000 BTC)');
+      expect(err!.message).toMatch(/50\d{3} sats \(0\.000\d{5} BTC\)/); // needed: amount plus fee
+      expect(err!.message).toContain('90000 sats'); // unconfirmed coins are named, not spent
+      expect(client.requests).toHaveLength(0);
+    });
+
+    it('refuses a send below the minimum amount', async () => {
+      esplora.fund(address, 80_000);
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '545' }, { client })).rejects.toThrow(/546 sats/);
+      expect(client.requests).toHaveLength(0);
+    });
+
+    it('refuses an address that is not valid for the vault network, before reaching Esplora', async () => {
+      const dead = await startMockEsplora();
+      await dead.close();
+      await writeFile(configPath, configToml(dead.url));
+      for (const to of ['not-an-address', MAINNET_DEST]) {
+        await expect(btcSend({ configPath, vaultPath, to, amount: '50000' }, { client })).rejects.toThrow(
+          /not a valid testnet4 address/,
+        );
+      }
+      expect(client.requests).toHaveLength(0);
+    });
+
+    it('refuses bad amounts and fee rates', async () => {
+      esplora.fund(address, 80_000);
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: 'lots' }, { client })).rejects.toThrow(/invalid amount/);
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '0.5sats' }, { client })).rejects.toThrow(/integer/);
+      for (const feeRate of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000', feeRate }, { client })).rejects.toThrow(/fee rate/);
+      }
+      expect(client.requests).toHaveLength(0);
+    });
+
+    it('passes a daemon refusal through and broadcasts nothing', async () => {
+      esplora.fund(address, 80_000);
+      client.fail = new DaemonClientError(403, 'gate rejected');
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client })).rejects.toMatchObject({
+        status: 403,
+        message: 'gate rejected',
+      });
+      expect(esplora.broadcasts).toHaveLength(0);
+    });
+
+    it('rejects a daemon reply without a signed transaction', async () => {
+      esplora.fund(address, 80_000);
+      client.reply = { ceremonyId: 'sign-x', status: 'done' };
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client })).rejects.toThrow(
+        /daemon reply/,
+      );
+      expect(esplora.broadcasts).toHaveLength(0);
+    });
   });
 
-  it('rejects when no UTXOs', async () => {
-    provider.utxoManager.getUTXOs.mockImplementationOnce(async () => []);
-    await expect(
-      btcSend({ configPath, vaultPath, toAddress: testnetVaultAddr, amount: '100000sats' }),
-    ).rejects.toThrow(/no UTXOs/);
+  describe('btcSign', () => {
+    async function writeProposal(proposal: unknown): Promise<string> {
+      const path = join(tmp, 'proposal.json');
+      await writeFile(path, JSON.stringify(proposal));
+      return path;
+    }
+
+    it('sign prints the analysis and broadcasts only with --broadcast', async () => {
+      const proposal = makeProposal(vault, NETWORK, {
+        inputs: [{ amount: 100_000 }],
+        outputs: [{ address: DEST, amount: 50_000 }],
+        change: 49_000,
+      });
+      const proposalPath = await writeProposal(proposal);
+
+      const dry = await btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, { client });
+
+      expect(esplora.broadcasts).toHaveLength(0);
+      expect(client.requests).toHaveLength(1);
+      expect(client.requests[0]!.proposal).toEqual(proposal);
+      expect(dry.txid).toMatch(/^[0-9a-f]{64}$/);
+      expect(btc.Transaction.fromRaw(hex.decode(dry.signedTxHex)).id).toBe(dry.txid);
+      expect(dry.explorerUrl).toBeUndefined();
+      expect(dry.summary).toContain(DEST);
+      expect(dry.summary).toContain('50000 sats');
+      expect(dry.summary).toMatch(/change/);
+      expect(dry.summary).toContain('49000 sats');
+      expect(dry.summary).toMatch(/fee: 1000 sats \(0\.00001000 BTC\)/);
+      expect(dry.summary).toMatch(/\d+(\.\d+)? sat\/vB/);
+
+      const wet = await btcSign({ configPath, vaultPath, proposalPath, broadcast: true }, { client });
+
+      expect(esplora.broadcasts).toEqual([wet.signedTxHex]);
+      expect(wet.explorerUrl).toBe(`${esplora.url}/tx/${wet.txid}`);
+    });
+
+    it('a rejected broadcast of a signed proposal surfaces the signed hex', async () => {
+      const proposalPath = await writeProposal(makeProposal(vault, NETWORK));
+      esplora.rejectBroadcasts('txn-mempool-conflict');
+      const err = await btcSign({ configPath, vaultPath, proposalPath, broadcast: true }, { client }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(BroadcastFailedError);
+      expect((err as BroadcastFailedError).signedTxHex).toMatch(/^[0-9a-f]+$/);
+    });
+
+    it('fails analysis before any daemon call for a proposal this vault would not sign', async () => {
+      const other = makeTestVault(2, 3).vault;
+      const proposalPath = await writeProposal(makeProposal(other, NETWORK));
+      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, { client })).rejects.toThrow(
+        /does not spend a coin of this vault/,
+      );
+      expect(client.requests).toHaveLength(0);
+    });
+
+    it('refuses a proposal for another network before any daemon call', async () => {
+      const proposalPath = await writeProposal(makeProposal(vault, 'mainnet'));
+      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, { client })).rejects.toThrow(
+        /mainnet.*testnet4/,
+      );
+      expect(client.requests).toHaveLength(0);
+    });
+
+    it('refuses more than 255 prevouts before any daemon call', async () => {
+      const proposal = makeProposal(vault, NETWORK, {
+        inputs: Array.from({ length: 256 }, () => ({ amount: 1_000 })),
+        outputs: [{ address: DEST, amount: 200_000 }],
+        change: 0,
+      });
+      const proposalPath = await writeProposal(proposal);
+      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, { client })).rejects.toThrow(
+        'proposal has 256 inputs; at most 255 fit in one transaction',
+      );
+      expect(client.requests).toHaveLength(0);
+    });
+
+    it('names the file when it is missing, not JSON, or not a proposal', async () => {
+      const missing = join(tmp, 'absent.json');
+      await expect(btcSign({ configPath, vaultPath, proposalPath: missing, broadcast: false }, { client })).rejects.toThrow(
+        /absent\.json/,
+      );
+      const notJson = join(tmp, 'garbage.json');
+      await writeFile(notJson, '{nope');
+      await expect(btcSign({ configPath, vaultPath, proposalPath: notJson, broadcast: false }, { client })).rejects.toThrow(
+        /garbage\.json.*JSON/,
+      );
+      const wrongShape = await writeProposal({ network: NETWORK });
+      await expect(btcSign({ configPath, vaultPath, proposalPath: wrongShape, broadcast: false }, { client })).rejects.toThrow(
+        /proposal must be/,
+      );
+      expect(client.requests).toHaveLength(0);
+    });
   });
 });

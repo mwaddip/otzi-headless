@@ -74,4 +74,10 @@ describe('formatSats', () => {
     expect(formatSats(0n, 'btc')).toBe('0');
     expect(formatSats(0n)).toBe('0');
   });
+
+  it('negative amounts (an unconfirmed balance can fall)', () => {
+    expect(formatSats(-25_000n)).toBe('-25000');
+    expect(formatSats(-150_000n, 'btc')).toBe('-0.0015');
+    expect(formatSats(-100_000n, 'mbtc')).toBe('-1');
+  });
 });

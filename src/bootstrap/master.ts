@@ -20,7 +20,7 @@
 import * as http from 'node:http';
 import type { PartyId } from '../core/types';
 import type { IdentityKeyPair } from '../transport/identity';
-import { toHex } from '../wire/hex';
+import { toHex } from '../otzi/lib/hex';
 import { canonicalizeEndpoint, EndpointParseError } from '../util/endpoint';
 import {
   buildBook,

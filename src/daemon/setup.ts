@@ -29,7 +29,7 @@ import {
   importIdentity,
   type IdentityKeyPair,
 } from '../transport/identity';
-import { fromHex, toHex } from '../wire/hex';
+import { fromHex, toHex } from '../otzi/lib/hex';
 
 export async function setupMaster(configPath: string, bind: string): Promise<void> {
   const config = await loadDaemonConfig(configPath);

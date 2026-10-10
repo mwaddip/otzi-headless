@@ -14,8 +14,7 @@ password_env = "X"
 [node]
 id = "a"
 [network]
-name = "regtest"
-opnet_rpc = "http://x"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "127.0.0.1:8800"
@@ -28,6 +27,16 @@ kind = "uds"
 path = "${socketPath}"
 `;
 }
+
+const VAULT_INFO = {
+  partyIds: [0, 1, 2],
+  threshold: 3,
+  parties: 3,
+  network: 'testnet4',
+  address: 'tb1pexampleexampleexampleexampleexampleexampleexampleexample00',
+  internalKey: `02${'ab'.repeat(32)}`,
+  outputKey: 'cd'.repeat(32),
+};
 
 describe('DaemonClient over UDS', () => {
   let tmp: string;
@@ -43,6 +52,7 @@ describe('DaemonClient over UDS', () => {
         const body = req.body as { op?: string };
         if (body.op === 'echo') return { status: 200, body: { echoed: body } };
         if (body.op === 'fail') return { status: 400, body: { error: 'asked to fail' } };
+        if (body.op === 'vault-info') return { status: 200, body: VAULT_INFO };
         return { status: 404, body: { error: 'unknown op' } };
       },
     });
@@ -67,6 +77,14 @@ describe('DaemonClient over UDS', () => {
     const client = DaemonClient.fromParsed(cfg);
     const result = await client.request<{ echoed: unknown }>({ op: 'echo', n: 42 });
     expect(result.echoed).toEqual({ op: 'echo', n: 42 });
+  });
+
+  it('vaultInfo returns the vault-info reply', async () => {
+    const cfg = parseDaemonConfigToml(buildToml(socketPath));
+    const client = DaemonClient.fromParsed(cfg);
+    const info = await client.vaultInfo();
+    expect(info).toEqual(VAULT_INFO);
+    expect(info.address).toMatch(/^tb1p/);
   });
 
   it('throws DaemonClientError on non-200', async () => {
@@ -97,8 +115,7 @@ password_env = "X"
 [node]
 id = "a"
 [network]
-name = "regtest"
-opnet_rpc = "http://x"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "127.0.0.1:8800"
@@ -136,8 +153,7 @@ password_env = "X"
 [node]
 id = "a"
 [network]
-name = "regtest"
-opnet_rpc = "http://x"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "127.0.0.1:8800"

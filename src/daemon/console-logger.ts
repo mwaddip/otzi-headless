@@ -14,7 +14,7 @@
  *
  *   ^.*peer-allowlist: dropped connection from non-peer source\s*[\{].*?ip["']?\s*[:=]\s*["']?<HOST>["']?.*$
  *
- * Stdout is reserved for CLI output (`otzi list`, `otzi sign` → tx id, ...).
+ * Stdout is reserved for CLI output (`otzi btc send` → txid and explorer URL, ...).
  * Daemon-mode logging MUST go to stderr so it doesn't pollute machine-readable
  * stdout of operator subcommands.
  *

@@ -9,7 +9,7 @@
 
 import * as http from 'node:http';
 import { loadDaemonConfig } from '../config/load';
-import type { DaemonConfig } from '../config/types';
+import type { DaemonConfig, NetworkName } from '../config/types';
 
 export class DaemonClientError extends Error {
   constructor(
@@ -21,13 +21,18 @@ export class DaemonClientError extends Error {
   }
 }
 
+/** The daemon's `vault-info` reply (docs/api.md, `op: "vault-info"`). */
 export interface VaultInfo {
   partyIds: number[];
   threshold: number;
   parties: number;
-  network: 'mainnet' | 'testnet' | 'regtest';
-  btcAddress: string;
-  opnetAddress: string;
+  network: NetworkName;
+  /** Bech32m key-path-only P2TR address. */
+  address: string;
+  /** 33-byte SEC1 hex, the untweaked group key. */
+  internalKey: string;
+  /** 32-byte x-only hex, the BIP341 output key. */
+  outputKey: string;
 }
 
 interface TransportOpts {

@@ -16,7 +16,7 @@
  */
 
 import type { BlobKey, PartyId } from '../../core/types';
-import { fromHex, toHex } from '../../wire/hex';
+import { fromHex, toHex } from '../../otzi/lib/hex';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Handshake

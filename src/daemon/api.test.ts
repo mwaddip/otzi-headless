@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { CEREMONY_ID_RE } from '../core/messages';
 import type { PartyId } from '../core/types';
 import type { SendProposal } from '../otzi/lib/vault-types';
-import { defaultCeremonyId, parseDkgRequest, parseSignRequest, parseVaultInfoRequest, RequestError } from './api';
+import {
+  defaultCeremonyId,
+  parseDkgRequest,
+  parseProposal,
+  parseSignRequest,
+  parseVaultInfoRequest,
+  RequestError,
+} from './api';
 
 const RING = { partyIds: [2, 0, 1] as PartyId[], self: 1, minSigners: 2 };
 
@@ -138,5 +145,18 @@ describe('parseSignRequest', () => {
     // The request body itself is left as sent.
     expect(upper.tx).toBe(lower.tx.toUpperCase());
     expect(upper.prevouts[1]!.txid).toBe('AB'.repeat(32));
+  });
+});
+
+describe('parseProposal', () => {
+  it('applies the sign op proposal rules to untrusted JSON (otzi btc sign)', () => {
+    expect(parseProposal(proposal(2))).toEqual(proposal(2));
+    expect(requestError(() => parseProposal({ network: 'testnet4' })).message).toBe(
+      'proposal must be an object with string tx and array prevouts',
+    );
+    expect(requestError(() => parseProposal(proposal(256))).message).toBe(
+      'proposal has 256 inputs; at most 255 fit in one transaction',
+    );
+    expect(requestError(() => parseProposal({ ...proposal(), fee: 1 })).status).toBe(400);
   });
 });

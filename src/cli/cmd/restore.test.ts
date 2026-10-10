@@ -72,8 +72,7 @@ identity_key_file = "${identityPath}"
 pubkey_book_file = "${pubkeyBookPath}"
 
 [network]
-name = "regtest"
-opnet_rpc = "https://example/rpc"
+name = "testnet4"
 
 [transport]
 kind = "peer-mesh"

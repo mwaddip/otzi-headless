@@ -55,7 +55,7 @@ export function parseSignRequest(
   allowOnly(body, ['op', 'ceremonyId', 'signers', 'proposal']);
   const ceremonyId = ceremonyIdOf(body, 'sign');
   const signers = body.signers === undefined ? [...ring.partyIds].sort((a, b) => a - b) : signersOf(body.signers, ring);
-  return { ceremonyId, signers, proposal: proposalOf(body.proposal) };
+  return { ceremonyId, signers, proposal: parseProposal(body.proposal) };
 }
 
 // ─── Rules ──────────────────────────────────────────────────────────────────
@@ -102,7 +102,12 @@ function lowercased(o: Body, keys: readonly string[]): Body {
   return out;
 }
 
-function proposalOf(raw: unknown): SendProposal {
+/**
+ * A `SendProposal` from untrusted JSON: the same shape, size and hex-case
+ * rules the `sign` op applies, so the CLI refuses exactly what the daemon
+ * would (`otzi btc sign`).
+ */
+export function parseProposal(raw: unknown): SendProposal {
   if (!isObject(raw) || typeof raw.tx !== 'string' || !Array.isArray(raw.prevouts)) {
     bad('proposal must be an object with string tx and array prevouts');
   }

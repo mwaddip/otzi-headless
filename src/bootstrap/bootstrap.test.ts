@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import * as net from 'node:net';
 import { createHash } from 'node:crypto';
 import { generateIdentity, type IdentityKeyPair } from '../transport/identity';
-import { toHex } from '../wire/hex';
+import { toHex } from '../otzi/lib/hex';
 import {
   buildBook,
   computeFingerprint,

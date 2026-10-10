@@ -1,12 +1,13 @@
 /**
- * CLI entrypoint — dispatches to subcommands:
+ * CLI entrypoint — dispatches to subcommands (docs/cli.md):
  *
  *   otzi daemon <config.toml>                   — run the daemon
  *   otzi setup <config.toml>                    — run bootstrap (reads [bootstrap].role from config)
- *   otzi generate <config.toml> [flags]         — trigger DKG against local daemon
+ *   otzi generate [--config <path>] [...]       — run the DKG through the local daemon
  *   otzi vault [--json]                         — print vault metadata
- *   otzi btc send <addr> <amount>[unit]         — send BTC from the vault
- *   otzi btc balance [--unit ...]               — read vault BTC balance
+ *   otzi btc balance [--unit ...]               — vault balance from Esplora
+ *   otzi btc send <addr> <amount>[unit]|max     — build, sign and broadcast a vault transfer
+ *   otzi btc sign <proposal.json> [--broadcast] — sign a caller-built proposal
  *   otzi backup                                 — write password-protected archive of daemon state
  *   otzi restore <path> [--password-stdin]      — recover daemon state from an archive
  *
@@ -16,15 +17,15 @@
  * mode (signing rejected; DKG works) — the operator runs `otzi generate` on
  * one node, then restarts every daemon to load its new share.
  *
- * Operator-facing commands (vault/btc/...) talk to the local daemon
- * over a Unix domain socket (typically /var/run/otzi/otzi.sock). The default
- * config path /etc/otzi/daemon.toml matches the .deb install layout.
- *
- * Explicitly does NOT call `initEccLib` — phase-4d trap: double-init would
- * silently misroute the FROST legacy-sig monkey-patch when BTC broadcast
- * modules also import `@btc-vision/transaction`.
+ * Every other verb is short-lived: it talks to the local daemon over a Unix
+ * domain socket (typically /var/run/otzi/otzi.sock), reads the chain through
+ * Esplora, or works on local files. Machine output goes to stdout; banners and
+ * errors go to stderr. The default config path /etc/otzi/daemon.toml matches
+ * the .deb install layout.
  */
 
+import { BroadcastFailedError } from '../cli/cmd/btc';
+import type { BtcUnit } from '../cli/units';
 import { loadDaemonConfig } from '../config/load';
 import { loadAndValidate } from './config-merge';
 import { createConsoleLogger } from './console-logger';
@@ -68,10 +69,11 @@ function usage(): string {
     'usage:',
     '  otzi daemon <path/to/daemon.toml>',
     '  otzi setup <path/to/daemon.toml>',
-    '  otzi generate <path/to/daemon.toml> [--ceremony-id <id>]',
+    '  otzi generate [--config <path>] [--ceremony-id <id>]',
     '  otzi vault [--json]',
-    '  otzi btc send <address> <amount>[unit] [--config <path>] [--fee-rate <sat/vB>]',
-    '  otzi btc balance [--unit sats|btc|mbtc|ubtc]',
+    '  otzi btc balance [--unit sats|btc|mbtc|ubtc] [--config <path>]',
+    '  otzi btc send <address> <amount>[unit]|max [--fee-rate <sat/vB>] [--config <path>]',
+    '  otzi btc sign <proposal.json> [--broadcast] [--config <path>]',
     '  otzi backup',
     '  otzi restore <archive-path> [--password-stdin]',
   ].join('\n');
@@ -173,108 +175,18 @@ async function runSetupCommand(args: string[]): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// `otzi generate` — trigger combined DKG against the local daemon
+// Arguments and errors
 // ─────────────────────────────────────────────────────────────────────────
 
-async function runGenerateCommand(args: string[]): Promise<void> {
-  const configPath = args[0];
-  if (!configPath) throw new Error(usage());
-  const flags = parseFlags(args.slice(1));
-
-  const config = await loadDaemonConfig(configPath);
-
-  // Find the HTTP trigger to POST to. Generate operates against the local
-  // daemon over its operator-API HTTP trigger — same surface the daemon
-  // already exposes for ceremony triggers.
-  const httpTrigger = config.triggers.find((t) => t.kind === 'http');
-  if (!httpTrigger)
-    throw new Error(
-      'otzi generate: no [[triggers]] entry of kind="http" in config — required to deliver the DKG request to the local daemon',
-    );
-  const bind = httpTrigger.params?.bind;
-  if (typeof bind !== 'string')
-    throw new Error('otzi generate: triggers.http.bind missing in config');
-
-  const url = `http://${bind}/`;
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
-  const authTokenEnv = httpTrigger.params?.auth_token_env;
-  if (typeof authTokenEnv === 'string') {
-    const token = process.env[authTokenEnv];
-    if (!token)
-      throw new Error(
-        `otzi generate: env var '${authTokenEnv}' not set (required for HTTP trigger Bearer auth)`,
-      );
-    headers['authorization'] = `Bearer ${token}`;
-  }
-
-  const ceremonyId = flags.get('ceremony-id') ?? `dkg-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-
-  // Daemon derives parties (= configured peers + 1) and threshold (= parties,
-  // n-of-n by v0.1 design); we just kick the ceremony.
-  console.error(
-    `otzi generate: triggering combined DKG (ceremonyId=${ceremonyId}) → POST ${url}`,
-  );
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ op: 'dkg-combined', ceremonyId }),
-  });
-  const bodyText = await res.text();
-  if (res.status !== 200)
-    throw new Error(`otzi generate: HTTP ${res.status}: ${bodyText}`);
-
-  const result = JSON.parse(bodyText) as {
-    ceremonyId: string;
-    status: string;
-    mldsaPublicKeyHex: string;
-    frostVerifyingKeyHex: string;
-    btcAddress?: string;
-    opnetAddress?: string;
-    network?: string;
-  };
-
-  console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.error(`  otzi generate: DKG complete (status=${result.status})`);
-  console.error(`  ceremonyId:        ${result.ceremonyId}`);
-  if (result.btcAddress) {
-    console.error(`  vault BTC:         ${result.btcAddress} (fund here for BTC)`);
-  }
-  if (result.opnetAddress) {
-    console.error(`  vault OPNet:       ${result.opnetAddress} (send OP20/contract calls here)`);
-  }
-  console.error(`  mldsaPublicKey:    ${result.mldsaPublicKeyHex}`);
-  console.error(`  frostVerifyingKey: ${result.frostVerifyingKeyHex}`);
-  console.error(`  share file:        ${config.share.path} (each peer also persisted its own copy)`);
-  console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.error('Restart all daemons to load the persisted share and enable signing.');
-}
-
-function parseFlags(args: string[]): Map<string, string> {
-  const out = new Map<string, string>();
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
-    if (!arg.startsWith('--'))
-      throw new Error(`unexpected positional argument '${arg}'`);
-    const key = arg.slice(2);
-    const value = args[i + 1];
-    if (value === undefined || value.startsWith('--'))
-      throw new Error(`flag --${key} is missing a value`);
-    out.set(key, value);
-    i += 1;
-  }
-  return out;
-}
-
 /**
- * Parse mixed positional + --flag args. Boolean flags (`--json` with no
- * following value) are also allowed and surface in the flags map with an
- * empty string value.
+ * Parse a verb's arguments: positionals and `--flag`s in any order.
+ * `spec.values` flags take the next argument; `spec.booleans` flags take none.
+ * Any other `--flag` is an error, so a typo never silently falls back to a default.
  */
-function parsePositionalAndFlags(args: string[]): {
-  positional: string[];
-  flags: Map<string, string>;
-} {
+export function parseVerbArgs(
+  args: readonly string[],
+  spec: { values?: readonly string[]; booleans?: readonly string[] },
+): { positional: string[]; flags: Map<string, string> } {
   const positional: string[] = [];
   const flags = new Map<string, string>();
   for (let i = 0; i < args.length; i++) {
@@ -284,15 +196,65 @@ function parsePositionalAndFlags(args: string[]): {
       continue;
     }
     const key = arg.slice(2);
-    const next = args[i + 1];
-    if (next === undefined || next.startsWith('--')) {
+    if (spec.booleans?.includes(key)) {
       flags.set(key, '');
-      continue;
+    } else if (spec.values?.includes(key)) {
+      const value = args[i + 1];
+      if (value === undefined || value.startsWith('--')) throw new Error(`flag '--${key}' needs a value`);
+      flags.set(key, value);
+      i += 1;
+    } else {
+      throw new Error(`unknown flag '--${key}'`);
     }
-    flags.set(key, next);
-    i += 1;
   }
   return { positional, flags };
+}
+
+/**
+ * Print an error the way every verb does: the message on stderr. A broadcast
+ * that failed after signing also prints the signed transaction hex, so the
+ * operator can post it by other means.
+ */
+export function reportCliError(err: unknown, write: (line: string) => void = console.error): void {
+  write(err instanceof Error ? err.message : String(err));
+  if (err instanceof BroadcastFailedError) {
+    write(`The transaction is signed (txid ${err.txid}) but was not broadcast. Its hex follows; broadcast it by other means:`);
+    write(err.signedTxHex);
+  }
+}
+
+function noPositional(positional: readonly string[]): void {
+  if (positional.length > 0) throw new Error(`unexpected argument '${positional[0]}'\n${usage()}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi generate` — run the DKG through the local daemon
+// ─────────────────────────────────────────────────────────────────────────
+
+async function runGenerateCommand(args: string[]): Promise<void> {
+  const { positional, flags } = parseVerbArgs(args, { values: ['config', 'ceremony-id'] });
+  if (positional.length > 0)
+    throw new Error(
+      `otzi generate takes no positional argument (got '${positional[0]}'); use --config <path> for a config other than ${DEFAULT_DAEMON_CONFIG_PATH}`,
+    );
+  const configPath = flags.get('config') ?? DEFAULT_DAEMON_CONFIG_PATH;
+  const ceremonyId = flags.get('ceremony-id');
+
+  const config = await loadDaemonConfig(configPath);
+  console.error(
+    'otzi generate: running the DKG with every node in the ring (the others must be running and hold no vault)',
+  );
+  const { generate } = await import('../cli/cmd/generate');
+  const result = await generate({ configPath, ...(ceremonyId !== undefined ? { ceremonyId } : {}) });
+
+  console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.error('  otzi generate: DKG complete');
+  console.error(`  ceremonyId: ${result.ceremonyId}`);
+  console.error(`  network:    ${result.network}`);
+  console.error(`  address:    ${result.address} (fund this address)`);
+  console.error(`  share file: ${config.share.path} (every node wrote its own share)`);
+  console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.error('Restart every daemon to load its share before signing.');
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -300,45 +262,76 @@ function parsePositionalAndFlags(args: string[]): {
 // ─────────────────────────────────────────────────────────────────────────
 
 async function runVaultCommand(args: string[]): Promise<void> {
-  const { flags } = parsePositionalAndFlags(args);
+  const { positional, flags } = parseVerbArgs(args, { booleans: ['json'] });
+  noPositional(positional);
   const { vault } = await import('../cli/cmd/vault');
-  const out = await vault({ json: flags.has('json') });
-  console.log(out);
+  console.log(await vault({ json: flags.has('json') }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// `otzi btc {send|balance} ...`
+// `otzi btc {balance|send|sign} ...`
 // ─────────────────────────────────────────────────────────────────────────
+
+const BTC_UNITS: readonly BtcUnit[] = ['sats', 'btc', 'mbtc', 'ubtc'];
+
+function parseFeeRate(raw: string): number {
+  const rate = Number(raw);
+  if (raw.trim() === '' || !Number.isFinite(rate) || rate <= 0)
+    throw new Error(`--fee-rate must be a positive number of sat/vB (got '${raw}')`);
+  return rate;
+}
 
 async function runBtcCommand(args: string[]): Promise<void> {
   const sub = args[0];
+  const rest = args.slice(1);
+  if (sub === 'balance') {
+    const { positional, flags } = parseVerbArgs(rest, { values: ['unit', 'config'] });
+    noPositional(positional);
+    const unit = flags.get('unit');
+    if (unit !== undefined && !(BTC_UNITS as readonly string[]).includes(unit))
+      throw new Error(`--unit must be one of ${BTC_UNITS.join(', ')} (got '${unit}')`);
+    const { btcBalance } = await import('../cli/cmd/btc');
+    console.log(
+      await btcBalance({
+        configPath: flags.get('config') ?? DEFAULT_DAEMON_CONFIG_PATH,
+        ...(unit !== undefined ? { unit: unit as BtcUnit } : {}),
+      }),
+    );
+    return;
+  }
   if (sub === 'send') {
-    const { positional, flags } = parsePositionalAndFlags(args.slice(1));
-    if (positional.length !== 2)
-      throw new Error('usage: otzi btc send <address> <amount>[unit]');
-    const [toAddress, amount] = positional;
+    const { positional, flags } = parseVerbArgs(rest, { values: ['fee-rate', 'config'] });
+    if (positional.length !== 2) throw new Error('usage: otzi btc send <address> <amount>[unit]|max [--fee-rate <sat/vB>]');
+    const [to, amount] = positional as [string, string];
+    const feeRate = flags.get('fee-rate');
     const { btcSend } = await import('../cli/cmd/btc');
     const result = await btcSend({
-      configPath: flags.get('config') || DEFAULT_DAEMON_CONFIG_PATH,
-      toAddress: toAddress!,
-      amount: amount!,
-      ...(flags.has('fee-rate') ? { feeRate: Number(flags.get('fee-rate')) } : {}),
+      configPath: flags.get('config') ?? DEFAULT_DAEMON_CONFIG_PATH,
+      to,
+      amount,
+      ...(feeRate !== undefined ? { feeRate: parseFeeRate(feeRate) } : {}),
     });
-    console.log(result.transactionId);
+    console.log(result.txid);
+    console.log(result.explorerUrl);
     return;
   }
-  if (sub === 'balance') {
-    const { flags } = parsePositionalAndFlags(args.slice(1));
-    const { btcBalance } = await import('../cli/cmd/btc');
-    const out = await btcBalance({
-      ...(flags.has('unit')
-        ? { unit: flags.get('unit') as 'sats' | 'btc' | 'mbtc' | 'ubtc' }
-        : {}),
+  if (sub === 'sign') {
+    const { positional, flags } = parseVerbArgs(rest, { values: ['config'], booleans: ['broadcast'] });
+    if (positional.length !== 1) throw new Error('usage: otzi btc sign <proposal.json> [--broadcast]');
+    const { btcSign } = await import('../cli/cmd/btc');
+    const result = await btcSign({
+      configPath: flags.get('config') ?? DEFAULT_DAEMON_CONFIG_PATH,
+      proposalPath: positional[0]!,
+      broadcast: flags.has('broadcast'),
     });
-    console.log(out);
+    console.error(result.summary);
+    if (result.explorerUrl === undefined) console.error('not broadcast; run again with --broadcast to post it');
+    console.log(result.txid);
+    console.log(result.signedTxHex);
+    if (result.explorerUrl !== undefined) console.log(result.explorerUrl);
     return;
   }
-  throw new Error('usage: otzi btc {send <address> <amount>[unit] | balance [--unit ...]}');
+  throw new Error(usage());
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -396,7 +389,7 @@ async function runRestoreCommand(args: string[]): Promise<void> {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   main(process.argv).catch((err) => {
-    console.error(err instanceof Error ? err.message : err);
+    reportCliError(err);
     process.exit(1);
   });
 }
