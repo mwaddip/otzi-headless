@@ -153,7 +153,7 @@ strategy = "auto"
     await writeShare();
     await writeFile(configPath, toml({ network: 'signet' }));
     await expect(loadAndValidate(configPath, { env, vaultPubkeyPath })).rejects.toThrow(
-      'This share file belongs to a different vault',
+      /^share file .* is for testnet4, \[network\]\.name is signet$/,
     );
     expect(existsSync(vaultPubkeyPath)).toBe(false);
   });

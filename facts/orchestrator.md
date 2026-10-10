@@ -87,7 +87,7 @@
     - **Invariant:** Reentrant (returns early if already started).
 
   - **`stop(): void`**
-    - **Post:** Unsubscribes from transport; aborts every live ceremony, the local DKG slot included; clears all trackers, records (settled outcomes and ended local slots), local signing reservations and timers; wakes pending `waitFor` calls. Ceremonies cut short by `stop` emit no outcome. A joined DKG still unwinding keeps the DKG slot until its ceremony promise settles.
+    - **Post:** Unsubscribes from transport; aborts every live ceremony, the local DKG slot included, and schedules the blob clear (`scheduleClear`, the kind's retention) of every live tracker's ceremony, so DKG secret shares never stay in memory past the retention period; clears all trackers, records (settled outcomes and ended local slots), local signing reservations and timers; wakes pending `waitFor` calls. Ceremonies cut short by `stop` emit no outcome. A joined DKG still unwinding keeps the DKG slot until its ceremony promise settles.
     - **Invariant:** Reentrant (returns early if not started).
 
   - **`onCompleted(handler: (o: CeremonyOutcome) => void): Unsubscribe`**
@@ -123,15 +123,16 @@
 Every announce first passes the duplicate checks: no tracker exists for the `ceremonyId` (an announce for a live tracker is dropped: warn when the sender is not the pinned leader or the kind differs, info for a duplicate from the leader); the `ceremonyId` is not held by a local DKG or signing slot, live or ended within its retention period (warn); and no ceremony with that `ceremonyId` settled on this node within its retention period (info) — reusing an id within retention would collide with its stored blobs and its scheduled clear.
 
 - **`announce-dkg`** — drop unless all of these hold, in this order:
-  1. the duplicate checks;
-  2. no DKG is live on this node (local slot, participant tracker, or a joined DKG still unwinding);
-  3. `network === deps.network`;
-  4. `parties === peersById.size` (the parser already guarantees `2 ≤ threshold ≤ parties`);
-  5. no share is loaded (`!deps.vault`);
-  6. `await deps.vaultExists()` is `false` (a throw is a drop) — a `.pending` file does not count;
-  7. the gate approves `buildDkgSpec({ ceremonyId, leader: resolveLeaderId(from), role: 'participant' }, { threshold, parties, network, peerIds })`, with `peerIds` = every `peersById` label in party order.
+  1. the sender is a ring member (`peersById.has(from)`; the transport already authenticates ring members — defence in depth);
+  2. the duplicate checks;
+  3. no DKG is live on this node (local slot, participant tracker, or a joined DKG still unwinding);
+  4. `network === deps.network`;
+  5. `parties === peersById.size` (the parser already guarantees `2 ≤ threshold ≤ parties`);
+  6. no share is loaded (`!deps.vault`);
+  7. `await deps.vaultExists()` is `false` (a throw is a drop) — a `.pending` file does not count;
+  8. the gate approves `buildDkgSpec({ ceremonyId, leader: resolveLeaderId(from), role: 'participant' }, { threshold, parties, network, peerIds })`, with `peerIds` = every `peersById` label in party order.
 
-  Before step 6 the orchestrator creates the tracker (leader pinned = sender, which also takes the DKG slot) and starts the `dkgMs` deadline; a drop at step 6 removes the tracker without an outcome. Then: run `runDkgCeremony(io, { ceremonyId, sessionId, threshold, parties, network, rng }, createStager(), signal)` with the tracker's `AbortController` signal. Success settles `done` with `address` (`vaultPayment(toVaultKey(publicKeyPackage), network).address`); a failure settles `aborted` with the reason. A `DkgShareKeptError` (the ceremony failed after this node published its `dkg-verified`, so its staged share was kept) settles `aborted` at error level; when the tracker had already settled (a ring member's `signoff-aborted`, the deadline, `stop()`), it is logged at error level on its own line. Either way the line carries the kept path and the recovery. `createStager` is called only here.
+  Before step 7 the orchestrator creates the tracker (leader pinned = sender, which also takes the DKG slot) and starts the `dkgMs` deadline; a drop at step 7 removes the tracker without an outcome. Then: run `runDkgCeremony(io, { ceremonyId, sessionId, threshold, parties, network, rng }, createStager(), signal)` with the tracker's `AbortController` signal. Success settles `done` with `address` (`vaultPayment(toVaultKey(publicKeyPackage), network).address`); a failure settles `aborted` with the reason. A `DkgShareKeptError` (the ceremony failed after this node published its `dkg-verified`, so its staged share was kept) settles `aborted` at error level; when the tracker had already settled (a ring member's `signoff-aborted`, the deadline, `stop()`), it is logged at error level on its own line. Either way the line carries the kept path and the recovery. `createStager` is called only here.
 
 - **`announce-sign`** — drop unless all of these hold, in this order:
   1. the duplicate checks — the sender of the first announce is pinned as leader;
@@ -165,7 +166,7 @@ Every announce first passes the duplicate checks: no tracker exists for the `cer
 - At most one live DKG per node, whichever node leads it.
 - Silent drops (failed checks, failed analysis, gate non-approve) are indistinguishable from offline to peers.
 - Participant never sends a signoff for signing; for DKG, `runDkgCeremony` broadcasts `signoff-aborted` on its own failure (not when aborted by signal).
-- Every settle schedules exactly one blob clear.
+- Every settle schedules exactly one blob clear, and so does `stop()` for every live tracker.
 - No promise the orchestrator starts rejects unhandled: every ceremony chain ends in a `catch` that logs at error level, and `onCompleted` handlers run isolated.
 
 **Cross-component contracts:**

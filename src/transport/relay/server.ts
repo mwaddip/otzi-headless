@@ -24,6 +24,7 @@ import * as http from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { PartyId } from '../../core/types';
 import { NOOP_LOGGER, type Logger } from '../../orchestrator/types';
+import { MAX_FRAME_BYTES } from '../peer-mesh/wire';
 import {
   encodeServerMsg,
   parseClientMsg,
@@ -65,7 +66,7 @@ export class RelayServer {
   async start(): Promise<void> {
     if (this.wss) return;
     const httpServer = http.createServer();
-    const wss = new WebSocketServer({ server: httpServer });
+    const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_FRAME_BYTES });
     this.httpServer = httpServer;
     this.wss = wss;
 

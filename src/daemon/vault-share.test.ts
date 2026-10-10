@@ -297,13 +297,13 @@ describe('vault-share', () => {
       );
     });
 
-    it('rejects a share for another network', async () => {
+    it('rejects a share for another network, naming the file and both networks', async () => {
       await writeShare();
       await expect(loadVaultShare(path, PASSWORD, 'mainnet')).rejects.toThrow(
-        'This share file belongs to a different vault',
+        `share file ${path} is for testnet4, [network].name is mainnet`,
       );
       await expect(loadVaultShare(path, PASSWORD, 'signet')).rejects.toThrow(
-        'This share file belongs to a different vault',
+        `share file ${path} is for testnet4, [network].name is signet`,
       );
     });
 

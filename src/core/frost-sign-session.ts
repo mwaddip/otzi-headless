@@ -192,16 +192,34 @@ export function aggregate(session: FrostSigningSession): Uint8Array[] {
       if (!c) throw new Error(`Missing r1 commitment[${i}] from party ${id}`);
       return c;
     });
-    sigs[i] = signAggregate(
-      shares,
-      session.sighashes[i]!.hash,
-      commitments,
-      session.publicKeyPackage,
-      { tweaked: session.sighashes[i]!.tweaked },
-    );
+    try {
+      sigs[i] = signAggregate(
+        shares,
+        session.sighashes[i]!.hash,
+        commitments,
+        session.publicKeyPackage,
+        { tweaked: session.sighashes[i]!.tweaked },
+      );
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(`signature aggregation for input ${i} failed: ${namePartiesInFrostMessage(reason)}`, {
+        cause: err,
+      });
+    }
   }
   session.signatures = sigs;
   return sigs;
+}
+
+/**
+ * frots names signers by FROST identifier (`party + 1`); every other message
+ * names parties. `signer(s): 2, 3` → `party(ies) 1, 2`; `signer 3` → `party 2`.
+ */
+function namePartiesInFrostMessage(message: string): string {
+  const party = (id: string) => String(Number(id) - 1);
+  return message
+    .replace(/signer\(s\): (\d+(?:, \d+)*)/g, (_m, ids: string) => `party(ies) ${ids.split(', ').map(party).join(', ')}`)
+    .replace(/signer (\d+)/g, (_m, id: string) => `party ${party(id)}`);
 }
 
 export type FrostSignRound = 1 | 2;

@@ -42,11 +42,11 @@
   - **Throws:** Any other `stat` error.
 
 - `async loadVaultShare(path: string, password: string, network: NetworkName): Promise<DecryptedShare | undefined>`
-  - **Post:** Reads the JSON at `path`, `decryptShareFile(raw, password)`, `assertShareMatchesVault(share, network)`; returns the share. Returns `undefined` when `path` does not exist (ENOENT).
+  - **Post:** Reads the JSON at `path`, `decryptShareFile(raw, password)`, checks `share.network === network`, then `assertShareMatchesVault(share, network)`; returns the share. Returns `undefined` when `path` does not exist (ENOENT).
   - **Throws:**
     - invalid JSON → `Error('share file <path> is not valid JSON', { cause })`;
     - any `decryptShareFile` failure other than otzi's own messages (`Unsupported share file version`, `Share file is corrupted`, `This share file belongs to a different vault`), i.e. a wrong password or ciphertext that does not decode → `Error('cannot decrypt share file <path>: wrong password or corrupted file', { cause })`; otzi's own messages pass through unchanged;
-    - network mismatch → `assertShareMatchesVault`'s `Error('This share file belongs to a different vault')`;
+    - network mismatch → `Error('share file <path> is for <share network>, [network].name is <configured network>')`;
     - other read errors (anything but ENOENT).
   - **Invariant:** the password is never logged and never part of an error message.
 

@@ -57,6 +57,8 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 
 ### Addressed-blob access control
 - `BlobServer` serves a blob whose key has a `to` only when the authenticated requester equals `to`; any other requester gets `null`. Blobs without `to` are served to any ring member. The DKG round-2 secret shares (`dkg-r2`) are the addressed blobs.
+- `BlobServer` serves only blobs this node produced (`key.from` = this node); blobs it pulled from peers are never served onward.
+- A pull response is accepted only from the peer the pull was sent to.
 
 ### Sender binding
 - For every pulled blob, the party ID inside the decoded blob equals the authenticated `from` of the pull (the producer the blob was pulled from).

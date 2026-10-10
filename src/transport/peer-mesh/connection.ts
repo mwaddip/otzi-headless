@@ -40,6 +40,7 @@ import {
   encodeHandshake1,
   encodeHandshake2,
   ephemeralFromHandshake,
+  MAX_FRAME_BYTES,
   parseAppMessage,
   parseHandshake,
   type AppMessage,
@@ -88,7 +89,7 @@ export class PeerConnection {
     url: string;
     wsCtor: typeof WebSocket;
   }): Promise<PeerConnection> {
-    const ws = new options.wsCtor(options.url);
+    const ws = new options.wsCtor(options.url, { maxPayload: MAX_FRAME_BYTES });
     await waitFor(ws, 'open', HANDSHAKE_TIMEOUT_MS);
     const queue = new HandshakeQueue(ws);
     try {

@@ -407,6 +407,8 @@
 - Offline peers are silently skipped (broadcast) or return null (pull); no error.
 - All peer connections are closed gracefully on stop(); pending pulls are rejected.
 - `partyId` is immutable; peers list is derived from options and cannot change post-construction.
+- Every WebSocket (the server's inbound sockets and the dialer's) has `maxPayload` = 4 MiB (`MAX_FRAME_BYTES`); the largest legitimate frame is about 1.4 MB. A larger frame closes the connection (1009).
+- A `pull-resp` resolves a pending pull only when it arrives on the connection the request went out on; a response from any other peer is ignored.
 - Inbound connections from non-peer source IPs are silently destroyed before the WS upgrade completes. The check runs in `WebSocketServer`'s synchronous `verifyClient` hook; on miss, the handler calls `info.req.socket.destroy()` and returns `false` so `ws` never writes the HTTP 401 response that returning `false` alone would produce. **Do NOT move this check to a `connection`-event handler** — by then the 101 upgrade is already on the wire and the silent-drop property is lost. The allowlist resolves at startup only; relay-only peers without an `endpoint` are skipped. The cryptographic layer (Noise-KK + P-256 pubkey book) is the security boundary; the allowlist is defense-in-depth against random scanners.
 
 **Cross-component contracts:**
@@ -500,6 +502,7 @@
 - Each ring maintains a roster (Map<partyId, WebSocket>).
 - First-come-first-served partyId slot per ring; duplicate partyId in same ring rejected (409).
 - Frame routing: only to peers in the same ring; target not connected → silent drop.
+- `maxPayload` = 4 MiB on every client socket; a larger message closes that client (1009).
 - Frame to self is rejected (400 error).
 - Peer joined/left events broadcast to all other members in the ring (excluding self).
 - Relay sees only opaque hex payloads; never validates or decrypts (Noise KK at peer layer provides auth).
@@ -564,6 +567,8 @@
 - Role: lower partyId is initiator (sends hs1 when peer appears), higher is responder (waits for hs1).
 - Peer status: disconnected → waiting-for-hs1 (responder) or waiting-for-hs2 (initiator after hs1) → connected.
 - Per-peer `processing` flag + `pending` FIFO queue serialize handshake and message dispatch (prevent counter race).
+- The relay socket has `maxPayload` = 4 MiB; a larger message from the relay closes it (as a relay drop).
+- A `pull-resp` resolves a pending pull only when it comes from the peer the pull was sent to; a response from any other peer is ignored.
 - Per-peer send chain serializes every frame to that peer — hs1, hs2 and seal-then-send of records — so frames reach the relay in counter order. A responder enqueues hs2 in the same synchronous step that makes the session usable, so no record overtakes it. A record queued under a session that has since been replaced is dropped, not sent.
 - Handshake: initiator sends message1 (raw 65-byte ephemeral, not encrypted), responder replies with message2 (also raw), then both derive AES-GCM session.
 - Peer roster discovered via relay's ack + peer-joined/peer-left events. Initiators trigger handshake on roster update (a join restarts any handshake in flight).

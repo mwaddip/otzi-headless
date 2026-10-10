@@ -2,6 +2,8 @@ import * as net from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { PartyId } from '../../core/types';
 import { generateIdentity, type IdentityKeyPair } from '../identity';
+import { WebSocket, WebSocketServer } from 'ws';
+import { encodePullResponse } from '../peer-mesh/wire';
 import { RelayServer } from './server';
 import { RelayTransport } from './relay-transport';
 
@@ -396,4 +398,80 @@ describe('RelayTransport — send ordering, transient failures and recovery', ()
       { timeout: 15_000, interval: 100 },
     );
   }, 40_000);
+});
+
+describe('RelayTransport / RelayServer — frame size and response binding', () => {
+  let server: RelayServer | null = null;
+  let nodes: RelayTestNode[] = [];
+  let extra: WebSocketServer | null = null;
+  afterEach(async () => {
+    await Promise.all(nodes.map((n) => n.transport.stop()));
+    nodes = [];
+    if (server) await server.stop();
+    server = null;
+    if (extra) await new Promise<void>((r) => extra!.close(() => r()));
+    extra = null;
+  });
+
+  it('the relay server drops a client that sends a frame over 4 MiB', async () => {
+    const port = await freePort();
+    server = new RelayServer({ listen: `127.0.0.1:${port}` });
+    await server.start();
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((r, j) => {
+      ws.once('open', () => r());
+      ws.once('error', j);
+    });
+    const closed = new Promise<number>((r) => ws.once('close', (code) => r(code)));
+    ws.on('error', () => {});
+    ws.send(JSON.stringify({ kind: 'hello', ringId: 'big', partyId: 0 }));
+    ws.send('x'.repeat(4 * 1024 * 1024 + 1));
+    expect(await closed).toBe(1009);
+  }, 20_000);
+
+  it('the relay client drops a relay that sends a message over 4 MiB', async () => {
+    const port = await freePort();
+    extra = new WebSocketServer({ host: '127.0.0.1', port });
+    extra.on('connection', (sock) => {
+      sock.on('error', () => {});
+      sock.once('message', () => sock.send('x'.repeat(4 * 1024 * 1024 + 1)));
+    });
+    await new Promise<void>((r) => extra!.once('listening', () => r()));
+    const identity = await generateIdentity();
+    const peer = await generateIdentity();
+    const transport = new RelayTransport({
+      self: { partyId: 0, identity },
+      relayUrl: `ws://127.0.0.1:${port}`,
+      ringId: 'big',
+      peers: [{ partyId: 1, publicKey: peer.publicKeyRaw }],
+    });
+    nodes = [{ partyId: 0, identity, transport }];
+    await transport.start();
+    await vi.waitFor(() => expect(relayInternals(transport).ws).toBeNull(), { timeout: 10_000, interval: 20 });
+  }, 20_000);
+
+  it('ignores a pull response that comes from another peer than the one pulled', async () => {
+    const port = await freePort();
+    server = new RelayServer({ listen: `127.0.0.1:${port}` });
+    await server.start();
+    nodes = await buildRelayRing(3, `ws://127.0.0.1:${port}`, 'ring-bind');
+    await Promise.all(nodes.map((n) => n.transport.start()));
+    await waitForRing(nodes);
+    // Node 1 never answers pulls.
+    (nodes[1]!.transport as unknown as { onIncoming: () => Promise<void> }).onIncoming = async () => {};
+    relayInternals(nodes[0]!.transport).pullTimeoutMs = 2_000;
+
+    const pending = nodes[0]!.transport.pull({ ceremonyId: 'c', round: 'r', from: 1 });
+    const pulls = (nodes[0]!.transport as unknown as { pendingPulls: Map<string, unknown> }).pendingPulls;
+    await vi.waitFor(() => expect(pulls.size).toBe(1), { timeout: 5_000, interval: 5 });
+    const [requestId] = [...pulls.keys()];
+    // Node 2 answers in node 1's place, over its own authenticated session with node 0.
+    const t2 = nodes[2]!.transport as unknown as {
+      peerStates: Map<PartyId, unknown>;
+      sendAppMessage(peer: unknown, bytes: Uint8Array): Promise<void>;
+    };
+    await t2.sendAppMessage(t2.peerStates.get(0), encodePullResponse(requestId!, new TextEncoder().encode('forged')));
+
+    await expect(pending).resolves.toBeNull();
+  }, 20_000);
 });

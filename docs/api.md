@@ -24,7 +24,10 @@ The operator API listens on a Unix domain socket by default:
 `[[triggers]] kind="http"` opts into a TCP listener. The parser enforces a
 loopback bind (`127.0.0.1`, `::1`, `localhost`); external binds are rejected at
 startup with a `ConfigError`. Loopback-only binding is what makes mTLS
-unnecessary: the daemon is reachable only from the local machine.
+unnecessary: the daemon is reachable only from the local machine. A request
+whose `Host` header is not a loopback name (`localhost`, `127.0.0.0/8`, `[::1]`)
+with the listener's port is answered `403` `{ "error": "forbidden host" }`, so
+a web page in a local browser cannot reach the API through DNS rebinding.
 
 When `[[triggers]] kind="http" auth_token_env="…"` is set, the daemon reads the
 token from that env var at startup and requires a matching
@@ -66,6 +69,7 @@ a fresh one.
 | `400` | `{ "error": "<detail>" }` | Malformed body, unknown op, unknown top-level field, invalid `ceremonyId` / `signers` / `proposal`, or a proposal this node's analysis rejects (the message comes from `analyzeProposal`). Nothing was announced to peers. |
 | `401` | `{ "error": "unauthorized" }` | HTTP trigger with `auth_token_env`, token missing or wrong. |
 | `403` | `{ "error": "gate rejected", "decision": "reject"\|"pending", "ceremonyId": "…" }` | This daemon's own gate did not approve. Nothing was announced to peers. See [`gates.md`](./gates.md). |
+| `403` | `{ "error": "forbidden host" }` | HTTP trigger: the `Host` header is not a loopback name with the listener's port. |
 | `405` | `{ "error": "method not allowed" }` | Non-POST method. |
 | `409` | `{ "error": "<detail>" }` | `vault-info` / `sign`: no vault is loaded (`no vault loaded — run otzi generate, then restart the daemon`). `dkg`: this node already holds a vault, or a DKG is already running on this node. `dkg` / `sign`: the `ceremonyId` is already in use on this node — by a live ceremony, or by one that ended here within its retention period (5 min signing, 15 min DKG). Nothing was announced to peers. |
 | `500` | `{ "error": "<detail>", "ceremonyId": "…" }` | Ceremony failure after the announce: a peer dropped or rejected, the ceremony deadline passed (`ceremony deadline of <ms> ms passed`, from `[deadlines]`), a blob failed sender binding, a signature failed verification. Check the daemon logs; the cause names the offending party where one is known. |

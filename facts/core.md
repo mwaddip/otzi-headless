@@ -196,6 +196,7 @@
   - `constructor(transport: Transport, store: BlobStore)`
     - **Pre:** transport and store are both live; at most one BlobServer per daemon (enforced by `Transport.servePulls`).
     - **Post:** Registers the pull handler `(from, key)`:
+      - `key.from !== transport.partyId` → `null`: this node serves only blobs it produced (a pull is addressed to the producer), never one it pulled from a peer;
       - `key.to !== undefined` and `from !== key.to` → `null`, whether or not the blob exists;
       - otherwise `store.get(key) ?? null`.
     - **Throws:** If transport already has a pull handler registered (InMemoryTransport throws).
@@ -207,6 +208,7 @@
 
 **Invariants:**
 - **Addressed-blob access:** a blob whose key has a `to` is served only to the authenticated requester equal to `to`. Blobs without `to` are served to any ring member (the transport delivers pulls only from ring members). DKG round-2 secret shares (`dkg-r2`) are the addressed blobs, so with `threshold < parties` no peer can collect another party's shares.
+- **Own blobs only:** a blob whose `from` is another party is never served, even though the store holds it (pulled blobs land in the same store).
 - A refused pull is indistinguishable from "not produced yet" (`null`).
 - BlobServer lifetime decouples blob availability from ceremony completion: a peer that finishes keeps serving its blobs to lagging peers until retention clears them.
 
@@ -462,7 +464,7 @@ export type CeremonyMessage = AnnounceDkg | AnnounceSign | SignoffDone | Signoff
 - `function aggregate(session) → Uint8Array[]`
   - **Pre:** Round 2 run; one share set collected for every active signer. Leader only (and every node in DKG verification).
   - **Post:** For each sighash, frots `signAggregate(shares, hash, commitments, publicKeyPackage, { tweaked })` with the full `publicKeyPackage`; returns one 64-byte BIP340 signature per sighash, in sighash order. Cached on repeated calls.
-  - **Throws:** On missing shares, or a frots verification failure naming the cheating identifier (needs the full `verifyingShares`).
+  - **Throws:** On missing shares, or `Error('signature aggregation for input <i> failed: <frots message>')` where every FROST identifier frots names (`signer(s): 3`, `signer 3`) is rewritten to the party id (`party(ies) 2`, `party 2`): the cheater identification (needs the full `verifyingShares`) reaches errors and `signoff-aborted` reasons in party ids, like every other message.
 
 - `function addBlob(session, blob: string, expectedRound: FrostSignRound, from: PartyId) → { ok: true } | { ok: false; error: string }`
   - **Pre:** `from` is the authenticated producer the blob was pulled from; session not destroyed.

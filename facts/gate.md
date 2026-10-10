@@ -69,14 +69,14 @@
 - `interface PolicyGateOptions { now?: () => number; loadAddressBook?: () => Promise<string[]>; logger?: Logger }`
   - `now` defaults to `Date.now` (injectable for window tests).
   - `loadAddressBook` returns the addresses in this node's address book; required for `allowedRecipients === 'address-book'`. It rejects (throws) when the book cannot be loaded, including when the book file does not exist.
-  - `logger` (`Logger` / `NOOP_LOGGER` from `src/orchestrator/types.ts`, default `NOOP_LOGGER`) receives the warning the `"address-book"` rule logs when it rejects for a missing dependency or a failed load.
+  - `logger` (`Logger` / `NOOP_LOGGER` from `src/orchestrator/types.ts`, default `NOOP_LOGGER`) receives the warning the `"address-book"` rule logs when it rejects for a missing dependency or a failed load, and the warning for a spec the rules could not evaluate.
 
 - `class PolicyGate implements ApprovalGate`
   - **Constructor:** `new PolicyGate(config: PolicyConfig, opts?: PolicyGateOptions)`. Never throws.
 
 - `PolicyGate.approve(spec)` — async
   - **Pre:** `spec` built by `spec-builder.ts`.
-  - **Post:** `'approve'` iff every active rule passes; `'reject'` otherwise. Never `'pending'`. Never throws.
+  - **Post:** `'approve'` iff every active rule passes; `'reject'` otherwise. Never `'pending'`. Never throws: an unexpected error while evaluating the rules (a malformed spec, a `null` output) is logged at warn level (`policy: signing <ceremonyId> rejected: the rules could not be evaluated: <reason>`) and answered `'reject'`.
   - **Signing rules:**
 
     | Key (`[gate]`) | Field | Rule |

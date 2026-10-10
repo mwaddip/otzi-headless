@@ -130,6 +130,8 @@ export class Orchestrator {
       // Cut short without an outcome: the late rejection of its ceremony is ignored.
       t.settled = true;
       this.halt(t);
+      // Its blobs (DKG round-2 secret shares included) still leave the store.
+      scheduleClear(this.deps.io.store, t.ceremonyId, this.retentionMs(t.kind));
     }
     this.trackers.clear();
     for (const { timer } of this.ended.values()) clearTimeout(timer);
@@ -276,6 +278,8 @@ export class Orchestrator {
     const drop = (level: LogLevel, reason: string) => this.drop(level, msg.kind, ceremonyId, from, reason);
     const ringSize = this.deps.peersById.size;
 
+    // The transport authenticates ring members; this check keeps it that way here.
+    if (!this.deps.peersById.has(from)) return drop('warn', `party ${from} is not a ring member`);
     if (this.isDuplicate(from, msg, 'dkg')) return;
     if (this.dkgLive()) return drop('warn', 'a DKG is already running on this node');
     if (network !== this.deps.network) return drop('warn', `network ${network} does not match ${this.deps.network}`);

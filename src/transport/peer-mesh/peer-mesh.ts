@@ -26,6 +26,7 @@ import { PeerAllowlist } from './allowlist';
 import { PeerConnection } from './connection';
 import {
   broadcastBytes,
+  MAX_FRAME_BYTES,
   encodeBroadcast,
   encodePullRequest,
   encodePullResponse,
@@ -140,6 +141,7 @@ export class PeerMeshTransport implements Transport {
     const server = new WebSocketServer({
       host: this.listenHost,
       port: this.listenPort,
+      maxPayload: MAX_FRAME_BYTES,
       // Synchronous verifyClient runs BEFORE ws writes the HTTP 101 upgrade
       // response. Returning false makes ws abort with 401 — but we destroy
       // the socket first so the response never reaches the wire (truly
@@ -364,7 +366,7 @@ export class PeerMeshTransport implements Transport {
     }
 
     conn.onMessage((msg) => {
-      this.handleAppMessage(peer, msg);
+      this.handleAppMessage(peer, msg, conn);
     });
     conn.onClose(() => {
       // No response can arrive on a closed connection: its pulls end now, not at their timeout.
@@ -401,7 +403,8 @@ export class PeerMeshTransport implements Transport {
   // Internal — message dispatch
   // ─────────────────────────────────────────────────────────────────────
 
-  private handleAppMessage(peer: PeerState, msg: AppMessage): void {
+  /** `conn` is the connection `msg` arrived on (authenticated as `peer`). */
+  private handleAppMessage(peer: PeerState, msg: AppMessage, conn: PeerConnection): void {
     switch (msg.kind) {
       case 'broadcast': {
         const payload = broadcastBytes(msg);
@@ -428,7 +431,15 @@ export class PeerMeshTransport implements Transport {
         return;
       }
       case 'pull-resp': {
-        if (!this.pendingPulls.has(msg.requestId)) return;
+        const pending = this.pendingPulls.get(msg.requestId);
+        if (!pending) return;
+        // Only the peer that was asked may answer.
+        if (pending.conn !== conn) {
+          this.log.warn('peer-mesh: dropped a pull response from a peer the pull was not sent to', {
+            peerPartyId: peer.partyId,
+          });
+          return;
+        }
         this.settlePull(msg.requestId, pullResponseBlob(msg));
         return;
       }

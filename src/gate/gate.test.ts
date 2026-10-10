@@ -1439,3 +1439,15 @@ function isAlive(pid: number): boolean {
     return false;
   }
 }
+
+describe('PolicyGate — unexpected input', () => {
+  it('rejects, never throws, on a spec it cannot evaluate', async () => {
+    const warnings: string[] = [];
+    const logger: Logger = { ...NOOP_LOGGER, warn: (msg) => warnings.push(msg) };
+    const gate = new PolicyGate({ allowedRecipients: [RECIPIENT_A] }, { logger });
+    const broken = { ...signing(), outputs: [null] } as unknown as SigningSpec;
+    await expect(gate.approve(broken)).resolves.toBe('reject');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/^policy: signing ceremony-1 rejected: the rules could not be evaluated: /);
+  });
+});

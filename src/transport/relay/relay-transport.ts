@@ -38,6 +38,7 @@ import {
 import { RecordSession } from '../record';
 import {
   broadcastBytes,
+  MAX_FRAME_BYTES,
   encodeBroadcast,
   encodePullRequest,
   encodePullResponse,
@@ -162,7 +163,7 @@ export class RelayTransport implements Transport {
 
   async start(): Promise<void> {
     if (this.ws) return;
-    const ws = new this.wsCtor(this.relayUrl);
+    const ws = new this.wsCtor(this.relayUrl, { maxPayload: MAX_FRAME_BYTES });
     this.ws = ws;
 
     await new Promise<void>((resolve, reject) => {
@@ -574,7 +575,15 @@ export class RelayTransport implements Transport {
         return;
       }
       case 'pull-resp': {
-        if (!this.pendingPulls.has(msg.requestId)) return;
+        const pending = this.pendingPulls.get(msg.requestId);
+        if (!pending) return;
+        // Only the peer that was asked may answer.
+        if (pending.peer !== peer.partyId) {
+          this.log.warn('relay-transport: dropped a pull response from a peer the pull was not sent to', {
+            peerPartyId: peer.partyId,
+          });
+          return;
+        }
         this.settlePull(msg.requestId, pullResponseBlob(msg));
         return;
       }

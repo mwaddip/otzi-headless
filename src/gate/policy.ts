@@ -96,12 +96,23 @@ export class PolicyGate implements ApprovalGate {
   }
 
   async approve(spec: CeremonySpec): Promise<Decision> {
-    if (spec.kind === 'dkg') return this.approveDkg(spec);
-    // The address book is read before, never during, the rules: every rule is checked
-    // and the approval recorded in one synchronous section (`approveSigning`), so
-    // concurrent evaluations cannot both pass a cap.
-    const book = this.config.allowedRecipients === 'address-book' ? await this.readBook(spec) : undefined;
-    return this.approveSigning(spec, book);
+    try {
+      if (spec.kind === 'dkg') return this.approveDkg(spec);
+      // The address book is read before, never during, the rules: every rule is checked
+      // and the approval recorded in one synchronous section (`approveSigning`), so
+      // concurrent evaluations cannot both pass a cap.
+      const book = this.config.allowedRecipients === 'address-book' ? await this.readBook(spec) : undefined;
+      return this.approveSigning(spec, book);
+    } catch (err) {
+      // A spec the rules cannot evaluate (a null output, a missing field) is a reject, never a throw.
+      this.log.warn(
+        `policy: ${spec?.kind ?? 'unknown'} ${spec?.ceremonyId ?? '?'} rejected: the rules could not be evaluated: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        { ceremonyId: spec?.ceremonyId },
+      );
+      return 'reject';
+    }
   }
 
   /** This node's address book addresses, or `null` (with a warning) when there is no usable book. */

@@ -90,6 +90,9 @@ export async function loadVaultShare(
       cause: err,
     });
   }
+  if (share.network !== network) {
+    throw new Error(`share file ${path} is for ${share.network}, [network].name is ${network}`);
+  }
   assertShareMatchesVault(share, network);
   return share;
 }

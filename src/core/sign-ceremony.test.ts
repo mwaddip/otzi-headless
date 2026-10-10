@@ -252,8 +252,8 @@ describe('proposal signing ceremony', () => {
       participateInSigning(ring[2]!.io, spec(2, sighashes)),
     ]);
 
-    // frots names the FROST identifier: 3 is party 2.
-    expect(reasonOf(out[0])).toMatch(/invalid share\(s\) from signer\(s\): 3$/);
+    // frots names the FROST identifier (3); the error names the party (2).
+    expect(reasonOf(out[0])).toMatch(/^signature aggregation for input 0 failed: .*invalid share\(s\) from party\(ies\) 2$/);
   });
 
   it('a signer that signed a different sighash makes the leader abort', async () => {
@@ -267,7 +267,7 @@ describe('proposal signing ceremony', () => {
       participateInSigning(ring[2]!.io, spec(2, other)),
     ]);
 
-    expect(reasonOf(out[0])).toMatch(/invalid share\(s\) from signer\(s\): 3$/);
+    expect(reasonOf(out[0])).toMatch(/invalid share\(s\) from party\(ies\) 2$/);
   });
 
   it('a signature that does not verify against the vault key makes the leader throw', async () => {

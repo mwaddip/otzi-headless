@@ -309,6 +309,8 @@ absolute UDS path. External binds are rejected at parse time.
 | `bind` | string | `host:port`. Loopback enforced — `0.0.0.0` and external IPs are rejected. |
 | `auth_token_env` | string, optional | When set, the daemon requires `Authorization: Bearer <value-of-env>` on every request. Missing env at startup → refuse to start. |
 
+Requests must carry a `Host` header naming a loopback host with the listener's port (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`); anything else gets `403` (DNS-rebinding protection).
+
 ### `kind = "cron"`
 
 | Key | Type | Notes |

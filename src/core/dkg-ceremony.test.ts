@@ -583,7 +583,9 @@ describe('runDkgCeremony with real share stagers: no lost share', () => {
 
   it('a node that hears signoff-aborted after its own confirmation keeps its staged share', async () => {
     const stagers = [0, 1, 2].map(i => stagerFor(i));
-    const sigs = signals();
+    // Node 0 sends the abort, as a failing node would; its own ceremony stops with it.
+    const sender = new AbortController();
+    const sigs = signals().map((s, i) => (i === 0 ? AbortSignal.any([s, sender.signal]) : s));
     // Node 1 waits for node 2's confirmation; meanwhile node 0 announces an abort.
     const pull = ring[1]!.io.transport.pull.bind(ring[1]!.io.transport);
     ring[1]!.io.transport.pull = async key =>
@@ -594,6 +596,7 @@ describe('runDkgCeremony with real share stagers: no lost share', () => {
       () => expect(ring[1]!.io.store.has({ ceremonyId, round: DKG_ROUNDS.verified, from: 1 })).toBe(true),
       { timeout: 15_000, interval: 5 },
     );
+    sender.abort();
     await ring[0]!.io.transport.broadcast(
       encodeMessage({ v: 2, kind: 'signoff-aborted', ceremonyId, reason: 'operator abort' }),
     );
@@ -603,9 +606,12 @@ describe('runDkgCeremony with real share stagers: no lost share', () => {
     const err = keptError(out[1]);
     expect(err.reason).toBe('aborted');
     expect(existsSync(sharePath(1))).toBe(false);
-    // Whatever the others did, no node that published its confirmation lost its share.
+    // Whatever the others did: a node that published its confirmation still holds its share
+    // (committed or staged); one that had not has discarded its staged share.
     for (const i of [0, 2]) {
-      expect(existsSync(sharePath(i)) || existsSync(pendingPath(sharePath(i)))).toBe(true);
+      const confirmed = ring[i]!.io.store.has({ ceremonyId, round: DKG_ROUNDS.verified, from: i });
+      const holds = existsSync(sharePath(i)) || existsSync(pendingPath(sharePath(i)));
+      expect(holds, `node ${i} (confirmed: ${confirmed})`).toBe(confirmed);
     }
   }, REAL_STAGER_TEST_MS);
 });

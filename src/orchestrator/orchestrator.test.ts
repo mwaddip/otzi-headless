@@ -363,6 +363,32 @@ describe('Orchestrator: DKG participation', () => {
     await eventually(() => expect(p1.stagers[0]!.calls).toEqual(['discard']));
   });
 
+  it('drops announce-dkg from a sender outside the ring', async () => {
+    const big = makeRing(4, LEADER_PULLS);
+    // Node 1's ring is parties 0..2: party 3 is not a member.
+    const p1 = participant(big[1]!);
+
+    await broadcastFrom(big, 3, announceDkg('dkg-stranger', new Uint8Array(32).fill(1)));
+
+    expect(p1.log.about('dkg-stranger')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about('dkg-stranger')[0]!.msg).toMatch(/party 3 is not a ring member/);
+    expect(p1.createStager).not.toHaveBeenCalled();
+    expect(p1.gate.specs).toEqual([]);
+    await expect(p1.orch.waitFor('dkg-stranger', 50)).rejects.toThrow(/timed out/);
+  });
+
+  it('stop() schedules the clear of a live ceremony\'s blobs', async () => {
+    const id = 'dkg-stopped';
+    const p1 = participant(ring[1]!, { blobRetentionMs: { signing: 50, dkg: 50 } });
+
+    // The announcing node never takes part: node 1 produces its round-1 blob and waits.
+    await broadcastFrom(ring, 0, announceDkg(id, new Uint8Array(32).fill(11)));
+    await eventually(() => expect(ring[1]!.io.store.list(id).length).toBeGreaterThan(0));
+    p1.orch.stop();
+
+    await eventually(() => expect(ring[1]!.io.store.list(id)).toEqual([]));
+  });
+
   it('accepts a fresh DKG after a leftover pending file', async () => {
     const id = 'dkg-pending';
     const dir = await mkdtemp(join(tmpdir(), 'otzi-orchestrator-'));
