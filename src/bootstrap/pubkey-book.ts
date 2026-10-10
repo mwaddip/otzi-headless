@@ -5,7 +5,8 @@
  * by `partyId` (canonical order) so all nodes compute byte-identical
  * fingerprints. The fingerprint is what operators eyeball across nodes to
  * confirm no silent MitM of the bootstrap exchange — truncated SHA-256 over
- * the raw pubkey bytes in partyId order, rendered as 8 hex chars.
+ * the raw pubkey bytes in partyId order, rendered as 96 bits in the form
+ * `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx`.
  *
  * On-disk format: pretty-printed JSON, operator-readable.
  */
@@ -70,8 +71,10 @@ export function parseBook(text: string): PubkeyBook {
 }
 
 /**
- * 8-char hex fingerprint — truncated SHA-256 over the sorted raw pubkey bytes.
- * Operators compare this across all nodes after bootstrap; mismatch = abort + redo.
+ * 96-bit fingerprint — first 12 bytes of SHA-256 over the raw pubkey bytes in
+ * book order (ascending partyId), as lowercase hex in six groups of 4 joined
+ * by `-`. Operators compare this across all nodes after bootstrap; mismatch =
+ * abort + redo.
  */
 export async function computeFingerprint(book: PubkeyBook): Promise<string> {
   let total = 0;
@@ -91,7 +94,8 @@ export async function computeFingerprint(book: PubkeyBook): Promise<string> {
     'SHA-256',
     new Uint8Array(concat).buffer as ArrayBuffer,
   );
-  return toHex(new Uint8Array(hashBuf).slice(0, 4));
+  const hex = toHex(new Uint8Array(hashBuf).slice(0, 12));
+  return Array.from({ length: 6 }, (_, i) => hex.slice(i * 4, i * 4 + 4)).join('-');
 }
 
 function validateEntry(e: PubkeyBookEntry, path: string): void {
