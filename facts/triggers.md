@@ -46,7 +46,7 @@
 
 **Invariants:**
 - Trigger sources are stateless; they emit to handler-supplied callbacks.
-- Handlers own all ceremony logic (gate, runner invocation, persistence).
+- Handlers own all ceremony logic (request parsing, gate, ceremony dispatch, share staging).
 - Errors in handlers are NOT propagated back to the trigger (best-effort execution).
 - Trigger sources must be stopped before process exit to avoid resource leaks.
 
@@ -56,7 +56,7 @@
 
 **Notes / gotchas:**
 - Chain-watching is NOT a trigger source (daemon is a signing backend, not autonomous).
-- Triggers are generic; ceremony dispatch logic lives in the handler (phase 5e wires it).
+- Triggers are generic; ceremony dispatch logic lives in the handler (the daemon's `buildDefaultHttpHandler`).
 
 ---
 
@@ -114,7 +114,7 @@
 
 **Notes / gotchas:**
 - No HTTPS / mTLS (operator configures reverse proxy or OS-level firewall).
-- Max body is 1MB; OPNet params blobs should fit comfortably.
+- Max body is 1MB; a `sign` request (one `SendProposal` of at most 255 inputs) fits comfortably.
 - Errors in the handler (e.g., ceremony failure) are user-level; HTTP itself doesn't fail (status 500 carries the error message).
 - Port 0 is supported for tests; `address()` returns actual bound port.
 

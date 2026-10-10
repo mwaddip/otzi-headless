@@ -1,532 +1,511 @@
-# Contracts: src/daemon/
+# Contracts: src/daemon/, src/cli/
 
 > Global invariants and the rule of engagement live in [../INTERFACES.md](../INTERFACES.md). Update this file before changing any contract surface in this subsystem.
 
 ## src/daemon/
 
 ### `config-merge.ts`
-**Purpose:** Loads daemon TOML config + optional share file, assembles `LoadedDaemonState`, binds the post-DKG persistence sink.
+**Purpose:** Loads the daemon TOML config, the share password and the v4 share (if present) into `LoadedDaemonState`.
 
 **Public surface:**
-- `LoadedDaemonState`
-  - **Pre:** Config loaded; share optionally decrypted.
-  - **Post:** Carries config, share (undefined in DKG-only mode), FROST public material, optional `frostLegacySig`, persistence sink (when from `validateLoaded`), and optional `bootstrapSecret`.
-  - **Invariant:** `share` presence gates signing ceremonies; DKG-only mode has share == undefined. `peersById` was removed in Phase F — it lives on `TransportBundle.peersById` now, built from the pubkey book at startup.
+- `interface LoadedDaemonState { config: DaemonConfig; share?: DecryptedShare; password: string }`
+  - **Post:** `share` is the decrypted v4 share, checked against `config.network.name`; `undefined` on a node without a vault (no file at `[share].path`). `password` is kept in memory so a DKG on this node can encrypt its new share with it.
+  - **Invariant:** `share` presence gates signing; a node without a share can run the run-once DKG.
 
-- `loadAndValidate(configPath, options): Promise<LoadedDaemonState>`
-  - **Pre:** Config file path is valid; share password is in env var named by `[share].password_env`.
-  - **Post:** Loads TOML, attempts to read share file, returns full state.
-  - **Throws:** `Error` on TOML parse, share JSON parse, share decrypt, missing password env.
-  - **Share-missing branch:** If share file does not exist (ENOENT), enters DKG-only mode; builds state without share but with persistence sink ready for post-DKG write.
-
-- `validateLoaded(config, options): Promise<LoadedDaemonState>`
-  - **Pre:** Config is already parsed `DaemonConfig`; password is in env var.
-  - **Post:** Same as `loadAndValidate` (file read skipped).
-
-- `buildStateFromShare(config, share): LoadedDaemonState`
-  - **Pre:** `share` is decrypted.
-  - **Post:** Builds FROST public material if a FROST key package is present; returns state WITHOUT persistence sink.
-  - **Invariant:** Test-friendly (no disk I/O). No config-vs-share alignment check happens here — that moved to `transport-factory.resolveSelfFromBook` (which compares `share.partyId` against the authoritative `selfBookEntry.partyId`).
-
-- `buildStateNoShare(config): LoadedDaemonState`
-  - **Pre:** Daemon has no share file (DKG-only mode).
-  - **Post:** Returns state without share, FROST material, or persistence sink.
-
-- **Phase F note: validateAlignment removed**
-  - Previous validation invariants (share.partyId === config.node.partyId, peers-count match, contiguous partyIds spanning `[0, share.parties)`) all required operator-typed `partyId` fields that no longer exist in `DaemonConfig`. The single residual cross-check — that `share.partyId` matches the loaded identity's slot in the ring — is now enforced by `transport-factory.resolveSelfFromBook`, which looks up the identity in the book by pubkey and asserts `share.partyId === selfBookEntry.partyId`. The book is the authoritative source for partyId post-Phase-F.
-
-- **Frost legacy sig extraction** (from share file JSON)
-  - **Pre:** Share file is parsed as JSON.
-  - **Post:** Extracts top-level `frostLegacySig` hex field; validates it's a valid hex string (non-empty).
-  - **Throws:** `Error` if field is present but invalid.
-  - **Invariant:** Absence is OK (returns undefined); field is a daemon-side add-on, not part of Ötzi's V3 byte format.
+- `async loadAndValidate(configPath: string, options?: { env?: Readonly<Record<string, string | undefined>> }): Promise<LoadedDaemonState>`
+  - **Pre:** `configPath` is a readable `daemon.toml`. The share password is in the env var named by `[share].password_env` (`options.env`, default `process.env`).
+  - **Post:** Config parsed (`parseDaemonConfigToml`); `share = await loadVaultShare(config.share.path, password, config.network.name)`; a `.pending` file next to the share path is reported through `warnOnPendingShare` and never loaded.
+  - **Throws:** `ConfigError` / TOML errors; `Error` naming the env var when the password is missing or empty; every `loadVaultShare` error (wrong password, network mismatch, corrupted file).
 
 **Invariants:**
-- Share file is optional; its absence triggers DKG-only mode, not failure.
-- Password env var MUST be set (used for both existing share decrypt and future DKG output encrypt).
-- FROST public material is derived from FROST key package (if present); external supply overrides.
-- Persistence sink is pre-bound at load time; captures password + path in closure.
+- The password env var MUST be set even without a share (the DKG encrypts the new share with it).
+- No partial state: a share that fails any check refuses startup; it is never treated as "no vault".
 
 **Cross-component contracts:**
-- Depends on: TOML loader, share crypto (`decryptShareFile`), FROST reconstruct.
-- Used by: `entrypoint.ts` (loadAndValidate), `Daemon` constructor (passes state).
-
-**Notes / gotchas:**
-- `buildStateFromShare` is used by tests that inject a pre-built share (dealerKeygen result).
-- `frostLegacySig` is piggy-backed on the V3 envelope; Ötzi's decoder tolerates unknown keys.
-- DKG-only mode is a full operational mode (daemon can orchestrate + lead DKG); signing is rejected + logged.
-
-**Bootstrap-secret lifecycle (phase 9a)**
-- **Load:** `loadAndValidate` (in `config-merge.ts`) optionally reads `/var/lib/otzi/bootstrap-secret` if it exists. Stored on `LoadedDaemonState.bootstrapSecret: string | undefined`. ENOENT is fine — secret may have been wiped post-DKG.
-- **Use:** Phase 9c's control-plane wire opcode verifies the operator-typed shared secret via HMAC-SHA-256. Phase 9a only loads it; 9c consumes it.
-- **Wipe:** `share-persistence.persistCombinedDkgShare` `unlink()`s `/var/lib/otzi/bootstrap-secret` after the share is durably written. Daemon's in-memory `bootstrapSecret` is also cleared. Subsequent control-plane attempts get a defined "control plane closed" error.
-- **Reentrancy:** ENOENT on unlink is silently ignored (idempotent on retries / repeat DKG).
+- Depends on: `loadDaemonConfig` / `parseDaemonConfigToml`, `vault-share.ts`.
+- Used by: `entrypoint.ts` (`runDaemonCommand`), tests.
 
 ---
 
-### `share-persistence.ts`
-**Purpose:** Persists combined-DKG result to disk as an Ötzi-compatible V3 encrypted file, with chmod 0600 + parent mkdir.
+### `vault-share.ts`
+**Purpose:** Load, stage, commit and discard v4 share files.
 
 **Public surface:**
-- `persistCombinedDkgShare(args): Promise<void>`
-  - **Pre:** `args.result` is CombinedDkgResult (mldsa.share, mldsa.publicKey, frost.keyPackage, frost.keyPackage.verifyingKey populated); threshold, parties, level are positive integers; path is writable (or parent is); password is set.
-  - **Post:** Encrypts share via `encryptShareV3` (Ötzi compat); adds `frostLegacySig` hex as top-level field; creates parent directory; writes JSON with mode 0600; applies explicit chmod after write (belt-and-suspenders against umask).
-  - **Throws:** `Promise` rejection on mkdir / writeFile / chmod failure.
-  - **Invariant:** File is overwritten (no append); parent directory is created if missing (recursive).
+- `pendingPath(path: string): string`
+  - **Post:** `` `${path}.pending` ``.
 
-- **File format**
-  - V3 envelope produced by `encryptShareV3` (Ötzi-compatible byte structure, JSON-serialized).
-  - Extra top-level `frostLegacySig` field (hex string) piggybacked outside the byte-compat format.
-  - JSON pretty-printed (2-space indent).
+- `async vaultFileExists(path: string): Promise<boolean>`
+  - **Post:** `true` iff a file system entry exists at `path`; `false` on ENOENT.
+  - **Throws:** Any other `stat` error.
 
-- **Permissions**
-  - File mode is explicitly set to 0o600 (owner read/write only) at construction time AND after write (explicit chmod).
-  - Parent directory is created with default permissions (recursive mkdir).
-
-**Invariants:**
-- Persistence is best-effort; errors do NOT abort the ceremony (participant-side behavior) but DO propagate to caller on leader side.
-- Chmod is applied twice (once in writeFile options, once explicitly) to defend against umask.
-- `frostLegacySig` is a daemon-side add-on; not part of Ötzi's canonical V3 byte format, but `decryptShareFile` + loader tolerate unknown JSON keys.
-
-**Cross-component contracts:**
-- Depends on: `encryptShareV3`, dkg utilities (getKL), hex encoding.
-- Called by: `LeaderDispatcher.runCombinedDkg`, `Orchestrator.dispatchCombinedDkg` (both via pre-bound sink).
-
-**Notes / gotchas:**
-- `frostLegacySig` is populated from `CombinedDkgResult.frostLegacySig` (produced by runner); if absent, field is not added to JSON.
-- Parent mkdir is recursive; supports operator workflows that point at e.g. `/etc/otzi/share.json` on a fresh box.
-- File is synchronously readable after Promise resolves (await ensures chmod has finished).
-
----
-
-### `control-plane.ts`
-**Purpose:** Bootstrap-window-only control-plane handlers. Currently: `manifest-push` (Phase 9c). Verifies HMAC, validates schema, atomically installs the pushed manifest.
-
-**Public surface:**
-- `ControlPlane` (class)
-  - **Constructor(opts: ControlPlaneOpts = {})**
-    - `secretPath` defaults to `/var/lib/otzi/bootstrap-secret`; tests override.
-    - `manifestPath` defaults to `/etc/otzi/manifest.otzi.json`; tests override.
-    - `logger` defaults to `NOOP_LOGGER`.
-- `installPushedManifest(input: { manifest: string; hmacHex: string }): Promise<void>`
-  - **Pre:** Caller has decoded the wire message; `manifest` is verbatim text, `hmacHex` is the asserted HMAC.
-  - **Post:** On success, manifest is at `manifestPath` (chmod 0o660, atomic write via `.tmp` + rename). Idempotent on byte-identical existing manifest (no-op write, info log).
+- `async loadVaultShare(path: string, password: string, network: NetworkName): Promise<DecryptedShare | undefined>`
+  - **Post:** Reads the JSON at `path`, `decryptShareFile(raw, password)`, `assertShareMatchesVault(share, network)`; returns the share. Returns `undefined` when `path` does not exist (ENOENT).
   - **Throws:**
-    - `ControlPlaneClosed` — `bootstrap-secret` file missing or empty (post-DKG).
-    - `HmacMismatch` — HMAC verify failed (constant-time compare via `timingSafeEqual`).
-    - `ManifestRejected` — JSON parse or schema validation failure.
-    - `ManifestExists` — a different manifest already installed at `manifestPath` (operator must `otzi uninstall` locally first).
+    - wrong password → `Error('cannot decrypt share file <path>: wrong password or corrupted file')`;
+    - network mismatch → `assertShareMatchesVault`'s `Error('This share file belongs to a different vault')`;
+    - other read, JSON or `decryptShareFile` validation errors.
+
+- `async warnOnPendingShare(path: string, log: Logger): Promise<void>`
+  - **Post:** When `pendingPath(path)` exists, logs one warn line naming it: it is left over from an unfinished DKG, is not loaded, and the next DKG overwrites it. Otherwise does nothing.
+
+- `interface ShareStagerOptions { path: string; password: string; network: NetworkName; partyId: PartyId; vaultPubkeyPath?: string }`
+
+- `createShareStager(opts: ShareStagerOptions): ShareStager`
+  - **`stage(r)`:** writes `JSON.stringify(await encryptShareFile(r.keyPackage, r.publicKeyPackage, network, partyId, password))` to `pendingPath(path)` with mode 0600, creating the parent directory and overwriting any earlier `.pending`.
+  - **`commit()`:**
+    - **Pre:** `stage` resolved.
+    - **Post:** `pendingPath(path)` renamed to `path`; then `writeVaultPubkeyFile(vaultPubkeyFromPackage(r.publicKeyPackage, network), vaultPubkeyPath)`.
+    - **Throws:** `Error('share path already exists: <path>')` when a file exists at `path` (nothing renamed).
+  - **`discard()`:** removes `pendingPath(path)`; ENOENT is ignored.
 
 **Invariants:**
-- HMAC compare is constant-time. HMAC computed as `HMAC-SHA-256(secret, manifestText)` with the secret read fresh from disk per request (so the post-DKG wipe takes effect immediately, no daemon-restart needed).
-- Manifest is written verbatim — no canonicalization. The HMAC is over the exact bytes the operator sent.
-- Trailing-whitespace tolerance on `existing.trim() !== input.manifest.trim()` so an existing file with a trailing newline is still considered identical.
+- A share reaches `path` only through `commit`, i.e. only after the DKG's all-N confirmation.
+- Share files are mode 0600 from the first byte written (`.pending` and after the rename).
+- Share files are byte-compatible with web Ötzi in both directions.
 
 **Cross-component contracts:**
-- Depends on: `validateManifest` from `src/cli/manifest-validate.ts` (reuses the same schema check as `otzi install`); `node:crypto` for HMAC + constant-time compare.
-- Used by: `Daemon`'s `op:'sync'` HTTP handler (local install path) and `Orchestrator.handleManifestPush` (remote-receive path).
-
-**Lifecycle:**
-- The `bootstrap-secret` is created by 9a's debconf flow at install time; persisted at `/var/lib/otzi/bootstrap-secret` chmod 660 root:otzi.
-- `share-persistence.persistCombinedDkgShare` `unlink()`s the file on first successful DKG completion (Phase 9a.5).
-- After the unlink, every `installPushedManifest` call throws `ControlPlaneClosed` — the control plane is permanently closed for that federation.
+- Depends on: `encryptShareFile`, `decryptShareFile`, `assertShareMatchesVault` (`src/otzi/lib/share-file.ts`), `vault-pubkey.ts`.
+- Used by: `config-merge.ts` (`loadVaultShare`, `warnOnPendingShare`), `Daemon` (`vaultFileExists`, `createShareStager` for orchestrator and leader).
 
 ---
 
 ### `vault-pubkey.ts`
-**Purpose:** Writes the operator-facing vault metadata cache `/var/lib/otzi/vault-pubkey.json`. Cache exists so the CLI (`otzi vault` / `otzi btc balance` / `otzi op20 balance` / `otzi btc send`) can answer "what's our vault address?" without ever decrypting the share file.
+**Purpose:** The public vault metadata file `/var/lib/otzi/vault-pubkey.json`, so the CLI can build transactions and show the vault without decrypting the share.
 
 **Public surface:**
-- `writeVaultPubkeyFile(input): Promise<void>`
-  - **Pre:** `input.network` is a valid `NetworkName`; `input.frostUntweakedPubKey` is the 33B SEC1 untweaked aggregate FROST pubkey; `input.frostTweakedPubKey` is the 32B x-only post-tweak (or 33B SEC1, both accepted as raw bytes for hex-encoding); `input.mldsaPubKey` is the raw ML-DSA public key bytes.
-  - **Post:** Creates parent dir (recursive); writes JSON with mode 0o644. Schema:
+- `const DEFAULT_VAULT_PUBKEY_PATH = '/var/lib/otzi/vault-pubkey.json'`
+
+- `interface VaultPubkeyFile { network: NetworkName; address: string; internalKey: string; outputKey: string; threshold: number; parties: number; vaultKey: VaultKey }`
+  - **Schema:**
     ```json
     {
-      "network": "mainnet" | "testnet" | "regtest",
-      "btcAddress": "<bech32m P2TR>",
-      "opnetAddress": "0x<64 hex>",
-      "frostUntweakedPubKey": "<hex>",
-      "frostTweakedPubKey": "<hex>",
-      "mldsaPubKeyHex": "<hex>"
+      "network": "mainnet" | "testnet4" | "signet",
+      "address": "<bech32m P2TR, bc1p… / tb1p…>",
+      "internalKey": "<33-byte SEC1 hex = vaultKey.untweakedVerifyingKey>",
+      "outputKey": "<32-byte x-only hex = vaultPayment(vaultKey, network).outputKey>",
+      "threshold": 3,
+      "parties": 3,
+      "vaultKey": { "minSigners": 3, "verifyingKey": "…", "untweakedVerifyingKey": "…", "verifyingShares": {…}, "untweakedVerifyingShares": {…} }
     }
     ```
-  - **Trigger:** Written (overwriting) on every `loadAndValidate` (daemon startup post share decrypt) AND post-DKG via `share-persistence.persistCombinedDkgShare`.
-  - **Permissions:** chmod 0o644 (world-readable) — values are public (BTC address, OPNet address, ML-DSA pubkey, FROST aggregate pubkeys). The CLI reads the file as the operator user; group + world readability avoids needing operator-group elevation for read-only commands.
-  - **Output path override:** Callers may pass `outputPath` (defaults to `/var/lib/otzi/vault-pubkey.json`); production paths use the default.
+    `vaultKey` is Ötzi's public `VaultKey`, needed by `buildSend` in the CLI.
+
+- `vaultPubkeyFromPackage(publicKeyPackage: PublicKeyPackage, network: NetworkName): VaultPubkeyFile`
+  - **Post:** `vaultKey = toVaultKey(publicKeyPackage)`; `address` / `outputKey` from `vaultPayment(vaultKey, network)`; `internalKey = vaultKey.untweakedVerifyingKey`; `threshold = minSigners`; `parties` = number of verifying shares.
+  - **Throws:** Never.
+
+- `async writeVaultPubkeyFile(file: VaultPubkeyFile, outputPath?: string): Promise<void>`
+  - **Post:** Creates the parent directory; writes pretty-printed JSON at `outputPath` (default `DEFAULT_VAULT_PUBKEY_PATH`) with mode 0644 (chmod applied after write).
+
+- `async readVaultPubkeyFile(path?: string): Promise<VaultPubkeyFile>`
+  - **Post:** Parsed file at `path` (default `DEFAULT_VAULT_PUBKEY_PATH`).
+  - **Throws:** ENOENT → `Error` pointing the operator at `otzi generate`; malformed JSON or missing fields → `Error`.
 
 **Invariants:**
-- Address derivation matches `deriveVaultP2tr` (broadcast subsystem) — both compute the same bech32m for the same untweaked FROST aggregate + network.
-- OPNet address is `0x` + hex(SHA256(mldsaPubKey)) — same identity model the rest of the codebase uses.
-- File is overwritten (no append); writes are NOT atomic (write failure mid-flight could leave a truncated file). Acceptable: the file is rewritten on every daemon startup, and the schema is small (KB-scale), so partial-write corruption is rare and self-healing on restart.
-
-**Failure mode:** ENOENT before first DKG completes. CLI commands that need the vault address print a clean error pointing the operator to `otzi generate`.
+- Every value is public; mode 0644 lets `otzi` group members and other users run read-only CLI commands.
+- Written by the share stager's `commit()` after a DKG completes.
 
 **Cross-component contracts:**
-- Depends on: `deriveVaultP2tr` from `src/broadcast/opnet-params-reconstruct.ts`; sha256 from `@noble/hashes`; hex helpers.
-- Called by: `config-merge.loadAndValidate` (startup), `share-persistence.persistCombinedDkgShare` (post-DKG).
-- Consumed by: CLI commands `otzi vault`, `otzi btc balance`, `otzi btc send`, `otzi op20 balance` (read-only).
+- Depends on: `toVaultKey`, `vaultPayment` (`src/otzi/lib`).
+- Consumed by: `otzi vault`, `otzi btc balance|send|sign` (read-only).
+
+---
+
+### `api.ts`
+**Purpose:** Daemon API request parsing and input rules (spec §6.1).
+
+**Public surface:**
+- `class RequestError extends Error { constructor(readonly status: 400 | 409, message: string) }`
+- `interface LeaderSignRequest { ceremonyId: string; signers: PartyId[]; proposal: SendProposal }`
+
+- `defaultCeremonyId(op: 'dkg' | 'sign'): string`
+  - **Post:** `` `${op}-${crypto.randomUUID()}` `` (matches `CEREMONY_ID_RE`).
+
+- `parseDkgRequest(body: Record<string, unknown>): { ceremonyId: string }`
+  - **Pre:** `body` is the JSON request object (`op === 'dkg'`).
+  - **Post:** Allowed keys: `op`, `ceremonyId`. `ceremonyId` must satisfy `isCeremonyId` when present; `defaultCeremonyId('dkg')` when absent.
+  - **Throws:** `RequestError(400, …)` on any other key or an invalid `ceremonyId`.
+
+- `parseSignRequest(body: Record<string, unknown>, ring: { partyIds: readonly PartyId[]; self: PartyId; minSigners: number }): LeaderSignRequest`
+  - **Pre:** `body` is the JSON request object (`op === 'sign'`); `ring.partyIds` = every ring member; `ring.minSigners` = the loaded share's threshold.
+  - **Post:** Allowed keys: `op`, `ceremonyId`, `signers`, `proposal`.
+    - `ceremonyId`: `isCeremonyId` when present; `defaultCeremonyId('sign')` when absent.
+    - `signers`: defaults to all of `ring.partyIds` (ascending); otherwise an array of integers, unique, each in `ring.partyIds`, containing `ring.self`, with at least `ring.minSigners` entries.
+    - `proposal`: an object with string `tx` and array `prevouts`; hex fields (`tx`, `prevouts[].txid`, `prevouts[].script`) are lowercased, then the result must pass `isProposalShape` (1–255 prevouts).
+  - **Throws:** `RequestError(400, <reason>)` on any violation.
+  - **Notes:** Shape and ring rules only; `analyzeProposal` runs in `LeaderDispatcher.sign`.
+
+**Cross-component contracts:**
+- Depends on: `isCeremonyId`, `isProposalShape`, `MAX_INPUTS` (`src/core/messages.ts`).
+- Used by: `buildDefaultHttpHandler`.
 
 ---
 
 ### `leader.ts`
-**Purpose:** Leader-side ceremony dispatcher. Evaluates gate, invokes runner, broadcasts signoff, surfaces result. Discriminated DKG + signing requests.
+**Purpose:** Leader-side ceremony dispatcher: the leader half of the DKG and of proposal signing.
 
 **Public surface:**
-- `LeaderDeps`
-  - **Pre:** `runner`, `gate`, `node`, `peersById` are all set; share optional (signing requires it); FROST material optional (FROST ceremonies require it); network optional (set iff keylink needed); frostLegacySig optional (required for opnet-params).
-  - **Post:** Fully configures a leader dispatcher.
+- `class GateRejection extends Error { constructor(readonly ceremonyId: string, readonly decision: Decision) }`
+  - **Post:** Thrown when the leader's own gate does not approve; the handler maps it to 403. Nothing was announced.
 
-- `LeaderSignRequest` (discriminated union)
-  - **btc:** scheme='frost', protocol='btc'; provides BTC tx construction params (to, amount, fee, network, pubkey, utxos). Operator asserts UTXOs; leader + participants rebuild tx + sighashes locally.
-  - **opnet:** scheme='frost', protocol='opnet'; provides raw unsigned tx + prevout info. Sighashes extracted from bytes. Hints are advisory.
-  - **opnet-params:** scheme='frost', protocol='opnet-params'; provides contract + method + params + pre-computed ML-DSA threshold sig. Leader fetches UTXOs + challenge, generates rnd seed, runs capture, broadcasts tx internally.
-  - **mldsa:** scheme='mldsa', protocol='raw'; provides opaque message bytes to sign. No intent fields.
+- `interface LeaderDeps`
+  ```ts
+  io: CeremonyIo; gate: ApprovalGate; node: { id: string; partyId: PartyId };
+  peersById: ReadonlyMap<PartyId, string>; network: NetworkName; vault?: DecryptedShare;
+  vaultExists: () => Promise<boolean>; createStager: () => ShareStager; rng: Rng;
+  blobRetentionMs?: { signing: number; dkg: number };   // default BLOB_RETENTION_MS
+  addressBook?: () => Promise<AddressBookEntry[]>; logger?: Logger;
+  ```
+  - **Pre:** Same meaning as the matching `OrchestratorDeps` fields; the daemon passes the same values to both.
 
-- `LeaderSignResult`
-  - **Pre:** Sign ceremony completed.
-  - **Post:** Carries scheme + signatures; opnet-params includes transactionId (daemon broadcast it).
+- `class LeaderDispatcher`
+  - **`constructor(deps: LeaderDeps)`**
 
-- `GateRejection` (Error subclass)
-  - **Pre:** Gate returns non-approve decision.
-  - **Post:** Thrown with ceremonyId + decision; HTTP handler catches and returns 403.
-  - **Invariant:** Ceremony never announces when gate rejects (no side effect on peers).
+  - **`runDkg(req: { ceremonyId: string }): Promise<{ ceremonyId: string; address: string; internalKey: string; network: NetworkName }>`**
+    1. `deps.vault` set or `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`.
+    2. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })`; non-approve (or a gate error) → `GateRejection`.
+    3. Random 32-byte session ID; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, createStager())`.
+    4. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
+    - **Throws:** `RequestError`, `GateRejection`, or the `runDkgCeremony` error (which already broadcast `signoff-aborted`).
+    - **Post:** Success and failure both `scheduleClear` the ceremony with the DKG retention. The new vault is on disk but not loaded; signing on it needs a daemon restart.
 
-- **runCombinedDkg(req)**
-  - **Pre:** req.ceremonyId, threshold, parties, level set.
-  - **Post:** Gates the spec; runs `runner.runCombinedDkg` with `network` passed if set; persists result (errors propagate).
-  - **Throws:** `GateRejection` on gate non-approve; other errors propagate.
-
-- **runMldsaDkg(req)**, **runFrostDkg(req)**
-  - **Pre:** Same as combined (thresh, parties for mldsa; thresh, parties for frost).
-  - **Post:** Gates, runs, persists (if applicable).
-
-- **sign(req: LeaderSignRequest)**
-  - **Pre:** `req.signers` includes self; FROST/ML-DSA key material present as required.
-  - **Post:** Gates spec (varies by scheme/protocol); runs ceremony; broadcasts signoff on success; returns signatures.
-  - **BTC:** Builds tx from params, gates spec with verified outputs, runs FROST signing, broadcasts, returns sigs.
-  - **OPNet raw-tx:** Gates spec with advisory hints, runs FROST signing, broadcasts, returns sigs.
-  - **OPNet opnet-params:** Fetches UTXOs + challenge, generates rnd seed, runs capture, gates with verified destination + method, runs FROST signing, broadcasts tx internally, returns sigs + txid.
-  - **ML-DSA:** Gates generic signing spec, runs signing, broadcasts signoff, returns signature.
-  - **Throws:** `GateRejection` on gate non-approve; `Error` on missing key material (e.g., DKG-only mode, no FROST material).
-
-- **Spec building per protocol**
-  - **btc:** Populates operation='btc-transfer'; filters self from outputs; computes amount + destination.
-  - **opnet:** Populates operation='opnet-call'; copies advisory hints (contractAddress, method, amountTokenAtomic).
-  - **opnet-params:** Populates operation='opnet-call'; destination + method are structurally verified (capture rebuilt them); amount from hints.
-  - **mldsa generic:** Populates operation='generic' (no intent fields).
+  - **`sign(req: LeaderSignRequest): Promise<{ ceremonyId: string; txid: string; signedTxHex: string; signaturesHex: string[] }>`**
+    1. No vault → `RequestError(409, 'no vault loaded — run otzi generate, then restart the daemon')`.
+    2. `analysis = analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), network)`; a throw → `RequestError(400, <message>)`.
+    3. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)` (labels from `addressBook` when present); non-approve (or a gate error) → `GateRejection`.
+    4. `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal)` — this broadcasts `announce-sign`.
+    5. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` → signed hex and txid.
+    6. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`.
+    - **Failure after the announce:** broadcast `signoff-aborted {ceremonyId, reason}` and rethrow (handler → 500).
+    - **Post:** Settle and failure both `scheduleClear` the ceremony with the signing retention.
 
 **Invariants:**
-- Gate evaluation happens once per ceremony (decision is not cached, unlike participant-side; leader always evaluates fresh).
-- BTC outputs are verified locally (rebuild); participants verify by matching sighashes.
-- OPNet raw-tx hints are advisory; only sighash is trusted.
-- OPNet opnet-params destination + method are structurally verified (deterministic capture is same on all peers).
-- Signoff always comes from the leader (no exception for participants).
-- Share + FROST material are required for signing ceremonies; absence produces clear error before side effects.
-- Network field is only passed to combined DKG when mainnet/testnet (regtest passes undefined, key-link skipped).
-- `frostLegacySig` is required for opnet-params leader flow; absence throws before capture.
+- Nothing is announced unless the leader's own analysis and gate passed (400 / 403 leave peers untouched).
+- The leader never broadcasts the transaction; it returns it.
+- The leader's own gate is evaluated once per request.
+- Signoffs come only from the leader for signing; DKG aborts come from whichever node fails.
 
 **Cross-component contracts:**
-- Depends on: `CeremonyRunner`, gate, BTC/OPNet rebuild/capture functions, OPNet provider.
-- Used by: `Daemon` (instantiated once; HTTP handler dispatches to leader methods).
-
-**Notes / gotchas:**
-- Leader is NOT distinguished from participants in the DKG protocol itself; leadership is a node-level role in the daemon config.
-- BTC UTXO mismatch is worst-case DoS (wasted ceremony); consensus rejects at broadcast.
-- OPNet opnet-params is the most complex flow: async UTXO/challenge fetch, deterministic capture, broadcast.
-- `opnetSeedFill` defaults to WebCrypto; tests inject a deterministic fill for reproducibility.
-- `persistDkgShare` on leader side propagates errors (500 to HTTP caller); participant side logs errors but continues.
+- Depends on: `runDkgCeremony`, `leadSigning`, `encodeMessage`, `analyzeProposal` / `toVaultKey` / `vaultPayment` / `labelFor` (`src/otzi/lib`), `finalizeSend` (`src/otzi/backend/bitcoin.ts`), `spec-builder.ts`, `scheduleClear`.
+- Used by: `Daemon` (one instance; the handler dispatches to it).
 
 ---
 
 ### `daemon.ts`
-**Purpose:** Composition root. Wires blob infra + runner + gate + orchestrator + leader + triggers into a single Daemon object.
+**Purpose:** Composition root. Wires blob infrastructure, gate, orchestrator, leader dispatcher and triggers into one `Daemon`.
 
 **Public surface:**
-- `DaemonDeps`
-  - **Pre:** `state` is LoadedDaemonState (config + optional share + persistence sink); transport is injected; `selfPartyId` resolved from book by pubkey match (sourced from `TransportBundle.selfPartyId`); `peersById` is the logging-label map (sourced from `TransportBundle.peersById`); rng + pullOpts provided; logger optional.
-  - **Post:** Passed to Daemon constructor.
+- `interface DaemonDeps`
+  ```ts
+  state: LoadedDaemonState; transport: Transport; selfPartyId: number;
+  peersById: ReadonlyMap<PartyId, string>; rng: Rng; pullOpts: PullOpts; logger?: Logger;
+  httpHandler?: HttpHandler; cronHandlers?: ReadonlyMap<string, CronHandler>;
+  env?: Readonly<Record<string, string | undefined>>; vaultPubkeyPath?: string;
+  ```
+  - **Pre:** `selfPartyId` and `peersById` come from `TransportBundle` (book lookup by pubkey); `transport.partyId === selfPartyId`.
 
-- `Daemon` (class)
-  - **Constructor(deps: DaemonDeps)**
-    - **Pre:** All deps are set.
-    - **Post:** Constructs composition: BlobStore, BlobServer, BlobPuller, CeremonyRunner, ApprovalGate, Orchestrator, LeaderDispatcher, trigger sources.
-    - **Invariant:** Does NOT call `start()` yet.
+- `class Daemon`
+  - **`constructor(deps: DaemonDeps)`**
+    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo`; the gate via `createGate(config.gate, { loadAddressBook })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists = () => vaultFileExists(config.share.path)`, `createStager = () => createShareStager({ path, password, network, partyId: selfPartyId, vaultPubkeyPath })`, `rng`, and `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)`; trigger sources from `config.triggers`. `loadAddressBook` returns the book's addresses.
+    - **Invariant:** Does NOT start anything.
+  - **`async start(): Promise<void>`** — starts the orchestrator and every trigger. Reentrant.
+  - **`async stop(): Promise<void>`** — stops triggers, the orchestrator, and closes the blob server. Reentrant.
+  - **`onCompleted(handler): Unsubscribe`** — forwards orchestrator outcomes.
 
-  - **async start(): Promise<void>**
-    - **Pre:** Called exactly once (or after stop).
-    - **Post:** Starts orchestrator + all triggers.
-    - **Logs:** Info message with trigger count.
-    - **Throws:** Any error from trigger.start() propagates.
-    - **Invariant:** Reentrant (returns early if already started).
+- **Trigger assembly** (`buildTriggers`)
+  - `http`: requires `bind`; optional `auth_token_env`; uses `httpHandler` (default or injected).
+  - `uds`: requires `path`; same handler.
+  - `cron`: requires `job_name` + `schedule`; optional `timezone`; handler from `cronHandlers`.
+  - **Throws:** `Error` on missing required params or a missing cron handler.
 
-  - **async stop(): Promise<void>**
-    - **Pre:** Called after start (or redundantly).
-    - **Post:** Stops all triggers; stops orchestrator; closes blob server.
-    - **Logs:** Info message on stop.
-    - **Invariant:** Reentrant (returns early if not started).
+- `buildDefaultHttpHandler(leader: LeaderDispatcher, state: LoadedDaemonState, peersById: ReadonlyMap<PartyId, string>, selfPartyId: PartyId, logger: Logger): HttpHandler`
+  - **Pre:** POST with a JSON object body; dispatch on `body.op`.
+  - **Ops:**
 
-  - **onCompleted(handler): Unsubscribe**
-    - **Pre:** Called at any time.
-    - **Post:** Wires listener to orchestrator.onCompleted; forwards ceremony outcomes.
+    | Op | Request | 200 response |
+    |---|---|---|
+    | `vault-info` | `{ op }` | `{ partyIds, threshold, parties, network, address, internalKey, outputKey }` — `partyIds` ascending from `peersById`; key fields as in `vault-pubkey.json`. 409 when no vault is loaded. |
+    | `dkg` | `{ op, ceremonyId? }` | `{ ceremonyId, status: 'done', address, internalKey, network }`. `parties` = ring size, `threshold` = `parties`. 409 when this node already holds a vault. |
+    | `sign` | `{ op, ceremonyId?, signers?, proposal }` | `{ ceremonyId, status: 'done', txid, signedTxHex, signaturesHex }`. 409 when no vault is loaded. |
 
-- **Trigger assembly** (buildTriggers)
-  - **Pre:** Trigger config entries from DaemonConfig.
-  - **Post:** Instantiates HttpTrigger / CronTrigger per entry.
-  - **HTTP:** Requires 'bind' param; optional 'auth_token_env'; uses httpHandler (default or injected).
-  - **Cron:** Requires 'job_name' + 'schedule' params; optional 'timezone'; resolves handler from cronHandlers map.
-  - **Throws:** `Error` on missing required params or missing cron handler.
-
-- **Default HTTP handler** (buildDefaultHttpHandler)
-  - **Pre:** POST requests to handler. Constructed with `(leader, network: NetworkName, state: LoadedDaemonState, peersById: ReadonlyMap<PartyId, string>, controlPlane: ControlPlane, transport: Transport, logger)`.
-  - **Post:** Discriminated dispatch on `req.body.op` field: 'vault-info', 'dkg-combined', 'dkg-mldsa', 'dkg-frost', 'sign', 'sync'.
-  - **vault-info (read):** Returns `{ partyIds, threshold, parties, network, btcAddress, opnetAddress }`. `partyIds` is sorted ascending from `peersById.keys()`. 409 if no share is loaded yet (`vault-info: no share loaded (run 'otzi generate' first)`).
-  - **dkg-combined:** Runs combined DKG; `parties` is `peersById.size` (= ring size = n; v0.1 is n-of-n by design, threshold == parties); level is fixed at 44. Response carries `mldsaPublicKeyHex`, `frostVerifyingKeyHex`, plus operator-facing `btcAddress` + `opnetAddress` + `network` (computed via `deriveVaultAddresses`). The address triple matches what `vault-pubkey.json` will hold post-restart.
-  - **DKG ops (mldsa, frost):** `parties` is `peersById.size`; threshold == parties (n-of-n); level 44. Response carries the resulting public material.
-  - **sign op:** Discriminate on scheme + protocol; parse BTC/OPNet/opnet-params/raw-mldsa request; invoke leader.sign; return signatures + optional txid.
-  - **sync op (Phase 9c):** Operator-facing manifest distribution endpoint.
-    - **Pre:** Local `bootstrap-secret` exists; `manifest` is valid headless-manifest-v1 JSON; `hmac` matches HMAC-SHA-256(secret, manifest).
-    - **Post:** Local manifest atomically installed via `controlPlane.installPushedManifest`; `manifest-push` wire message broadcast to every peer via `transport.broadcast`; response carries `{ ceremonyId, status, peersNotified }` where `peersNotified = peersById.size - 1`.
-    - **Status 410:** `{ error: 'control plane closed' }` when `bootstrap-secret` is missing (post-DKG).
-    - **Status 400:** HMAC mismatch / schema failure / existing-non-identical-manifest (carries `kind` for the error class name).
-    - **Status 502:** Manifest installed locally, but `transport.broadcast` failed.
-    - **Invariant:** Local install runs first — failure short-circuits the broadcast.
-  - **Status 403 on gate reject:** `{ error: 'gate rejected', decision, ceremonyId }`.
-  - **Status 500 on other errors:** `{ error: <message>, ceremonyId }`.
-  - **Status 400 on malformed input.**
-  - **Invariant:** All field validation is strict (throws on type mismatch); missing fields are caught early.
-
-- **Network branching**
-  - **Pre:** config.network.name is 'mainnet' | 'testnet' | 'regtest'.
-  - **Post:** Regtest → key-link skipped, opnetProvider undefined; mainnet/testnet → key-link enabled, opnetProvider set.
+  - `dkg` runs `parseDkgRequest` then `leader.runDkg`; `sign` runs `parseSignRequest(body, { partyIds, self: selfPartyId, minSigners: share.threshold })` then `leader.sign`.
+  - **Status codes:** 400 for a malformed body, an unknown op, an unknown top-level field, bad input, or a proposal rejected by analysis (message from `analyzeProposal`); `RequestError` → its status with `{ error }`; `GateRejection` → 403 `{ error: 'gate rejected', decision, ceremonyId }`; anything else → 500 `{ error, ceremonyId }`.
 
 **Invariants:**
-- HTTP listener should be localhost-bound (security assumption; should be enforced at HttpTrigger level).
-- Daemon does NOT call `initEccLib` (phase-4d trap; double-init misroutes FROST legacy-sig monkey-patch).
-- `opnetProvider` is only used on mainnet/testnet (regtest passes undefined).
+- One gate, one orchestrator, one leader dispatcher, one blob server per daemon.
+- The daemon makes no chain requests; Esplora and broadcast are used only by CLI verbs.
+- The HTTP trigger is loopback-only (enforced by the config parser); the UDS socket is the default operator API.
 
 **Cross-component contracts:**
-- Depends on: All ceremony infrastructure (runner, gate, orchestrator, leader, blob, triggers).
-- Used by: `entrypoint.ts` (instantiated after state + transport are ready).
-
-**Notes / gotchas:**
-- `frostKeyPackage` is optional in DaemonDeps but required for FROST ceremonies; absence throws at ceremony time.
-- HTTP handler errors are caught; GateRejection is special-cased to 403 (decision in body).
-- Default handler is comprehensive; custom handlers can be injected for alternative APIs.
-- Trigger assembly validates that all cron jobs have handlers; unknown job names fail at start() time.
+- Depends on: all of `src/core`, `src/gate`, `src/orchestrator`, `src/triggers`, `src/address-book/store.ts`, `vault-share.ts`, `api.ts`, `leader.ts`.
+- Used by: `entrypoint.ts` (after state and transport are ready).
 
 ---
 
 ### `transport-factory.ts`
-**Purpose:** Loads identity key file + pubkey book, identifies self via pubkey match, cross-checks `[[peers]]` against the book on canonical endpoints (peer-mesh only), derives the deterministic ringId (SHA-256 of sorted pubkeys), synthesizes the daemon-wide `peersById` logging-label map, and builds peer-mesh or relay transport.
+**Purpose:** Loads the identity key file and pubkey book, identifies self by pubkey match, cross-checks the share and `[[peers]]` against the book, derives the ringId and the `peersById` label map, and builds the peer-mesh or relay transport.
 
 **Public surface:**
 - `TransportBundle`
-  - **Pre:** Transport is built and validated.
-  - **Post:** Carries `transport` instance, `identity` keypair, `pubkeyBook`, authoritative `selfPartyId` (from book lookup by pubkey), `selfEntry` (the matched book entry), `peersById` (synth `peer-${partyId}` labels for non-self; `config.node.id` for self), `ringId`, and `start`/`stop` methods.
+  - **Post:** Carries `transport`, `identity` keypair, `pubkeyBook`, authoritative `selfPartyId` (book lookup by pubkey), `selfEntry`, `peersById` (`peer-${partyId}` for non-self, `config.node.id` for self), `ringId`, and `start`/`stop`.
 
 - `buildTransportFromFiles(state, options): Promise<TransportBundle>`
   - **Pre:** `config.node.identityKeyFile` + `pubkeyBookFile` paths are set.
   - **Post:** Loads identity + book from disk, runs `resolveSelfFromBook`, runs `validatePeersAgainstBook` for peer-mesh, derives ringId + peersById, returns bundle.
-  - **Throws:** `Error` on file read, JSON parse, identity-not-in-book, [[peers]]/book mismatch, missing paths, share/book partyId disagreement.
+  - **Throws:** `Error` on file read, JSON parse, identity-not-in-book, `[[peers]]`/book mismatch, missing paths, or share/book disagreement.
 
 - `buildTransportFromMemory(state, identity, book, options): Promise<TransportBundle>`
   - **Pre:** Identity + book are pre-built (test path).
   - **Post:** Same validation, same bundle, no disk I/O.
 
-- **Identity file format** (JSON)
-  - `{ pkcs8Hex: <hex>, publicKeyHex: <hex> }`
-  - PKCS#8 DER encoding, 130-char hex uncompressed P-256 public key.
+- **Identity file format** (JSON): `{ pkcs8Hex: <hex>, publicKeyHex: <hex> }` — PKCS#8 DER, 130-char hex uncompressed P-256 public key.
 
-- **Pubkey book format**
-  - Produced by bootstrap (`runMasterBootstrap` / `runMemberRegister`); parsed by `parseBook`.
-  - Entries: `{ partyId, publicKeyHex (130-char), advertisedEndpoint (canonical host:port) }`. No `nodeId` (Phase F dropped it).
+- **Pubkey book format:** produced by bootstrap (`runMasterBootstrap` / `runMemberRegister`), parsed by `parseBook`. Entries: `{ partyId, publicKeyHex (130-char), advertisedEndpoint (canonical host:port) }`.
 
-- **`resolveSelfFromBook(identity, book)` (internal helper)**
-  - **Pre:** Identity is loaded; book is parsed.
-  - **Post:** Returns the book entry whose `publicKeyHex` (case-insensitive) matches the loaded identity. Plus a share-vs-book partyId check when a share file is present (`state.share.partyId === selfEntry.partyId`).
-  - **Throws:** `Error` if no book entry matches the identity pubkey (operator must re-run `otzi setup` if the book is stale) OR if `share.partyId` disagrees with `selfBookEntry.partyId` (config swap / stale share).
+- **`resolveSelfFromBook(identity, book)`** (internal)
+  - **Post:** Returns the book entry whose `publicKeyHex` (case-insensitive) matches the loaded identity. When a share is loaded: `share.partyId === selfEntry.partyId` and `share.parties === book.entries.length`.
+  - **Throws:** `Error` if no entry matches the identity (re-run `otzi setup` for a stale book); if `share.partyId` disagrees with the book; `Error('share is for <p> parties but the pubkey book has <n>')`.
 
-- **`validatePeersAgainstBook(book, configPeers, selfPartyId)` (internal, peer-mesh only)**
-  - **Pre:** `configPeers` each carry a canonical `endpoint` (parser already canonicalized); book has canonical `advertisedEndpoint` for every entry.
-  - **Post:** Returns void if the set of non-self book `advertisedEndpoint` values equals the set of `[[peers]].endpoint` values (bidirectional). The book is authoritative for partyId + pubkey; `[[peers]]` is a typo-detection sanity check.
-  - **Throws:** `Error` if any `[[peers]] endpoint` is not in the book, or if any non-self book entry's `advertisedEndpoint` is not in `[[peers]]`.
+- **`validatePeersAgainstBook(book, configPeers, selfPartyId)`** (internal, peer-mesh only)
+  - **Post:** Returns when the set of non-self book `advertisedEndpoint` values equals the set of `[[peers]].endpoint` values. The book is authoritative for partyId + pubkey; `[[peers]]` is a typo check.
+  - **Throws:** `Error` on any endpoint present on one side only.
 
-- **ringId derivation**
-  - **Pre:** Pubkey book entries are present (at least self).
-  - **Post:** Concatenate all pubkeys in order (sorted by partyId), SHA-256 hash, hex-encoded.
-  - **Invariant:** Same on every peer (deterministic, used for relay routing + peer coordination).
+- **ringId derivation:** SHA-256 over all raw pubkeys concatenated in partyId order, hex-encoded. Identical on every peer.
 
 - **Transport branching**
-  - **peer-mesh:** Requires `config.transport.advertisedEndpoint`; runs `validatePeersAgainstBook`; constructs `PeerMeshTransport` with self + peers built from book entries (`endpoint: ws://${book.advertisedEndpoint}`). The `[[peers]]` array's only role is the sanity-check above — the peer dial table itself comes from the book.
-  - **relay:** Requires `config.transport.url`; constructs `RelayTransport` with self + peers (partyId + pubkey from book, no endpoint). Relay routes by partyId from each peer's `hello` frame; no L4 source-IP allowlist (cryptographic auth alone gates relay traffic).
+  - **peer-mesh:** requires `config.transport.advertisedEndpoint`; runs `validatePeersAgainstBook`; builds `PeerMeshTransport` from the book (`endpoint: ws://${advertisedEndpoint}`).
+  - **relay:** requires `config.transport.url`; builds `RelayTransport` with partyId + pubkey per book entry. The relay routes by partyId; cryptographic auth alone gates relay traffic.
 
 **Invariants:**
-- Identity file is loaded once at startup; private key never leaves daemon (only public key is broadcast in book).
-- Pubkey book is read-only at runtime (bootstrap produces it once; daemon consumes it).
-- Self identification is by raw-pubkey match into the book — operator-typed `partyId` is gone, derived authoritatively from the book.
-- ringId is deterministic across all peers (enables relay routing + peer coordination).
-- For peer-mesh, the book is the authoritative dial table; `[[peers]]` only catches operator typos at startup.
-- `peersById` labels are local-only — `peer-${partyId}` for non-self, `config.node.id` for self. Operators do not need to agree on what they call peer N locally.
+- The private key is loaded once at startup and never leaves the daemon.
+- The pubkey book is read-only at runtime.
+- Self identification is by raw-pubkey match; partyId comes from the book.
+- A loaded share must belong to this book's ring: same partyId, same party count.
+- `peersById` labels are local-only.
 
 **Cross-component contracts:**
-- Depends on: File I/O, bootstrap types (`PubkeyBook`, `parseBook`), identity crypto, transport implementations, `canonicalizeEndpoint` (via parser).
+- Depends on: `PubkeyBook` / `parseBook`, identity crypto, transport implementations, `canonicalizeEndpoint`.
 - Used by: `entrypoint.ts` (`buildTransportFromFiles`); tests via `buildTransportFromMemory`.
 
 **Notes / gotchas:**
-- ringId is a SHA-256 hash of concatenated raw pubkeys; order is sorted by partyId (which itself is sorted-pubkey-bytes order — so ringId is deterministic across the federation regardless of registration timing).
-- Identity-not-in-book is a fatal startup error; operator must regenerate the book via `otzi setup` if it's stale.
-- For peer-mesh, `book.advertisedEndpoint` is bare `host:port`; transport-factory prepends `ws://` before handing to `PeerMeshTransport` (which uses `new URL` and needs a scheme).
-- `peersById` is passed to the `Daemon` constructor via `DaemonDeps.peersById`; the daemon's `buildDefaultHttpHandler` consumes it for vault-info partyId enumeration and DKG `parties` count.
+- `book.advertisedEndpoint` is bare `host:port`; transport-factory prepends `ws://` for `PeerMeshTransport`.
+- `peersById` reaches the `Daemon` via `DaemonDeps.peersById`; `peersById.size` is the ring size used for DKG `parties` and the default `signers`.
 
 ---
 
 ### `entrypoint.ts`
-**Purpose:** CLI entrypoint. Dispatches `otzi daemon`, `otzi setup`, `otzi generate` subcommands. Loads config + state + transport + daemon. Handles SIGINT/SIGTERM for graceful shutdown.
+**Purpose:** The `otzi` executable. Dispatches verbs, runs the daemon, prints operator banners, maps errors to exit codes.
 
-**Public surface:**
-- **main(argv): Promise<void>**
-  - **Pre:** argv is process.argv.
-  - **Post:** Parses subcommand + args; dispatches to handler.
-  - **Subcommands:**
-    - `daemon <config.toml>` — Loads state, transport, daemon; starts; waits for signals.
-    - `setup leader <config.toml> --bind <host:port>` — Runs bootstrap leader (master).
-    - `setup leaf <config.toml> --leader <url>` — Runs bootstrap follower (member).
-    - `generate <config.toml> [--threshold N] [--level 44] [--ceremony-id <id>]` — Triggers combined DKG via HTTP POST to local daemon.
+**Verbs:**
 
-- **runDaemonCommand**
-  - **Pre:** Config path provided.
-  - **Post:** Loads config + share (if present); builds transport; instantiates Daemon; starts; sets up signal handlers.
-  - **Logs:** Startup message with mode (signing+DKG vs DKG-only).
-  - **Shutdown:** SIGINT/SIGTERM trigger graceful shutdown (daemon.stop, bundle.stop).
-  - **DKG-only mode:** Daemon announces that operator must run `otzi generate` from another shell, then restart.
-  - **Invariant:** Does NOT call `initEccLib` (phase-4d trap).
+| Verb | Behaviour |
+|---|---|
+| `otzi daemon <config>` | Run the daemon (`runDaemonCommand`). |
+| `otzi setup <config>` | Bootstrap pubkey exchange; prints the 96-bit fingerprint. |
+| `otzi generate [--config <path>] [--ceremony-id <id>]` | Daemon `dkg` op (`generate`); banner prints the vault address and the restart instruction. |
+| `otzi vault [--json]` | Address, network, threshold/parties; the full file (keys included) with `--json`. |
+| `otzi btc balance [--unit sats\|btc\|mbtc\|ubtc] [--config <path>]` | Esplora balance: confirmed and unconfirmed. |
+| `otzi btc send <label\|address> <amount[unit]\|max> [--fee-rate N] [--config <path>]` | `btcSend`: prints the txid and explorer URL. |
+| `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` | `btcSign`: prints the analysis summary, txid and signed hex; `--broadcast` posts it. |
+| `otzi book list` | Print entries. |
+| `otzi book add <label> <address> [--note <text>]` | Add or update an entry. |
+| `otzi book remove <label\|address>` | Remove an entry. |
+| `otzi book import <file> [--replace]` | Merge (default) or replace; prints added/updated/unchanged counts. |
+| `otzi book export [path]` | Write the book file (stdout without a path). |
+| `otzi backup` / `otzi restore <archive> [--password-stdin]` | Archive and restore node state. |
 
-- **runSetupCommand**
-  - **Pre:** Subcommand + config path + flags provided.
-  - **Post:** Dispatches to setupMaster or setupMember.
+- `--config` defaults to `/etc/otzi/daemon.toml`.
+- CLI verbs other than `daemon` keep `NOOP_LOGGER` and write machine output to stdout only; banners and errors go to stderr.
+- `BroadcastFailedError` → the signed transaction hex is printed to stderr (so the operator can broadcast it by other means) and the process exits 1. Any other error → message on stderr, exit 1.
 
-- **runGenerateCommand**
-  - **Pre:** Config path + optional flags provided.
-  - **Post:** Finds HTTP trigger in config; POSTs dkg-combined request to local daemon; awaits result; announces complete with public keys.
-  - **Flags:** --threshold (defaults to 2/3 of parties), --level (defaults to 44), --ceremony-id (auto-generated).
-  - **Invariant:** Daemon MUST have an HTTP trigger configured; error if not.
+- **`runDaemonCommand`**
+  - **Post:** `loadAndValidate` → `buildTransportFromFiles` → `Daemon` → `start`; SIGINT/SIGTERM stop the daemon and the transport, then exit 0. The startup line names the mode: signing (vault loaded) or setup (no vault). In setup mode it states that signing is refused until `otzi generate` completes and the daemon restarts. A stale `.pending` share is reported at warn level.
 
 **Invariants:**
-- Daemon is the primary entrypoint; setup + generate are supportive CLIs.
-- DKG-only mode is fully operational; signing is rejected + logged until share is reloaded via restart.
-- Graceful shutdown is enforced via signal handlers; process.exit(0) on completion.
-- TOML + share password are required; absence fails at load time.
+- The daemon is the only long-lived verb; every other verb talks to it over the daemon client (UDS by default) or works on local files.
+- TOML + share password are required by the daemon; absence fails at load time.
 
 **Cross-component contracts:**
-- Depends on: Config loader, state loader, transport factory, Daemon, setupMaster/setupMember, signal handlers.
-- Entry point: Executed when module is main (if import.meta.url === ...).
-
-**Notes / gotchas:**
-- Phase 4d trap: `initEccLib` is NOT called in entrypoint (comment explains why; @btc-vision/transaction auto-inits).
-- Generate command is a convenience; it POSTs to the daemon's HTTP trigger (same endpoint users would use).
-- Setup is a one-time per-node workflow; pubkey book is re-used (idempotent).
+- Depends on: `config-merge`, `transport-factory`, `Daemon`, `setup`, `src/cli/cmd/*`.
 
 ---
 
 ### `setup.ts`
-**Purpose:** Bootstrap CLI wrappers. Drives setupMaster (leader) + setupMember (member) with identity key generation + pubkey book persistence.
+**Purpose:** Bootstrap CLI wrappers: identity key generation, pubkey book exchange and persistence.
 
 **CLI surface (`entrypoint.ts`)**
   - `otzi setup <config.toml>` — zero-arg. Reads `[bootstrap].role` from config to dispatch:
-    - `role = "leader"` → calls `setupMaster(configPath, config.bootstrap.bind)`.
-    - `role = "leaf"` → calls `setupMember(configPath, config.bootstrap.leaderUrl)`.
-  - Throws `Error` if `[bootstrap]` is missing, role is unknown, or the role-specific field is absent. The legacy `setup leader|leaf` CLI form is REMOVED — config-driven dispatch is the only path.
+    - `role = "leader"` → `setupMaster(configPath, config.bootstrap.bind)`.
+    - `role = "leaf"` → `setupMember(configPath, config.bootstrap.leaderUrl)`.
+  - Throws `Error` if `[bootstrap]` is missing, role is unknown, or the role-specific field is absent.
 
 **Public surface:**
-- **setupMaster(configPath, bind): Promise<void>** — internal helper, unchanged signature.
+- **`setupMaster(configPath, bind): Promise<void>`**
   - **Pre:** Config path + bind address (host:port) provided.
-  - **Post:** Loads config; loads/generates identity key; runs bootstrap master; writes pubkey book.
-  - **Idempotent:** If pubkey book already exists, re-emits fingerprint without re-bootstrapping.
+  - **Post:** Loads config; loads/generates identity key; runs bootstrap master; writes pubkey book; prints the fingerprint banner.
+  - **Idempotent:** If the pubkey book already exists, re-prints the fingerprint without re-bootstrapping.
   - **Identity:** Reused if file exists; generated if missing (mode 0660).
-  - **Logs:** Announcement of setup complete + fingerprint + verification warning.
 
-- **setupMember(configPath, masterUrl): Promise<void>** — internal helper, unchanged signature.
+- **`setupMember(configPath, masterUrl): Promise<void>`**
   - **Pre:** Config path + master URL provided.
-  - **Post:** Loads config; loads/generates identity key; registers with master; writes pubkey book.
-  - **Idempotent:** If pubkey book already exists, re-emits fingerprint.
+  - **Post:** Loads config; loads/generates identity key; registers with master; writes pubkey book; prints the fingerprint banner.
+  - **Idempotent:** If the pubkey book already exists, re-prints the fingerprint.
 
-- **Validation**
-  - **identity_key_file** must be set in config.
-  - **pubkey_book_file** must be set in config.
-  - **Errors:** Missing paths cause immediate failure.
+- **Fingerprint banner:** the 96-bit fingerprint `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` from `computeFingerprint`, with the instruction to compare it out of band with every other operator before any DKG.
+
+- **Validation:** `identity_key_file` and `pubkey_book_file` must be set in config; missing paths fail immediately.
 
 - **File I/O**
-  - **Identity:** Mode 0660 (group read/write — Phase 9a.3). Daemon-user (otzi) reads via group membership when an operator-user (in `otzi` group) ran `setup`.
+  - **Identity:** Mode 0660 (group read/write); the daemon user (`otzi`) reads it through group membership when an operator in the `otzi` group ran `setup`.
   - **Pubkey book:** Mode 0644 (world-readable).
   - **Parent directories:** Created recursively.
 
 **Invariants:**
 - Setup is idempotent; re-running after abort is safe.
-- Fingerprint must match across all nodes (operator manually verifies).
-- Mismatch indicates tampering; operator deletes books + restarts setup.
+- The fingerprint must match across all nodes (operators compare it); a mismatch means tampering — delete the books and redo setup.
 
 **Cross-component contracts:**
-- Depends on: Config loader, bootstrap runners (runMasterBootstrap, runMemberRegister), identity crypto, pubkey book serialization.
-- Used by: `entrypoint.ts` (via `runSetupCommand`).
-
-**Notes / gotchas:**
-- Setup is a separate CLI invocation (not integrated into daemon startup).
-- Fingerprint is a hash of the pubkey book; operator manually verifies it matches across peers.
-- Identity key generation uses a secured random source (not mnemonic-based).
+- Depends on: Config loader, bootstrap runners (`runMasterBootstrap`, `runMemberRegister`), identity crypto, pubkey book serialization.
+- Used by: `entrypoint.ts`.
 
 ---
 
 **Cross-file contracts (orchestrator/triggers/daemon):**
 
-- **Phase-4d trap (initEccLib):** `daemon.ts` + `entrypoint.ts` MUST NOT call `initEccLib(createNobleBackend())` — `@btc-vision/transaction` auto-inits. Double-init silently misroutes FROST legacy-sig monkey-patch.
-- **HTTP listener binding:** `HttpTrigger` should enforce strict host:port (no 0.0.0.0 defaults). This is load-bearing security: localhost binding justifies future lack of mTLS.
-- **Verify-before-gate pattern:** `Orchestrator.verifyFrostAnnounce` runs before `evaluateGate`; participants verify sighashes locally (BTC rebuild, OPNet extract, opnet-params capture); gate policy operates over verified fields + advisory hints.
-- **Asymmetric leadership:** Leader is distinguished by node-level config role; protocol itself treats all peers symmetrically (DKG). Leadership is for ceremony initiation + signoff broadcast, not protocol asymmetry.
-- **Share persistence:** Leader-side persistence propagates errors (HTTP 500); participant-side persistence is best-effort (ceremony succeeds even if disk write fails; operator monitors logs).
-- **Network gating:** `network` field gates key-link phase (mainnet/testnet only); regtest daemons skip key-link, `frostLegacySig` remains undefined, opnet-params announces silent-drop.
+- **HTTP listener binding:** `HttpTrigger` binds loopback only (parser-enforced). Localhost binding is load-bearing: it is why the API needs no mTLS.
+- **Verify-before-gate:** leader (`LeaderDispatcher.sign`) and participants (`Orchestrator`) both run `analyzeProposal` against their own key before the gate; specs are built from that analysis.
+- **Leadership:** the leader is the node whose trigger fired. For signing it announces, aggregates, finalizes and sends the signoff; for DKG it only generates the session ID and announces.
+- **Share persistence:** leader and participants persist a DKG result through the same `ShareStager`: stage to `.pending`, commit after all-N confirmation. A failure discards `.pending` on every node.
+- **No chain access:** the daemon returns signed transactions; the CLI broadcasts.
+
+---
+
+## src/cli/
+
+### `daemon-client.ts`
+**Purpose:** HTTP-over-UDS client for the local daemon.
+
+**Public surface:**
+- `class DaemonClientError extends Error { readonly status: number }`
+- `interface VaultInfo { partyIds: number[]; threshold: number; parties: number; network: NetworkName; address: string; internalKey: string; outputKey: string }` — the `vault-info` response.
+- `class DaemonClient`
+  - `static fromConfig(configPath): Promise<DaemonClient>` / `static fromParsed(cfg): DaemonClient` — prefers the `uds` trigger's `path`; falls back to the `http` trigger's `bind` (a `/`-path is a socket path).
+  - `request<T>(body: unknown): Promise<T>` — POSTs JSON; 200 → parsed body; non-200 → `DaemonClientError(status, message)`.
+  - `vaultInfo(): Promise<VaultInfo>` — `{ op: 'vault-info' }`.
+  - **Throws:** `Error` when the config has neither trigger.
+
+**Cross-component contracts:** Used by every CLI verb that talks to the daemon (`generate`, `btc send`, `btc sign`). Commands take an injectable `{ request }` (`CliDeps.client`) for tests.
+
+### `units.ts`
+**Purpose:** CLI amount parsing and formatting.
+
+- `type BtcUnit = 'sats' | 'btc' | 'mbtc' | 'ubtc'`
+- `parseBtcAmount(input: string): { sats: bigint; unit: BtcUnit; raw: string }`
+  - **Post:** `<number>[sats|btc|mbtc|ubtc]` (default sats) converted to integer sats without floating point.
+  - **Throws:** On empty input, an unknown unit, a fractional sat, or a negative amount.
+- `formatSats(sats: bigint, unit?: BtcUnit): string` — decimal string in `unit` (default sats), trailing zeros trimmed.
 
 ---
 
 ## src/cli/cmd/
 
+### `generate.ts`
+**Purpose:** `otzi generate` — run the run-once DKG through the local daemon.
+
+- `generate(opts: { configPath: string; ceremonyId?: string }, deps?: CliDeps): Promise<{ ceremonyId: string; address: string; network: NetworkName }>`
+  - **Pre:** The daemon on this node is running and holds no vault; every other daemon in the ring is running and holds no vault.
+  - **Post:** Sends `{ op: 'dkg', ceremonyId? }` through `deps.client` or `DaemonClient.fromConfig(configPath)`; returns the response's `ceremonyId`, `address`, `network`.
+  - **Throws:** `DaemonClientError` (409 when the node already holds a vault, 403 gate reject, 500 ceremony failure).
+  - **Banner (entrypoint):** vault address, network, share path, and the instruction to restart every daemon to load the new share.
+
+### `vault.ts`
+**Purpose:** `otzi vault [--json]` — print the vault metadata from `vault-pubkey.json`.
+
+- `vault(opts?: { vaultPath?: string; json?: boolean }): Promise<string>`
+  - **Post:** Reads `readVaultPubkeyFile(opts.vaultPath)`. Default output: address, network, `threshold`-of-`parties`. With `json`: the whole file as pretty JSON (keys and `vaultKey` included).
+  - **Throws:** `readVaultPubkeyFile` errors (missing file points at `otzi generate`).
+
+### `btc.ts`
+**Purpose:** `otzi btc balance|send|sign` — chain access through Esplora, signing through the daemon.
+
+**Public surface:**
+- `interface CliDeps { client?: { request<T>(body: unknown): Promise<T> } }`
+- `class BroadcastFailedError extends Error { constructor(message: string, readonly txid: string, readonly signedTxHex: string) }`
+
+- `btcBalance(opts: { configPath: string; vaultPath?: string; unit?: BtcUnit }): Promise<string>`
+  - **Post:** `getBalance(base, address)` with `base = config.network.esploraUrl` or `chainApiUrl({ network })`; returns `"confirmed: X\nunconfirmed: Y"` formatted in `unit` (default sats).
+
+- `btcSend(opts: { configPath: string; vaultPath?: string; to: string; amount: string; feeRate?: number }, deps?: CliDeps): Promise<{ txid: string; explorerUrl: string }>`
+  1. Read `vault-pubkey.json` and the config (Esplora base: `esplora_url` or the `chainApiUrl` default).
+  2. Resolve `to` with `resolveRecipient(readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network), to, network)`.
+  3. `getUtxos`, keeping confirmed ones only.
+  4. `amount` is `'max'` or `parseBtcAmount(amount).sats`; fee rate is `feeRate` or `getFeeRates(base).normal`.
+  5. `buildSend({ utxos, vault: vaultKey, network, to, amount, feeRate })`.
+  6. More than 255 prevouts → `Error('this send needs <k> inputs; at most 255 fit in one transaction — consolidate first')` before any daemon call.
+  7. Daemon `{ op: 'sign', proposal: { network, tx, prevouts } }`.
+  8. `broadcastTx(base, signedTxHex)`; on failure throw `BroadcastFailedError(message, txid, signedTxHex)`.
+  - **Post:** Returns the txid and `explorerTxUrl(base, txid)`.
+  - **Throws:** recipient, UTXO, `InsufficientFundsError`, input-limit, daemon (`DaemonClientError`) and broadcast errors.
+
+- `btcSign(opts: { configPath: string; vaultPath?: string; proposalPath: string; broadcast: boolean }, deps?: CliDeps): Promise<{ txid: string; signedTxHex: string; summary: string; explorerUrl?: string }>`
+  - **Post:** Reads a `SendProposal` JSON file; refuses more than 255 prevouts; `analyzeProposal` against `vault-pubkey.json`'s `vaultKey` and network gives `summary` (outputs with labels, change, fee, fee rate); daemon `{ op: 'sign', proposal }`; broadcasts only when `broadcast` is true (`explorerUrl` then set; a failure throws `BroadcastFailedError`).
+  - **Throws:** file / JSON errors, analysis errors (before any daemon call), daemon errors, `BroadcastFailedError`.
+
+**Invariants:**
+- The CLI is the only component that talks to the chain.
+- A signed transaction is never lost: if broadcast fails after signing, the hex reaches the operator.
+
+### `book.ts`
+**Purpose:** `otzi book list|add|remove|import|export` — manage this node's address book.
+
+**Public surface:**
+- `interface BookOpts { configPath: string; bookPath?: string }` — network from the config; `bookPath` defaults to `DEFAULT_ADDRESS_BOOK_PATH`.
+- `bookList(o: BookOpts): Promise<string>` — one line per entry: label, address, note.
+- `bookAdd(o: BookOpts & { label: string; address: string; note?: string }): Promise<void>` — adds the entry, or updates the label and note of the entry with the same address; the result must pass `validateEntries`; written with `writeAddressBook`.
+- `bookRemove(o: BookOpts & { key: string }): Promise<void>` — removes the entry whose label or address equals `key`. **Throws** when nothing matches.
+- `bookImport(o: BookOpts & { file: string; replace: boolean }): Promise<{ added: number; updated: number; unchanged: number }>` — `parseAddressBookFile` on the file for the configured network; merges with `mergeAddressBooks` (default) or makes the file's entries the book (`replace`); writes; returns the counts `mergeAddressBooks(current, incoming)` reports.
+- `bookExport(o: BookOpts & { out?: string }): Promise<string>` — `addressBookFile(entries, network)` as pretty JSON; also written to `out` when given.
+
+**Invariants:**
+- Every write goes through `writeAddressBook` (validation, atomic replace, mode 0640). Writing needs the same privilege as editing `daemon.toml`.
+- Import/export files are Ötzi address-book files and move between nodes and web Ötzi unchanged.
+
 ### `backup.ts`
-**Purpose:** Pack full daemon state (config + manifest + share + identity + pubkey-book + vault-pubkey cache + bootstrap-secret + meta) into a single password-protected archive so an operator who loses their host can recover into a fresh `.deb` install via `otzi restore`.
+**Purpose:** Pack full node state (config, share, identity, pubkey book, vault metadata, address book, meta) into one password-protected archive so an operator who loses their host can recover into a fresh `.deb` install via `otzi restore`.
 
 **Public surface:**
 - `runBackup(opts?: BackupOptions): Promise<BackupResult>`
-  - **Pre:** `configPath` (default `/etc/otzi/daemon.toml`) exists and is readable; share file (path resolved by loose-parsing `[share].path` from daemon.toml), identity file (`[node].identity_key_file`), and pubkey-book file (`[node].pubkey_book_file`) all exist on disk. Optional files (manifest, vault-pubkey, bootstrap-secret) are silently skipped if absent.
-  - **Post:** Single archive written at `<outputDir>/otzi-backup-<safe-ISO>.otzi-backup` (default `outputDir` is `os.homedir()`); mode 0600; atomic via `.tmp` + rename. Returns `{ path, password, filesIncluded }` where `filesIncluded` is the list of tar paths that ended up in the archive.
+  - **Pre:** `configPath` (default `/etc/otzi/daemon.toml`) exists and is readable; share file (`[share].path`, loose-parsed from daemon.toml), identity file (`[node].identity_key_file`) and pubkey-book file (`[node].pubkey_book_file`) exist. Optional files (`vault-pubkey.json`, the address book) are skipped if absent.
+  - **Post:** Single archive written at `<outputDir>/otzi-backup-<safe-ISO>.otzi-backup` (default `outputDir` is `os.homedir()`); mode 0600; atomic via `.tmp` + rename. Returns `{ path, password, filesIncluded }`.
   - **Throws:**
     - Required file missing → `Error` with message ending in `". This looks like a fresh / pre-bootstrap install; nothing meaningful to back up yet."`.
     - daemon.toml unreadable (ENOENT) → propagates with the same canonical tail.
 
 - `BackupOptions`
-  - `configPath?: string` — daemon.toml location (test seam; default `/etc/otzi/daemon.toml`).
-  - `outputDir?: string` — archive destination directory (test seam; default `os.homedir()`).
-  - `passwordOverride?: string` — bypasses generated 32-char base62 password. Production callers MUST NOT set this; tests use it for determinism.
-  - `now?: () => Date` — clock seam for the filename ISO timestamp.
-  - `pathOverrides?: { manifest?, vaultPubkey?, bootstrapSecret? }` — test seam for the three fixed paths that aren't derived from daemon.toml.
+  - `configPath?: string` — daemon.toml location (default `/etc/otzi/daemon.toml`).
+  - `outputDir?: string` — archive destination directory (default `os.homedir()`).
+  - `passwordOverride?: string` — bypasses the generated 32-char base62 password. Production callers MUST NOT set this; tests use it for determinism.
+  - `now?: () => Date` — clock seam for the filename timestamp.
+  - `pathOverrides?` — test seam for the fixed paths not derived from daemon.toml (`vault-pubkey.json`, the address book).
 
 - `BackupResult`
   - `path: string` — absolute path to the written archive.
-  - `password: string` — generated (or override) password. CLI wrapper in `entrypoint.ts` prints the operator-facing banner.
-  - `filesIncluded: string[]` — tar paths actually packed (skipped optionals omitted).
+  - `password: string` — generated (or override) password; the entrypoint prints it once.
+  - `filesIncluded: string[]` — tar paths actually packed.
 
 **Invariants:**
-- Password is generated by `runBackup` (32 chars from `[A-Za-z0-9]`, ≈190 bits entropy); operators do not choose. Returned for the wrapper to display once.
+- Password is generated by `runBackup` (32 chars from `[A-Za-z0-9]`, ≈190 bits entropy); operators do not choose it.
 - Tar paths are RELATIVE (no leading slash) so restore can place each entry at the corresponding absolute path.
 - `meta.json` is generated in-tar (version, createdAt, hostname, partyId); never copied from disk.
-- `runBackup` is pure-ish: filesystem I/O + crypto only, no logging, no `process.exit`, no banner. The `entrypoint.ts` wrapper handles operator-facing output and exit codes.
+- `runBackup` is pure-ish: filesystem I/O + crypto only, no logging, no `process.exit`, no banner.
 
 **Cross-component contracts:**
-- Depends on: `node:crypto` (PBKDF2-SHA256, AES-256-GCM, randomBytes), `tar` (tar.create with gzip), `smol-toml` (loose parse for share/identity/pubkey paths).
-- Used by: `entrypoint.ts` `runBackupCommand` wrapper.
-- Exports the wire-format constants `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_SALT_LEN`, `BACKUP_IV_LEN`, `BACKUP_TAG_LEN`, `BACKUP_HEADER_LEN`, `BACKUP_PBKDF2_ITERATIONS`, plus the default file paths and `stripLeadingSlash` helper — `restore.ts` consumes all of these.
-
----
+- Depends on: `node:crypto` (PBKDF2-SHA256, AES-256-GCM, randomBytes), `tar` (gzip), `smol-toml` (loose parse for share/identity/pubkey paths).
+- Used by: `entrypoint.ts`.
+- Exports the wire-format constants `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_SALT_LEN`, `BACKUP_IV_LEN`, `BACKUP_TAG_LEN`, `BACKUP_HEADER_LEN`, `BACKUP_PBKDF2_ITERATIONS`, the default file paths and `stripLeadingSlash` — `restore.ts` consumes all of these.
 
 ### `restore.ts`
-**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, untar it into a tmpdir, validate, then place each file at its canonical absolute path with the per-file mode the daemon expects. Usable both as a standalone CLI verb and as the engine the debconf postinst pipes the password into via stdin.
+**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, untar it into a tmpdir, validate, then place each file at its canonical absolute path with the mode the daemon expects. Usable as a CLI verb and as the engine the debconf postinst pipes the password into via stdin.
 
 **Public surface:**
 - `runRestore(opts: RestoreOptions): Promise<RestoreResult>`
@@ -534,39 +513,49 @@
     1. Magic byte check on the archive (cheap precheck before decryption).
     2. Existing `/etc/otzi/daemon.toml` MUST NOT exist (refuses to clobber).
     3. `systemctl is-active otzi` MUST report inactive (refuses while daemon is running).
-  - **Post:** All tar entries placed at canonical (or `rootOverride`-prefixed) absolute paths; each file `chmod`'d to its hardcoded mode (see "Restored file modes" invariant below). `meta.json` is read into the result for operator confirmation but NEVER written to disk. Returns `{ restoredFiles: { path, mode }[], metaPartyId?, metaCreatedAt?, metaHostname? }`.
+  - **Post:** All tar entries placed at canonical (or `rootOverride`-prefixed) absolute paths; each file `chmod`'d to its mode (see "Restored file modes"). `meta.json` is read into the result but NEVER written to disk. Returns `{ restoredFiles: { path, mode }[], metaPartyId?, metaCreatedAt?, metaHostname? }`.
   - **Throws:**
     - Bad magic → `Error('not an otzi backup archive (magic mismatch)')`.
     - Existing daemon.toml → `Error('config already present at <path>; remove it first')`.
     - Daemon running → `Error('daemon is running; stop it with \`systemctl stop otzi\` first')`.
     - Wrong password OR tampered ciphertext → BOTH surface as `Error('wrong password or corrupted archive')`. Distinguishing the two would give an attacker an oracle.
-    - Mid-extract failure → track-and-rollback: every file already placed at a real-path destination is `rm`'d in LIFO order; original error is rethrown. Parent directories are NOT rolled back (postinst may have created them; idempotent mkdir can't be safely undone).
+    - Mid-extract failure → every file already placed is `rm`'d in LIFO order; the original error is rethrown. Parent directories are NOT rolled back.
 
 - `RestoreOptions`
   - `archivePath: string` — required positional CLI arg.
-  - `password?: string` — explicit password (test path or `--password` flag; flag leaks via `/proc/<pid>/cmdline`, docs steer operators to stdin).
+  - `password?: string` — explicit password (test path or `--password` flag; the flag leaks via `/proc/<pid>/cmdline`, docs steer operators to stdin).
   - `passwordStdin?: boolean` — read password from stdin until newline (postinst path).
-  - `rootOverride?: string` — chroot-style prefix for all extraction targets (test seam; default `/`). Also threaded into the default config-exists probe.
+  - `rootOverride?: string` — chroot-style prefix for all extraction targets (test seam; default `/`).
   - `daemonStatusCheck?: () => Promise<boolean>` — override the `systemctl is-active otzi` probe (test seam).
   - `configExistsCheck?: () => Promise<boolean>` — override the daemon.toml-exists probe (test seam).
-  - `stdinStream?: Readable` — alternate stream for the `passwordStdin` path (test seam; default `process.stdin`).
+  - `stdinStream?: Readable` — alternate stream for the `passwordStdin` path (test seam).
 
 - `RestoreResult`
-  - `restoredFiles: { path: string; mode: number }[]` — absolute paths after extraction with the mode each was `chmod`'d to.
-  - `metaPartyId?: number`, `metaCreatedAt?: string`, `metaHostname?: string` — parsed from in-archive `meta.json` for the CLI banner; missing/malformed meta is non-fatal (operator just loses the confirmation).
+  - `restoredFiles: { path: string; mode: number }[]`.
+  - `metaPartyId?: number`, `metaCreatedAt?: string`, `metaHostname?: string` — from in-archive `meta.json`; missing/malformed meta is non-fatal.
 
 **Invariants:**
-- Pre-flights run in the order listed above; each is independent of the others.
-- Wrong-password and tampered-archive surface IDENTICALLY (`'wrong password or corrupted archive'`). Don't leak which.
+- Pre-flights run in the order listed above.
+- Wrong-password and tampered-archive surface IDENTICALLY.
 - Extraction is staged-then-placed: `tar.extract` lands files in a tmpdir, modes are computed by parsing the staged daemon.toml, then files are copied to their real destinations. A throw mid-place triggers LIFO rollback of placed files only.
-- `meta.json` (tar path `meta.json`) is the only entry never written to disk.
-- Unrecognized tar entries fall back to the most-restrictive default mode (0600).
-- Password resolution precedence: explicit `password` → `passwordStdin` (read until newline) → interactive readline prompt on stderr (no echo muting).
-- `runRestore` is pure-ish: filesystem I/O + crypto + `systemctl` exec only. Single `console.error` on rollback for operator visibility; no other logging, no `process.exit`. The `entrypoint.ts` wrapper handles banners and exit codes.
+- `meta.json` is the only entry never written to disk.
+- Unrecognized tar entries fall back to the most-restrictive mode (0600).
+- Password resolution precedence: explicit `password` → `passwordStdin` → interactive readline prompt on stderr.
+- `runRestore` is pure-ish: filesystem I/O + crypto + `systemctl` exec only; a single `console.error` on rollback.
 
 **Cross-component contracts:**
-- Depends on: `node:crypto` (AES-256-GCM, PBKDF2), `tar` (tar.extract with gzip), `smol-toml` (loose parse of staged daemon.toml for operator-configurable paths), `node:child_process` (`systemctl is-active otzi` default probe), wire-format constants imported from `backup.ts`.
-- Used by: `entrypoint.ts` `runRestoreCommand` wrapper, debconf postinst (via `--password-stdin`).
+- Depends on: `node:crypto`, `tar`, `smol-toml`, `node:child_process`, constants from `backup.ts`.
+- Used by: `entrypoint.ts`, debconf postinst (via `--password-stdin`).
+
+---
+
+## src/testing/mock-esplora.ts (test only)
+
+**Purpose:** In-process Esplora stand-in (Node `http`) for CLI end-to-end tests.
+
+- `interface MockEsplora { url: string; broadcasts: string[]; fund(address: string, value: number, opts?: { confirmed?: boolean }): { txid: string; vout: number }; rejectBroadcasts(message: string | null): void; close(): Promise<void> }`
+- `startMockEsplora(): Promise<MockEsplora>`
+  - **Post:** Listens on loopback; `url` is the Esplora base. Serves `GET /address/:a/utxo`, `GET /address/:a`, `POST /tx` (records the hex in `broadcasts`, returns its txid, or fails with the `rejectBroadcasts` message), `GET /v1/fees/recommended` → `{ fastestFee: 10, halfHourFee: 5, hourFee: 2 }`, and test-only `POST /_fund {address, value, confirmed}`. `fund` (default confirmed) adds a UTXO and returns its outpoint.
 
 ---
 
@@ -588,21 +577,33 @@ Constants exported by `backup.ts`: `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_S
 
 ---
 
+## Backup file set (invariant)
+
+| Tar path | Source | Required |
+|---|---|---|
+| `etc/otzi/daemon.toml` | `--config` path | yes |
+| share file (from `[share].path`) | v4 share | yes |
+| identity file (from `[node].identity_key_file`) | P-256 identity | yes |
+| pubkey-book file (from `[node].pubkey_book_file`) | pubkey book | yes |
+| `var/lib/otzi/vault-pubkey.json` | vault metadata | no (skipped if absent) |
+| `etc/otzi/address-book.otzi.json` | address book | no (skipped if absent) |
+| `meta.json` | generated in-tar | always |
+
+---
+
 ## Restored file modes (invariant)
 
-`restore.ts` applies these modes after extraction. Match what the `.deb` postinst sets up (chmod-only; ownership inherits from `/etc/otzi` and `/var/lib/otzi` setgid bits).
+`restore.ts` applies these modes after extraction. They match what the `.deb` postinst sets up (chmod-only; ownership inherits from `/etc/otzi` and `/var/lib/otzi` setgid bits).
 
 | Path | Mode |
 |---|---|
 | `/etc/otzi/daemon.toml` | 0640 |
-| `/etc/otzi/manifest.otzi.json` | 0660 |
+| `/etc/otzi/address-book.otzi.json` | 0640 |
 | share file (configurable path) | 0600 |
 | identity file | 0660 |
 | pubkey-book file | 0644 |
 | `/var/lib/otzi/vault-pubkey.json` | 0644 |
-| `/var/lib/otzi/bootstrap-secret` | 0660 |
 
 Operator-configurable paths (share / identity / pubkeys per `[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file` in daemon.toml) are resolved at restore time by loose-parsing the staged daemon.toml. Unrecognized tar entries fall back to 0600 (most restrictive default).
 
 ---
-

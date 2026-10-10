@@ -5,179 +5,145 @@
 ## src/orchestrator/
 
 ### `types.ts`
-**Purpose:** Defines participant-side orchestrator and logger contracts; decouples ceremony outcomes and persistence sinks.
+**Purpose:** Participant-side orchestrator dependencies, ceremony outcomes and the logger contract.
 
 **Public surface:**
-- `OrchestratorCeremonyKind`
-  - Type: `'signing-mldsa' | 'signing-frost' | 'dkg-mldsa' | 'dkg-frost' | 'dkg-combined'`
-  - **Pre:** None (discriminated union tag).
-  - **Post:** Uniquely identifies ceremony class for tracker routing and outcome emission.
+- `type OutcomeStatus = 'done' | 'aborted' | 'timeout' | 'rejected' | 'invalid-signoff'`
 
-- `CeremonyOutcome` (discriminated union)
-  - **Pre:** `baseCeremonyId` is set; `kind` matches one of the five types; `status` in `'done' | 'aborted' | 'timeout' | 'rejected'`.
-  - **Post:** Outcome payload shape matches `kind`: signing outcomes carry signatures (hex) iff `status === 'done'`; DKG outcomes carry key material or empty.
-  - **Throws:** Never (outcome is a pure data structure).
+- `interface CeremonyOutcome { ceremonyId: string; kind: 'signing' | 'dkg'; status: OutcomeStatus; signaturesHex?: string[]; address?: string; reason?: string }`
+  - **Post:**
+    - `done` (signing): `signaturesHex` = the verified signatures from `signoff-done`.
+    - `done` (DKG): `address` = the new vault address.
+    - `rejected`: this node declined to take part (analysis or gate); `reason` says why.
+    - `invalid-signoff`: the leader's `signoff-done` failed verification.
+    - `aborted`: a `signoff-aborted` was accepted, or this node's ceremony failed; `reason` says why.
+    - `timeout`: the ceremony deadline fired first.
+  - **Throws:** Never (pure data).
 
-- `DkgPersistenceSink` (callback)
-  - **Pre:** `result` is non-null `CombinedDkgResult`; `meta.threshold`, `meta.parties`, `meta.level` are positive integers.
-  - **Post:** Persists the result to configured path; resolves on success, rejects on file I/O error.
-  - **Throws:** `Promise<void>` rejection on mkdir/writeFile/chmod failure.
-  - **Concurrency:** One write at a time per node (orchestrator awaits; leader awaits).
-
-- `Logger`
+- `Logger` — `{ debug; info; warn; error }`
   - **Pre:** All methods accept string message + optional metadata object.
   - **Post:** Methods return void; implementation decides whether to emit, buffer, or discard.
   - **Throws:** Never (caller must not depend on handler exceptions).
 
 - `NOOP_LOGGER`
-  - **Pre:** None (singleton).
   - **Post:** Every method is a no-op; safe default when no logging is desired.
 
-- `OrchestratorDeps`
-  - **Pre:** `transport.partyId === node.partyId`; `peersById` includes self; `share` and FROST packages either both present or both absent (signing vs DKG-only); `ceremonyDeadlines` are positive integers.
+- `interface OrchestratorDeps`
+  ```ts
+  io: CeremonyIo; gate: ApprovalGate;
+  node: { id: string; partyId: PartyId }; peersById: ReadonlyMap<PartyId, string>;
+  network: NetworkName; vault?: DecryptedShare;
+  vaultExists: () => Promise<boolean>; createStager: () => ShareStager;
+  rng: Rng; ceremonyDeadlines: { signingMs: number; dkgMs: number };
+  blobRetentionMs?: { signing: number; dkg: number };   // default BLOB_RETENTION_MS
+  addressBook?: () => Promise<AddressBookEntry[]>;
+  logger?: Logger;
+  ```
+  - **Pre:** `io.transport.partyId === node.partyId`; `peersById` holds every ring member, self included (`peersById.size` = ring size); `network` is the configured network; `vault` is the share loaded at startup (undefined on a node without a vault); `vaultExists` reports whether a file exists at the share path; `createStager` returns a fresh stager for the share path; deadlines are positive.
   - **Post:** Fully initializes a participant orchestrator; no lazy fields.
-  - **Invariant:** `share` presence gates ML-DSA signing; `frostKeyPackage` + `frostPublicKeyPackage` presence gates FROST signing; both required for combined DKG (`network` set).
-
-**Invariants:**
-- `share` and FROST key material must be consistent: if share has `frostKeyPackage`, it MUST also be in `frostKeyPackage` param (or `node/opnet-client` re-derives it).
-- `network` is only meaningful when producing `frostLegacySig` (combined DKG on mainnet/testnet); regtest passes `undefined`, key-link skipped.
-- `frostLegacySig` is only valid after combined DKG runs; participant-side capture re-extracts it locally.
-- Persistence sink errors on participant side do NOT abort the ceremony — DKG memory result is final.
 
 **Cross-component contracts:**
-- Depends on: `Transport`, `CeremonyRunner`, `ApprovalGate`, wire types (`DecryptedShare`, `KeyPackage`, etc.).
-- Used by: `Orchestrator` (accepts as constructor arg).
-
-**Notes / gotchas:**
-- `share` can be undefined (DKG-only mode); all signing requests must check before dispatch.
-- `frostLegacySig` must be hex-decoded from share file JSON by caller (not done here).
-- Phase 5e: `persistDkgShare` was added; earlier phases had no participant persistence.
+- Depends on: `CeremonyIo`, `ApprovalGate`, `DecryptedShare` (`src/otzi/lib/share-file.ts`), `ShareStager` (`src/core/dkg-ceremony.ts`), `AddressBookEntry`.
+- Used by: `Orchestrator`, `LeaderDispatcher` (`Logger`), `Daemon`.
 
 ---
 
 ### `spec-builder.ts`
-**Purpose:** Translates parsed announce messages into `CeremonySpec` for gate evaluation, extracting and verifying intent fields.
+**Purpose:** Builds the `CeremonySpec` a gate evaluates, from data this node derived itself.
 
 **Public surface:**
-- `SpecBuilderCtx`
-  - **Pre:** `fromPartyId` is the announce sender; `peersById` maps all party IDs to node names (includes self); `btcOutputs` populated iff BTC verify succeeded; `btcFrostP2tr` addresses the vault's own change-back address.
-  - **Post:** Context carries verified decoding state + peer name resolution.
+- `resolveLeaderId(from: PartyId, peersById: ReadonlyMap<PartyId, string>): string`
+  - **Post:** Returns the label from the map, or the stringified `PartyId` as fallback.
+  - **Throws:** Never.
 
-- `resolveLeaderId(from, peersById)`
-  - **Pre:** `from` is a `PartyId`; `peersById` is the peer map.
-  - **Post:** Returns node ID string from map, or stringified `PartyId` as fallback.
-  - **Throws:** Never (fallback is always safe).
+- `buildSigningSpec(analysis: ProposalAnalysis, base: CeremonySpecBase, network: NetworkName, labelFor?: (address: string) => string | undefined): SigningSpec`
+  - **Pre:** `analysis` is this node's own `analyzeProposal(proposal, toVaultKey(own publicKeyPackage), network)` result.
+  - **Post:** `{ ...base, kind: 'signing', network, txid, inputs, outputs, amount, totalIn, totalOut, fee, vsize, feeRate }` with fields copied from `analysis`. Each output carries `address`, `amount`, `isChange`, and `label` when `labelFor(address)` returns one. `amount` = sum of outputs with `isChange === false`.
+  - **Throws:** Never.
 
-- `buildSpecFromAnnounce(msg, ctx)`
-  - **Pre:** `msg` is one of five announce kinds (announce, announce-frost, announce-dkg, announce-frost-dkg, announce-combined-dkg); `ctx.peersById` is non-empty.
-  - **Post:** Returns `CeremonySpec` with `kind` (`'signing' | 'dkg'`), `ceremonyId`, `leader`, `role: 'participant'`, and operation/protocol fields populated.
-  - **Throws:** Never (all inputs are parsed by `parseCeremonyMessage`).
-  - **FROST signing (announce-frost):** Populates `operation` based on `msg.protocol` (btc→btc-transfer, opnet→opnet-call, opnet-params→opnet-call); BTC outputs filtered to exclude self; `amount` + `destination` computed; OPNet raw-tx uses advisory hints; opnet-params carries structurally-verified contractAddress + method.
-  - **Invariant:** Non-FROST announces always return `operation: 'generic'` (no intent fields).
+- `buildDkgSpec(base: CeremonySpecBase, p: { threshold: number; parties: number; network: NetworkName; peerIds: string[] }): DkgSpec`
+  - **Post:** `{ ...base, kind: 'dkg', threshold, parties, network, peerIds }`.
+  - **Throws:** Never.
 
 **Invariants:**
-- BTC outputs are STRUCTURALLY verified by orchestrator before spec-build; filtering self-address is safe.
-- OPNet raw-tx hints are ADVISORY (federation-trust posture); only the sighash is trusted.
-- OPNet opnet-params destination + method are STRUCTURALLY verified (participant re-ran capture locally); policy rules evaluate trusted data.
-- `peersById` must not be empty; at minimum, self is always in it.
+- No spec field comes from the leader's announce except `ceremonyId`, the leader identity and the DKG parameters the receiver has already checked against its own configuration.
 
 **Cross-component contracts:**
-- Depends on: `CeremonyMessage` types, `PartyId`.
-- Used by: `Orchestrator.evaluateGate()` after FROST verify succeeds.
-
-**Notes / gotchas:**
-- FROST verify happens upstream in orchestrator before `buildSpecFromAnnounce` is called — all BTC sighashes are already matched.
-- `btcFrostP2tr` filtering is critical: without it, change-back to self would inflate `amount` + pollute `destination`.
-- ML-DSA announce (announce) has no intent fields; `operation: 'generic'` is the only spec field besides ceremony metadata.
+- Used by: `Orchestrator` (participant), `LeaderDispatcher` (leader).
 
 ---
 
 ### `orchestrator.ts`
-**Purpose:** Long-lived participant-side ceremony listener. Multiplexes announces/signoffs, verifies FROST sighashes, gates specs, dispatches ceremony runners, tracks outcomes.
+**Purpose:** Long-lived participant-side listener. Parses ceremony messages, applies the participant checks, analyses proposals against this node's own key, gates, runs DKG and signing participation, verifies signoffs, enforces deadlines, and schedules blob cleanup.
 
 **Public surface:**
-- `Orchestrator` (class)
-  - **Constructor(deps: OrchestratorDeps)**
-    - **Pre:** `deps.transport` is started and listening for broadcasts; `deps.node.partyId === deps.transport.partyId`.
-    - **Post:** Constructs internal state; does NOT call `transport.onBroadcast` or emit any events yet.
+- `class Orchestrator`
+  - **`constructor(deps: OrchestratorDeps)`**
+    - **Pre:** `deps.io.transport` is started; `deps.node.partyId === deps.io.transport.partyId`.
+    - **Post:** Constructs internal state; does NOT subscribe or emit yet.
 
-  - **start(): void**
-    - **Pre:** Called exactly once (or after stop).
-    - **Post:** Subscribes to `transport.onBroadcast`; listener is active for daemon lifetime.
+  - **`start(): void`**
+    - **Post:** Subscribes to `io.transport.onBroadcast`; listener is active for daemon lifetime.
     - **Invariant:** Reentrant (returns early if already started).
 
-  - **stop(): void**
-    - **Pre:** Called after start (or redundantly).
-    - **Post:** Unsubscribes from transport; clears all ceremony trackers and timers; emits 'stopped' event to wake any pending `waitFor` calls.
+  - **`stop(): void`**
+    - **Post:** Unsubscribes from transport; aborts every live ceremony; clears all trackers and timers; wakes pending `waitFor` calls.
     - **Invariant:** Reentrant (returns early if not started).
 
-  - **onCompleted(handler): Unsubscribe**
-    - **Pre:** Called at any time (before or after start).
-    - **Post:** Registers a listener that fires on every ceremony outcome; returns an unsubscribe function.
+  - **`onCompleted(handler: (o: CeremonyOutcome) => void): Unsubscribe`**
+    - **Post:** Registers a listener that fires on every ceremony outcome.
     - **Throws:** Never (handler exceptions are NOT caught by orchestrator; caller must handle them).
 
-  - **waitFor(baseCeremonyId, timeoutMs): Promise<CeremonyOutcome>**
-    - **Pre:** Called before leader broadcasts the announce (or synchronously during onBroadcast).
-    - **Post:** Resolves when ceremony settles (outcome emitted) or rejects on timeout / stop.
-    - **Throws:** `Error` on timeout or orchestrator stopped before outcome.
-    - **Concurrency:** Multiple waitFor calls for the same ceremony all resolve/reject together (single listener, shared promise).
+  - **`waitFor(ceremonyId: string, timeoutMs?: number): Promise<CeremonyOutcome>`**
+    - **Post:** Resolves when the ceremony settles on this node.
+    - **Throws:** `Error` on timeout or orchestrator stopped before an outcome.
+    - **Concurrency:** Multiple `waitFor` calls for the same ceremony all resolve/reject together.
 
-- **Leader authentication**
-  - **Pre:** First announce for a `baseCeremonyId` pins the sender as leader; all subsequent announces (including retries + signoff) MUST come from that peer.
-  - **Post:** Non-leader announces for that ceremony are silently dropped (logged at warn level).
-  - **Invariant:** Once pinned, leader cannot change for that ceremony.
+**Message handling** (messages that fail `parseMessage` are dropped with a log line):
 
-- **Gate evaluation** (happens once per ceremony)
-  - **Pre:** FROST verify succeeds (if applicable); spec is built.
-  - **Post:** Gate decision is cached in tracker; retries (ML-DSA #N) skip re-evaluation.
-  - **Invariant:** Gate errors are treated as reject; ceremony silent-drops.
+- **`announce-dkg`** — drop (log line with the reason) unless all of these hold:
+  - no tracker exists for the `ceremonyId`;
+  - `!deps.vault && !(await deps.vaultExists())` — this node holds no vault;
+  - `network === deps.network`;
+  - `parties === peersById.size` (the parser already guarantees `2 ≤ threshold ≤ parties`);
+  - the gate approves `buildDkgSpec(base, { threshold, parties, network, peerIds })` with `role: 'participant'` and `leader = resolveLeaderId(from)`.
 
-- **FROST sighash verification** (`verifyFrostAnnounce`)
-  - **Pre:** `announce.protocol` is one of `'btc' | 'opnet' | 'opnet-params' | 'keylink'`.
-  - **Post:** Returns `{ ok: true, btcOutputs?, btcFrostP2tr? }` on success; `{ ok: false, reason }` on mismatch/error.
-  - **btc (btcParams present):** Rebuilds tx via `buildBtcTxFromParams`, compares sighash array length, matches hashes. On mismatch: silent drop, logged at error level.
-  - **opnet (unsignedTxHex + inputs):** Re-extracts sighashes via `extractBtcSighashes`, compares count + hashes. On mismatch: silent drop.
-  - **opnet-params (opnetParams present):** Rebuilds refund address (theft check), re-runs deterministic capture, compares sighash hashes. On mismatch: silent drop.
-  - **keylink:** Unverified (DKG state threading is a future plug-in); returns `ok: true` unconditionally.
-  - **Invariant:** Missing key material (share, frost pkg, legacy sig, mnemonic, network) causes opnet-params to silent-drop (logged at error level).
+  Then: create a tracker (leader pinned = sender), start the `dkgMs` deadline, and run `runDkgCeremony(io, { ceremonyId, sessionId, threshold, parties, network, rng }, createStager(), signal)` with an `AbortController` signal. Success settles `done` with `address` (`vaultPayment(toVaultKey(publicKeyPackage), network).address`); a failure settles `aborted` with the reason; the deadline aborts the controller and settles `timeout`.
 
-- **Ceremony dispatch**
-  - **ML-DSA signing:** Checks `announce.signers` includes self; verifies `deps.share` is present; launches `participateInSigning` task.
-  - **FROST signing:** Checks signer set; verifies FROST key material; launches `participateInFrostSigning` task.
-  - **ML-DSA DKG:** Derives sessionId; launches `participateInMldsaDkg`; settles on result or error.
-  - **FROST DKG:** Launches `participateInFrostDkg`; settles on result or error.
-  - **Combined DKG:** Passes `network` to spec if set; launches `participateInCombinedDkg`; calls `persistDkgShare` on success (best-effort, errors logged but don't abort).
-  - **Invariant:** All inflight tasks are tracked; settling waits for none (fire-and-forget results in outcome signaling).
+- **`announce-sign`** — drop (log line with the reason) unless all of these hold:
+  - no tracker exists for the `ceremonyId` — the sender of the first announce is pinned as leader;
+  - this node has a vault loaded (`deps.vault`);
+  - this node and the sender are in `signers`; `signers` has no duplicates, contains only ring members, and has at least `vault.threshold` entries;
+  - the proposal has at most 255 inputs (`MAX_INPUTS`; the parser enforces it on `prevouts`);
+  - `analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), deps.network)` succeeds;
+  - the gate approves `buildSigningSpec(analysis, base, network, labelFor)`, with labels from `deps.addressBook` when present (a failed address-book read means no labels).
 
-- **Signoff handling**
-  - **Pre:** Leader broadcasts signoff-done / signoff-frost-done / signoff-aborted.
-  - **Post:** Settles ceremony with the signoff outcome (abort → aborted, signoff-done → done with signature/batch).
-  - **Invariant:** Signoff from non-leader is silently dropped (logged).
+  Then: keep the analysed sighashes for signoff verification, start the `signingMs` deadline, and run `participateInSigning(io, { ceremonyId, signers, sighashes, keyPackage, publicKeyPackage, rng }, signal)`. A failure settles `aborted` with the reason; success leaves the tracker live until a signoff or the deadline (`timeout`).
 
-- **Ceremony settlement**
-  - **Pre:** Outcome is being recorded.
-  - **Post:** Clears deadline timer; removes tracker from ceremonies map; emits 'completed' event; logs at info level.
-  - **Invariant:** `settled` flag prevents duplicate settlements.
-  - **Deadline:** Fires on ceremony-kind specific timeout (signingMs, dkgMs from config); settles as 'timeout'.
+- **`signoff-done`** — accepted only from the pinned leader of a live signing tracker. Settles `done` (with `signaturesHex`) when the count equals the kept sighash count and every signature passes `verifySignature(sig, sighash, vault.publicKeyPackage.verifyingKey)`; otherwise logs at error level and settles `invalid-signoff`.
+
+- **`signoff-aborted`** — for signing, accepted only from the pinned leader; for DKG, from any ring member. Aborts the tracker's controller and settles `aborted` with the message's `reason`.
+
+**Settle:** clears the deadline timer, removes the tracker, calls `scheduleClear(io.store, ceremonyId, retention)` with the kind's retention (`blobRetentionMs ?? BLOB_RETENTION_MS`), emits the outcome, logs at info level. A `settled` flag prevents double settlement.
+
+**Rejected participation:** a failed analysis or a gate non-approve (`reject`, `pending`, or a gate that throws) sends nothing to peers and settles the ceremony as `rejected` with the reason. Drops that do not concern a new ceremony — an announce for a `ceremonyId` with a live tracker, a signoff from anyone but the pinned leader (signing), messages for unknown ceremonies — are logged only.
 
 **Invariants:**
-- Orchestrator is a long-lived listener, NOT per-ceremony (unlike test helpers `orchestrateParticipant`).
-- Gate decision is cached per baseCeremonyId; ML-DSA retries (#N suffixes) skip re-evaluation.
-- Signoff always comes from the leader; participant never sends signoff.
-- Participant cannot affect ceremony outcome; runner result (or timeout) drives settlement.
-- Deadline is enforced per ceremony; timeout-based settlement prevents hung ceremonies from leaking resources.
-- Silent drops (sighash mismatch, non-leader announce, gate non-approve) are indistinguishable from offline to peers.
+- Orchestrator is a long-lived listener, NOT per-ceremony.
+- First announce wins: once a tracker is live, its leader cannot change and no second announce for that `ceremonyId` is processed.
+- Verify-before-gate: the gate never sees a spec this node did not derive from its own analysis.
+- No DKG while a vault exists: the vault check runs on every `announce-dkg`. A `.pending` file does not count as a vault; a committed share file does.
+- Silent drops (failed checks, failed analysis, gate non-approve) are indistinguishable from offline to peers.
+- Participant never sends a signoff for signing; for DKG, `runDkgCeremony` broadcasts `signoff-aborted` on its own failure.
+- Every settle schedules exactly one blob clear.
 
 **Cross-component contracts:**
-- Depends on: `Transport.onBroadcast`, `CeremonyRunner.participate*`, `ApprovalGate.approve`, verify/rebuild functions.
-- Used by: `Daemon` (instantiated once; orchestrator.onCompleted wired for logging).
+- Depends on: `Transport.onBroadcast`, `parseMessage`, `runDkgCeremony`, `participateInSigning`, `analyzeProposal` / `toVaultKey` / `vaultPayment` (`src/otzi/lib`), frots `verifySignature`, `ApprovalGate.approve`, `scheduleClear`.
+- Used by: `Daemon` (instantiated once; `onCompleted` wired for logging).
 
 **Notes / gotchas:**
-- No ceremony execution happens if gate is non-approve; peer is silent.
-- Ceremony timeout is the safety-net; crashed leaders cause participant-side timeout + settlement as 'timeout'.
-- Phase 4d / 5c: key-link unverified in announce; DKG state threading needed for full verification.
-- `buildOpnetParamsKeyMat()` returns undefined if any required field (share, frost pkg, legacy sig, mnemonic, network) is missing; opnet-params announce then silent-drops.
-- FROST legacy sig is extracted from share during DKG and reused for all opnet-params verification; regeneration is not an option.
+- A node that completes a DKG keeps running without the new vault loaded; signing on it starts after a daemon restart. Its `vaultExists()` is true from the commit on, so a second DKG is refused.
+- The ceremony deadline is the safety net for a crashed leader or a lost signoff.
+- `waitFor` is used by tests; runtime code reacts through `onCompleted`.
 
 ---
-

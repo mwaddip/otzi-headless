@@ -11,122 +11,119 @@
 - `Decision` — `'approve' | 'reject' | 'pending'`.
 - `CeremonyRole` — `'leader' | 'participant'`.
 
-- `CeremonySpecBase` — interface
-  - **Pre:** `ceremonyId` unique; `leader` matches a peer id in config; `role` in `{'leader', 'participant'}`.
+- `interface CeremonySpecBase { ceremonyId: string; leader: string; role: CeremonyRole }`
+  - **Pre:** `ceremonyId` matches `CEREMONY_ID_RE`; `leader` is the leader's label from `peersById` (`resolveLeaderId`); `role` is this node's role.
   - **Post:** Common fields for all ceremony specs.
 
-- `SigningSpec` — interface
-  - **Pre:**
-    - `kind === 'signing'`.
-    - `operation` ∈ `{'btc-transfer', 'opnet-call', 'key-link', 'generic'}`.
-    - `amount` bigint (smallest units: sats for BTC, atomic for OPNet) or undefined (e.g., raw-message signing).
-    - `destination` address string or undefined (primary output for BTC, contract for OPNet).
-    - `method` string (OPNet method or BTC sighash tag) or undefined.
-    - `outputs` populated ONLY for `operation === 'btc-transfer'`; every non-self output address decoded (verified by participant rebuild).
-    - Vault's own change output is EXCLUDED from outputs (policy rules like `allowed_btc_recipients` don't require self-address in allowlist).
-  - **Post:** High-level operation intent, amount, destination, external outputs.
+- `interface SpecOutput { address: string; amount: number; isChange: boolean; label?: string }`
+  - **Post:** One transaction output from this node's `analyzeProposal`: `address` as the analysis encodes it, `amount` in sats (safe integer), `isChange` ⇔ the output pays this node's own vault script, `label` from this node's own address book when the address is in it.
 
-- `DkgSpec` — interface
-  - **Pre:**
-    - `kind === 'dkg'`.
-    - `protocol` ∈ `{'mldsa', 'frost', 'combined'}`.
-    - `threshold` ≥ 1.
-    - `parties` ≥ threshold.
-    - `peerIds` array of expected peer ids (including self).
+- `interface SigningSpec extends CeremonySpecBase`
+  ```ts
+  kind: 'signing'; network: NetworkName; txid: string;
+  inputs: Array<{ txid: string; vout: number; amount: number }>; outputs: SpecOutput[];
+  amount: number; totalIn: number; totalOut: number; fee: number; vsize: number; feeRate: number;
+  ```
+  - **Pre:** Built by `buildSigningSpec` from this node's own `ProposalAnalysis` — never from leader-supplied fields.
+  - **Post:** `outputs` lists every output, change included, in transaction order. `amount` = sum of outputs with `isChange === false`. `fee = totalIn − totalOut`. `vsize` assumes one 64-byte key-path signature per input. `feeRate = fee / vsize` (sat/vB, may be fractional). All sat amounts are safe integers.
+
+- `interface DkgSpec extends CeremonySpecBase { kind: 'dkg'; threshold: number; parties: number; network: NetworkName; peerIds: string[] }`
+  - **Pre:** `2 ≤ threshold ≤ parties`; `parties` = ring size; `network` = the announced network (equal to this node's); `peerIds` = labels of every ring member, self included.
   - **Post:** DKG ceremony identity and participant list.
 
-- `CeremonySpec` — `SigningSpec | DkgSpec` (discriminated union on `.kind`).
+- `type CeremonySpec = SigningSpec | DkgSpec` (discriminated union on `.kind`).
 
-- `ApprovalGate` — interface
+- `interface ApprovalGate`
   - **Post:** Single async method `approve(spec: CeremonySpec): Promise<Decision>`.
-  - **Contract:** Gate can only FURTHER RESTRICT; never widen decisions. Rejecting node stays silent to peers. DKG aborts on any reject (threshold = n). Signing proceeds iff ≥ t peers approve.
-  - **Lifecycle:** Gate lives in trigger layer; ceremony core / transport are unaware.
+  - **Contract:** A gate can only FURTHER RESTRICT; never widen. A rejecting node stays silent to peers. DKG aborts on any reject (every ring member takes part). Signing completes only if every node in `signers` approves (`signers` defaults to all n).
+  - **Lifecycle:** Gate lives in the trigger layer; ceremony core / transport are unaware.
 
 **Invariants:**
-- `outputs` is readonly (immutable view). Non-self outputs only; change filtered at spec-build.
-- `SigningSpec.details` extra fields for audit/logging; gate behavior ignores unless rule-relevant.
-- `Decision` semantics: `'approve'` → proceed; `'reject'` → drop (participant silent, leader surfaces); `'pending'` → re-check on external signal.
+- Every spec field is derived by this node: the leader and each participant analyse the proposal against their own key and network before building the spec (verify-before-gate).
+- `isChange` is decided by script equality with this node's own vault script; a leader cannot mark a foreign output as change.
+- `Decision` semantics: `'approve'` → proceed; `'reject'` → drop (participant silent, leader surfaces 403); `'pending'` → re-check on external signal.
 
 **Cross-component contracts:**
-- `CeremonySpec` built at trigger time (leader) or announce-receipt (participant).
-- Specs wired through announce payload (phase 5c/5d).
+- `CeremonySpec` built at trigger time (leader, `src/daemon/leader.ts`) or announce-receipt time (participant, `src/orchestrator/orchestrator.ts`) via `src/orchestrator/spec-builder.ts`.
 - Daemon promises NOT to mutate spec after passing to gate.
+- Exec and webhook approvers receive the spec as JSON.
 
 **Notes / gotchas:**
-- BTC outputs exclude change (detected & filtered during spec build). Policy rule `allowed_btc_recipients` applies only to external outputs.
-- `amount` is sum of non-self outputs for BTC; hints-supplied for OPNet (treated as opaque by gate, verification is upstream).
+- Output addresses are exactly the strings `analyzeProposal` produces (lowercase bech32/bech32m for segwit and taproot). Allowlists compare by exact string.
 
 ---
 
 ### `policy.ts`
-**Purpose:** Deterministic, strict-by-default policy rule engine on ceremony specs.
+**Purpose:** Deterministic, strict-by-default policy rules on Bitcoin ceremony specs.
 
 **Public surface:**
-- `PolicyConfig` — interface
-  - **Pre:** All fields optional; combination determines which rules are active.
-  - **Post:** Parsed policy state (allowlists, caps, rate limit).
-  - **Rules:**
-    - `maxAmount` (u64 or decimal string) — cap on `spec.amount`. Spec rejected if amount missing OR > cap.
-    - `destinationAllowlist` (string array) — destination must be in list if set. Rejected if destination missing.
-    - `methodAllowlist` (string array) — method must be in list if set. Rejected if method missing.
-    - `maxBtcPerTx` (BTC-only, smallest units) — cap on sum of non-self outputs. Active only when `operation === 'btc-transfer'`. Rejected if outputs missing.
-    - `allowedBtcRecipients` (BTC-only) — every non-self output address must be in list. Rejected if outputs missing or any address is null (OP_RETURN, etc.).
-    - `allowedContracts` (OPNet-only) — `spec.destination` must be in list. Active only when `operation === 'opnet-call'`. Rejected if destination missing.
-    - `maxCeremoniesPerHour` (sliding window, approvals-only) — max signing ceremonies approved per rolling hour. Rejected when exceeded.
-    - `dkgLeaderAllowlist` (DKG-only) — leader must be in list if set.
+- `interface PolicyConfig`
+  ```ts
+  maxSatsPerTx?: number; maxSatsPer24h?: number;
+  allowedRecipients?: string[] | 'address-book';
+  maxFeeSats?: number; maxFeeRate?: number;
+  maxCeremoniesPerHour?: number; dkgLeaderAllowlist?: string[];
+  ```
+  - **Post:** Parsed policy state; a rule is active iff its field is set.
 
-- `PolicyGate` — class implements `ApprovalGate`
-  - **Pre:** Constructor takes `PolicyConfig` and optional `now: () => number` (for deterministic testing of rate limit).
-  - **Post:** Instance ready to approve specs.
-  - **Throws:** Never in constructor.
-  - **Invariant:** `signingApprovals` array holds timestamps (ms) of approved signing ceremonies; pruned by sliding-window cutoff.
+- `interface PolicyGateOptions { now?: () => number; loadAddressBook?: () => Promise<string[]> }`
+  - `now` defaults to `Date.now` (injectable for window tests).
+  - `loadAddressBook` returns the addresses in this node's address book; required for `allowedRecipients === 'address-book'`.
 
-- `PolicyGate.approve(spec)` — async method
-  - **Pre:** `spec` is fully populated (spec-builder responsibility).
-  - **Post:** Returns `Promise<Decision>`.
-  - **Returns:**
-    - `'approve'` if all active rules pass.
-    - `'reject'` if any rule fails (no partial information leaked; fail-stop).
-    - Never `'pending'`.
-  - **Throws:** Never (async, returns Decision).
-  - **Semantics of strict-by-default:**
-    - If operator sets allowlist/cap AND spec lacks the corresponding field → reject.
-    - Rationale: operator explicitly opted in; field-missing should not bypass.
-  - **Rate limit:** Check + record atomically (no async gap). Sliding window: cutoff = now() - 1hr, prune old entries, check count, append timestamp.
+- `class PolicyGate implements ApprovalGate`
+  - **Constructor:** `new PolicyGate(config: PolicyConfig, opts?: PolicyGateOptions)`. Never throws.
 
-- `parsePolicyParams(params)` — function
-  - **Pre:** Raw TOML `[gate.params]` table (string keys, unknown values).
+- `PolicyGate.approve(spec)` — async
+  - **Pre:** `spec` built by `spec-builder.ts`.
+  - **Post:** `'approve'` iff every active rule passes; `'reject'` otherwise. Never `'pending'`. Never throws.
+  - **Signing rules:**
+
+    | Key (`[gate.params]`) | Field | Rule |
+    |---|---|---|
+    | `max_sats_per_tx` | `maxSatsPerTx` | `spec.amount` ≤ cap. |
+    | `max_sats_per_24h` | `maxSatsPer24h` | Sum of `amount` over this node's approvals in the last 24 h, plus `spec.amount`, ≤ cap. |
+    | `allowed_recipients` | `allowedRecipients` | Every output with `isChange === false` has its `address` in the set. With `"address-book"`, the set is `loadAddressBook()` read at each evaluation. |
+    | `max_fee_sats` | `maxFeeSats` | `spec.fee` ≤ cap. |
+    | `max_fee_rate` | `maxFeeRate` | `spec.feeRate` ≤ cap (sat/vB). |
+    | `max_ceremonies_per_hour` | `maxCeremoniesPerHour` | Signing approvals by this node in the last hour < cap. |
+
+  - **DKG rule:** `dkg_leader_allowlist` (`dkgLeaderAllowlist`) — `spec.leader` must be in the list. Signing rules never apply to a `DkgSpec`; the DKG rule never applies to a `SigningSpec`.
+  - **Strict by default:** a configured rule whose input is missing rejects. With `"address-book"`, a failed load, an invalid book file, or no `loadAddressBook` dependency rejects (and a warning is logged).
+  - **Windows:** every rule is evaluated first; only when the final decision is approve is the approval recorded in the hourly window (timestamp) and the 24 h window (`{ at: now(), amount }`). Entries older than 3 600 000 ms / 86 400 000 ms are pruned. The checks and the records happen in one synchronous section (after any address-book load), so concurrent evaluations cannot both pass a cap.
+
+- `parsePolicyParams(params: Record<string, unknown>): PolicyConfig`
+  - **Pre:** Raw TOML `[gate.params]` table.
   - **Post:** Validated `PolicyConfig`.
-  - **Throws:** `ConfigError` with path like `gate.max_amount`, `gate.allowed_btc_recipients[i]`, etc.
   - **Validation:**
-    - `max_amount` coerced to bigint via `coerceAmount` (accepts number, bigint, or decimal string "12345").
-    - Allowlists coerced to string array via `coerceStringArray`.
-    - `max_ceremonies_per_hour` coerced to positive integer via `coercePositiveInt`.
-    - Unknown keys rejected.
+    - `max_sats_per_tx`, `max_sats_per_24h`, `max_fee_sats`: non-negative safe integers, given as a TOML integer or a decimal string.
+    - `max_fee_rate`: non-negative number (may be fractional) or decimal string.
+    - `allowed_recipients`: an array of non-empty address strings, or the string `"address-book"`.
+    - `max_ceremonies_per_hour`: positive integer.
+    - `dkg_leader_allowlist`: array of strings.
+    - Unknown keys are rejected.
+  - **Rejected keys** (each a `ConfigError` at `gate.<key>`):
 
-- `coerceAmount(v, path)`, `coercePositiveInt(v, path)`, `coerceStringArray(v, path)` — helpers
-  - **Pre:** `v` is unknown; `path` for error reporting.
-  - **Post:** Coerced type or throws.
-  - **Throws:** `ConfigError` when invalid.
-  - **Notes:** `coerceAmount` accepts `number`, `bigint`, or non-negative decimal string.
+    | Key | Message |
+    |---|---|
+    | `max_amount`, `max_btc_per_tx` | `use max_sats_per_tx` |
+    | `allowed_btc_recipients`, `destination_allowlist` | `use allowed_recipients` |
+    | `method_allowlist`, `allowed_contracts` | `no longer supported` |
+
+  - **Throws:** `ConfigError` (from `../config/parse`) with a path like `gate.max_fee_rate` or `gate.allowed_recipients[2]`.
 
 **Invariants:**
-- Strict-by-default: if a rule is configured and spec lacks the field, gate rejects.
-- Rate limit window is in-memory (resets on daemon restart); entries are per-approval (not per-ceremony, not per-leader).
-- BTC rules (maxBtcPerTx, allowedBtcRecipients) only active when `operation === 'btc-transfer'`.
-- OPNet rule (allowedContracts) only active when `operation === 'opnet-call'`.
-- DKG rule (dkgLeaderAllowlist) only active when `kind === 'dkg'`.
+- Strict-by-default: if a rule is configured and the spec lacks its input, the gate rejects.
+- Windows are in memory (reset on daemon restart) and count approvals only — every approval this node gives, leader or participant, whether or not the ceremony then completes.
+- `amount` counts only non-change outputs, so change back to the vault never consumes a cap.
 
 **Cross-component contracts:**
 - Created by `factory.createGate()` when `gate.strategy === 'policy'`.
-- Expected by daemon to be deterministic and side-effect-free (except rate-limit memory).
-- Needs injectable `now()` for testing.
+- `loadAddressBook` is wired by the daemon from `readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)` (see [address-book.md](address-book.md)).
+- Expected by daemon to be deterministic and side-effect-free apart from the window memory.
 
 **Notes / gotchas:**
-- Rate limit is in-memory and approvals-only (rejects are not recorded, so they don't count toward the window).
-- Change output filtering happens at spec-build time, not in the policy gate.
-- Null addresses in BTC outputs (OP_RETURN) are explicitly rejected if `allowedBtcRecipients` is set.
-- Amount validation is generic (any operation with amount); BTC + OPNet can both use it.
+- Rejects are not recorded, so they don't count toward the windows.
+- With `"address-book"`, editing `/etc/otzi/address-book.otzi.json` widens the allowlist; the file is root-owned 0640 for that reason.
 
 ---
 
@@ -161,14 +158,12 @@
     - `'approve'` if exit code 0 and first stdout line is "approve".
     - `'reject'` if exit code 0 and first stdout line is "reject".
   - **Throws:** Error when exit code ≠ 0, timeout, spawn failure, or unexpected output.
-  - **Note:** Thrown errors are caught by orchestrator and converted to `reject` at participant (silent), or `GateRejection` at leader.
+  - **Note:** Thrown errors are caught by the orchestrator and treated as `reject` at a participant (silent), or as `GateRejection` at the leader.
   - **Timeout:** Hard cap via `setTimeout` → `SIGTERM`. Timer cleared on success.
 
 - `serializeSpec(spec)` — function
   - **Pre:** `spec` is `CeremonySpec` (SigningSpec or DkgSpec).
-  - **Post:** JSON string with bigints → decimal strings.
-  - **Contract:** Bigint serialization is load-bearing. Exec delegate must parse decimal strings back to bigint if needed for arithmetic.
-  - **Example:** `{amount: 50000n}` → `{"amount":"50000"}`.
+  - **Post:** JSON string; any bigint is rendered as a decimal string. Bitcoin specs carry only safe-integer and finite numbers, so amounts, fee and fee rate appear as JSON numbers.
 
 - `parseExecParams(params)` — function
   - **Pre:** Raw TOML `[gate.params]` table.
@@ -190,7 +185,7 @@
 **Cross-component contracts:**
 - Created by `factory.createGate()` when `gate.strategy === 'exec'`.
 - Daemon expects synchronous-looking approval via stdin/stdout protocol.
-- Spec includes all fields; delegate is responsible for validation if needed.
+- Spec includes all fields; delegate is responsible for validation if needed. `examples/gate-file-approver.sh` reads the signing spec fields.
 
 **Notes / gotchas:**
 - Command is spawned every time `approve()` is called (no caching; idempotency is delegate's responsibility).
@@ -198,7 +193,6 @@
 - Environment is merged (not replaced); delegate sees `process.env` + `[gate.params].env`.
 - Timeout is hard wall (SIGTERM); no grace period for cleanup.
 - stderr truncated to 500 chars in error message for readability.
-- Bigint in spec is serialized as decimal string (e.g., "50000", not 50000); delegate must parse back if needed.
 
 ---
 
@@ -237,7 +231,7 @@
   - **Throws:** `ConfigError` for invalid url, missing timeout_sec, bad bearer_token_env, etc.
 
 **Invariants:**
-- POST body is JSON-serialized spec (bigints as decimal strings, as with `ExecGate`).
+- POST body is the JSON-serialized spec (`serializeSpec`, as with `ExecGate`).
 - Response is expected to be JSON with `{"decision": "approve" | "reject"}`.
 - Bearer token is read from env at request time (not at config time); throws if env var is missing/empty when set.
 - Non-OK HTTP status (not 2xx) throws before parsing response body.
@@ -245,7 +239,7 @@
 **Cross-component contracts:**
 - Created by `factory.createGate()` when `gate.strategy === 'webhook'`.
 - Daemon expects synchronous-looking approval via HTTP (long-polling supported; endpoint holds connection open).
-- Spec includes all fields; delegate is responsible for validation if needed.
+- Spec includes all fields; delegate is responsible for validation if needed. `examples/gate-web-btc-message/` is a webhook approver whose operator signs each decision with a Bitcoin message signature.
 
 **Notes / gotchas:**
 - Bearer token is read from `process.env[bearerTokenEnv]` on each request (allows rotation without daemon restart).
@@ -265,33 +259,31 @@
   - **Pre:** None.
   - **Post:** Instance that always returns `'approve'`.
   - **Throws:** Never.
-  - **Use:** Default gate strategy (tautological, no policy).
+  - **Use:** Default gate strategy (no policy).
 
 - `AutoGate.approve(spec)` — async method
   - **Pre:** Any spec.
   - **Post:** Returns `Promise<'approve'>`.
   - **Throws:** Never.
 
-- `createGate(config)` — function
+- `createGate(config: GateConfig, deps?: { loadAddressBook?: () => Promise<string[]> }): ApprovalGate`
   - **Pre:** `config` is validated `GateConfig` with strategy ∈ `GATE_STRATEGIES`.
   - **Post:** Returns `ApprovalGate` (one of AutoGate, PolicyGate, ExecGate, WebhookGate).
   - **Dispatch table:**
     - `'auto'` → `new AutoGate()`.
-    - `'policy'` → `new PolicyGate(parsePolicyParams(config.params ?? {}))`.
+    - `'policy'` → `new PolicyGate(parsePolicyParams(config.params ?? {}), { loadAddressBook: deps?.loadAddressBook })`.
     - `'exec'` → `new ExecGate(parseExecParams(config.params ?? {}))`.
     - `'webhook'` → `new WebhookGate(parseWebhookParams(config.params ?? {}))`.
     - Fallback → Throw "unreachable" (exhaustive check via TypeScript `never`).
   - **Throws:** ConfigError from parse* helpers if params are invalid.
-  - **Note:** Passing `config.params ?? {}` ensures parse* helpers receive an object (even if params is undefined).
 
 **Invariants:**
-- Exactly one gate is constructed per daemon (singleton at startup, used for every ceremony).
+- Exactly one gate is constructed per daemon (singleton at startup, used for every ceremony, leader and participant).
 - Each strategy's `parseFooParams()` is called here; errors abort daemon startup.
 
 **Cross-component contracts:**
-- Called by daemon entrypoint (phase 5b gate narrowing).
-- Returned gate is passed to trigger layer for each ceremony.
-- Gate instance persists for daemon lifetime (stateful for rate limit, etc.).
+- Called by `Daemon` at construction, with `loadAddressBook` reading this node's address book.
+- Gate instance persists for daemon lifetime (stateful for rate windows).
 
 **Notes / gotchas:**
 - `config.params` defaults to empty object (`{}`) if undefined; ensures parse* helpers don't crash on null/undefined.
@@ -299,3 +291,20 @@
 
 ---
 
+## examples/ (approver examples, not part of the daemon)
+
+### `examples/gate-web-btc-message/`
+**Purpose:** Webhook approver whose operator signs every decision with a Bitcoin message signature in any wallet that signs messages. Run with `npx tsx examples/gate-web-btc-message/approver.ts`; `APPROVER_ADDRESS` pins the one operator address whose signatures count. The page lists pending specs with outputs, labels, change, fee and fee rate.
+
+**Public surface (`decision.ts`):**
+- `decisionMessage(decision: 'approve' | 'reject', ceremonyId: string, nonce: string): string`
+  - **Post:** `` `otzi-gate:${decision}:${ceremonyId}:${nonce}` ``.
+- `verifyDecision(p: { address: string; decision: 'approve' | 'reject'; ceremonyId: string; nonce: string; signature: string }): boolean`
+  - **Post:** `verifyBitcoinMessage(p.address, decisionMessage(p.decision, p.ceremonyId, p.nonce), p.signature)` — BIP-322 simple for P2WPKH / P2TR, legacy / BIP-137 for older types. Never throws.
+
+**Invariants:**
+- The signed message binds the decision to one ceremony and one approver-issued nonce, so a signature cannot be replayed for another ceremony or the other decision.
+- The approver imports the lifted `src/otzi/backend/btc-message.ts`; the daemon never does. The daemon sees only `{"decision": …}` from the webhook.
+
+### `examples/gate-file-approver.sh`
+**Purpose:** File-drop `exec` approver. Reads the spec JSON from stdin, writes it to `<pending dir>/<ceremonyId>.json` for the operator, waits for a decision file `<decisions dir>/<ceremonyId>` containing `approve` or `reject`, and prints that decision. Every spec field it reads is a field of the Bitcoin `SigningSpec` / `DkgSpec` above.
