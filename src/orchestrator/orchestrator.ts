@@ -1,119 +1,114 @@
 /**
- * Participant-side ceremony orchestrator.
+ * Participant-side ceremony orchestrator (facts/orchestrator.md, `orchestrator.ts`;
+ * spec §5.3 and §5.4, participant side).
  *
- * Lifts the per-ceremony test helpers (`orchestrateParticipant`,
- * `orchestrateFrostParticipant`, `orchestrateDkgParticipant`,
- * `orchestrateFrostDkgParticipant`, `orchestrateCombinedDkgParticipant`)
- * into a single long-lived listener. Serves a daemon over its lifetime,
- * multiplexing many ceremonies.
+ * One long-lived listener per daemon. For every ceremony announce it applies
+ * the participant checks, derives the gate spec from this node's own data
+ * (verify-before-gate), asks the gate once, and runs the DKG or the signing
+ * participation. A tracker per ceremony pins the leader (first announce wins),
+ * owns the abort controller and the deadline, and keeps the sighashes this
+ * node computed so the leader's `signoff-done` can be verified.
  *
- * Contract (from CLAUDE.md § Core Architecture + § Security Model):
- *   - Leader-authenticated signoffs: the first announce's `from` is pinned
- *     as the leader; all subsequent announces (including `#N` retries) and
- *     the signoff for that baseCeremonyId MUST come from the same peer.
- *   - Gate evaluation happens once per ceremony (decision is cached across
- *     ML-DSA retries — intent doesn't change between attempts).
- *   - Rejected/pending gate decisions are silent: the node contributes no
- *     blobs, and peers see it as indistinguishable from offline.
- *   - DKG completion is driven by the participate method's resolution; only
- *     signoff-aborted settles DKG as failed (and the deadline fires on a
- *     crashed-leader fallback).
+ * Refusals are silent to peers. A failed analysis or a gate non-approve
+ * settles the ceremony locally as `rejected`; every earlier check is a
+ * structural drop that is only logged.
+ *
+ * The orchestrator also holds this node's single DKG slot: a DKG this node
+ * leads registers through `beginLocalDkg`, and no second DKG — led or joined —
+ * starts while one is live (two DKGs would share one `.pending` path).
  */
 
 import { EventEmitter } from 'node:events';
+import { verifySignature } from '@mwaddip/frots';
+import { BLOB_RETENTION_MS, scheduleClear } from '../core/blob-retention';
+import type { CeremonyIo } from '../core/ceremony-io';
+import { runDkgCeremony, type ShareStager } from '../core/dkg-ceremony';
 import {
-  buildBtcTxFromParams,
-  extractBtcSighashes,
-  type DecodedBtcOutput,
-} from '../broadcast/btc-vault';
-import { captureOpnetSighashes } from '../broadcast/opnet-capture';
-import {
-  buildCaptureInputsFromParams,
-  deriveVaultP2tr,
-  type OpnetParamsKeyMat,
-} from '../broadcast/opnet-params-reconstruct';
-import {
-  messageFromAnnounce,
-  parseCeremonyMessage,
-  sessionIdFromAnnounceCombinedDkg,
-  sessionIdFromAnnounceDkg,
-  sessionIdFromAnnounceFrostDkg,
-  sighashesFromAnnounceFrost,
-  type CeremonyMessage,
-} from '../core/ceremony-messages';
-import { fromHex, toHex } from '../wire/hex';
+  MAX_INPUTS,
+  parseMessage,
+  type AnnounceDkg,
+  type AnnounceSign,
+  type SignoffAborted,
+  type SignoffDone,
+} from '../core/messages';
+import { participateInSigning } from '../core/sign-ceremony';
 import type { PartyId, Unsubscribe } from '../core/types';
-import type { Decision } from '../gate/types';
-import { buildSpecFromAnnounce } from './spec-builder';
+import type { CeremonySpec, CeremonySpecBase, Decision } from '../gate/types';
+import { labelFor } from '../otzi/lib/address-book';
+import { analyzeProposal, vaultPayment, type ProposalAnalysis } from '../otzi/lib/bitcoin';
+import { toVaultKey } from '../otzi/lib/dkg';
+import { fromHex } from '../otzi/lib/hex';
+import { buildDkgSpec, buildSigningSpec, resolveLeaderId } from './spec-builder';
 import {
   NOOP_LOGGER,
   type CeremonyOutcome,
   type Logger,
-  type OrchestratorCeremonyKind,
   type OrchestratorDeps,
+  type OutcomeStatus,
 } from './types';
 
-interface FrostVerifyOk {
-  ok: true;
-  btcOutputs?: ReadonlyArray<DecodedBtcOutput>;
-  btcFrostP2tr?: string;
-}
-interface FrostVerifyError {
-  ok: false;
-  reason: string;
-}
-type FrostVerifyOutcome = FrostVerifyOk | FrostVerifyError;
+type CeremonyKind = CeremonyOutcome['kind'];
+type LogLevel = keyof Logger;
 
-type AnnounceMessage = Extract<
-  CeremonyMessage,
-  {
-    kind:
-      | 'announce'
-      | 'announce-frost'
-      | 'announce-dkg'
-      | 'announce-frost-dkg'
-      | 'announce-combined-dkg';
-  }
->;
-
-interface CeremonyTracker {
-  baseCeremonyId: string;
-  kind: OrchestratorCeremonyKind;
-  leaderId: PartyId;
-  inflight: Promise<unknown>[];
-  dispatchedCeremonyIds: Set<string>;
-  gateDecisionPromise?: Promise<Decision>;
+interface Tracker {
+  readonly ceremonyId: string;
+  readonly kind: CeremonyKind;
+  /** The sender of the first announce. */
+  readonly leader: PartyId;
+  readonly controller: AbortController;
+  timer: ReturnType<typeof setTimeout> | null;
   settled: boolean;
-  deadlineTimer: NodeJS.Timeout | null;
+  /** Signing: the sighashes this node computed, for signoff verification. */
+  sighashes?: readonly Uint8Array[];
 }
 
-const ANNOUNCE_KIND_TO_CEREMONY_KIND: Record<AnnounceMessage['kind'], OrchestratorCeremonyKind> = {
-  announce: 'signing-mldsa',
-  'announce-frost': 'signing-frost',
-  'announce-dkg': 'dkg-mldsa',
-  'announce-frost-dkg': 'dkg-frost',
-  'announce-combined-dkg': 'dkg-combined',
+interface Settlement {
+  status: OutcomeStatus;
+  reason?: string;
+  signaturesHex?: string[];
+  address?: string;
+  /** Overrides the status's default log level. */
+  level?: LogLevel;
+}
+
+interface LocalDkgSlot {
+  readonly ceremonyId: string;
+  readonly controller: AbortController;
+}
+
+const SETTLE_LEVEL: Record<OutcomeStatus, LogLevel> = {
+  done: 'info',
+  rejected: 'info',
+  aborted: 'warn',
+  timeout: 'warn',
+  'invalid-signoff': 'error',
 };
+
+const DEFAULT_WAIT_MS = 60_000;
 
 export class Orchestrator {
   private readonly deps: OrchestratorDeps;
   private readonly log: Logger;
   private readonly events = new EventEmitter();
-  private readonly ceremonies = new Map<string, CeremonyTracker>();
+  /** Live ceremonies by `ceremonyId`. */
+  private readonly trackers = new Map<string, Tracker>();
+  /** Outcomes of ceremonies that settled within their retention period. */
+  private readonly ended = new Map<string, { outcome: CeremonyOutcome; timer: ReturnType<typeof setTimeout> }>();
+  private localDkg: LocalDkgSlot | null = null;
   private off: Unsubscribe | null = null;
   private started = false;
 
   constructor(deps: OrchestratorDeps) {
     this.deps = deps;
     this.log = deps.logger ?? NOOP_LOGGER;
+    // One listener per pending waitFor; there is no fixed bound.
+    this.events.setMaxListeners(0);
   }
 
   start(): void {
     if (this.started) return;
     this.started = true;
-    this.off = this.deps.transport.onBroadcast((from, bytes) => {
-      this.onBroadcast(from, bytes);
-    });
+    this.off = this.deps.io.transport.onBroadcast((from, bytes) => this.onBroadcast(from, bytes));
     this.log.info('orchestrator: started', { nodeId: this.deps.node.id, partyId: this.deps.node.partyId });
   }
 
@@ -122,39 +117,48 @@ export class Orchestrator {
     this.started = false;
     this.off?.();
     this.off = null;
-    for (const tracker of this.ceremonies.values()) {
-      if (tracker.deadlineTimer) clearTimeout(tracker.deadlineTimer);
+    for (const t of this.trackers.values()) {
+      // Cut short without an outcome: the late rejection of its ceremony is ignored.
+      t.settled = true;
+      this.halt(t);
     }
-    this.ceremonies.clear();
+    this.trackers.clear();
+    for (const { timer } of this.ended.values()) clearTimeout(timer);
+    this.ended.clear();
+    this.localDkg?.controller.abort();
+    this.localDkg = null;
     this.events.emit('stopped');
     this.log.info('orchestrator: stopped');
   }
 
-  /** Subscribe to ceremony outcomes. Use for daemon-level event handling (logging, persistence). */
-  onCompleted(handler: (outcome: CeremonyOutcome) => void): Unsubscribe {
+  /** Fires on every ceremony outcome. Handler exceptions are not caught. */
+  onCompleted(handler: (o: CeremonyOutcome) => void): Unsubscribe {
     this.events.on('completed', handler);
-    return () => this.events.off('completed', handler);
+    return () => {
+      this.events.off('completed', handler);
+    };
   }
 
   /**
-   * Resolves when the named ceremony settles. Test-friendly — subscribes
-   * synchronously, so call this BEFORE the leader broadcasts its announce.
-   * Rejects if the timeout elapses without a matching outcome or if stop() fires.
+   * Resolves when `ceremonyId` settles on this node, or at once when it
+   * settled within its retention period. Rejects on timeout or `stop()`.
    */
-  waitFor(baseCeremonyId: string, timeoutMs = 60_000): Promise<CeremonyOutcome> {
+  waitFor(ceremonyId: string, timeoutMs = DEFAULT_WAIT_MS): Promise<CeremonyOutcome> {
+    const ended = this.ended.get(ceremonyId);
+    if (ended) return Promise.resolve(ended.outcome);
     return new Promise((resolve, reject) => {
-      const onCompleted = (outcome: CeremonyOutcome) => {
-        if (outcome.baseCeremonyId !== baseCeremonyId) return;
+      const onCompleted = (o: CeremonyOutcome) => {
+        if (o.ceremonyId !== ceremonyId) return;
         cleanup();
-        resolve(outcome);
+        resolve(o);
       };
       const onStopped = () => {
         cleanup();
-        reject(new Error(`orchestrator stopped before ${baseCeremonyId} settled`));
+        reject(new Error(`orchestrator stopped before ${ceremonyId} settled`));
       };
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error(`orchestrator.waitFor timed out for ${baseCeremonyId}`));
+        reject(new Error(`orchestrator.waitFor timed out for ${ceremonyId}`));
       }, timeoutMs);
       const cleanup = () => {
         clearTimeout(timer);
@@ -166,601 +170,393 @@ export class Orchestrator {
     });
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Dispatch
-  // ─────────────────────────────────────────────────────────────────────────
+  /**
+   * Register a DKG this node leads. `null` while any DKG — led or joined — is
+   * live. The slot's `signal` aborts on a ring member's `signoff-aborted` for
+   * `ceremonyId` or on `stop()`; `end()` releases the slot (idempotent).
+   */
+  beginLocalDkg(ceremonyId: string): { signal: AbortSignal; end(): void } | null {
+    if (this.dkgLive()) return null;
+    const slot: LocalDkgSlot = { ceremonyId, controller: new AbortController() };
+    this.localDkg = slot;
+    return {
+      signal: slot.controller.signal,
+      end: () => {
+        if (this.localDkg === slot) this.localDkg = null;
+      },
+    };
+  }
+
+  // ─── Dispatch ────────────────────────────────────────────────────────────
 
   private onBroadcast(from: PartyId, bytes: Uint8Array): void {
-    const msg = parseCeremonyMessage(bytes);
-    if (!msg) return;
-
-    if (
-      msg.kind === 'announce' ||
-      msg.kind === 'announce-frost' ||
-      msg.kind === 'announce-dkg' ||
-      msg.kind === 'announce-frost-dkg' ||
-      msg.kind === 'announce-combined-dkg'
-    ) {
-      void this.handleAnnounce(from, msg as AnnounceMessage);
+    const msg = parseMessage(bytes);
+    if (!msg) {
+      this.log.warn(`orchestrator: dropped an unparseable message from party ${from}`, { from, bytes: bytes.length });
       return;
     }
-
-    if (
-      msg.kind === 'signoff-done' ||
-      msg.kind === 'signoff-frost-done' ||
-      msg.kind === 'signoff-aborted'
-    ) {
-      this.handleSignoff(from, msg);
-      return;
+    switch (msg.kind) {
+      case 'announce-dkg':
+        this.run(this.onAnnounceDkg(from, msg));
+        return;
+      case 'announce-sign':
+        this.run(this.onAnnounceSign(from, msg));
+        return;
+      case 'signoff-done':
+        this.onSignoffDone(from, msg);
+        return;
+      case 'signoff-aborted':
+        this.onSignoffAborted(from, msg);
+        return;
     }
   }
 
-  private async handleAnnounce(from: PartyId, msg: AnnounceMessage): Promise<void> {
-    const baseId = msg.baseCeremonyId;
-    const kind = ANNOUNCE_KIND_TO_CEREMONY_KIND[msg.kind];
+  private run(task: Promise<void>): void {
+    task.catch(err => this.log.error(`orchestrator: unexpected error: ${errorMessage(err)}`));
+  }
 
-    let tracker = this.ceremonies.get(baseId);
+  // ─── announce-dkg ────────────────────────────────────────────────────────
 
-    if (!tracker) {
-      tracker = this.initTracker(baseId, kind, from);
-      this.ceremonies.set(baseId, tracker);
-    } else {
-      if (tracker.settled) return;
-      if (tracker.leaderId !== from) {
-        this.log.warn('orchestrator: announce from non-leader; ignored', {
-          baseId,
-          leaderId: tracker.leaderId,
+  private async onAnnounceDkg(from: PartyId, msg: AnnounceDkg): Promise<void> {
+    const { ceremonyId, threshold, parties, network } = msg;
+    const drop = (level: LogLevel, reason: string) => this.drop(level, msg.kind, ceremonyId, from, reason);
+    const ringSize = this.deps.peersById.size;
+
+    if (this.isDuplicate(from, msg, 'dkg')) return;
+    if (this.dkgLive()) return drop('warn', 'a DKG is already running on this node');
+    if (network !== this.deps.network) return drop('warn', `network ${network} does not match ${this.deps.network}`);
+    if (parties !== ringSize) return drop('warn', `parties ${parties} does not match ring size ${ringSize}`);
+    if (this.deps.vault) return drop('warn', 'this node already holds a vault (share loaded)');
+
+    // Reserve the ceremonyId and the DKG slot before the first await.
+    const t = this.open(ceremonyId, 'dkg', from);
+    let exists: boolean;
+    try {
+      exists = await this.deps.vaultExists();
+    } catch (err) {
+      if (t.settled) return;
+      this.discard(t);
+      return drop('warn', `cannot check the share path: ${errorMessage(err)}`);
+    }
+    if (t.settled) return;
+    if (exists) {
+      this.discard(t);
+      return drop('warn', 'this node already holds a vault (a share file exists at the share path)');
+    }
+
+    const spec = buildDkgSpec(this.specBase(ceremonyId, from), { threshold, parties, network, peerIds: this.peerIds() });
+    if (!(await this.approved(t, spec))) return;
+
+    let stager: ShareStager;
+    try {
+      stager = this.deps.createStager();
+    } catch (err) {
+      return this.settle(t, { status: 'aborted', reason: `cannot create the share stager: ${errorMessage(err)}` });
+    }
+    const dkgSpec = { ceremonyId, sessionId: fromHex(msg.sessionIdHex), threshold, parties, network, rng: this.deps.rng };
+    runDkgCeremony(this.ceremonyIo('dkg'), dkgSpec, stager, t.controller.signal).then(
+      ({ publicKeyPackage }) => {
+        const address = vaultPayment(toVaultKey(publicKeyPackage), network).address;
+        if (t.settled) {
+          this.log.warn(
+            `orchestrator: dkg ${ceremonyId} committed a share for ${address} after the ceremony ended here; the share is on disk`,
+            { ceremonyId, address },
+          );
+          return;
+        }
+        this.settle(t, { status: 'done', address });
+      },
+      err => this.settle(t, { status: 'aborted', reason: errorMessage(err) }),
+    );
+  }
+
+  // ─── announce-sign ───────────────────────────────────────────────────────
+
+  private async onAnnounceSign(from: PartyId, msg: AnnounceSign): Promise<void> {
+    const { ceremonyId, signers, proposal } = msg;
+    const drop = (level: LogLevel, reason: string) => this.drop(level, msg.kind, ceremonyId, from, reason);
+    const { vault } = this.deps;
+    const me = this.deps.node.partyId;
+
+    if (this.isDuplicate(from, msg, 'signing')) return;
+    if (!vault) return drop('warn', 'no vault loaded on this node');
+    if (!signers.includes(me)) return drop('info', `party ${me} is not in signers`);
+    const signerProblem = this.signerProblem(from, signers, vault.threshold);
+    if (signerProblem) return drop('warn', signerProblem);
+    if (proposal.prevouts.length > MAX_INPUTS) {
+      return drop('warn', `proposal has ${proposal.prevouts.length} inputs, at most ${MAX_INPUTS}`);
+    }
+
+    const t = this.open(ceremonyId, 'signing', from);
+    let analysis: ProposalAnalysis;
+    try {
+      analysis = analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), this.deps.network);
+    } catch (err) {
+      return this.settle(t, { status: 'rejected', reason: `proposal analysis failed: ${errorMessage(err)}`, level: 'warn' });
+    }
+    const sighashes = analysis.sighashes.map(s => fromHex(s.hash));
+    t.sighashes = sighashes;
+
+    const label = await this.labeler(ceremonyId);
+    if (t.settled) return;
+    const spec = buildSigningSpec(analysis, this.specBase(ceremonyId, from), this.deps.network, label);
+    if (!(await this.approved(t, spec))) return;
+
+    const signSpec = {
+      ceremonyId,
+      signers,
+      sighashes,
+      keyPackage: vault.keyPackage,
+      publicKeyPackage: vault.publicKeyPackage,
+      rng: this.deps.rng,
+    };
+    // Success leaves the tracker live until a signoff or the deadline.
+    participateInSigning(this.ceremonyIo('signing'), signSpec, t.controller.signal).then(
+      () => {},
+      err => this.settle(t, { status: 'aborted', reason: errorMessage(err) }),
+    );
+  }
+
+  private signerProblem(from: PartyId, signers: readonly PartyId[], threshold: number): string | null {
+    if (!signers.includes(from)) return `leader party ${from} is not in signers`;
+    if (new Set(signers).size !== signers.length) return 'signers has duplicates';
+    const stranger = signers.find(p => !this.deps.peersById.has(p));
+    if (stranger !== undefined) return `signer ${stranger} is not in the ring`;
+    if (signers.length < threshold) return `signers has ${signers.length} entries, the vault needs ${threshold}`;
+    return null;
+  }
+
+  /** Output labels from this node's address book; a failed read means no labels. */
+  private async labeler(ceremonyId: string): Promise<((address: string) => string | undefined) | undefined> {
+    const { addressBook } = this.deps;
+    if (!addressBook) return undefined;
+    try {
+      const entries = await addressBook();
+      return address => labelFor(entries, address);
+    } catch (err) {
+      this.log.warn(
+        `orchestrator: signing ${ceremonyId}: address book read failed, the gate sees no output labels: ${errorMessage(err)}`,
+        { ceremonyId },
+      );
+      return undefined;
+    }
+  }
+
+  // ─── Signoffs ────────────────────────────────────────────────────────────
+
+  private onSignoffDone(from: PartyId, msg: SignoffDone): void {
+    const { ceremonyId, signaturesHex } = msg;
+    const drop = (level: LogLevel, reason: string) => this.drop(level, msg.kind, ceremonyId, from, reason);
+    const t = this.trackers.get(ceremonyId);
+    if (!t) return drop('debug', 'no live ceremony with this id');
+    if (t.kind !== 'signing') return drop('warn', 'the ceremony is a DKG');
+    if (from !== t.leader) return drop('warn', `party ${from} is not the pinned leader (party ${t.leader})`);
+
+    const problem = this.signoffProblem(t, signaturesHex);
+    if (problem) return this.settle(t, { status: 'invalid-signoff', reason: problem });
+    this.settle(t, { status: 'done', signaturesHex: [...signaturesHex] });
+  }
+
+  /** Why the signatures fail against this node's own sighashes and output key, or null. */
+  private signoffProblem(t: Tracker, signaturesHex: readonly string[]): string | null {
+    const { sighashes } = t;
+    const { vault } = this.deps;
+    if (!sighashes || !vault) return 'this node computed no sighashes for the ceremony';
+    if (signaturesHex.length !== sighashes.length) {
+      return `${signaturesHex.length} signatures for ${sighashes.length} inputs`;
+    }
+    const key = vault.publicKeyPackage.verifyingKey;
+    for (let i = 0; i < sighashes.length; i++) {
+      if (!verifies(fromHex(signaturesHex[i]!), sighashes[i]!, key)) return `signature for input ${i} does not verify`;
+    }
+    return null;
+  }
+
+  private onSignoffAborted(from: PartyId, msg: SignoffAborted): void {
+    const { ceremonyId } = msg;
+    const reason = msg.reason ?? `aborted by party ${from}`;
+    const ringMember = this.deps.peersById.has(from);
+    let known = false;
+
+    // The DKG this node leads stops as soon as any ring member aborts it.
+    const slot = this.localDkg;
+    if (slot && slot.ceremonyId === ceremonyId && ringMember) {
+      known = true;
+      if (!slot.controller.signal.aborted) {
+        this.log.warn(`orchestrator: dkg ${ceremonyId} (led here) aborted by party ${from}: ${reason}`, {
+          ceremonyId,
           from,
         });
-        return;
-      }
-      if (tracker.kind !== kind) {
-        this.log.warn('orchestrator: announce kind mismatch for existing ceremony; ignored', {
-          baseId,
-          expected: tracker.kind,
-          got: kind,
-        });
-        return;
+        slot.controller.abort();
       }
     }
 
-    // ML-DSA signing has `#N` retry suffixes; every unique ceremonyId under the
-    // baseId is a fresh attempt. Other kinds have a single attempt — duplicates
-    // (rebroadcast / network echo) must be deduped.
-    if (tracker.dispatchedCeremonyIds.has(msg.ceremonyId)) {
-      this.log.debug('orchestrator: duplicate ceremonyId; dropping', { ceremonyId: msg.ceremonyId });
-      return;
-    }
-    tracker.dispatchedCeremonyIds.add(msg.ceremonyId);
-
-    // Verify FROST-signing construction/sighashes before the gate sees the
-    // spec — so policy evaluation runs over VERIFIED fields. BTC rebuild from
-    // `btcParams`; OPNet re-extracts sighashes from raw tx + inputs;
-    // `opnet-params` re-runs the deterministic capture. Mismatch → silent
-    // drop (peer indistinguishable from offline). Verify outcome for BTC
-    // carries the decoded outputs that populate the spec.
-    let verify: FrostVerifyOutcome = { ok: true };
-    if (msg.kind === 'announce-frost') {
-      verify = await this.verifyFrostAnnounce(msg);
-      if (!verify.ok) {
-        this.log.error(
-          `orchestrator: FROST announce sighash mismatch — silent drop (${verify.reason})`,
-          { baseId },
-        );
-        return;
+    const t = this.trackers.get(ceremonyId);
+    if (t) {
+      known = true;
+      if (t.kind === 'signing' && from !== t.leader) {
+        this.drop('warn', msg.kind, ceremonyId, from, `party ${from} is not the pinned leader (party ${t.leader})`);
+      } else if (t.kind === 'dkg' && !ringMember) {
+        this.drop('warn', msg.kind, ceremonyId, from, `party ${from} is not a ring member`);
+      } else {
+        this.settle(t, { status: 'aborted', reason });
       }
     }
 
-    const decision = await this.evaluateGate(tracker, msg, verify);
+    if (!known) this.drop('debug', msg.kind, ceremonyId, from, 'no live ceremony with this id');
+  }
+
+  // ─── Trackers ────────────────────────────────────────────────────────────
+
+  /**
+   * The checks every announce passes first. Reusing an id that ended here
+   * within retention would collide with its blobs and its scheduled clear.
+   */
+  private isDuplicate(from: PartyId, msg: AnnounceDkg | AnnounceSign, kind: CeremonyKind): boolean {
+    const { ceremonyId } = msg;
+    const drop = (level: LogLevel, reason: string) => this.drop(level, msg.kind, ceremonyId, from, reason);
+    const live = this.trackers.get(ceremonyId);
+    if (live) {
+      if (live.leader !== from) drop('warn', `party ${from} is not the pinned leader (party ${live.leader})`);
+      else if (live.kind !== kind) drop('warn', `a ${live.kind} ceremony with this id is live`);
+      else drop('info', 'duplicate announce for a live ceremony');
+      return true;
+    }
+    if (this.localDkg?.ceremonyId === ceremonyId) {
+      drop('warn', 'this node leads a DKG with this id');
+      return true;
+    }
+    if (this.ended.has(ceremonyId)) {
+      drop('info', 'the ceremony already ended on this node');
+      return true;
+    }
+    return false;
+  }
+
+  private dkgLive(): boolean {
+    if (this.localDkg) return true;
+    for (const t of this.trackers.values()) if (t.kind === 'dkg') return true;
+    return false;
+  }
+
+  /** Create the tracker (leader pinned) and start the ceremony deadline. */
+  private open(ceremonyId: string, kind: CeremonyKind, leader: PartyId): Tracker {
+    const t: Tracker = { ceremonyId, kind, leader, controller: new AbortController(), timer: null, settled: false };
+    const ms = this.deadlineMs(kind);
+    t.timer = setTimeout(() => this.settle(t, { status: 'timeout', reason: `ceremony deadline of ${ms} ms passed` }), ms);
+    this.trackers.set(ceremonyId, t);
+    return t;
+  }
+
+  /** Remove a tracker after a structural drop: no outcome, nothing to clear. */
+  private discard(t: Tracker): void {
+    t.settled = true;
+    this.halt(t);
+    if (this.trackers.get(t.ceremonyId) === t) this.trackers.delete(t.ceremonyId);
+  }
+
+  private halt(t: Tracker): void {
+    if (t.timer) clearTimeout(t.timer);
+    t.timer = null;
+    t.controller.abort();
+  }
+
+  /** Gate once. Anything but approve (a throw included) settles `rejected`. */
+  private async approved(t: Tracker, spec: CeremonySpec): Promise<boolean> {
+    let decision: Decision;
+    try {
+      decision = await this.deps.gate.approve(spec);
+    } catch (err) {
+      this.settle(t, { status: 'rejected', reason: `gate error: ${errorMessage(err)}`, level: 'warn' });
+      return false;
+    }
+    if (t.settled) return false;
     if (decision !== 'approve') {
-      this.log.info('orchestrator: gate non-approve; silent drop', { baseId, decision });
-      return;
+      this.settle(t, { status: 'rejected', reason: `gate decision: ${decision}` });
+      return false;
     }
-
-    this.dispatchParticipant(tracker, msg);
+    return true;
   }
 
-  private async evaluateGate(
-    tracker: CeremonyTracker,
-    msg: AnnounceMessage,
-    verify: FrostVerifyOutcome,
-  ): Promise<Decision> {
-    if (!tracker.gateDecisionPromise) {
-      const spec = buildSpecFromAnnounce(msg, {
-        fromPartyId: tracker.leaderId,
-        peersById: this.deps.peersById,
-        ...(verify.ok && verify.btcOutputs
-          ? { btcOutputs: verify.btcOutputs, btcFrostP2tr: verify.btcFrostP2tr }
-          : {}),
-      });
-      tracker.gateDecisionPromise = this.deps.gate.approve(spec).catch((err) => {
-        this.log.warn('orchestrator: gate threw; treating as reject', {
-          baseId: tracker.baseCeremonyId,
-          err: errString(err),
-        });
-        return 'reject' as Decision;
-      });
-    }
-    return tracker.gateDecisionPromise;
-  }
+  private settle(t: Tracker, s: Settlement): void {
+    if (t.settled) return;
+    t.settled = true;
+    this.halt(t);
+    if (this.trackers.get(t.ceremonyId) === t) this.trackers.delete(t.ceremonyId);
 
-  private dispatchParticipant(tracker: CeremonyTracker, msg: AnnounceMessage): void {
-    switch (msg.kind) {
-      case 'announce':
-        this.dispatchMldsaSigning(tracker, msg);
-        return;
-      case 'announce-frost':
-        this.dispatchFrostSigning(tracker, msg);
-        return;
-      case 'announce-dkg':
-        this.dispatchMldsaDkg(tracker, msg);
-        return;
-      case 'announce-frost-dkg':
-        this.dispatchFrostDkg(tracker, msg);
-        return;
-      case 'announce-combined-dkg':
-        this.dispatchCombinedDkg(tracker, msg);
-        return;
-    }
-  }
+    const retention = (this.deps.blobRetentionMs ?? BLOB_RETENTION_MS)[t.kind];
+    scheduleClear(this.deps.io.store, t.ceremonyId, retention);
 
-  private dispatchMldsaSigning(
-    tracker: CeremonyTracker,
-    announce: Extract<CeremonyMessage, { kind: 'announce' }>,
-  ): void {
-    if (!announce.signers.includes(this.deps.node.partyId)) {
-      this.log.debug('orchestrator: not in signer set; passive listener', { baseId: tracker.baseCeremonyId });
-      return;
-    }
-    if (!this.deps.share) {
-      this.log.error('orchestrator: ML-DSA signing requested but no share loaded — daemon is DKG-only (restart with share file present)', {
-        baseId: tracker.baseCeremonyId,
-      });
-      return;
-    }
-    const spec = {
-      ceremonyId: announce.ceremonyId,
-      message: messageFromAnnounce(announce),
-      signers: announce.signers,
-      share: this.deps.share,
-    };
-    const task = this.deps.runner
-      .participateInSigning(spec, this.deps.pullOpts)
-      .catch((err) => {
-        this.log.warn('orchestrator: participateInSigning errored', {
-          baseId: tracker.baseCeremonyId,
-          ceremonyId: spec.ceremonyId,
-          err: errString(err),
-        });
-      });
-    tracker.inflight.push(task);
-  }
+    const outcome: CeremonyOutcome = { ceremonyId: t.ceremonyId, kind: t.kind, status: s.status };
+    if (s.signaturesHex) outcome.signaturesHex = s.signaturesHex;
+    if (s.address) outcome.address = s.address;
+    if (s.reason) outcome.reason = s.reason;
+    this.record(outcome, retention);
 
-  private dispatchFrostSigning(
-    tracker: CeremonyTracker,
-    announce: Extract<CeremonyMessage, { kind: 'announce-frost' }>,
-  ): void {
-    if (!announce.signers.includes(this.deps.node.partyId)) {
-      this.log.debug('orchestrator: not in FROST signer set; passive listener', {
-        baseId: tracker.baseCeremonyId,
-      });
-      return;
-    }
-    if (!this.deps.frostKeyPackage || !this.deps.frostPublicKeyPackage) {
-      this.log.error('orchestrator: FROST signing requested but no FROST key package loaded', {
-        baseId: tracker.baseCeremonyId,
-      });
-      return;
-    }
-    // Sighash verification already happened upstream in handleAnnounce (BTC
-    // rebuild from btcParams or OPNet extract from unsignedTxHex+inputs) —
-    // a mismatching announce would have been silent-dropped before reaching
-    // dispatch. Signers here can trust `sighashes` are consistent with the
-    // construction data (or were absent, in which case participants sign
-    // the asserted sighashes directly — tests exercise this path).
-    const spec = {
-      ceremonyId: announce.ceremonyId,
-      sighashes: sighashesFromAnnounceFrost(announce),
-      signers: announce.signers,
-      keyPackage: this.deps.frostKeyPackage,
-      publicKeyPackage: this.deps.frostPublicKeyPackage,
-      rng: this.deps.rng,
-    };
-    const task = this.deps.runner
-      .participateInFrostSigning(spec, this.deps.pullOpts)
-      .catch((err) => {
-        this.log.warn('orchestrator: participateInFrostSigning errored', {
-          baseId: tracker.baseCeremonyId,
-          err: errString(err),
-        });
-      });
-    tracker.inflight.push(task);
-  }
-
-  private dispatchMldsaDkg(
-    tracker: CeremonyTracker,
-    announce: Extract<CeremonyMessage, { kind: 'announce-dkg' }>,
-  ): void {
-    const spec = {
-      ceremonyId: announce.ceremonyId,
-      threshold: announce.threshold,
-      parties: announce.parties,
-      level: announce.level,
-    };
-    const sessionId = sessionIdFromAnnounceDkg(announce);
-    const task = this.deps.runner.participateInMldsaDkg(spec, sessionId, this.deps.pullOpts).then(
-      (result) => {
-        this.settle(tracker, {
-          baseCeremonyId: tracker.baseCeremonyId,
-          kind: 'dkg-mldsa',
-          status: 'done',
-          result,
-        });
-      },
-      (err) => {
-        this.log.warn('orchestrator: participateInMldsaDkg errored', {
-          baseId: tracker.baseCeremonyId,
-          err: errString(err),
-        });
-      },
-    );
-    tracker.inflight.push(task);
-  }
-
-  private dispatchFrostDkg(
-    tracker: CeremonyTracker,
-    announce: Extract<CeremonyMessage, { kind: 'announce-frost-dkg' }>,
-  ): void {
-    const spec = {
-      ceremonyId: announce.ceremonyId,
-      threshold: announce.threshold,
-      parties: announce.parties,
-      rng: this.deps.rng,
-    };
-    const sessionId = sessionIdFromAnnounceFrostDkg(announce);
-    const task = this.deps.runner.participateInFrostDkg(spec, sessionId, this.deps.pullOpts).then(
-      (result) => {
-        this.settle(tracker, {
-          baseCeremonyId: tracker.baseCeremonyId,
-          kind: 'dkg-frost',
-          status: 'done',
-          keyPackage: result.keyPackage,
-          publicKeyPackage: result.publicKeyPackage,
-        });
-      },
-      (err) => {
-        this.log.warn('orchestrator: participateInFrostDkg errored', {
-          baseId: tracker.baseCeremonyId,
-          err: errString(err),
-        });
-      },
-    );
-    tracker.inflight.push(task);
-  }
-
-  private dispatchCombinedDkg(
-    tracker: CeremonyTracker,
-    announce: Extract<CeremonyMessage, { kind: 'announce-combined-dkg' }>,
-  ): void {
-    const spec = {
-      ceremonyId: announce.ceremonyId,
-      threshold: announce.threshold,
-      parties: announce.parties,
-      level: announce.level,
-      rng: this.deps.rng,
-      ...(this.deps.network ? { network: this.deps.network } : {}),
-    };
-    const sessionId = sessionIdFromAnnounceCombinedDkg(announce);
-    const task = this.deps.runner
-      .participateInCombinedDkg(spec, sessionId, this.deps.pullOpts)
-      .then(
-        async (result) => {
-          if (this.deps.persistDkgShare) {
-            try {
-              await this.deps.persistDkgShare(result, {
-                threshold: spec.threshold,
-                parties: spec.parties,
-                level: spec.level,
-              });
-            } catch (err) {
-              // Persistence is best-effort on participants: the DKG itself
-              // succeeded in memory, so we still settle as `done` and let the
-              // operator notice the error in logs. (Leader-side, by contrast,
-              // propagates the error to its HTTP caller.)
-              this.log.error('orchestrator: persist DKG share failed', {
-                baseId: tracker.baseCeremonyId,
-                err: errString(err),
-              });
-            }
-          }
-          this.settle(tracker, {
-            baseCeremonyId: tracker.baseCeremonyId,
-            kind: 'dkg-combined',
-            status: 'done',
-            result,
-          });
-        },
-        (err) => {
-          this.log.warn('orchestrator: participateInCombinedDkg errored', {
-            baseId: tracker.baseCeremonyId,
-            err: errString(err),
-          });
-        },
-      );
-    tracker.inflight.push(task);
-  }
-
-  private handleSignoff(
-    from: PartyId,
-    msg: Extract<
-      CeremonyMessage,
-      { kind: 'signoff-done' | 'signoff-frost-done' | 'signoff-aborted' }
-    >,
-  ): void {
-    const tracker = this.ceremonies.get(msg.baseCeremonyId);
-    if (!tracker || tracker.settled) return;
-    if (tracker.leaderId !== from) {
-      this.log.warn('orchestrator: signoff from non-leader; ignored', {
-        baseId: msg.baseCeremonyId,
-        leaderId: tracker.leaderId,
-        from,
-      });
-      return;
-    }
-
-    if (msg.kind === 'signoff-done' && tracker.kind === 'signing-mldsa') {
-      this.settle(tracker, {
-        baseCeremonyId: msg.baseCeremonyId,
-        kind: 'signing-mldsa',
-        status: 'done',
-        signatureHex: msg.signatureHex,
-      });
-      return;
-    }
-    if (msg.kind === 'signoff-frost-done' && tracker.kind === 'signing-frost') {
-      this.settle(tracker, {
-        baseCeremonyId: msg.baseCeremonyId,
-        kind: 'signing-frost',
-        status: 'done',
-        signaturesHex: msg.signaturesHex,
-      });
-      return;
-    }
-    if (msg.kind === 'signoff-aborted') {
-      this.settle(tracker, this.abortedOutcome(tracker));
-      return;
-    }
-    // Otherwise: signoff kind mismatches tracker kind. Ignore (shouldn't happen from a valid leader).
-    this.log.warn('orchestrator: signoff kind/ceremony-kind mismatch; ignored', {
-      baseId: msg.baseCeremonyId,
-      ceremonyKind: tracker.kind,
-      signoffKind: msg.kind,
-    });
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Tracker helpers
-  // ─────────────────────────────────────────────────────────────────────────
-
-  private initTracker(
-    baseCeremonyId: string,
-    kind: OrchestratorCeremonyKind,
-    leaderId: PartyId,
-  ): CeremonyTracker {
-    const deadlineMs = kind === 'signing-mldsa' || kind === 'signing-frost'
-      ? this.deps.ceremonyDeadlines.signingMs
-      : this.deps.ceremonyDeadlines.dkgMs;
-    const tracker: CeremonyTracker = {
-      baseCeremonyId,
-      kind,
-      leaderId,
-      inflight: [],
-      dispatchedCeremonyIds: new Set(),
-      settled: false,
-      deadlineTimer: null,
-    };
-    tracker.deadlineTimer = setTimeout(() => {
-      if (tracker.settled) return;
-      this.log.warn('orchestrator: ceremony deadline elapsed; settling as timeout', {
-        baseId: baseCeremonyId,
-        kind,
-      });
-      this.settle(tracker, this.timeoutOutcome(tracker));
-    }, deadlineMs);
-    return tracker;
-  }
-
-  private settle(tracker: CeremonyTracker, outcome: CeremonyOutcome): void {
-    if (tracker.settled) return;
-    tracker.settled = true;
-    if (tracker.deadlineTimer) {
-      clearTimeout(tracker.deadlineTimer);
-      tracker.deadlineTimer = null;
-    }
-    this.ceremonies.delete(tracker.baseCeremonyId);
-    this.log.info('orchestrator: ceremony settled', {
-      baseId: tracker.baseCeremonyId,
-      kind: outcome.kind,
-      status: outcome.status,
+    const level = s.level ?? SETTLE_LEVEL[s.status];
+    this.log[level](`orchestrator: ${t.kind} ${t.ceremonyId} ${s.status}${s.reason ? `: ${s.reason}` : ''}`, {
+      ceremonyId: t.ceremonyId,
+      kind: t.kind,
+      status: s.status,
+      leader: t.leader,
     });
     this.events.emit('completed', outcome);
   }
 
-  private abortedOutcome(tracker: CeremonyTracker): CeremonyOutcome {
-    return { baseCeremonyId: tracker.baseCeremonyId, kind: tracker.kind, status: 'aborted' } as CeremonyOutcome;
+  /** Keep the outcome for the retention period (duplicate announces, late `waitFor`). */
+  private record(outcome: CeremonyOutcome, retentionMs: number): void {
+    const { ceremonyId } = outcome;
+    const previous = this.ended.get(ceremonyId);
+    if (previous) clearTimeout(previous.timer);
+    const timer = setTimeout(() => {
+      if (this.ended.get(ceremonyId)?.timer === timer) this.ended.delete(ceremonyId);
+    }, retentionMs);
+    timer.unref();
+    this.ended.set(ceremonyId, { outcome, timer });
   }
 
-  private timeoutOutcome(tracker: CeremonyTracker): CeremonyOutcome {
-    return { baseCeremonyId: tracker.baseCeremonyId, kind: tracker.kind, status: 'timeout' } as CeremonyOutcome;
+  private drop(level: LogLevel, kind: string, ceremonyId: string, from: PartyId, reason: string): void {
+    this.log[level](`orchestrator: dropped ${kind} ${ceremonyId} from party ${from}: ${reason}`, {
+      ceremonyId,
+      from,
+      kind,
+      reason,
+    });
   }
 
-  /**
-   * Verify the leader's asserted FROST-signing sighashes against what this
-   * node computes locally from the announce's construction data.
-   *
-   * - `btc` (`btcParams` present): rebuild via `buildBtcTxFromParams` +
-   *   compare. Produces decoded outputs for `SigningSpec.outputs`.
-   * - `opnet` (`unsignedTxHex` + `inputs`): re-extract sighashes via
-   *   `extractBtcSighashes` + compare. ABI-agnostic; policy uses hints.
-   * - `opnet-params` (`opnetParams`): re-run the deterministic capture via
-   *   `captureOpnetSighashes` with asserted UTXOs / challenge / rnd-bytes
-   *   seed + local key material + compare. Silent-drop if any key material
-   *   or deps are missing (capture needs share + frost + mnemonic).
-   * - `keylink`: unverified (DKG-state threading is the plug-in point).
-   */
-  private async verifyFrostAnnounce(
-    announce: Extract<CeremonyMessage, { kind: 'announce-frost' }>,
-  ): Promise<FrostVerifyOutcome> {
-    const { sighashes } = announce;
+  // ─── Helpers ─────────────────────────────────────────────────────────────
 
-    if (announce.protocol === 'btc') {
-      const bp = announce.btcParams;
-      let rebuilt;
-      try {
-        rebuilt = buildBtcTxFromParams({
-          to: bp.to,
-          amountSat: BigInt(bp.amountSat),
-          feeRate: bp.feeRate,
-          network: bp.network,
-          frostP2tr: bp.frostP2tr,
-          frostUntweakedPubKey: fromHex(bp.frostUntweakedPubKeyHex),
-          utxos: bp.utxos.map((u) => ({
-            transactionId: u.transactionId,
-            outputIndex: u.outputIndex,
-            value: BigInt(u.valueSat),
-          })),
-        });
-      } catch (err) {
-        return { ok: false, reason: `btc rebuild failed: ${errString(err)}` };
-      }
-      if (rebuilt.sighashes.length !== sighashes.length) {
-        return {
-          ok: false,
-          reason: `btc rebuild produced ${rebuilt.sighashes.length} sighashes, announce has ${sighashes.length}`,
-        };
-      }
-      for (let i = 0; i < sighashes.length; i++) {
-        const leaderHex = sighashes[i]!.hashHex.toLowerCase();
-        const ourHex = toHex(rebuilt.sighashes[i]!.hash).toLowerCase();
-        if (leaderHex !== ourHex) {
-          return {
-            ok: false,
-            reason: `btc sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
-          };
-        }
-      }
-      return { ok: true, btcOutputs: rebuilt.outputs, btcFrostP2tr: bp.frostP2tr };
-    }
-
-    if (announce.protocol === 'opnet') {
-      const { unsignedTxHex, inputs } = announce;
-      if (inputs.length !== sighashes.length) {
-        return {
-          ok: false,
-          reason: `inputs.length=${inputs.length} != sighashes.length=${sighashes.length}`,
-        };
-      }
-      let recomputed: Array<{ index: number; hash: Uint8Array; tweaked: boolean }>;
-      try {
-        recomputed = extractBtcSighashes(unsignedTxHex, inputs);
-      } catch (err) {
-        return { ok: false, reason: `extract failed: ${errString(err)}` };
-      }
-      for (let i = 0; i < sighashes.length; i++) {
-        const leaderHex = sighashes[i]!.hashHex.toLowerCase();
-        const ourHex = toHex(recomputed[i]!.hash).toLowerCase();
-        if (leaderHex !== ourHex) {
-          return {
-            ok: false,
-            reason: `sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
-          };
-        }
-      }
-      return { ok: true };
-    }
-
-    if (announce.protocol === 'opnet-params') {
-      const keyMat = this.buildOpnetParamsKeyMat();
-      if (!keyMat) {
-        return {
-          ok: false,
-          reason: 'opnet-params: missing share / frost pkg / frostLegacySig / mnemonic / network',
-        };
-      }
-      // Refund address controls where the SDK sends change — a bogus value
-      // would be theft, not DoS. Verify it matches our locally-derived P2TR
-      // before trusting the rest of the announce.
-      let expectedRefund: string;
-      try {
-        expectedRefund = deriveVaultP2tr(keyMat.frostUntweakedPubKey, keyMat.network);
-      } catch (err) {
-        return { ok: false, reason: `refund derive failed: ${errString(err)}` };
-      }
-      if (announce.opnetParams.refundAddress !== expectedRefund) {
-        return {
-          ok: false,
-          reason: `refundAddress mismatch: announce=${announce.opnetParams.refundAddress} expected=${expectedRefund}`,
-        };
-      }
-      let captured;
-      try {
-        const inputs = buildCaptureInputsFromParams(announce.opnetParams, keyMat);
-        captured = await captureOpnetSighashes(inputs);
-      } catch (err) {
-        return { ok: false, reason: `opnet-params capture failed: ${errString(err)}` };
-      }
-      if (captured.sighashes.length !== sighashes.length) {
-        return {
-          ok: false,
-          reason: `opnet-params rebuild produced ${captured.sighashes.length} sighashes, announce has ${sighashes.length}`,
-        };
-      }
-      for (let i = 0; i < sighashes.length; i++) {
-        const leaderHex = sighashes[i]!.hashHex.toLowerCase();
-        const ourHex = captured.sighashes[i]!.hash.toLowerCase();
-        if (leaderHex !== ourHex) {
-          return {
-            ok: false,
-            reason: `opnet-params sighash[${i}] mismatch: leader=${leaderHex} ours=${ourHex}`,
-          };
-        }
-      }
-      return { ok: true };
-    }
-
-    // keylink — unverified at the orchestrator. The hash inputs (mldsaPubKey,
-    // frostTweakedPubKey, frostUntweakedPubKey, network) are DKG-derived; a
-    // verify step would need DKG state threaded in.
-    return { ok: true };
+  private specBase(ceremonyId: string, from: PartyId): CeremonySpecBase {
+    return { ceremonyId, leader: resolveLeaderId(from, this.deps.peersById), role: 'participant' };
   }
 
-  /**
-   * Assemble the per-daemon key material for opnet-params capture. Returns
-   * undefined if any required piece is missing (share, frost publicKeyPackage,
-   * frostLegacySig, network). Callers silent-drop the announce when this
-   * returns undefined.
-   */
-  private buildOpnetParamsKeyMat(): OpnetParamsKeyMat | undefined {
-    const { share, frostPublicKeyPackage, frostLegacySig, network } = this.deps;
-    if (!share || !frostPublicKeyPackage || !frostLegacySig || !network) {
-      return undefined;
-    }
+  /** Every ring member's label, in party order. */
+  private peerIds(): string[] {
+    return [...this.deps.peersById.entries()].sort(([a], [b]) => a - b).map(([, id]) => id);
+  }
+
+  private deadlineMs(kind: CeremonyKind): number {
+    return kind === 'signing' ? this.deps.ceremonyDeadlines.signingMs : this.deps.ceremonyDeadlines.dkgMs;
+  }
+
+  /** The ceremony's I/O: pulls bounded by the ceremony deadline, not an attempt count. */
+  private ceremonyIo(kind: CeremonyKind): CeremonyIo {
+    const { io } = this.deps;
     return {
-      mldsaPubKey: fromHex(share.publicKey),
-      frostTweakedPubKey: frostPublicKeyPackage.verifyingKey,
-      frostUntweakedPubKey: frostPublicKeyPackage.untweakedVerifyingKey,
-      frostLegacySig,
-      network,
+      ...io,
+      pullOpts: { ...io.pullOpts, deadlineMs: this.deadlineMs(kind), maxAttempts: Number.MAX_SAFE_INTEGER },
     };
   }
 }
 
-function errString(err: unknown): string {
-  if (err instanceof Error) return err.message;
+function verifies(signature: Uint8Array, message: Uint8Array, key: Uint8Array): boolean {
   try {
-    return JSON.stringify(err);
+    return verifySignature(signature, message, key);
   } catch {
-    return String(err);
+    return false;
   }
 }
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}

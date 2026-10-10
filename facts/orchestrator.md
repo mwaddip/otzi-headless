@@ -39,7 +39,7 @@
   addressBook?: () => Promise<AddressBookEntry[]>;
   logger?: Logger;
   ```
-  - **Pre:** `io.transport.partyId === node.partyId`; `peersById` holds every ring member, self included (`peersById.size` = ring size); `network` is the configured network; `vault` is the share loaded at startup (undefined on a node without a vault); `vaultExists` reports whether a file exists at the share path; `createStager` returns a fresh stager for the share path; deadlines are positive.
+  - **Pre:** `io.transport.partyId === node.partyId`; `peersById` holds every ring member, self included (`peersById.size` = ring size); `network` is the configured network; `vault` is the share loaded at startup (undefined on a node without a vault); `vaultExists` reports whether a file exists at the share path; `createStager` returns a fresh stager for the share path; `io.pullOpts` supplies the pull backoff (`initialDelayMs`, `maxDelayMs`) — participant ceremonies replace its `deadlineMs` and `maxAttempts` (see *Participant pulls*); `addressBook` returns this node's address-book entries; deadlines are positive.
   - **Post:** Fully initializes a participant orchestrator; no lazy fields.
 
 **Cross-component contracts:**
@@ -74,7 +74,7 @@
 ---
 
 ### `orchestrator.ts`
-**Purpose:** Long-lived participant-side listener. Parses ceremony messages, applies the participant checks, analyses proposals against this node's own key, gates, runs DKG and signing participation, verifies signoffs, enforces deadlines, and schedules blob cleanup.
+**Purpose:** Long-lived participant-side listener. Parses ceremony messages, applies the participant checks, analyses proposals against this node's own key, gates, runs DKG and signing participation, verifies signoffs, enforces deadlines, schedules blob cleanup, and holds this node's single DKG slot.
 
 **Public surface:**
 - `class Orchestrator`
@@ -87,7 +87,7 @@
     - **Invariant:** Reentrant (returns early if already started).
 
   - **`stop(): void`**
-    - **Post:** Unsubscribes from transport; aborts every live ceremony; clears all trackers and timers; wakes pending `waitFor` calls.
+    - **Post:** Unsubscribes from transport; aborts every live ceremony, the local DKG slot included; clears all trackers, records and timers; wakes pending `waitFor` calls. Ceremonies cut short by `stop` emit no outcome.
     - **Invariant:** Reentrant (returns early if not started).
 
   - **`onCompleted(handler: (o: CeremonyOutcome) => void): Unsubscribe`**
@@ -95,54 +95,73 @@
     - **Throws:** Never (handler exceptions are NOT caught by orchestrator; caller must handle them).
 
   - **`waitFor(ceremonyId: string, timeoutMs?: number): Promise<CeremonyOutcome>`**
-    - **Post:** Resolves when the ceremony settles on this node.
+    - **Post:** Resolves when the ceremony settles on this node; resolves at once with the recorded outcome when it settled within its retention period. `timeoutMs` defaults to 60 000.
     - **Throws:** `Error` on timeout or orchestrator stopped before an outcome.
     - **Concurrency:** Multiple `waitFor` calls for the same ceremony all resolve/reject together.
 
-**Message handling** (messages that fail `parseMessage` are dropped with a log line):
+  - **`beginLocalDkg(ceremonyId: string): { signal: AbortSignal; end(): void } | null`**
+    - **Post:** Returns `null` when any DKG is live on this node — one registered here and not yet ended, or one joined as participant (a DKG tracker exists). Otherwise registers `ceremonyId` as this node's local DKG and returns its slot: `signal` aborts when a ring member's DKG `signoff-aborted` for `ceremonyId` arrives or `stop()` runs; `end()` releases the slot and is idempotent (it never releases a later slot).
+    - **Throws:** Never.
+    - **Used by:** `LeaderDispatcher.runDkg` (409 `a DKG is already running on this node` on `null`; passes `signal` to `runDkgCeremony`; calls `end()` in `finally`).
 
-- **`announce-dkg`** — drop (log line with the reason) unless all of these hold:
-  - no tracker exists for the `ceremonyId`;
-  - `!deps.vault && !(await deps.vaultExists())` — this node holds no vault;
-  - `network === deps.network`;
-  - `parties === peersById.size` (the parser already guarantees `2 ≤ threshold ≤ parties`);
-  - the gate approves `buildDkgSpec(base, { threshold, parties, network, peerIds })` with `role: 'participant'` and `leader = resolveLeaderId(from)`.
+**At most one live DKG per node.** Two concurrent DKGs would share one `.pending` path and could commit a share that never passed the all-N confirmation. The slot covers both roles: `beginLocalDkg` refuses while a participant DKG is live, and `announce-dkg` is dropped while a local or participant DKG is live.
 
-  Then: create a tracker (leader pinned = sender), start the `dkgMs` deadline, and run `runDkgCeremony(io, { ceremonyId, sessionId, threshold, parties, network, rng }, createStager(), signal)` with an `AbortController` signal. Success settles `done` with `address` (`vaultPayment(toVaultKey(publicKeyPackage), network).address`); a failure settles `aborted` with the reason; the deadline aborts the controller and settles `timeout`.
+**Message handling.** A message that fails `parseMessage` is dropped with a warn line. Every drop logs exactly one line naming the ceremony, the sender and the reason: warn for suspicious input (a parse failure, an announce or signoff from anyone but the pinned leader, a check below that fails on the leader's data), info or debug for benign cases (a duplicate announce, a ceremony that already ended here, this node not in `signers`, a signoff for a ceremony unknown here).
 
-- **`announce-sign`** — drop (log line with the reason) unless all of these hold:
-  - no tracker exists for the `ceremonyId` — the sender of the first announce is pinned as leader;
-  - this node has a vault loaded (`deps.vault`);
-  - this node and the sender are in `signers`; `signers` has no duplicates, contains only ring members, and has at least `vault.threshold` entries;
-  - the proposal has at most 255 inputs (`MAX_INPUTS`; the parser enforces it on `prevouts`);
-  - `analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), deps.network)` succeeds;
-  - the gate approves `buildSigningSpec(analysis, base, network, labelFor)`, with labels from `deps.addressBook` when present (a failed address-book read means no labels).
+Every announce first passes the duplicate checks: no tracker exists for the `ceremonyId` (an announce for a live tracker is dropped: warn when the sender is not the pinned leader or the kind differs, info for a duplicate from the leader); the `ceremonyId` is not the local DKG slot's (warn); and no ceremony with that `ceremonyId` settled on this node within its retention period (info) — reusing an id within retention would collide with its stored blobs and its scheduled clear.
 
-  Then: keep the analysed sighashes for signoff verification, start the `signingMs` deadline, and run `participateInSigning(io, { ceremonyId, signers, sighashes, keyPackage, publicKeyPackage, rng }, signal)`. A failure settles `aborted` with the reason; success leaves the tracker live until a signoff or the deadline (`timeout`).
+- **`announce-dkg`** — drop unless all of these hold, in this order:
+  1. the duplicate checks;
+  2. no DKG is live on this node (local slot or participant tracker);
+  3. `network === deps.network`;
+  4. `parties === peersById.size` (the parser already guarantees `2 ≤ threshold ≤ parties`);
+  5. no share is loaded (`!deps.vault`);
+  6. `await deps.vaultExists()` is `false` (a throw is a drop) — a `.pending` file does not count;
+  7. the gate approves `buildDkgSpec({ ceremonyId, leader: resolveLeaderId(from), role: 'participant' }, { threshold, parties, network, peerIds })`, with `peerIds` = every `peersById` label in party order.
 
-- **`signoff-done`** — accepted only from the pinned leader of a live signing tracker. Settles `done` (with `signaturesHex`) when the count equals the kept sighash count and every signature passes `verifySignature(sig, sighash, vault.publicKeyPackage.verifyingKey)`; otherwise logs at error level and settles `invalid-signoff`.
+  Before step 6 the orchestrator creates the tracker (leader pinned = sender, which also takes the DKG slot) and starts the `dkgMs` deadline; a drop at step 6 removes the tracker without an outcome. Then: run `runDkgCeremony(io, { ceremonyId, sessionId, threshold, parties, network, rng }, createStager(), signal)` with the tracker's `AbortController` signal. Success settles `done` with `address` (`vaultPayment(toVaultKey(publicKeyPackage), network).address`); a failure settles `aborted` with the reason. `createStager` is called only here.
 
-- **`signoff-aborted`** — for signing, accepted only from the pinned leader; for DKG, from any ring member. Aborts the tracker's controller and settles `aborted` with the message's `reason`.
+- **`announce-sign`** — drop unless all of these hold, in this order:
+  1. the duplicate checks — the sender of the first announce is pinned as leader;
+  2. this node has a vault loaded (`deps.vault`);
+  3. this node is in `signers` (info when not); the sender is in `signers`; `signers` has no duplicates, contains only ring members, and has at least `vault.threshold` entries;
+  4. the proposal has at most 255 inputs (`MAX_INPUTS`; the parser enforces it on `prevouts`);
+  5. `analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), deps.network)` succeeds;
+  6. the gate approves `buildSigningSpec(analysis, { ceremonyId, leader: resolveLeaderId(from), role: 'participant' }, network, labelFor)`. With `deps.addressBook`, `labelFor(address)` is otzi `labelFor(entries, address)`; a rejected `addressBook()` means no labels and one warn line, never a failed ceremony.
 
-**Settle:** clears the deadline timer, removes the tracker, calls `scheduleClear(io.store, ceremonyId, retention)` with the kind's retention (`blobRetentionMs ?? BLOB_RETENTION_MS`), emits the outcome, logs at info level. A `settled` flag prevents double settlement.
+  Before step 5 the orchestrator creates the tracker (leader pinned = sender) and starts the `signingMs` deadline. Then: keep the analysed sighashes for signoff verification and run `participateInSigning(io, { ceremonyId, signers, sighashes, keyPackage, publicKeyPackage, rng }, signal)`. A failure settles `aborted` with the reason; success leaves the tracker live until a signoff or the deadline (`timeout`).
 
-**Rejected participation:** a failed analysis or a gate non-approve (`reject`, `pending`, or a gate that throws) sends nothing to peers and settles the ceremony as `rejected` with the reason. Drops that do not concern a new ceremony — an announce for a `ceremonyId` with a live tracker, a signoff from anyone but the pinned leader (signing), messages for unknown ceremonies — are logged only.
+- **`signoff-done`** — accepted only from the pinned leader of a live signing tracker. Settles `done` (with `signaturesHex`) when the count equals the kept sighash count and every signature passes `verifySignature(sig, sighash, vault.publicKeyPackage.verifyingKey)`; otherwise settles `invalid-signoff`, logged at error level.
+
+- **`signoff-aborted`** — for signing, accepted only from the pinned leader; for DKG, from any ring member. Aborts the tracker's controller and settles `aborted` with the message's `reason` (or `aborted by party <from>` without one). A DKG `signoff-aborted` from any ring member for the `ceremonyId` of the local DKG slot aborts the slot's `signal`.
+
+**Rejected participation vs. structural drops.** A failed analysis (step 5 of `announce-sign`) or a gate non-approve (`reject`, `pending`, or a gate that throws; either kind) sends nothing to peers and settles the ceremony as `rejected` with the reason, so `waitFor` resolves and `onCompleted` fires. Every earlier check is a structural drop: a parse failure, a non-leader or duplicate announce, a ceremony that already ended, a live DKG, a wrong network or party count, a vault present for a DKG, a signer-list failure, or no vault for signing. A structural drop is logged only — no tracker survives it and no outcome is emitted.
+
+**Gate:** evaluated once per ceremony (signing has no retries; a second announce for the `ceremonyId` is a duplicate). A gate that throws counts as `reject`.
+
+**Deadline:** starts when the tracker is created, so it covers the gate decision; an `exec` or `webhook` decision must arrive within the ceremony deadline. When it fires it aborts the tracker's controller and settles `timeout`.
+
+**Participant pulls:** each ceremony runs on `{ ...io, pullOpts: { ...io.pullOpts, deadlineMs, maxAttempts: Number.MAX_SAFE_INTEGER } }` with `deadlineMs` = `signingMs` or `dkgMs`, so pulls are bounded by the ceremony deadline, not by an attempt count — a peer waiting on a slow gate is not given up on early.
+
+**Settle:** sets the `settled` flag (no double settlement), clears the deadline timer, aborts the tracker's controller, removes the tracker, calls `scheduleClear(io.store, ceremonyId, retention)` with the kind's retention (`blobRetentionMs ?? BLOB_RETENTION_MS`), records the outcome for the same retention period, logs one line (info for `done` and a gate `rejected`; warn for `aborted`, `timeout` and an analysis or gate-error `rejected`; error for `invalid-signoff`) and emits the outcome.
 
 **Invariants:**
 - Orchestrator is a long-lived listener, NOT per-ceremony.
 - First announce wins: once a tracker is live, its leader cannot change and no second announce for that `ceremonyId` is processed.
 - Verify-before-gate: the gate never sees a spec this node did not derive from its own analysis.
 - No DKG while a vault exists: the vault check runs on every `announce-dkg`. A `.pending` file does not count as a vault; a committed share file does.
+- At most one live DKG per node, whichever node leads it.
 - Silent drops (failed checks, failed analysis, gate non-approve) are indistinguishable from offline to peers.
-- Participant never sends a signoff for signing; for DKG, `runDkgCeremony` broadcasts `signoff-aborted` on its own failure.
+- Participant never sends a signoff for signing; for DKG, `runDkgCeremony` broadcasts `signoff-aborted` on its own failure (not when aborted by signal).
 - Every settle schedules exactly one blob clear.
 
 **Cross-component contracts:**
-- Depends on: `Transport.onBroadcast`, `parseMessage`, `runDkgCeremony`, `participateInSigning`, `analyzeProposal` / `toVaultKey` / `vaultPayment` (`src/otzi/lib`), frots `verifySignature`, `ApprovalGate.approve`, `scheduleClear`.
-- Used by: `Daemon` (instantiated once; `onCompleted` wired for logging).
+- Depends on: `Transport.onBroadcast`, `parseMessage`, `runDkgCeremony`, `participateInSigning`, `analyzeProposal` / `toVaultKey` / `vaultPayment` / `labelFor` (`src/otzi/lib`), frots `verifySignature`, `ApprovalGate.approve`, `scheduleClear`.
+- Used by: `Daemon` (instantiated once; `onCompleted` wired for logging), `LeaderDispatcher` (`beginLocalDkg`).
 
 **Notes / gotchas:**
 - A node that completes a DKG keeps running without the new vault loaded; signing on it starts after a daemon restart. Its `vaultExists()` is true from the commit on, so a second DKG is refused.
+- A DKG that commits after its tracker settled (an abort raced the commit) logs a warn line: the share is on disk although the outcome is not `done`.
 - The ceremony deadline is the safety net for a crashed leader or a lost signoff.
 - `waitFor` is used by tests; runtime code reacts through `onCompleted`.
 
