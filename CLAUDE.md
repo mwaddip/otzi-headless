@@ -61,7 +61,7 @@ Ring of trust established at bootstrap. The security boundary is:
 
 **Per-node approval gate — opt-in, additive.** The threshold protects *key material*: compromising <t keys yields nothing. It does not protect against a compromised *machine* being used as a signing oracle — an attacker who owns one daemon and can forge triggers into t-1 auto-signing peers reaches mnemonic-equivalent capability without ever stealing a key. For critical deployments, each daemon optionally gates its own participation in each ceremony:
 
-- Config-selectable strategy per node: `auto` (pure headless, the default), `policy` (deterministic rule check — amount, fee and fee-rate caps, every recipient ∈ allowlist or the node's own address book, rate limits), `exec` (spawn operator command, read approve/reject from stdout), `webhook` (POST spec to external approver, await signed response).
+- Config-selectable strategy per node: `auto` (pure headless, the default), `policy` (deterministic rule check — amount, fee and fee-rate caps, every recipient ∈ allowlist or the node's own address book, rate limits), `exec` (spawn operator command, read approve/reject from stdout), `webhook` (POST spec to external approver over https — or http on loopback only — and await its decision).
 - Interface: `approve(ceremonySpec) → approve | reject | pending`. Pending re-checks on external signal.
 - Semantics: a gate can only *further restrict* what its node will sign, never widen. A rejecting node stays silent; to peers it is indistinguishable from offline. DKG and signing both abort on any reject — operationally every node signs (see § Core Architecture).
 - Lives in the trigger layer. Ceremony core and transport do not know the gate exists — they just see a slower or absent peer.
