@@ -1,38 +1,16 @@
 /**
- * Build a `CeremonySpec` from a parsed announce message for gate evaluation.
+ * Build the `CeremonySpec` a gate evaluates (facts/gate.md).
  *
- * For FROST-signing announces, the caller (`orchestrator`) has already run
- * the verify/rebuild step and — for BTC — has decoded outputs in hand. Pass
- * them in via `btcOutputs` + `btcFrostP2tr` so the spec carries verified
- * policy fields (outputs[], amount, destination). OPNet populates intent
- * fields from operator-supplied `hints` on the announce (advisory,
- * matches federation-trust posture).
+ * A signing spec comes from this node's own `ProposalAnalysis` — the leader and
+ * every participant analyse the proposal against their own key and network before
+ * building it, so no field is taken from the leader's say-so. A DKG spec comes
+ * from the ring this node is configured with.
  */
 
-import type { CeremonyMessage } from '../core/ceremony-messages';
 import type { PartyId } from '../core/types';
-import type { CeremonySpec, SigningSpec } from '../gate/types';
-
-type AnnounceMessage = Extract<
-  CeremonyMessage,
-  {
-    kind:
-      | 'announce'
-      | 'announce-frost'
-      | 'announce-dkg'
-      | 'announce-frost-dkg'
-      | 'announce-combined-dkg';
-  }
->;
-
-export interface SpecBuilderCtx {
-  fromPartyId: PartyId;
-  peersById: ReadonlyMap<PartyId, string>;
-  /** Decoded BTC outputs from the participant's own rebuild. Present iff announce had `btcParams`. */
-  btcOutputs?: ReadonlyArray<{ address: string | null; amountSat: bigint }>;
-  /** FROST vault self-address — used to filter change outputs out of amount/destination. */
-  btcFrostP2tr?: string;
-}
+import type { CeremonySpecBase, DkgSpec, SigningSpec, SpecOutput } from '../gate/types';
+import type { ProposalAnalysis } from '../otzi/lib/bitcoin';
+import type { NetworkName } from '../otzi/lib/vault-types';
 
 export function resolveLeaderId(
   from: PartyId,
@@ -41,124 +19,54 @@ export function resolveLeaderId(
   return peersById.get(from) ?? String(from);
 }
 
-export function buildSpecFromAnnounce(
-  msg: AnnounceMessage,
-  ctx: SpecBuilderCtx,
-): CeremonySpec {
-  const leader = resolveLeaderId(ctx.fromPartyId, ctx.peersById);
-
-  switch (msg.kind) {
-    case 'announce':
-      return {
-        kind: 'signing',
-        ceremonyId: msg.baseCeremonyId,
-        leader,
-        role: 'participant',
-        operation: 'generic',
-      };
-    case 'announce-frost':
-      return buildFrostSigningSpec(msg, ctx, leader);
-    case 'announce-dkg':
-      return {
-        kind: 'dkg',
-        ceremonyId: msg.baseCeremonyId,
-        leader,
-        role: 'participant',
-        protocol: 'mldsa',
-        threshold: msg.threshold,
-        parties: msg.parties,
-        peerIds: collectPeerIds(ctx.peersById),
-      };
-    case 'announce-frost-dkg':
-      return {
-        kind: 'dkg',
-        ceremonyId: msg.baseCeremonyId,
-        leader,
-        role: 'participant',
-        protocol: 'frost',
-        threshold: msg.threshold,
-        parties: msg.parties,
-        peerIds: collectPeerIds(ctx.peersById),
-      };
-    case 'announce-combined-dkg':
-      return {
-        kind: 'dkg',
-        ceremonyId: msg.baseCeremonyId,
-        leader,
-        role: 'participant',
-        protocol: 'combined',
-        threshold: msg.threshold,
-        parties: msg.parties,
-        peerIds: collectPeerIds(ctx.peersById),
-      };
-  }
-}
-
-function buildFrostSigningSpec(
-  msg: Extract<CeremonyMessage, { kind: 'announce-frost' }>,
-  ctx: SpecBuilderCtx,
-  leader: string,
+/**
+ * Copy the analysis fields into a `SigningSpec` (dropping the sighashes) and add
+ * `amount`, the sum of the outputs with `isChange === false`. `labelFor` maps an
+ * output address to a label from this node's address book; an output gets a
+ * `label` only when it returns a string.
+ */
+export function buildSigningSpec(
+  analysis: ProposalAnalysis,
+  base: CeremonySpecBase,
+  network: NetworkName,
+  labelFor?: (address: string) => string | undefined,
 ): SigningSpec {
-  const operation =
-    msg.protocol === 'btc' ? 'btc-transfer' :
-    msg.protocol === 'opnet' ? 'opnet-call' :
-    msg.protocol === 'opnet-params' ? 'opnet-call' :
-    'generic';
-  const base: SigningSpec = {
+  const outputs = analysis.outputs.map((o): SpecOutput => {
+    const label = labelFor?.(o.address);
+    return typeof label === 'string'
+      ? { address: o.address, amount: o.amount, isChange: o.isChange, label }
+      : { address: o.address, amount: o.amount, isChange: o.isChange };
+  });
+  return {
     kind: 'signing',
-    ceremonyId: msg.baseCeremonyId,
-    leader,
-    role: 'participant',
-    operation,
+    ceremonyId: base.ceremonyId,
+    leader: base.leader,
+    role: base.role,
+    network,
+    txid: analysis.txid,
+    inputs: analysis.inputs.map((i) => ({ txid: i.txid, vout: i.vout, amount: i.amount })),
+    outputs,
+    amount: outputs.reduce((sum, o) => (o.isChange ? sum : sum + o.amount), 0),
+    totalIn: analysis.totalIn,
+    totalOut: analysis.totalOut,
+    fee: analysis.fee,
+    vsize: analysis.vsize,
+    feeRate: analysis.feeRate,
   };
-
-  // BTC: populate outputs from verified rebuild, filtering the vault's own
-  // change-back. Policy rules only care about external outputs.
-  if (msg.protocol === 'btc' && ctx.btcOutputs) {
-    const nonSelf = ctx.btcOutputs
-      .filter((o) => o.address !== ctx.btcFrostP2tr)
-      .map((o) => ({ address: o.address, amountSat: o.amountSat }));
-    const amount = nonSelf.reduce((sum, o) => sum + o.amountSat, 0n);
-    const destination = nonSelf.find((o) => o.address !== null)?.address ?? undefined;
-    return {
-      ...base,
-      amount,
-      ...(destination !== undefined ? { destination } : {}),
-      outputs: nonSelf,
-    };
-  }
-
-  // OPNet raw-tx: populate from operator-supplied hints (advisory).
-  if (msg.protocol === 'opnet' && msg.hints) {
-    const { contractAddress, method, amountTokenAtomic } = msg.hints;
-    return {
-      ...base,
-      ...(contractAddress !== undefined ? { destination: contractAddress } : {}),
-      ...(method !== undefined ? { method } : {}),
-      ...(amountTokenAtomic !== undefined ? { amount: BigInt(amountTokenAtomic) } : {}),
-    };
-  }
-
-  // OPNet construction-params: destination + method are STRUCTURALLY verified
-  // (participant re-ran the capture locally and matched sighashes). Policy
-  // rules (`allowed_contracts`, `method_allowlist`) evaluate trusted data.
-  // `amountTokenAtomic` is still advisory (ABI-agnostic daemon — value isn't
-  // structurally decoded).
-  if (msg.protocol === 'opnet-params') {
-    const { contractAddress, method, hints } = msg.opnetParams;
-    return {
-      ...base,
-      destination: contractAddress,
-      method,
-      ...(hints?.amountTokenAtomic !== undefined
-        ? { amount: BigInt(hints.amountTokenAtomic) }
-        : {}),
-    };
-  }
-
-  return base;
 }
 
-function collectPeerIds(peersById: ReadonlyMap<PartyId, string>): string[] {
-  return [...peersById.values()];
+export function buildDkgSpec(
+  base: CeremonySpecBase,
+  p: { threshold: number; parties: number; network: NetworkName; peerIds: string[] },
+): DkgSpec {
+  return {
+    kind: 'dkg',
+    ceremonyId: base.ceremonyId,
+    leader: base.leader,
+    role: base.role,
+    threshold: p.threshold,
+    parties: p.parties,
+    network: p.network,
+    peerIds: [...p.peerIds],
+  };
 }
