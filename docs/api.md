@@ -230,12 +230,14 @@ over the wire: each node computes them from the proposal. BIP341 sighashes
 commit to every input amount and script, so a proposal with false prevout data
 produces signatures that are invalid on chain.
 
-On the leader a rejected proposal is a `400` and nothing is announced. A
-`ceremonyId` already in use on the leader (live, or used there within its
-retention period) is a `409` before analysis and the gate, so it consumes no
-gate approval. On a
+On the leader a rejected proposal is a `400` and nothing is announced. On a
 participant it is a silent drop with a log line; to the leader the participant
 is indistinguishable from an offline node, and the leader's ceremony fails (`500`).
+
+A `ceremonyId` already in use on the leader — by a live ceremony, or by one
+that ended there within its blob retention period (5 min after a signing
+ceremony, 15 min after a DKG) — is a `409` before analysis and the gate, so it
+consumes no gate approval.
 
 ### Gate
 

@@ -6,8 +6,9 @@ field-by-field reference; for operator workflows (bootstrap → DKG → restart 
 fund), see [`install.md`](./install.md).
 
 TOML uses `snake_case` keys. The parser is strict — missing required tables,
-unknown enum values and rejected keys throw `ConfigError` with the dotted field
-path.
+unknown enum values, rejected keys and unknown keys (a misspelt
+`network.esplora_uri`, a stray table) throw `ConfigError` with the dotted field
+path. Every table takes exactly the keys listed below.
 
 ## Shape at a glance
 
@@ -66,7 +67,7 @@ canonicalization happens once at parse and is stored normalized in
 | Key | Type | Notes |
 |---|---|---|
 | `path` | string | Absolute path to the Ötzi v4 encrypted share JSON file (mode `0600`). A share written here opens in web Ötzi, and a web Ötzi share can be placed here. While a DKG runs, the new share is staged at `<path>.pending` and moved to `path` only after every node confirmed; a file at `path` is never replaced. No file at startup → the daemon runs in setup mode: no vault is loaded, `sign` returns `409`, and `otzi generate` can run the DKG. |
-| `password_env` | string | Name of the env var holding the share-file password. The password itself is never stored in the config. The variable must be set in the daemon's environment even on a node that holds no vault yet, because the DKG encrypts the new share with it. On a .deb install, the unit loads `/etc/otzi/otzi.env` (`root:root`, mode `0600`, one line `OTZI_SHARE_PASSWORD=…`). |
+| `password_env` | string | Name of the env var holding the share-file password. The password itself is never stored in the config. The variable must be set in the daemon's environment even on a node that holds no vault yet, because the DKG encrypts the new share with it. On a .deb install, the unit loads `/etc/otzi/otzi.env` (`root:root`, mode `0600`, one line `OTZI_SHARE_PASSWORD=…`; create it with `sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env`, then edit it). systemd interprets quotes and backslashes in that file: use a password without `"`, `'` and `\`, or quote and escape it. |
 
 At startup the daemon decrypts the share, checks it against `[network].name`,
 and checks its `partyId` and `parties` against the pubkey book. Any mismatch

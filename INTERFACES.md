@@ -33,7 +33,7 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 
 ### Code shared with Ötzi (`src/otzi/` lift rule)
 - **`src/otzi/lib/` and `src/otzi/backend/` are byte-identical copies** of Ötzi files at the commit in `src/otzi/OTZI_COMMIT` (`71eb9bd07822583ffc7424b1c419dd8d76e78e9c`). DO NOT EDIT THEM. Headless code that needs more lives in its own modules outside `src/otzi/`.
-- **Drift check.** `scripts/check-otzi-drift.sh <otzi-checkout>` diffs every lifted file against the checkout and exits non-zero on any difference. CI clones Ötzi at the recorded commit and runs it.
+- **Drift check.** `scripts/check-otzi-drift.sh <otzi-checkout>` diffs every lifted file (the 21 it lists) against the checkout and exits non-zero on any difference, a missing or extra file under `src/otzi/lib` / `src/otzi/backend`, or a checkout that is not a git working tree of its own. CI and the release workflow clone Ötzi at the recorded commit and run it.
 - **Don't rewrite imports** in lifted files (extensionless `./hex` in `lib/`, `./types.js` in `backend/` stay as Ötzi has them).
 - **Share files are Ötzi v4** (`encryptShareFile` / `decryptShareFile`), mode 0600. A share written by otzi-headless opens in web Ötzi, and the reverse.
 - The full lifted surface and the functions headless consumes are in [facts/otzi.md](facts/otzi.md).

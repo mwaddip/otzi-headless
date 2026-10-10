@@ -15,7 +15,7 @@
 - `async readAddressBook(path: string, network: NetworkName, opts?: { missing?: 'empty' | 'error' }): Promise<AddressBookEntry[]>`
   - **Pre:** `network` is the configured network.
   - **Post:** Returns the validated entries (`parseAddressBookFile(JSON, network)`). It is the only reader of an address-book file: the daemon, the CLI verbs and `book import` all use it. A path that does not exist (ENOENT) is `[]` with `missing: 'empty'` (the default; the CLI and spec labelling rely on it) and an error with `missing: 'error'`, which the daemon's policy loader (`loadAddressBook`) and the incoming file of `book import` use.
-  - **Throws:** `Error('address book <path>: <reason>')` for an unreadable file (`cannot be read: <filesystem error>`; a missing file with `missing: 'error'` is this case, the error being ENOENT), invalid JSON (`not valid JSON`), wrong `kind` / `version`, any invalid entry, or a file network ≠ `network` (`<reason>` is then the message from `parseAddressBookFile`). Every error names the book that failed.
+  - **Throws:** `Error('address book <path>: <reason>')` for an unreadable file (`cannot be read: <filesystem error>`; a missing file with `missing: 'error'` is this case, the error being ENOENT), invalid JSON (`not valid JSON`), wrong `kind` / `version`, any invalid entry, or a file network ≠ `network` (`<reason>` is then the message from `parseAddressBookFile`, shown through `displayText` because it can quote the file's own `network` / `version` values). Every error names the book that failed.
 
 - `async writeAddressBook(path: string, network: NetworkName, entries: AddressBookEntry[]): Promise<void>`
   - **Pre:** Caller has write access to the directory (root on a `.deb` install).

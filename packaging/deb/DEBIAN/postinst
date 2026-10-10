@@ -40,6 +40,17 @@ case "$1" in
     # Leftovers of earlier releases; nothing reads these files any more.
     rm -f /var/lib/otzi/bootstrap-secret /etc/otzi/manifest.otzi.json
 
+    # daemon.toml and the address book decide what this node signs: root writes
+    # them, group otzi reads them. Re-applied on every configure, so a mode or
+    # owner loosened since (an editor, a copy) is put back. Symlinks are left
+    # alone rather than followed.
+    for OTZI_FILE in /etc/otzi/daemon.toml /etc/otzi/address-book.otzi.json; do
+      if [ -f "$OTZI_FILE" ] && [ ! -L "$OTZI_FILE" ]; then
+        chown root:otzi "$OTZI_FILE"
+        chmod 0640 "$OTZI_FILE"
+      fi
+    done
+
     # Add operator users to the otzi group.
     db_get otzi-headless/operators || true
     OPERATORS="$RET"
@@ -93,7 +104,8 @@ case "$1" in
   Create /etc/otzi/otzi.env (owner root:root, mode 600) with one line;
   the backup does not contain it, and the daemon refuses to start without
   the password:
-    OTZI_SHARE_PASSWORD=<this node's share password>
+    sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env
+    sudoedit /etc/otzi/otzi.env   # OTZI_SHARE_PASSWORD=<this node's share password>
   Then start the daemon:
     sudo systemctl enable --now otzi
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -277,8 +289,10 @@ otzi-headless installed. Next steps:
      on every node before going further:
        sudo -u otzi otzi setup /etc/otzi/daemon.toml
   2. Create /etc/otzi/otzi.env (owner root:root, mode 600) with one line. The
-     unit loads it, and the daemon refuses to start without the password:
-       OTZI_SHARE_PASSWORD=<a strong password>
+     unit loads it, and the daemon refuses to start without the password
+     (systemd interprets quotes and backslashes there: avoid them):
+       sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env
+       sudoedit /etc/otzi/otzi.env   # OTZI_SHARE_PASSWORD=<a strong password>
   3. Enable + start the daemon on every node:
        sudo systemctl enable --now otzi
   4. Run the DKG on one node (every other daemon must be running):

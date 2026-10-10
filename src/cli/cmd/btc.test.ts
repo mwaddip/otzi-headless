@@ -295,6 +295,20 @@ describe('otzi btc', () => {
       expect(esplora.broadcasts).toHaveLength(0);
     });
 
+    it('shows an Esplora error body without control characters', async () => {
+      esplora.fund(address, 80_000);
+      esplora.rejectBroadcasts('bad\u001b[31m-txns\r\nFORGED: broadcast ok\u0007');
+
+      const err = await btcSend({ configPath, vaultPath, bookPath, to: DEST, amount: '50000' }, deps()).then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+
+      expect(err).toBeInstanceOf(BroadcastFailedError);
+      expect(err!.message).toContain('bad[31m-txns FORGED: broadcast ok');
+      expect(err!.message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+    });
+
     it('reports insufficient funds in sats and BTC, before any daemon call', async () => {
       esplora.fund(address, 1_000);
       esplora.fund(address, 90_000, { confirmed: false });

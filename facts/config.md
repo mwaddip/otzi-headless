@@ -122,8 +122,11 @@
 | `gate.allowed_btc_recipients`, `gate.destination_allowlist` | `use allowed_recipients` (raised by `parsePolicyParams`) |
 | `gate.method_allowlist`, `gate.allowed_contracts` | `no longer supported` (raised by `parsePolicyParams`) |
 
+- **Unknown keys** — every table rejects a key it does not take, with `ConfigError('<dotted key>', 'unknown key (expected one of …)')` (`network.esplora_uri`, `peers[0].port`, `triggers[1].mode`, a stray top-level `logging`). The keys each table takes: root `share, node, network, transport, peers, gate, deadlines, triggers, bootstrap`; `[share]` `path, password_env`; `[node]` `id, identity_key_file, pubkey_book_file`; `[network]` `name, esplora_url`; `[transport]` `kind, url` (relay) or `kind, advertised_endpoint` (peer-mesh); `[[peers]]` `endpoint`; `[deadlines]` `signing_ms, dkg_ms`; `[[triggers]]` `kind` plus `bind, auth_token_env` (http), `path` (uds), `schedule, job_name, timezone` (cron); `[bootstrap]` `role` plus `bind` (leader) or `leader_url` (leaf). The rejected keys above keep their specific messages (checked first). `[gate]` params are checked by the strategy's parser (`parsePolicyParams`, `parseExecParams`, `parseWebhookParams`, all of which reject unknown keys) when the daemon builds its gate; under `auto` the config parser refuses every param itself.
+
 **Invariants:**
 - All section paths use snake_case (e.g., `share.password_env`); coerced to camelCase in types.
+- A misspelt key is an error, never a silently missing setting.
 - The `params` of `[gate]` (every key beside `strategy`) and of `[[triggers]]` (every key beside `kind`) stay raw `Record<string, unknown>` here; the gate and trigger builders narrow them. Strategy params are flat keys directly under `[gate]`.
 - `strategy = "auto"` takes no params: any other key in `[gate]` is `ConfigError('gate.<key>', 'not used by strategy auto')`, so leftover policy keys never look like rules that are not enforced.
 - Deadlines default to 5 min / 15 min if the section is missing.

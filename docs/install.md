@@ -77,9 +77,14 @@ follow up with `sudo apt -f install` to resolve.)
    `/etc/otzi/otzi.env`, so create that file **before the first start**: owner
    `root:root`, mode `0600`, one line:
    ```
-   OTZI_SHARE_PASSWORD=<a strong password>
+   sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env
+   sudoedit /etc/otzi/otzi.env      # one line: OTZI_SHARE_PASSWORD=<a strong password>
    ```
-   (systemd reads the file as root, before it drops to the `otzi` user.) The
+   (systemd reads the file as root, before it drops to the `otzi` user.)
+   systemd interprets quotes and backslashes in this file and strips spaces
+   around the value, so pick a password without `"`, `'`, `\` or
+   leading/trailing spaces — `openssl rand -base64 32` gives one — or write it
+   in double quotes with `\"` and `\\` escaped. The
    password encrypts this node's share file; each node picks its own, and web Ötzi
    asks for it when it opens the share.
 
@@ -138,9 +143,9 @@ sudo dpkg-reconfigure otzi-headless
 | `/usr/lib/otzi/entrypoint.mjs` | esbuild bundle | root:root 644 |
 | `/lib/systemd/system/otzi.service` | systemd unit | root:root 644 |
 | `/etc/otzi/` | config dir (setgid; only root writes, group otzi reads) | root:otzi 2750 |
-| `/etc/otzi/daemon.toml` | rendered config (preserved across upgrades) | root:otzi 640 |
+| `/etc/otzi/daemon.toml` | rendered config (preserved across upgrades; owner and mode re-applied on every configure) | root:otzi 640 |
 | `/etc/otzi/otzi.env` | share password for the unit (`OTZI_SHARE_PASSWORD=…`) | root:root 600 |
-| `/etc/otzi/address-book.otzi.json` | this node's address book (optional) | root:otzi 640 |
+| `/etc/otzi/address-book.otzi.json` | this node's address book (optional; owner and mode re-applied on every configure) | root:otzi 640 |
 | `/var/lib/otzi/` | data dir (setgid; group otzi can write) | root:otzi 2770 |
 | `/var/lib/otzi/identity.json` | ECDH identity | written 660 |
 | `/var/lib/otzi/pubkeys.json` | pubkey book from bootstrap | otzi:otzi 644 |
@@ -216,17 +221,19 @@ book.
 
 #### Backup
 
-Run `otzi backup` after every config change, after `otzi generate` completes,
+Run `sudo otzi backup` after every config change, after `otzi generate` completes,
 and after address-book changes. Beyond that, cadence is per-operator risk
 tolerance. **Back up every node:** the vault is n-of-n, so every share is
 required to sign, and losing one share without a backup makes the funds
 unspendable.
 
 ```
-otzi backup
+sudo otzi backup
 ```
 
-Output: a single password-protected archive in your home directory:
+It runs as root because the share file is readable only by its owner. Output:
+a single password-protected archive in your home directory (`/root` under
+plain `sudo`):
 
 ```
 ~/otzi-backup-2026-10-10T12-34-56Z.otzi-backup    # mode 0600
@@ -325,8 +332,13 @@ Restore places each file at its canonical path with these modes:
 | `/var/lib/otzi/vault-pubkey.json` | 0644 |
 
 The archive does not contain `/etc/otzi/otzi.env`. Recreate it with the share
-password as in the walkthrough, then start the daemon; it loads the restored
-share.
+password, then start the daemon; it loads the restored share:
+
+```
+sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env
+sudoedit /etc/otzi/otzi.env      # one line: OTZI_SHARE_PASSWORD=<the share password>
+sudo systemctl start otzi
+```
 
 **Restore refuses if:**
 
@@ -360,7 +372,7 @@ sudo apt purge otzi-headless     # ALSO removes the share + config + user
 
 > **Warning:** `purge` deletes `/var/lib/otzi/share.json`. The vault is n-of-n:
 > losing any one share without a backup makes the funds unspendable. Run
-> `otzi backup` on every node before purging if you might reinstall.
+> `sudo otzi backup` on every node before purging if you might reinstall.
 
 ## Container smoke test
 

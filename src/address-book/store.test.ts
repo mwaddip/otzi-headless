@@ -148,6 +148,21 @@ describe('address book store', () => {
       expect(err?.message).toContain('Address book is for testnet4, this vault is on mainnet');
     });
 
+    it('shows a hostile network or version value without control characters', async () => {
+      for (const file of [
+        { kind: 'otzi-address-book', version: 1, network: 'main\u001b[2Jnet\nFORGED LINE', entries: [] },
+        { kind: 'otzi-address-book', version: 'v\u001b]0;pwned\u0007\r\n2', network: NETWORK, entries: [] },
+      ]) {
+        await writeFile(path, JSON.stringify(file));
+        const err = await readAddressBook(path, NETWORK).then(
+          () => null,
+          (e: unknown) => e as Error,
+        );
+        expect(err?.message).toContain(path);
+        expect(err?.message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+      }
+    });
+
     it('rejects a book for another network even when it holds no entries', async () => {
       await writeFile(path, JSON.stringify({ kind: 'otzi-address-book', version: 1, network: 'mainnet', entries: [] }));
       await expect(readAddressBook(path, NETWORK)).rejects.toThrow(/Address book is for mainnet, this vault is on testnet4/);

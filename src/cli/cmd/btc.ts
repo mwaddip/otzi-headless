@@ -74,8 +74,9 @@ async function loadContext(configPath: string, vaultPath?: string): Promise<Cont
 
 // ─── Esplora errors ─────────────────────────────────────────────────────────
 
+/** The Esplora response body is untrusted: shown without control characters, on one line. */
 function esploraError(base: string, err: unknown): Error {
-  return new Error(`Esplora ${base}: ${errorReason(err)}`, { cause: err });
+  return new Error(`Esplora ${base}: ${displayText(errorReason(err))}`, { cause: err });
 }
 
 async function viaEsplora<T>(base: string, call: Promise<T>): Promise<T> {

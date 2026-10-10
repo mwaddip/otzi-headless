@@ -112,7 +112,7 @@
   - **`ceremonyIdInUse(ceremonyId: string): boolean`**
     - **Post:** `true` iff `ceremonyId` is taken (see *Ids this node leads*). Read-only.
     - **Throws:** Never.
-    - **Used by:** `LeaderDispatcher.runDkg`, to answer a reused id with `ceremony id <id> is already in use on this node` rather than the live-DKG 409.
+    - **Used by:** `LeaderDispatcher.runDkg`, to answer a reused id with `ceremony id <id> is already in use on this node` rather than the live-DKG 409; `LeaderDispatcher.sign`, to answer a reused id with that 409 before the analysis and the gate, so no approval is consumed for a request refused anyway.
 
 **At most one live DKG per node.** Two concurrent DKGs would share one `.pending` path and could commit a share that never passed the all-N confirmation. A DKG is live while a local DKG slot is held, while a DKG tracker exists, and while a joined DKG's `runDkgCeremony` has not settled — its `stage`, `commit` or `discard` can outlast the tracker (an abort or deadline settles the tracker at once), so the slot is held until the ceremony promise settles, also after `stop()`. `beginLocalDkg` returns `null` and `announce-dkg` is dropped while a DKG is live.
 

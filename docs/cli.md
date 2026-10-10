@@ -69,8 +69,8 @@ Each node has its own address book at `/etc/otzi/address-book.otzi.json` (Ötzi'
 - `otzi book list` — one line per entry on stdout: label, address, note, separated by tabs. Control characters in a label or note are not shown; the stored book is not changed.
 - `otzi book add <label> <address> [--note <text>]` — add an entry, or update the label and note of the entry with the same address (an update without `--note` clears the note).
 - `otzi book remove <label|address>` — remove the entry whose address matches, or else the one whose label matches. Fails when nothing matches, or when a label matches more than one entry (remove it by address).
-- `otzi book import <file> [--replace]` — merge an Ötzi address-book file (default) or replace the book with it. Prints `added <a>, updated <u>, unchanged <n>` on stdout. A file for another network is refused and nothing is written.
-- `otzi book export [path]` — write the book as an Ötzi address-book file (stdout without a path).
+- `otzi book import <file> [--replace]` — merge an Ötzi address-book file (default) or replace the book with it. Prints `added <a>, updated <u>, unchanged <n>, removed <r>` on stdout; `removed` counts the entries `--replace` dropped (always 0 for a merge). A file for another network is refused and nothing is written.
+- `otzi book export [path]` — write the book as an Ötzi address-book file (stdout without a path). A file written to `path` gets mode `0640`, like the book.
 
 Every `book` verb takes `--config <path>` (default `/etc/otzi/daemon.toml`) and reads the network from it. Confirmations go to stderr; errors exit 1.
 
@@ -78,11 +78,13 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
 
 ### Backup + restore
 
-- `otzi backup` — produce a password-protected archive of the full node state at `~/otzi-backup-<ISO>.otzi-backup` (mode 0600). It holds `daemon.toml`, the share, the identity key, the pubkey book, `vault-pubkey.json` and the address book (when present), and a `meta.json`. AES-256-GCM with PBKDF2-SHA256 (600k iterations). The 32-character password is auto-generated (~190 bits of entropy) and printed once to stdout in a banner; write it down. Exit code 0 on success.
+- `sudo otzi backup` — produce a password-protected archive of the full node state at `~/otzi-backup-<ISO>.otzi-backup` (mode 0600). It holds `daemon.toml`, the share, the identity key, the pubkey book, `vault-pubkey.json` and the address book (when present), and a `meta.json`. AES-256-GCM with PBKDF2-SHA256 (600k iterations). The 32-character password is auto-generated (~190 bits of entropy) and printed once to stdout in a banner; write it down. Exit code 0 on success.
 
   ```bash
-  otzi backup
+  sudo otzi backup
   ```
+
+  It needs root: the share file is readable only by its owner. Under plain `sudo` the archive lands in `/root`.
 
   Output:
   ```
@@ -95,7 +97,7 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ```
 
-- `otzi restore <archive-path> [--password-stdin]` — decrypt an `otzi-backup` archive and restore files to their canonical paths with canonical modes. Without `--password-stdin`, the CLI prompts for the password interactively (TTY-masked). With `--password-stdin`, it reads the password from stdin until newline — used by debconf during fresh installs and by scripted runs.
+- `otzi restore <archive-path> [--password-stdin]` — decrypt an `otzi-backup` archive and restore files to their canonical paths with canonical modes. Without `--password-stdin`, the CLI prompts for the password on the terminal; what you type is shown (the prompt does not mask it), so prefer `--password-stdin` where others can see the screen. With `--password-stdin`, it reads the password from stdin until newline — used by debconf during fresh installs and by scripted runs.
 
   Restore only creates files. It writes the vault's own files — `daemon.toml`, the address book, `vault-pubkey.json`, and the share, identity and pubkey book at the paths the archived `daemon.toml` names — and only under `/etc/otzi` and `/var/lib/otzi`. Any other entry in the archive is skipped with a warning. If it fails part-way, it removes the files it created; nothing that existed before is touched.
 
@@ -116,7 +118,7 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
   echo "$BACKUP_PWD" | sudo otzi restore --password-stdin ~/otzi-backup-...otzi-backup
   ```
 
-  On success, prints a per-file summary and a `Run systemctl start otzi` next step.
+  On success, prints a per-file summary, a warning line for each skipped entry, and the next steps: create `/etc/otzi/otzi.env` with the share password (the archive does not contain it; `sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env`, then edit it), then `sudo systemctl start otzi`.
 
   **Why stdin and not a `--password=<pwd>` flag?** A CLI flag would leak the password via `/proc/<pid>/cmdline` and `ps`. Stdin is the only safe non-interactive channel.
 

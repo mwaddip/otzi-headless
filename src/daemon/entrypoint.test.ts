@@ -145,9 +145,9 @@ strategy = "auto"
 
     await rm(bookPath);
     await book('import', out);
-    expect(stdout).toEqual(['added 1, updated 0, unchanged 0']);
+    expect(stdout).toEqual(['added 1, updated 0, unchanged 0, removed 0']);
     await book('import', out, '--replace');
-    expect(stdout[1]).toBe('added 0, updated 0, unchanged 1');
+    expect(stdout[1]).toBe('added 0, updated 0, unchanged 1, removed 0');
     expect(await readAddressBook(bookPath, 'testnet4')).toEqual([{ label: 'treasury', address: ADDR_A }]);
   });
 

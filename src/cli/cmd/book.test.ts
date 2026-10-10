@@ -4,7 +4,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
@@ -261,7 +261,7 @@ describe('otzi book', () => {
         { label: 'savings', address: ADDR_C }, // added
       ]);
 
-      expect(await bookImport({ ...o, file, replace: false })).toEqual({ added: 1, updated: 1, unchanged: 1 });
+      expect(await bookImport({ ...o, file, replace: false })).toEqual({ added: 1, updated: 1, unchanged: 1, removed: 0 });
       expect(await book()).toEqual([
         { label: 'treasury', address: ADDR_A, note: 'cold storage' },
         { label: 'cex', address: ADDR_B },
@@ -269,13 +269,13 @@ describe('otzi book', () => {
       ]);
     });
 
-    it('--replace makes the file the whole book and still reports the counts against the old one', async () => {
+    it('--replace makes the file the whole book and reports the counts against the old one, removals included', async () => {
       const file = await bookFile('incoming.otzi.json', [
         { label: 'treasury', address: ADDR_A, note: 'cold storage' },
         { label: 'savings', address: ADDR_C },
       ]);
 
-      expect(await bookImport({ ...o, file, replace: true })).toEqual({ added: 1, updated: 0, unchanged: 1 });
+      expect(await bookImport({ ...o, file, replace: true })).toEqual({ added: 1, updated: 0, unchanged: 1, removed: 1 });
       expect(await book()).toEqual([
         { label: 'treasury', address: ADDR_A, note: 'cold storage' },
         { label: 'savings', address: ADDR_C },
@@ -285,7 +285,7 @@ describe('otzi book', () => {
     it('creates the book on a node that has none', async () => {
       await rm(o.bookPath!);
       const file = await bookFile('incoming.otzi.json', [{ label: 'savings', address: ADDR_C }]);
-      expect(await bookImport({ ...o, file, replace: false })).toEqual({ added: 1, updated: 0, unchanged: 0 });
+      expect(await bookImport({ ...o, file, replace: false })).toEqual({ added: 1, updated: 0, unchanged: 0, removed: 0 });
       expect(await book()).toEqual([{ label: 'savings', address: ADDR_C }]);
       expect((await stat(o.bookPath!)).mode & 0o777).toBe(0o640);
     });
@@ -326,7 +326,7 @@ describe('otzi book', () => {
       expect(await readFile(o.bookPath!, 'utf8')).toBe(before);
 
       // As a replacement the same file fits.
-      expect(await bookImport({ ...o, file, replace: true })).toEqual({ added: 1000, updated: 0, unchanged: 0 });
+      expect(await bookImport({ ...o, file, replace: true })).toEqual({ added: 1000, updated: 0, unchanged: 0, removed: 2 });
       expect(await book()).toHaveLength(1000);
     });
   });
@@ -360,8 +360,17 @@ describe('otzi book', () => {
 
       // Another node imports what this one exported.
       const other: BookOpts = { configPath: o.configPath, bookPath: join(tmp, 'other.otzi.json') };
-      expect(await bookImport({ ...other, file: out, replace: false })).toEqual({ added: 2, updated: 0, unchanged: 0 });
+      expect(await bookImport({ ...other, file: out, replace: false })).toEqual({ added: 2, updated: 0, unchanged: 0, removed: 0 });
       expect(await readAddressBook(other.bookPath!, 'testnet4')).toEqual(await book());
+    });
+
+    it('writes the exported file with mode 0640, also over an existing file', async () => {
+      const out = join(tmp, 'exported.otzi.json');
+      await bookExport({ ...o, out });
+      expect((await stat(out)).mode & 0o777).toBe(0o640);
+      await chmod(out, 0o666);
+      await bookExport({ ...o, out });
+      expect((await stat(out)).mode & 0o777).toBe(0o640);
     });
 
     it('exports an empty book for a node without one', async () => {

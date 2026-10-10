@@ -16,7 +16,7 @@ import { NETWORK_NAMES } from '../otzi/backend/types';
 import { addressBookFile, parseAddressBookFile, validateEntries } from '../otzi/lib/address-book';
 import { isValidAddress } from '../otzi/lib/bitcoin';
 import type { AddressBookEntry, NetworkName } from '../otzi/lib/vault-types';
-import { errorReason } from '../util/text';
+import { displayText, errorReason } from '../util/text';
 
 export const DEFAULT_ADDRESS_BOOK_PATH = '/etc/otzi/address-book.otzi.json';
 
@@ -54,7 +54,8 @@ export async function readAddressBook(
   try {
     return parseAddressBookFile(json, network);
   } catch (err) {
-    throw new Error(`address book ${path}: ${errorReason(err)}`, { cause: err });
+    // The reason can quote the file's own `network` / `version` values: untrusted text.
+    throw new Error(`address book ${path}: ${displayText(errorReason(err))}`, { cause: err });
   }
 }
 

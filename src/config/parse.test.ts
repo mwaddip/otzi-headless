@@ -577,3 +577,80 @@ strategy = "auto"
     expect(() => parseDaemonConfigToml(text)).toThrow(/wildcard/);
   });
 });
+
+describe('parseDaemonConfigToml — unknown keys', () => {
+  const RELAY = MINIMAL_TOML.replace('kind = "peer-mesh"\nadvertised_endpoint = "127.0.0.1:8800"', 'kind = "relay"\nurl = "ws://relay.example:9000"');
+  const WITH_ALL = `${MINIMAL_TOML}
+[deadlines]
+signing_ms = 1000
+
+[[triggers]]
+kind = "http"
+bind = "127.0.0.1:7080"
+
+[[triggers]]
+kind = "uds"
+path = "/var/run/otzi/otzi.sock"
+
+[[triggers]]
+kind = "cron"
+schedule = "0 * * * *"
+job_name = "hourly"
+
+[bootstrap]
+role = "leader"
+bind = "0.0.0.0:7090"
+`;
+
+  it.each<[string, string, string]>([
+    ['share.pasword_env', WITH_ALL, 'password_env = "OTZI_SHARE_PASSWORD"'],
+    ['node.identity_file', WITH_ALL, 'id = "node-a"'],
+    ['network.esplora_uri', WITH_ALL, 'name = "testnet4"'],
+    ['transport.url', WITH_ALL, 'advertised_endpoint = "127.0.0.1:8800"'],
+    ['peers[0].port', WITH_ALL, 'endpoint = "127.0.0.1:8801"'],
+    ['deadlines.signing', WITH_ALL, 'signing_ms = 1000'],
+    ['triggers[0].auth_token', WITH_ALL, 'bind = "127.0.0.1:7080"'],
+    ['triggers[1].mode', WITH_ALL, 'path = "/var/run/otzi/otzi.sock"'],
+    ['triggers[2].tz', WITH_ALL, 'job_name = "hourly"'],
+    ['bootstrap.leader_url', WITH_ALL, 'bind = "0.0.0.0:7090"'],
+  ])('rejects %s', (dotted, base, anchor) => {
+    const key = dotted.split('.').at(-1)!;
+    const value = key === 'port' || key === 'signing' ? '1' : '"x"';
+    const toml = base.replace(anchor, `${anchor}\n${key} = ${value}`);
+    let err: unknown;
+    try {
+      parseDaemonConfigToml(toml);
+    } catch (e) {
+      err = e;
+    }
+    expect(err, dotted).toBeInstanceOf(ConfigError);
+    expect((err as ConfigError).path).toBe(dotted);
+    expect((err as Error).message).toMatch(/unknown key/);
+  });
+
+  it('rejects advertised_endpoint under a relay transport', () => {
+    const toml = RELAY.replace('url = "ws://relay.example:9000"', 'url = "ws://relay.example:9000"\nadvertised_endpoint = "127.0.0.1:8800"');
+    expect(() => parseDaemonConfigToml(toml)).toThrow(/config transport\.advertised_endpoint: unknown key/);
+  });
+
+  it('rejects an unknown top-level table or key', () => {
+    expect(() => parseDaemonConfigToml(`${MINIMAL_TOML}\n[logging]\nlevel = "debug"\n`)).toThrow(/config logging: unknown key/);
+    expect(() => parseDaemonConfigToml(`stray = 1\n${MINIMAL_TOML}`)).toThrow(/config stray: unknown key/);
+  });
+
+  it('keeps the specific messages for retired keys', () => {
+    expect(() => parseDaemonConfigToml(MINIMAL_TOML.replace('id = "node-a"', 'id = "node-a"\nparty_id = 1'))).toThrow(/node\.party_id: no longer supported/);
+    expect(() => parseDaemonConfigToml(MINIMAL_TOML.replace('name = "testnet4"', 'name = "testnet4"\nopnet_rpc = "x"'))).toThrow(/network\.opnet_rpc: no longer supported/);
+  });
+
+  it('accepts every documented key', () => {
+    const toml = WITH_ALL.replace('name = "testnet4"', 'name = "testnet4"\nesplora_url = "https://mempool.space/testnet4/api"')
+      .replace('id = "node-a"', 'id = "node-a"\nidentity_key_file = "/var/lib/otzi/identity.json"\npubkey_book_file = "/var/lib/otzi/pubkeys.json"')
+      .replace('signing_ms = 1000', 'signing_ms = 1000\ndkg_ms = 2000')
+      .replace('bind = "127.0.0.1:7080"', 'bind = "127.0.0.1:7080"\nauth_token_env = "OTZI_API_TOKEN"')
+      .replace('job_name = "hourly"', 'job_name = "hourly"\ntimezone = "UTC"');
+    expect(() => parseDaemonConfigToml(toml)).not.toThrow();
+    expect(() => parseDaemonConfigToml(RELAY)).not.toThrow();
+  });
+});
+

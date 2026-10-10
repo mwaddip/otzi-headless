@@ -8,13 +8,16 @@
  * (the book can widen a policy allowlist).
  */
 
-import { writeFile } from 'node:fs/promises';
+import { chmod, writeFile } from 'node:fs/promises';
 import { DEFAULT_ADDRESS_BOOK_PATH, readAddressBook, writeAddressBook } from '../../address-book/store';
 import { loadDaemonConfig } from '../../config/load';
 import type { NetworkName } from '../../config/types';
 import { addressBookFile, mergeAddressBooks, validateEntries } from '../../otzi/lib/address-book';
 import type { AddressBookEntry } from '../../otzi/lib/vault-types';
 import { displayText, errorReason } from '../../util/text';
+
+/** `book export <path>` files get the book's own mode. */
+const BOOK_FILE_MODE = 0o640;
 
 export interface BookOpts {
   /** The daemon config: the network comes from it. */
@@ -72,7 +75,7 @@ export async function bookRemove(o: BookOpts & { key: string }): Promise<void> {
 
 export async function bookImport(
   o: BookOpts & { file: string; replace: boolean },
-): Promise<{ added: number; updated: number; unchanged: number }> {
+): Promise<{ added: number; updated: number; unchanged: number; removed: number }> {
   const network = await networkOf(o);
   const incoming = await readAddressBook(o.file, network, { missing: 'error' }).catch((err: unknown) => {
     throw new Error(`cannot import: ${errorReason(err)}`, { cause: err });
@@ -80,12 +83,19 @@ export async function bookImport(
   const { path, entries } = await loadBook(o, network);
   const merged = mergeAddressBooks(entries, incoming);
   await writeAddressBook(path, network, o.replace ? incoming : merged.entries);
-  return { added: merged.added, updated: merged.updated, unchanged: merged.unchanged };
+  // A merge only adds and updates; a replacement drops every address the file does not have.
+  const kept = new Set(incoming.map(e => e.address));
+  const removed = o.replace ? entries.filter(e => !kept.has(e.address)).length : 0;
+  return { added: merged.added, updated: merged.updated, unchanged: merged.unchanged, removed };
 }
 
 export async function bookExport(o: BookOpts & { out?: string }): Promise<string> {
   const { network, entries } = await loadBook(o);
   const text = JSON.stringify(addressBookFile(entries, network), null, 2);
-  if (o.out !== undefined) await writeFile(o.out, `${text}\n`);
+  if (o.out !== undefined) {
+    // Same mode as the book itself: it lists the node's recipients.
+    await writeFile(o.out, `${text}\n`, { mode: BOOK_FILE_MODE });
+    await chmod(o.out, BOOK_FILE_MODE); // an existing file keeps its mode through writeFile
+  }
   return text;
 }

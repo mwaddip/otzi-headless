@@ -217,8 +217,20 @@ from your debconf "Other peers" answer at install time.
 The daemon reads the share password from the env var named by
 `[share].password_env` (default `OTZI_SHARE_PASSWORD`) and refuses to start
 without it. The systemd unit loads it from `/etc/otzi/otzi.env`: create that file
-(owner `root:root`, mode `0600`) with the single line
-`OTZI_SHARE_PASSWORD=<a strong password>`, then **on every node**:
+(owner `root:root`, mode `0600`) and put the single line
+`OTZI_SHARE_PASSWORD=<a strong password>` in it:
+
+```bash
+sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env
+sudoedit /etc/otzi/otzi.env      # OTZI_SHARE_PASSWORD=<a strong password>
+```
+
+systemd reads this file itself and interprets quotes and backslashes in it
+(and strips spaces around the value), so pick a password without `"`, `'`, `\`
+or leading/trailing spaces — `openssl rand -base64 32` gives one — or write it
+in double quotes with `\"` and `\\` escaped.
+
+Then, **on every node**:
 
 ```bash
 sudo systemctl enable --now otzi
@@ -375,8 +387,8 @@ Full gate contract + spec schema: [`docs/gates.md`](docs/gates.md).
 change, after `otzi generate`, and after address-book changes:
 
 ```bash
-otzi backup
-# → ~/otzi-backup-<ISO-timestamp>.otzi-backup (mode 0600)
+sudo otzi backup
+# → ~/otzi-backup-<ISO-timestamp>.otzi-backup (mode 0600; root reads the share)
 # Password (32 chars, ~190 bits entropy) printed once to stdout — write it down.
 ```
 

@@ -50,16 +50,16 @@ Pre/post conditions below are taken from Ötzi's `facts/INTERFACES.md` at the re
 ### `scripts/check-otzi-drift.sh <otzi-checkout>`
 **Purpose:** Mechanical proof that `src/otzi/` matches Ötzi at the recorded commit.
 
-- **Pre:** `<otzi-checkout>` is a directory holding an Ötzi working tree (CI checks out `OTZI_COMMIT`).
-- **Post:** Diffs every file in the table above against `<otzi-checkout>/<Ötzi source path>`. Exits 0 when all files are identical; exits non-zero and names each differing or missing file otherwise.
-- **CI:** `.github/workflows/ci.yml` clones Ötzi at `OTZI_COMMIT` and runs the script on push and pull request.
+- **Pre:** `<otzi-checkout>` is the top level of a git working tree of Ötzi (CI checks out `OTZI_COMMIT`); a plain directory, or one inside another repository, is refused (exit 2) — the reported HEAD must be the checkout's own.
+- **Post:** The script embeds the 21 lifted file names of the table above. It diffs each against `<otzi-checkout>/<Ötzi source path>` and also fails on a listed file missing under `src/otzi/` and on any file under `src/otzi/lib` or `src/otzi/backend` that is not on the list. Exits 0 when all 21 files are identical (`OK: 21 files match <otzi HEAD>`); exits non-zero and names each differing, missing or extra file otherwise.
+- **CI:** `.github/workflows/ci.yml` clones Ötzi at `OTZI_COMMIT` and runs the script on push and pull request; `.github/workflows/release.yml` runs it (and `npm run typecheck`) before building the `.deb`.
 
 ### Tests
 - The lifted tests run unchanged under Node's test runner: `node --import tsx --test src/otzi/lib/*.test.ts src/otzi/backend/*.test.ts` (`npm run test:otzi`).
 - vitest excludes `src/otzi/`. `npm test` runs vitest, then `npm run test:otzi`.
 
 ### Moving to a newer Ötzi commit
-1. Copy every file in the table from the new commit; add or drop files only together with this table.
+1. Copy every file in the table from the new commit; add or drop files only together with this table and the list in `scripts/check-otzi-drift.sh`.
 2. Write the new hash to `src/otzi/OTZI_COMMIT`.
 3. Re-read Ötzi's `facts/INTERFACES.md` §1, §3–§8, §11, §15 and update the sections below.
 4. Run `scripts/check-otzi-drift.sh`, `npm run typecheck` and `npm test`.

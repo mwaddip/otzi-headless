@@ -392,7 +392,7 @@ export async function runBookCommand(args: string[], bookPath?: string): Promise
       if (positional.length !== 1) throw new Error('usage: otzi book import <file> [--replace]');
       const { bookImport } = await import('../cli/cmd/book');
       const r = await bookImport({ ...book(flags), file: positional[0]!, replace: flags.has('replace') });
-      console.log(`added ${r.added}, updated ${r.updated}, unchanged ${r.unchanged}`);
+      console.log(`added ${r.added}, updated ${r.updated}, unchanged ${r.unchanged}, removed ${r.removed}`);
       return;
     }
     case 'export': {
@@ -463,7 +463,11 @@ async function runRestoreCommand(args: string[]): Promise<void> {
   for (const f of result.restoredFiles) {
     console.log(`  ${f.path} (mode 0${f.mode.toString(8).padStart(3, '0')})`);
   }
-  console.log('Run `systemctl start otzi` to bring up the daemon.');
+  console.log('Next steps:');
+  console.log('  1. Create /etc/otzi/otzi.env with the share password (the archive does not contain it):');
+  console.log('       sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env');
+  console.log("       sudoedit /etc/otzi/otzi.env   # OTZI_SHARE_PASSWORD=<this node's share password>");
+  console.log('  2. sudo systemctl start otzi');
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
