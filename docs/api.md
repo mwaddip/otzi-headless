@@ -67,8 +67,8 @@ a fresh one.
 | `401` | `{ "error": "unauthorized" }` | HTTP trigger with `auth_token_env`, token missing or wrong. |
 | `403` | `{ "error": "gate rejected", "decision": "reject"\|"pending", "ceremonyId": "…" }` | This daemon's own gate did not approve. Nothing was announced to peers. See [`gates.md`](./gates.md). |
 | `405` | `{ "error": "method not allowed" }` | Non-POST method. |
-| `409` | `{ "error": "<detail>" }` | `vault-info` / `sign`: no vault is loaded (`no vault loaded — run otzi generate, then restart the daemon`). `dkg`: this node already holds a vault, or a DKG is already running on this node. `sign`: the `ceremonyId` is already in use on this node. Nothing was announced to peers. |
-| `500` | `{ "error": "<detail>", "ceremonyId": "…" }` | Ceremony failure after the announce: a peer dropped, rejected or timed out, a blob failed sender binding, a signature failed verification. Check the daemon logs; the cause names the offending party where one is known. |
+| `409` | `{ "error": "<detail>" }` | `vault-info` / `sign`: no vault is loaded (`no vault loaded — run otzi generate, then restart the daemon`). `dkg`: this node already holds a vault, or a DKG is already running on this node. `dkg` / `sign`: the `ceremonyId` is already in use on this node — by a live ceremony, or by one that ended here within its retention period (5 min signing, 15 min DKG). Nothing was announced to peers. |
+| `500` | `{ "error": "<detail>", "ceremonyId": "…" }` | Ceremony failure after the announce: a peer dropped or rejected, the ceremony deadline passed (`ceremony deadline of <ms> ms passed`, from `[deadlines]`), a blob failed sender binding, a signature failed verification. Check the daemon logs; the cause names the offending party where one is known. |
 
 ## `op: "vault-info"`
 
@@ -145,7 +145,8 @@ Preconditions and failures:
   a vault; nothing is announced. Replacing a vault is an operator action: move
   the share file away and restart the daemon.
 - `409` (`a DKG is already running on this node`) while the node leads or takes
-  part in another DKG; nothing is announced.
+  part in another DKG, or (`ceremony id <id> is already in use on this node`)
+  for an ID used here within the last 15 minutes; nothing is announced.
 - `403` when the receiving node's gate does not approve the DKG spec.
 - `500` when the ceremony fails or times out (`[deadlines].dkg_ms`). Every node
   deletes its staged `<share path>.pending` file.

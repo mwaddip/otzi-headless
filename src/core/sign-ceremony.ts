@@ -41,15 +41,21 @@ const SIGHASH_LENGTH = 32;
 const utf8 = new TextEncoder();
 const fromUtf8 = new TextDecoder();
 
-/** Leader: announce, run both rounds, aggregate and verify. Broadcasts no signoff. */
+/**
+ * Leader: announce, run both rounds, aggregate and verify. Broadcasts no
+ * signoff. `signal` is checked before the announce, before round 2 and before
+ * aggregating, and stops every pull.
+ */
 export async function leadSigning(
   io: CeremonyIo,
   spec: SignCeremonySpec,
   proposal: SendProposal,
+  signal?: AbortSignal,
 ): Promise<Uint8Array[]> {
-  const ceremony = open(io, spec);
+  const ceremony = open(io, spec, signal);
   const { session } = ceremony;
   try {
+    throwIfAborted(signal);
     await io.transport.broadcast(
       encodeMessage({
         v: 2,
@@ -62,9 +68,12 @@ export async function leadSigning(
 
     ceremony.put(SIGN_ROUNDS.r1, signSession.round1(session));
     await ceremony.pullAndAdd(SIGN_ROUNDS.r1, 1);
+
+    throwIfAborted(signal);
     ceremony.put(SIGN_ROUNDS.r2, signSession.round2(session));
     await ceremony.pullAndAdd(SIGN_ROUNDS.r2, 2);
 
+    throwIfAborted(signal);
     const sigs = signSession.aggregate(session);
     const { verifyingKey } = spec.publicKeyPackage;
     sigs.forEach((sig, i) => {

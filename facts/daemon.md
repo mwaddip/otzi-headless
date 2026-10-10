@@ -183,8 +183,9 @@
   ```ts
   beginLocalDkg(ceremonyId: string): { signal: AbortSignal; end(): void } | null;
   beginLocalSigning(ceremonyId: string): { end(): void } | null;
+  ceremonyIdInUse(ceremonyId: string): boolean;
   ```
-  - **Post:** This node's DKG slot and its led-signing id reservations (see [orchestrator.md](orchestrator.md), `beginLocalDkg` / `beginLocalSigning`). Implemented by `Orchestrator`; the daemon passes its one orchestrator.
+  - **Post:** This node's DKG slot and its led-signing id reservations (see [orchestrator.md](orchestrator.md), `beginLocalDkg` / `beginLocalSigning` / `ceremonyIdInUse`). Implemented by `Orchestrator`; the daemon passes its one orchestrator. An id this node led stays taken for its retention period after `end()`, so reusing it is a 409 before anything is announced.
 
 - `interface LeaderDeps`
   ```ts
@@ -198,6 +199,9 @@
   ```
   - **Pre:** Same meaning as the matching `OrchestratorDeps` fields; the daemon passes the same values to both, and `slots` is the same orchestrator.
 
+- **Ceremony deadline:** each ceremony the leader runs is bounded as a whole. From the ceremony start (just before the announce) an `AbortController` is aborted after `ceremonyDeadlines.signingMs` / `dkgMs`; its timer is cleared in a `finally`.
+  - Signing: the controller's signal is `leadSigning`'s `signal`. A deadline abort fails the request with `Error('ceremony deadline of <ms> ms passed')` (500), and `signoff-aborted` carries that reason.
+  - DKG: the controller's signal is combined with the slot signal (`AbortSignal.any`) for `runDkgCeremony`, which takes its abort path (stager `discard`, no broadcast of its own). When the deadline, not the slot, aborted it, the leader broadcasts `signoff-aborted {ceremonyId, reason: 'ceremony deadline of <ms> ms passed'}` and the request fails with `DKG aborted: ceremony deadline of <ms> ms passed` (500).
 - **Leader pulls:** each ceremony the leader runs uses `{ ...io, pullOpts: { ...io.pullOpts, deadlineMs, maxAttempts: Number.MAX_SAFE_INTEGER } }` with `deadlineMs` = `ceremonyDeadlines.signingMs` or `ceremonyDeadlines.dkgMs` — pulls retry with backoff until the ceremony deadline, as on participants; `io.pullOpts` supplies only the backoff (`initialDelayMs`, `maxDelayMs`).
 
 - `class LeaderDispatcher`
@@ -205,12 +209,13 @@
 
   - **`runDkg(req: { ceremonyId: string }): Promise<{ ceremonyId: string; address: string; internalKey: string; network: NetworkName }>`**
     1. `deps.vault` set → `RequestError(409, 'this node already holds a vault')`.
-    2. `slots.beginLocalDkg(ceremonyId)`; `null` → `RequestError(409, 'a DKG is already running on this node')`. From here on, `end()` runs in a `finally`.
-    3. `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`. Checked while the slot is held, so a DKG this node joined and committed meanwhile is seen.
-    4. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })` (`peerIds` = every `peersById` label in party order); non-approve → `GateRejection`.
-    5. `createStager()`; random 32-byte session ID from `rng`; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, stager, slot.signal)`.
-    6. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
-    - **Throws:** `RequestError`, `GateRejection`, or the `runDkgCeremony` error (which already broadcast `signoff-aborted`, unless the slot's signal aborted it).
+    2. `slots.ceremonyIdInUse(ceremonyId)` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`.
+    3. `slots.beginLocalDkg(ceremonyId)`; `null` → `RequestError(409, 'a DKG is already running on this node')`. From here on, `end()` runs in a `finally`.
+    4. `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`. Checked while the slot is held, so a DKG this node joined and committed meanwhile is seen.
+    5. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })` (`peerIds` = every `peersById` label in party order); non-approve → `GateRejection`.
+    6. `createStager()`; random 32-byte session ID from `rng`; start the ceremony deadline; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, stager, AbortSignal.any([slot.signal, deadline]))`.
+    7. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
+    - **Throws:** `RequestError`, `GateRejection`, the deadline error above, or the `runDkgCeremony` error (which already broadcast `signoff-aborted`, unless its signal aborted it).
     - **Post:** From the announce on, success and failure both `scheduleClear` the ceremony with the DKG retention. The new vault is on disk but not loaded; signing on it needs a daemon restart.
 
   - **`sign(req: LeaderSignRequest): Promise<{ ceremonyId: string; txid: string; signedTxHex: string; signaturesHex: string[] }>`** — in this order:
@@ -218,10 +223,10 @@
     2. `analysis = analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), network)`; a throw → `RequestError(400, <message>)`.
     3. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)` (labels from `addressBook` when present; a rejected `addressBook()` means no labels and one warn line); non-approve → `GateRejection`.
     4. `slots.beginLocalSigning(ceremonyId)`; `null` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. From here on, `end()` and `scheduleClear` (signing retention) run in a `finally`.
-    5. `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal)` — this broadcasts `announce-sign`.
+    5. Start the ceremony deadline; `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal, deadline)` — this broadcasts `announce-sign`.
     6. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` (`src/otzi/backend/bitcoin.ts`) → signed hex and txid.
     7. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`. A failed `signoff-done` broadcast is logged at warn and the signed transaction is still returned (participants settle `timeout` at their deadline).
-    - **Failure in steps 5–6:** broadcast `signoff-aborted {ceremonyId, reason}` (`reason` = the error message, at most 1024 characters; the broadcast is best-effort) and rethrow (handler → 500).
+    - **Failure in steps 5–6:** broadcast `signoff-aborted {ceremonyId, reason}` (`reason` = the error message — `ceremony deadline of <ms> ms passed` when the deadline aborted it — at most 1024 characters; the broadcast is best-effort) and rethrow (handler → 500).
 
 **Invariants:**
 - Nothing is announced unless the leader's own analysis and gate passed (400 / 403 leave peers untouched) and this node holds the ceremony's slot (409 otherwise).
@@ -229,6 +234,7 @@
 - The leader's own gate is evaluated once per request.
 - Signoffs come only from the leader for signing; DKG aborts come from whichever node fails.
 - The slot is released (`end()`) on every exit path once taken.
+- A ceremony the leader runs fails at its ceremony deadline at the latest, however many pull phases it has.
 
 **Cross-component contracts:**
 - Depends on: `runDkgCeremony`, `leadSigning`, `encodeMessage`, `analyzeProposal` / `toVaultKey` / `vaultPayment` / `labelFor` (`src/otzi/lib`), `finalizeSend` (`src/otzi/backend/bitcoin.ts`), `spec-builder.ts`, `scheduleClear`, `LocalCeremonySlots` (`Orchestrator`), `api.ts` (`RequestError`, `NO_VAULT_MESSAGE`).
@@ -270,8 +276,8 @@
     | Op | Request | 200 response |
     |---|---|---|
     | `vault-info` | `{ op }` | `{ partyIds, threshold, parties, network, address, internalKey, outputKey }` — `partyIds` ascending from `peersById`; `threshold` / `parties` from the share; key fields as in `vault-pubkey.json` (`vaultPubkeyFromPackage`). 409 `NO_VAULT_MESSAGE` when no vault is loaded. |
-    | `dkg` | `{ op, ceremonyId? }` | `{ ceremonyId, status: 'done', address, internalKey, network }`. `parties` = ring size, `threshold` = `parties`. 409 when this node already holds a vault or a DKG is running. |
-    | `sign` | `{ op, ceremonyId?, signers?, proposal }` | `{ ceremonyId, status: 'done', txid, signedTxHex, signaturesHex }`. 409 `NO_VAULT_MESSAGE` when no vault is loaded (checked before the body is parsed); 409 when the `ceremonyId` is in use on this node. |
+    | `dkg` | `{ op, ceremonyId? }` | `{ ceremonyId, status: 'done', address, internalKey, network }`. `parties` = ring size, `threshold` = `parties`. 409 when this node already holds a vault, a DKG is running, or the `ceremonyId` is in use on this node (live, or led or settled here within its retention period). |
+    | `sign` | `{ op, ceremonyId?, signers?, proposal }` | `{ ceremonyId, status: 'done', txid, signedTxHex, signaturesHex }`. 409 `NO_VAULT_MESSAGE` when no vault is loaded (checked before the body is parsed); 409 when the `ceremonyId` is in use on this node (live, or led or settled here within its retention period). |
 
   - `vault-info` runs `parseVaultInfoRequest`; `dkg` runs `parseDkgRequest` then `leader.runDkg`; `sign` runs `parseSignRequest(body, { partyIds, self: selfPartyId, minSigners: share.threshold })` then `leader.sign`.
   - **Status codes:**

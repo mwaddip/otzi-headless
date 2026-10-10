@@ -469,29 +469,73 @@ describe('Orchestrator: local ceremony slots', () => {
     }
   });
 
-  it('reserves signing ids this node leads', () => {
-    const { orch } = participant(ring[1]!);
+  it('reserves signing ids this node leads', async () => {
+    const retention = { signing: 60, dkg: 60 };
+    const { orch } = participant(ring[1]!, { blobRetentionMs: retention });
 
     const a = orch.beginLocalSigning('sign-a');
     expect(a).not.toBeNull();
+    expect(orch.ceremonyIdInUse('sign-a')).toBe(true);
     expect(orch.beginLocalSigning('sign-a')).toBeNull();
     expect(orch.beginLocalDkg('sign-a')).toBeNull();
     const b = orch.beginLocalSigning('sign-b'); // distinct ids run side by side
     expect(b).not.toBeNull();
+    b!.end();
 
     a!.end();
     a!.end(); // idempotent
+    // Ended here: the id stays taken for the signing retention period.
+    expect(orch.ceremonyIdInUse('sign-a')).toBe(true);
+    expect(orch.beginLocalSigning('sign-a')).toBeNull();
+    expect(orch.beginLocalDkg('sign-a')).toBeNull();
+    await eventually(() => expect(orch.ceremonyIdInUse('sign-a')).toBe(false));
     const again = orch.beginLocalSigning('sign-a');
     expect(again).not.toBeNull();
     a!.end(); // a stale end() never releases a later reservation
     expect(orch.beginLocalSigning('sign-a')).toBeNull();
     again!.end();
-    b!.end();
 
     const dkg = orch.beginLocalDkg('dkg-a')!;
     expect(orch.beginLocalSigning('dkg-a')).toBeNull();
     dkg.end();
-    expect(orch.beginLocalSigning('dkg-a')).not.toBeNull();
+    expect(orch.beginLocalSigning('dkg-a')).toBeNull();
+    const other = orch.beginLocalDkg('dkg-b'); // the DKG slot itself is free again
+    expect(other).not.toBeNull();
+    other!.end();
+    await eventually(() => expect(orch.beginLocalDkg('dkg-a')).not.toBeNull());
+  });
+
+  it('keeps an ended local id for its own kind\'s retention period', async () => {
+    const { orch } = participant(ring[1]!, { blobRetentionMs: { signing: 40, dkg: 400 } });
+    orch.beginLocalSigning('led-sign')!.end();
+    orch.beginLocalDkg('led-dkg')!.end();
+    const ended = Date.now();
+
+    await eventually(() => expect(orch.ceremonyIdInUse('led-sign')).toBe(false));
+    expect(orch.ceremonyIdInUse('led-dkg')).toBe(true);
+    await eventually(() => expect(orch.ceremonyIdInUse('led-dkg')).toBe(false));
+    expect(Date.now() - ended).toBeGreaterThanOrEqual(390);
+  });
+
+  it('forgets ended local ids on stop', () => {
+    const { orch } = participant(ring[1]!);
+    orch.beginLocalSigning('led-stop')!.end();
+    expect(orch.ceremonyIdInUse('led-stop')).toBe(true);
+    orch.stop();
+    expect(orch.ceremonyIdInUse('led-stop')).toBe(false);
+  });
+
+  it('drops an announce whose id this node led within retention', async () => {
+    const p1 = participant(ring[1]!);
+    p1.orch.beginLocalDkg('led-before')!.end();
+
+    await broadcastFrom(ring, 0, announceDkg('led-before', new Uint8Array(32).fill(9)));
+
+    expect(p1.log.about('led-before')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about('led-before')[0]!.msg).toMatch(/this node led a ceremony with this id/);
+    expect(p1.createStager).not.toHaveBeenCalled();
+    expect(p1.gate.specs).toEqual([]);
+    await expect(p1.orch.waitFor('led-before', 50)).rejects.toThrow(/timed out/);
   });
 
   it.each([

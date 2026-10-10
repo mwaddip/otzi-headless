@@ -87,7 +87,7 @@
     - **Invariant:** Reentrant (returns early if already started).
 
   - **`stop(): void`**
-    - **Post:** Unsubscribes from transport; aborts every live ceremony, the local DKG slot included; clears all trackers, records, local signing reservations and timers; wakes pending `waitFor` calls. Ceremonies cut short by `stop` emit no outcome. A joined DKG still unwinding keeps the DKG slot until its ceremony promise settles.
+    - **Post:** Unsubscribes from transport; aborts every live ceremony, the local DKG slot included; clears all trackers, records (settled outcomes and ended local slots), local signing reservations and timers; wakes pending `waitFor` calls. Ceremonies cut short by `stop` emit no outcome. A joined DKG still unwinding keeps the DKG slot until its ceremony promise settles.
     - **Invariant:** Reentrant (returns early if not started).
 
   - **`onCompleted(handler: (o: CeremonyOutcome) => void): Unsubscribe`**
@@ -100,22 +100,27 @@
     - **Concurrency:** Multiple `waitFor` calls for the same ceremony all resolve/reject together.
 
   - **`beginLocalDkg(ceremonyId: string): { signal: AbortSignal; end(): void } | null`**
-    - **Post:** Returns `null` when any DKG is live on this node (see *At most one live DKG per node*) or when `ceremonyId` is taken (see *Ids this node leads*). Otherwise registers `ceremonyId` as this node's local DKG and returns its slot: `signal` aborts when a ring member's DKG `signoff-aborted` for `ceremonyId` arrives or `stop()` runs; `end()` releases the slot and is idempotent (it never releases a later slot).
+    - **Post:** Returns `null` when any DKG is live on this node (see *At most one live DKG per node*) or when `ceremonyId` is taken (see *Ids this node leads*). Otherwise registers `ceremonyId` as this node's local DKG and returns its slot: `signal` aborts when a ring member's DKG `signoff-aborted` for `ceremonyId` arrives or `stop()` runs; `end()` releases the slot and records `ceremonyId` as ended for the DKG retention period (`blobRetentionMs ?? BLOB_RETENTION_MS`), the same record and expiry settled ceremonies get. `end()` is idempotent (it never releases a later slot and records only once).
     - **Throws:** Never.
-    - **Used by:** `LeaderDispatcher.runDkg` (409 `a DKG is already running on this node` on `null`; passes `signal` to `runDkgCeremony`; calls `end()` in `finally`).
+    - **Used by:** `LeaderDispatcher.runDkg` (409 `a DKG is already running on this node` on `null` once `ceremonyIdInUse` was false; combines `signal` with its ceremony deadline for `runDkgCeremony`; calls `end()` in `finally`).
 
   - **`beginLocalSigning(ceremonyId: string): { end(): void } | null`**
-    - **Post:** Returns `null` when `ceremonyId` is taken (see *Ids this node leads*). Otherwise reserves `ceremonyId` as a signing ceremony this node leads and returns its slot; `end()` releases it and is idempotent (it never releases a later reservation of the same id). Any number of local signing ceremonies with distinct ids can be live.
+    - **Post:** Returns `null` when `ceremonyId` is taken (see *Ids this node leads*). Otherwise reserves `ceremonyId` as a signing ceremony this node leads and returns its slot; `end()` releases it and records `ceremonyId` as ended for the signing retention period, like `beginLocalDkg`. `end()` is idempotent (it never releases a later reservation of the same id and records only once). Any number of local signing ceremonies with distinct ids can be live.
     - **Throws:** Never.
     - **Used by:** `LeaderDispatcher.sign` (409 `ceremony id <id> is already in use on this node` on `null`; calls `end()` in `finally`).
 
+  - **`ceremonyIdInUse(ceremonyId: string): boolean`**
+    - **Post:** `true` iff `ceremonyId` is taken (see *Ids this node leads*). Read-only.
+    - **Throws:** Never.
+    - **Used by:** `LeaderDispatcher.runDkg`, to answer a reused id with `ceremony id <id> is already in use on this node` rather than the live-DKG 409.
+
 **At most one live DKG per node.** Two concurrent DKGs would share one `.pending` path and could commit a share that never passed the all-N confirmation. A DKG is live while a local DKG slot is held, while a DKG tracker exists, and while a joined DKG's `runDkgCeremony` has not settled — its `stage`, `commit` or `discard` can outlast the tracker (an abort or deadline settles the tracker at once), so the slot is held until the ceremony promise settles, also after `stop()`. `beginLocalDkg` returns `null` and `announce-dkg` is dropped while a DKG is live.
 
-**Ids this node leads.** A `ceremonyId` is taken while it has a live tracker, an outcome recorded within its retention period, a local DKG slot, or a local signing slot. `beginLocalDkg` and `beginLocalSigning` refuse a taken id, and an announce whose id is held by a local slot is dropped (see the duplicate checks), so a ceremony this node leads never shares its id — its blobs and its scheduled clear — with a ceremony it joins.
+**Ids this node leads.** A `ceremonyId` is taken while it has a live tracker, an outcome recorded within its retention period, a local DKG slot, a local signing slot, or a local slot that ended within its retention period (`end()` records it). `beginLocalDkg` and `beginLocalSigning` refuse a taken id, and an announce whose id is held by a local slot, live or ended, is dropped (see the duplicate checks), so a ceremony this node leads never shares its id — its blobs and its scheduled clear — with another ceremony on this node, led or joined, until its blobs are cleared. Reusing a led id within retention is therefore a 409 on the leader before anything is announced.
 
 **Message handling.** A message that fails `parseMessage` is dropped with a warn line. Every drop logs exactly one line naming the ceremony, the sender and the reason: warn for suspicious input (a parse failure, an announce or signoff from anyone but the pinned leader, a check below that fails on the leader's data), info or debug for benign cases (a duplicate announce, a ceremony that already ended here, this node not in `signers`, a signoff for a ceremony unknown here).
 
-Every announce first passes the duplicate checks: no tracker exists for the `ceremonyId` (an announce for a live tracker is dropped: warn when the sender is not the pinned leader or the kind differs, info for a duplicate from the leader); the `ceremonyId` is not held by a local DKG or signing slot (warn); and no ceremony with that `ceremonyId` settled on this node within its retention period (info) — reusing an id within retention would collide with its stored blobs and its scheduled clear.
+Every announce first passes the duplicate checks: no tracker exists for the `ceremonyId` (an announce for a live tracker is dropped: warn when the sender is not the pinned leader or the kind differs, info for a duplicate from the leader); the `ceremonyId` is not held by a local DKG or signing slot, live or ended within its retention period (warn); and no ceremony with that `ceremonyId` settled on this node within its retention period (info) — reusing an id within retention would collide with its stored blobs and its scheduled clear.
 
 - **`announce-dkg`** — drop unless all of these hold, in this order:
   1. the duplicate checks;
@@ -165,7 +170,7 @@ Every announce first passes the duplicate checks: no tracker exists for the `cer
 
 **Cross-component contracts:**
 - Depends on: `Transport.onBroadcast`, `parseMessage`, `runDkgCeremony`, `participateInSigning`, `analyzeProposal` / `toVaultKey` / `vaultPayment` / `labelFor` (`src/otzi/lib`), frots `verifySignature`, `ApprovalGate.approve`, `scheduleClear`.
-- Used by: `Daemon` (instantiated once; `onCompleted` forwarded by `Daemon.onCompleted`; passed to the leader as its `LocalCeremonySlots`), `LeaderDispatcher` (`beginLocalDkg`, `beginLocalSigning`).
+- Used by: `Daemon` (instantiated once; `onCompleted` forwarded by `Daemon.onCompleted`; passed to the leader as its `LocalCeremonySlots`), `LeaderDispatcher` (`beginLocalDkg`, `beginLocalSigning`, `ceremonyIdInUse`).
 
 **Notes / gotchas:**
 - A node that completes a DKG keeps running without the new vault loaded; signing on it starts after a daemon restart. Its `vaultExists()` is true from the commit on, so a second DKG is refused.

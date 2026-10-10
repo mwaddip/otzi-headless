@@ -356,6 +356,56 @@ describe('proposal signing ceremony', () => {
     });
   });
 
+  describe('leader abort', () => {
+    it('announces and stores nothing with an aborted signal', async () => {
+      const proposal = makeProposal(vault.vaultKey, NET);
+      const { sighashes } = analyse(proposal);
+      const heard: Uint8Array[] = [];
+      ring[1]!.io.transport.onBroadcast((_from, bytes) => heard.push(bytes));
+      const ac = new AbortController();
+      ac.abort();
+
+      await expect(leadSigning(ring[0]!.io, spec(0, sighashes), proposal, ac.signal)).rejects.toThrow('aborted');
+      expect(heard).toEqual([]);
+      expect(ring[0]!.io.store.list(ceremonyId)).toHaveLength(0);
+    });
+
+    it('stops pulling when the signal aborts, long before the pull deadline', async () => {
+      const proposal = makeProposal(vault.vaultKey, NET);
+      const { sighashes } = analyse(proposal);
+      ring = makeRing(3, { deadlineMs: 5000 });
+      const ac = new AbortController();
+      const started = Date.now();
+
+      // Nobody else takes part: round 1 waits on its pulls until the abort.
+      const running = leadSigning(ring[0]!.io, spec(0, sighashes), proposal, ac.signal);
+      const settled = running.then(() => 'resolved', (e: Error) => e.message);
+      await sleep(30);
+      ac.abort();
+
+      expect(await settled).toBe('aborted');
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(ring[0]!.io.store.has(key(SIGN_ROUNDS.r1, 0))).toBe(true);
+      expect(ring[0]!.io.store.has(key(SIGN_ROUNDS.r2, 0))).toBe(false);
+    });
+
+    it('stops before round 2 when the signal aborts during round 1', async () => {
+      const proposal = makeProposal(vault.vaultKey, NET);
+      const { sighashes } = analyse(proposal);
+      const ac = new AbortController();
+      // The abort lands as the last round-1 blob is stored: round-1 pulls complete.
+      const { store } = ring[0]!.io;
+      store.onPut(() => {
+        if (store.has(key(SIGN_ROUNDS.r1, 1)) && store.has(key(SIGN_ROUNDS.r1, 2))) ac.abort();
+      });
+
+      const participants = [1, 2].map(p => participateInSigning(ring[p]!.io, spec(p, sighashes)));
+      await expect(leadSigning(ring[0]!.io, spec(0, sighashes), proposal, ac.signal)).rejects.toThrow('aborted');
+      await Promise.allSettled(participants);
+      expect(ring[0]!.io.store.has(key(SIGN_ROUNDS.r2, 0))).toBe(false);
+    });
+  });
+
   describe('2-of-3 vault', () => {
     it('never pulls from the non-signer', async () => {
       const vault23 = testVault(2, 3);

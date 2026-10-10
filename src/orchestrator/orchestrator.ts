@@ -94,8 +94,11 @@ export class Orchestrator {
   private readonly events = new EventEmitter();
   /** Live ceremonies by `ceremonyId`. */
   private readonly trackers = new Map<string, Tracker>();
-  /** Outcomes of ceremonies that settled within their retention period. */
-  private readonly ended = new Map<string, { outcome: CeremonyOutcome; timer: ReturnType<typeof setTimeout> }>();
+  /**
+   * Ids that ended here within their retention period: settled ceremonies
+   * (with their outcome) and ended local slots (no outcome).
+   */
+  private readonly ended = new Map<string, { outcome?: CeremonyOutcome; timer: ReturnType<typeof setTimeout> }>();
   private localDkg: LocalDkgSlot | null = null;
   /** A joined DKG's ceremony, held until it settles: stage, commit and discard can outlast its tracker. */
   private joinedDkg: Promise<void> | null = null;
@@ -161,8 +164,8 @@ export class Orchestrator {
    * settled within its retention period. Rejects on timeout or `stop()`.
    */
   waitFor(ceremonyId: string, timeoutMs = DEFAULT_WAIT_MS): Promise<CeremonyOutcome> {
-    const ended = this.ended.get(ceremonyId);
-    if (ended) return Promise.resolve(ended.outcome);
+    const ended = this.ended.get(ceremonyId)?.outcome;
+    if (ended) return Promise.resolve(ended);
     return new Promise((resolve, reject) => {
       const onCompleted = (o: CeremonyOutcome) => {
         if (o.ceremonyId !== ceremonyId) return;
@@ -191,7 +194,8 @@ export class Orchestrator {
    * Register a DKG this node leads. `null` while any DKG — led or joined — is
    * live, or when `ceremonyId` is taken. The slot's `signal` aborts on a ring
    * member's `signoff-aborted` for `ceremonyId` or on `stop()`; `end()`
-   * releases the slot (idempotent).
+   * releases the slot and keeps `ceremonyId` taken for the DKG retention
+   * period (idempotent).
    */
   beginLocalDkg(ceremonyId: string): { signal: AbortSignal; end(): void } | null {
     if (this.dkgLive() || this.idTaken(ceremonyId)) return null;
@@ -200,14 +204,17 @@ export class Orchestrator {
     return {
       signal: slot.controller.signal,
       end: () => {
-        if (this.localDkg === slot) this.localDkg = null;
+        if (this.localDkg !== slot) return;
+        this.localDkg = null;
+        this.record(ceremonyId, this.retentionMs('dkg'));
       },
     };
   }
 
   /**
    * Reserve the id of a signing ceremony this node leads. `null` when
-   * `ceremonyId` is taken; `end()` releases the reservation (idempotent).
+   * `ceremonyId` is taken; `end()` releases the reservation and keeps
+   * `ceremonyId` taken for the signing retention period (idempotent).
    */
   beginLocalSigning(ceremonyId: string): { end(): void } | null {
     if (this.idTaken(ceremonyId)) return null;
@@ -215,9 +222,16 @@ export class Orchestrator {
     this.localSigning.set(ceremonyId, token);
     return {
       end: () => {
-        if (this.localSigning.get(ceremonyId) === token) this.localSigning.delete(ceremonyId);
+        if (this.localSigning.get(ceremonyId) !== token) return;
+        this.localSigning.delete(ceremonyId);
+        this.record(ceremonyId, this.retentionMs('signing'));
       },
     };
+  }
+
+  /** Whether `ceremonyId` is taken: live here, or ended here within its retention period. */
+  ceremonyIdInUse(ceremonyId: string): boolean {
+    return this.idTaken(ceremonyId);
   }
 
   // ─── Dispatch ────────────────────────────────────────────────────────────
@@ -475,8 +489,10 @@ export class Orchestrator {
       drop('warn', 'this node leads a ceremony with this id');
       return true;
     }
-    if (this.ended.has(ceremonyId)) {
-      drop('info', 'the ceremony already ended on this node');
+    const ended = this.ended.get(ceremonyId);
+    if (ended) {
+      if (ended.outcome) drop('info', 'the ceremony already ended on this node');
+      else drop('warn', 'this node led a ceremony with this id within its retention period');
       return true;
     }
     return false;
@@ -544,14 +560,14 @@ export class Orchestrator {
     this.halt(t);
     if (this.trackers.get(t.ceremonyId) === t) this.trackers.delete(t.ceremonyId);
 
-    const retention = (this.deps.blobRetentionMs ?? BLOB_RETENTION_MS)[t.kind];
+    const retention = this.retentionMs(t.kind);
     scheduleClear(this.deps.io.store, t.ceremonyId, retention);
 
     const outcome: CeremonyOutcome = { ceremonyId: t.ceremonyId, kind: t.kind, status: s.status };
     if (s.signaturesHex) outcome.signaturesHex = s.signaturesHex;
     if (s.address) outcome.address = s.address;
     if (s.reason) outcome.reason = s.reason;
-    this.record(outcome, retention);
+    this.record(t.ceremonyId, retention, outcome);
 
     const level = s.level ?? SETTLE_LEVEL[s.status];
     this.log[level](`orchestrator: ${t.kind} ${t.ceremonyId} ${s.status}${s.reason ? `: ${s.reason}` : ''}`, {
@@ -563,16 +579,23 @@ export class Orchestrator {
     this.events.emit('completed', outcome);
   }
 
-  /** Keep the outcome for the retention period (duplicate announces, late `waitFor`). */
-  private record(outcome: CeremonyOutcome, retentionMs: number): void {
-    const { ceremonyId } = outcome;
+  /**
+   * Keep `ceremonyId` taken for the retention period, with the outcome of a
+   * settled ceremony (duplicate announces, late `waitFor`) or none for an
+   * ended local slot.
+   */
+  private record(ceremonyId: string, retentionMs: number, outcome?: CeremonyOutcome): void {
     const previous = this.ended.get(ceremonyId);
     if (previous) clearTimeout(previous.timer);
     const timer = setTimeout(() => {
       if (this.ended.get(ceremonyId)?.timer === timer) this.ended.delete(ceremonyId);
     }, retentionMs);
     timer.unref();
-    this.ended.set(ceremonyId, { outcome, timer });
+    this.ended.set(ceremonyId, outcome ? { outcome, timer } : { timer });
+  }
+
+  private retentionMs(kind: CeremonyKind): number {
+    return (this.deps.blobRetentionMs ?? BLOB_RETENTION_MS)[kind];
   }
 
   private drop(level: LogLevel, kind: string, ceremonyId: string, from: PartyId, reason: string): void {

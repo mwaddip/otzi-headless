@@ -339,6 +339,34 @@ describe('Daemon API: DKG and signing', () => {
     expect(c.transcript.filter(l => l.includes(PASSWORD))).toEqual([]);
   });
 
+  it('a second dkg or sign with the same ceremonyId right after the first returns 409 and broadcasts nothing', async () => {
+    const fresh = await cluster();
+    const setup = await fresh.boot();
+    const joined = setup.daemons.slice(1).map(d => outcomeOf(d, 'gen-again'));
+    expect((await post(setup.urls[0]!, { op: 'dkg', ceremonyId: 'gen-again' })).status).toBe(200);
+    await Promise.all(joined);
+    const dkgBroadcast = vi.spyOn(setup.transports[0]!, 'broadcast');
+    expect(await post(setup.urls[0]!, { op: 'dkg', ceremonyId: 'gen-again' })).toEqual({
+      status: 409,
+      json: { error: 'ceremony id gen-again is already in use on this node' },
+    });
+    expect(dkgBroadcast).not.toHaveBeenCalled();
+    await fresh.shutdown();
+
+    const restored = await cluster();
+    const tv = await writeShares(restored);
+    const { urls, daemons, transports } = await restored.boot();
+    const signed = daemons.slice(1).map(d => outcomeOf(d, 'pay-again'));
+    const first = await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-again', proposal: makeProposal(tv.vaultKey, NET) });
+    expect(first.status).toBe(200);
+    await Promise.all(signed);
+    const signBroadcast = vi.spyOn(transports[0]!, 'broadcast');
+    expect(
+      await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-again', proposal: makeProposal(tv.vaultKey, NET) }),
+    ).toEqual({ status: 409, json: { error: 'ceremony id pay-again is already in use on this node' } });
+    expect(signBroadcast).not.toHaveBeenCalled();
+  });
+
   it('sign returns 400 with the analysis reason for a foreign input', async () => {
     const c = await cluster();
     const tv = await writeShares(c);

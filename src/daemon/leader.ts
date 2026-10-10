@@ -14,7 +14,8 @@
  *     the signed transaction; it never broadcasts it to the chain.
  *
  * Refusals before the announce (409, 400, a gate non-approve) leave peers
- * untouched. Ceremony pulls retry until the ceremony deadline.
+ * untouched. Each ceremony runs under its ceremony deadline as a whole, and
+ * its pulls retry until then.
  */
 
 import type { Rng } from '@mwaddip/frots';
@@ -52,10 +53,14 @@ export class GateRejection extends Error {
   }
 }
 
-/** This node's DKG slot and led-signing id reservations; implemented by `Orchestrator`. */
+/**
+ * This node's DKG slot and led-signing id reservations; implemented by
+ * `Orchestrator`. An id stays taken for its retention period after `end()`.
+ */
 export interface LocalCeremonySlots {
   beginLocalDkg(ceremonyId: string): { signal: AbortSignal; end(): void } | null;
   beginLocalSigning(ceremonyId: string): { end(): void } | null;
+  ceremonyIdInUse(ceremonyId: string): boolean;
 }
 
 export interface LeaderDeps {
@@ -73,7 +78,7 @@ export interface LeaderDeps {
   /** A fresh stager for the share path. */
   createStager: () => ShareStager;
   rng: Rng;
-  /** `config.deadlines`: the leader's pulls run until them. */
+  /** `config.deadlines`: each ceremony the leader runs ends at its deadline at the latest. */
   ceremonyDeadlines: { signingMs: number; dkgMs: number };
   /** The daemon's orchestrator. */
   slots: LocalCeremonySlots;
@@ -100,6 +105,13 @@ export interface LeaderSignResult {
 
 type CeremonyKind = 'signing' | 'dkg';
 
+/** Aborts `signal` when the ceremony deadline passes; `clear()` stops the timer. */
+interface CeremonyDeadline {
+  signal: AbortSignal;
+  ms: number;
+  clear(): void;
+}
+
 export class LeaderDispatcher {
   private readonly deps: LeaderDeps;
   private readonly log: Logger;
@@ -113,6 +125,7 @@ export class LeaderDispatcher {
     const { ceremonyId } = req;
     const { network, peersById, rng } = this.deps;
     if (this.deps.vault) throw new RequestError(409, VAULT_HELD);
+    if (this.deps.slots.ceremonyIdInUse(ceremonyId)) throw new RequestError(409, idInUse(ceremonyId));
 
     const slot = this.deps.slots.beginLocalDkg(ceremonyId);
     if (!slot) throw new RequestError(409, 'a DKG is already running on this node');
@@ -131,20 +144,30 @@ export class LeaderDispatcher {
       this.log.info(`leader: dkg ${ceremonyId}: announcing a ${threshold}-of-${parties} DKG on ${network}`, {
         ceremonyId,
       });
+      const deadline = this.startDeadline('dkg');
       try {
         await this.deps.io.transport.broadcast(
           encodeMessage({ v: 2, kind: 'announce-dkg', ceremonyId, sessionIdHex: toHex(sessionId), threshold, parties, network }),
         );
         const spec = { ceremonyId, sessionId, threshold, parties, network, rng };
-        const { publicKeyPackage } = await runDkgCeremony(this.ceremonyIo('dkg'), spec, stager, slot.signal);
+        const signal = AbortSignal.any([slot.signal, deadline.signal]);
+        const { publicKeyPackage } = await runDkgCeremony(this.ceremonyIo('dkg'), spec, stager, signal);
         const vaultKey = toVaultKey(publicKeyPackage);
         const address = vaultPayment(vaultKey, network).address;
         this.log.info(`leader: dkg ${ceremonyId} done: vault ${address}`, { ceremonyId, address });
         return { ceremonyId, address, internalKey: vaultKey.untweakedVerifyingKey, network };
       } catch (err) {
-        this.log.warn(`leader: dkg ${ceremonyId} failed: ${errorMessage(err)}`, { ceremonyId });
-        throw err;
+        let failure = err;
+        if (deadline.signal.aborted && !slot.signal.aborted) {
+          // The ceremony stops silently on its signal; nobody else has announced this abort.
+          const reason = deadlineReason(deadline);
+          await this.broadcastBestEffort({ v: 2, kind: 'signoff-aborted', ceremonyId, reason });
+          failure = new Error(`DKG aborted: ${reason}`, { cause: err });
+        }
+        this.log.warn(`leader: dkg ${ceremonyId} failed: ${errorMessage(failure)}`, { ceremonyId });
+        throw failure;
       } finally {
+        deadline.clear();
         this.clearLater(ceremonyId, 'dkg');
       }
     } finally {
@@ -168,7 +191,8 @@ export class LeaderDispatcher {
     await this.approve(buildSigningSpec(analysis, this.specBase(ceremonyId), network, label));
 
     const slot = this.deps.slots.beginLocalSigning(ceremonyId);
-    if (!slot) throw new RequestError(409, `ceremony id ${ceremonyId} is already in use on this node`);
+    if (!slot) throw new RequestError(409, idInUse(ceremonyId));
+    const deadline = this.startDeadline('signing');
     try {
       let result: LeaderSignResult;
       try {
@@ -184,7 +208,7 @@ export class LeaderDispatcher {
           ceremonyId,
           txid: analysis.txid,
         });
-        const signatures = await leadSigning(this.ceremonyIo('signing'), spec, proposal);
+        const signatures = await leadSigning(this.ceremonyIo('signing'), spec, proposal, deadline.signal);
         const signaturesHex = signatures.map(s => toHex(s));
         const finalized = finalizeSend(
           proposal.tx,
@@ -194,15 +218,17 @@ export class LeaderDispatcher {
         );
         result = { ceremonyId, txid: finalized.txid, signedTxHex: finalized.hex, signaturesHex };
       } catch (err) {
-        const reason = errorMessage(err);
+        const failure = deadline.signal.aborted ? new Error(deadlineReason(deadline), { cause: err }) : err;
+        const reason = errorMessage(failure);
         this.log.warn(`leader: signing ${ceremonyId} failed: ${reason}`, { ceremonyId });
         await this.broadcastBestEffort({ v: 2, kind: 'signoff-aborted', ceremonyId, reason: reason.slice(0, MAX_REASON_LENGTH) });
-        throw err;
+        throw failure;
       }
       await this.broadcastBestEffort({ v: 2, kind: 'signoff-done', ceremonyId, signaturesHex: result.signaturesHex });
       this.log.info(`leader: signing ${ceremonyId} done: txid ${result.txid}`, { ceremonyId, txid: result.txid });
       return result;
     } finally {
+      deadline.clear();
       slot.end();
       this.clearLater(ceremonyId, 'signing');
     }
@@ -258,6 +284,14 @@ export class LeaderDispatcher {
     }
   }
 
+  /** The whole-ceremony deadline, started at the ceremony start (just before the announce). */
+  private startDeadline(kind: CeremonyKind): CeremonyDeadline {
+    const ms = kind === 'signing' ? this.deps.ceremonyDeadlines.signingMs : this.deps.ceremonyDeadlines.dkgMs;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    return { signal: controller.signal, ms, clear: () => clearTimeout(timer) };
+  }
+
   private clearLater(ceremonyId: string, kind: CeremonyKind): void {
     const retention = (this.deps.blobRetentionMs ?? BLOB_RETENTION_MS)[kind];
     scheduleClear(this.deps.io.store, ceremonyId, retention);
@@ -269,6 +303,14 @@ export class LeaderDispatcher {
     const deadlineMs = kind === 'signing' ? ceremonyDeadlines.signingMs : ceremonyDeadlines.dkgMs;
     return { ...io, pullOpts: { ...io.pullOpts, deadlineMs, maxAttempts: Number.MAX_SAFE_INTEGER } };
   }
+}
+
+function idInUse(ceremonyId: string): string {
+  return `ceremony id ${ceremonyId} is already in use on this node`;
+}
+
+function deadlineReason(deadline: CeremonyDeadline): string {
+  return `ceremony deadline of ${deadline.ms} ms passed`;
 }
 
 function errorMessage(err: unknown): string {

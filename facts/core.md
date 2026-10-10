@@ -546,10 +546,11 @@ export interface SignCeremonySpec { ceremonyId: string; signers: readonly PartyI
 ```
 - `SignCeremonySpec.sighashes` are the sighashes this node computed with `analyzeProposal` (input order, 1–255 entries). `keyPackage` / `publicKeyPackage` come from this node's own share.
 
-- `async leadSigning(io: CeremonyIo, spec: SignCeremonySpec, proposal: SendProposal) → Promise<Uint8Array[]>`
+- `async leadSigning(io: CeremonyIo, spec: SignCeremonySpec, proposal: SendProposal, signal?: AbortSignal) → Promise<Uint8Array[]>`
   - **Pre:** The caller analysed `proposal` against this node's own key and network and its gate approved; `spec.signers` contains this node, has no duplicates, contains only ring members, and has at least `publicKeyPackage.minSigners` entries.
   - **Post:** Broadcasts `announce-sign {ceremonyId, signers, proposal}`; signing session with `sessionId = sighashes[0]` and `tweaked: true` for every sighash; puts `sign-r1`, pulls `sign-r1` from every other signer, `addBlob(..., 1, from)`; `round2`, puts `sign-r2`, pulls `sign-r2` from every other signer, `addBlob(..., 2, from)`; `aggregate` with the full `publicKeyPackage`; checks `verifySignature(sig, sighash, publicKeyPackage.verifyingKey)` for every input. Returns one 64-byte signature per input, in input order.
-  - **Throws:** Before announcing or storing anything, on a spec that breaks the checks listed under *Spec validation* below. Later, on any pull failure, rejected blob (`Rejected <round> blob from party <from>: <reason>` names the sender), aggregation failure (frots names the cheating signer) or failed verification (`signature for input <i> does not verify`).
+  - **Throws:** Before announcing or storing anything, on a spec that breaks the checks listed under *Spec validation* below. Later, on any pull failure, rejected blob (`Rejected <round> blob from party <from>: <reason>` names the sender), aggregation failure (frots names the cheating signer), failed verification (`signature for input <i> does not verify`), or `signal` abort (`Error('aborted')`).
+  - **Abort:** `signal` is checked before the announce (an already-aborted signal announces and stores nothing), before round 2 and before aggregating, and it stops every pull (`Error('aborted')`). `LeaderDispatcher` passes its ceremony-deadline signal.
   - **Notes:** Does not broadcast a signoff; `LeaderDispatcher` broadcasts `signoff-done` / `signoff-aborted`.
 
 - `async participateInSigning(io: CeremonyIo, spec: SignCeremonySpec, signal?: AbortSignal) → Promise<void>`
@@ -629,7 +630,7 @@ Test helpers; never imported by runtime code.
 | FrostSignSession.addBlob(s, blob, round, from) | `from` authenticated | stored, or `{ok:false}` naming `from` | Never |
 | FrostSignSession.round2(s) | all commitments collected; not started | shares blob; `myNonces === null` | already started / missing commitments |
 | runDkgCeremony(io, spec, stager, signal?) | announced; no vault | share committed, result returned | `DKG aborted: <reason>` |
-| leadSigning(io, spec, proposal) | analysed + gated by caller | verified signatures, input order | on any failure |
+| leadSigning(io, spec, proposal, signal?) | analysed + gated by caller | verified signatures, input order | on any failure / `aborted` |
 | participateInSigning(io, spec, signal?) | participant checks passed | `sign-r1`, `sign-r2` produced | on any failure / `aborted` |
 
 ---
