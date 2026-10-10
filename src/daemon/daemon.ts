@@ -18,7 +18,6 @@
  * returned to the caller, which broadcasts them.
  */
 
-import { access } from 'node:fs/promises';
 import type { Rng } from '@mwaddip/frots';
 import { DEFAULT_ADDRESS_BOOK_PATH, readAddressBook } from '../address-book/store';
 import type { PullOpts } from '../core/blob-puller';
@@ -28,7 +27,7 @@ import { BlobStore } from '../core/blob-store';
 import type { CeremonyIo } from '../core/ceremony-io';
 import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
-import type { NetworkName, TriggerEntry } from '../config/types';
+import type { TriggerEntry } from '../config/types';
 import { createGate } from '../gate/factory';
 import { Orchestrator } from '../orchestrator/orchestrator';
 import { NOOP_LOGGER, type CeremonyOutcome, type Logger } from '../orchestrator/types';
@@ -69,18 +68,6 @@ export interface DaemonDeps {
   addressBookPath?: string;
 }
 
-/**
- * The addresses of the address book at `path`, for the policy gate's
- * `allowed_recipients = "address-book"`. Unlike `readAddressBook`, which reads a
- * missing file as an empty book, a missing file is an error here: a node without
- * a book has no recipients to allow, so its policy rejects every signing spec.
- */
-async function bookAddresses(path: string, network: NetworkName): Promise<string[]> {
-  const entries = await readAddressBook(path, network);
-  if (entries.length === 0) await access(path); // throws ENOENT when the empty answer meant "no file"
-  return entries.map(e => e.address);
-}
-
 export class Daemon {
   private readonly orchestrator: Orchestrator;
   private readonly leader: LeaderDispatcher;
@@ -99,8 +86,11 @@ export class Daemon {
     this.server = new BlobServer(transport, store);
     const io: CeremonyIo = { transport, store, puller: new BlobPuller(transport, store), pullOpts: deps.pullOpts };
     const bookPath = deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH;
+    // The policy rule needs a book to exist: a node without one has no recipients to allow, so its
+    // policy rejects every signing spec. The labelling read below takes a missing file as no labels.
     const gate = createGate(config.gate, {
-      loadAddressBook: () => bookAddresses(bookPath, network),
+      loadAddressBook: async () =>
+        (await readAddressBook(bookPath, network, { missing: 'error' })).map(e => e.address),
       logger: this.log,
     });
     const node = { id: config.node.id, partyId: selfPartyId };

@@ -113,6 +113,23 @@ describe('address book store', () => {
 
     it('returns [] when the file does not exist', async () => {
       expect(await readAddressBook(join(dir, 'absent.json'), NETWORK)).toEqual([]);
+      expect(await readAddressBook(join(dir, 'absent.json'), NETWORK, { missing: 'empty' })).toEqual([]);
+    });
+
+    it("throws for a missing file with missing: 'error', naming the file", async () => {
+      const absent = join(dir, 'absent.json');
+      const err = await readAddressBook(absent, NETWORK, { missing: 'error' }).then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+      expect(err?.message).toContain(absent);
+      expect(err?.message).toContain('ENOENT');
+    });
+
+    it('reads an existing file the same with either missing mode', async () => {
+      await writeAddressBook(path, NETWORK, ENTRIES);
+      expect(await readAddressBook(path, NETWORK, { missing: 'error' })).toEqual(ENTRIES);
+      expect(await readAddressBook(path, NETWORK, { missing: 'empty' })).toEqual(ENTRIES);
     });
 
     it('reads an Ötzi address-book file as web Ötzi exports it', async () => {
@@ -185,9 +202,43 @@ describe('address book store', () => {
       expect(resolveRecipient([], ADDR_C, NETWORK)).toBe(ADDR_C);
     });
 
-    it('prefers a label over the same text read as an address', () => {
-      const tricky: AddressBookEntry[] = [{ label: ADDR_A, address: ADDR_B }];
-      expect(resolveRecipient(tricky, ADDR_A, NETWORK)).toBe(ADDR_B);
+    it('refuses an address-shaped label that points to another address, naming both', () => {
+      const redirect: AddressBookEntry[] = [{ label: ADDR_A, address: ADDR_B }];
+      const err = (() => {
+        try {
+          return resolveRecipient(redirect, ADDR_A, NETWORK);
+        } catch (e) {
+          return e as Error;
+        }
+      })();
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toContain(`'${ADDR_A}' is both an address and the label of ${ADDR_B}`);
+    });
+
+    it('refuses an address-shaped label whatever network the address is for', () => {
+      // A mainnet address as the label of a testnet4 entry: the input is not valid on testnet4, but it is an address.
+      const redirect: AddressBookEntry[] = [{ label: MAINNET_ADDR, address: ADDR_B }];
+      expect(() => resolveRecipient(redirect, MAINNET_ADDR, NETWORK)).toThrow(
+        `'${MAINNET_ADDR}' is both an address and the label of ${ADDR_B}`,
+      );
+    });
+
+    it('accepts an address-shaped label that points to that same address', () => {
+      const same: AddressBookEntry[] = [{ label: ADDR_A, address: ADDR_A, note: 'listed under its own name' }];
+      expect(resolveRecipient(same, ADDR_A, NETWORK)).toBe(ADDR_A);
+    });
+
+    it('only looks at the label that resolves: a later entry does not matter', () => {
+      const entries: AddressBookEntry[] = [
+        { label: ADDR_A, address: ADDR_A },
+        { label: ADDR_A, address: ADDR_B },
+      ];
+      expect(resolveRecipient(entries, ADDR_A, NETWORK)).toBe(ADDR_A);
+    });
+
+    it('does not mistake an ordinary label for an address', () => {
+      const entries: AddressBookEntry[] = [{ label: 'tb1-not-an-address', address: ADDR_B }];
+      expect(resolveRecipient(entries, 'tb1-not-an-address', NETWORK)).toBe(ADDR_B);
     });
 
     it('rejects an address of another network and anything that is neither label nor address', () => {

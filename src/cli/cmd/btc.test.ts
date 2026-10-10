@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { hex } from '@scure/base';
 import * as btc from '@scure/btc-signer';
 import { schnorr } from '@noble/curves/secp256k1.js';
-import { writeAddressBook } from '../../address-book/store';
+import { readAddressBook, writeAddressBook } from '../../address-book/store';
 import { DaemonClientError } from '../daemon-client';
 import { vaultPubkeyFromPackage, writeVaultPubkeyFile } from '../../daemon/vault-pubkey';
 import { finalizeSend, vaultPayment } from '../../otzi/backend/bitcoin';
@@ -378,12 +378,43 @@ describe('otzi btc', () => {
       });
 
       it('refuses an unknown label before reaching Esplora or the daemon', async () => {
+        // Esplora is down: a UTXO fetch would fail with an Esplora error instead of the label error.
+        const dead = await startMockEsplora();
+        await dead.close();
+        await writeFile(configPath, configToml(dead.url));
         await writeAddressBook(bookPath, NETWORK, [{ label: 'treasury', address: DEST }]);
+
         await expect(btcSend({ configPath, vaultPath, bookPath, to: 'Treasury', amount: '50000' }, deps())).rejects.toThrow(
           'unknown label or invalid address: Treasury',
         );
         expect(client.requests).toHaveLength(0);
-        expect(esplora.broadcasts).toHaveLength(0);
+        expect(summaries).toEqual([]);
+      });
+
+      it('refuses an address-shaped label that points elsewhere, instead of paying the other address', async () => {
+        const dead = await startMockEsplora();
+        await dead.close();
+        await writeFile(configPath, configToml(dead.url));
+        await writeAddressBook(bookPath, NETWORK, [{ label: DEST, address: OTHER }]);
+
+        await expect(btcSend({ configPath, vaultPath, bookPath, to: DEST, amount: '50000' }, deps())).rejects.toThrow(
+          `'${DEST}' is both an address and the label of ${OTHER}`,
+        );
+        expect(client.requests).toHaveLength(0);
+        expect(summaries).toEqual([]);
+      });
+
+      it('shows no control character of a label in the summary, and never changes the book', async () => {
+        const label = 'treasury\u001b[2J\u009b31m\u0007';
+        await writeAddressBook(bookPath, NETWORK, [{ label, address: DEST }]);
+        esplora.fund(address, 80_000);
+
+        await btcSend({ configPath, vaultPath, bookPath, to: label, amount: '50000' }, deps());
+
+        expect(summaries).toHaveLength(1);
+        expect(summaries[0]).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
+        expect(summaries[0]).toContain('"treasury[2J31m"');
+        expect(await readAddressBook(bookPath, NETWORK)).toEqual([{ label, address: DEST }]);
       });
 
       it('fails naming the book when it cannot be read or is for another network', async () => {
@@ -589,6 +620,18 @@ describe('otzi btc', () => {
       expect(lines.filter(l => l.includes('"'))).toHaveLength(1); // the change output carries no label
       expect(summaries).toEqual([r.summary]);
       expect(warnings).toEqual([]);
+    });
+
+    it('shows no control character of a label in the summary', async () => {
+      const label = 'cold\u001b]0;pwned\u0007\u009bstorage';
+      await writeAddressBook(bookPath, NETWORK, [{ label, address: DEST }]);
+      const proposalPath = await writeProposal(makeProposal(vault, NETWORK, { outputs: [{ address: DEST, amount: 50_000 }] }));
+
+      const r = await btcSign({ configPath, vaultPath, bookPath, proposalPath, broadcast: false }, deps());
+
+      expect(r.summary).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
+      expect(r.summary).toContain('"cold]0;pwnedstorage"');
+      expect(summaries).toEqual([r.summary]);
     });
 
     it('prints no labels on a node without a book', async () => {

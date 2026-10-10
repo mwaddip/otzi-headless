@@ -119,7 +119,7 @@
 
 **Cross-component contracts:**
 - Created by `factory.createGate()` when `gate.strategy === 'policy'`.
-- `loadAddressBook` is wired by the daemon: it reads `DEFAULT_ADDRESS_BOOK_PATH` like `readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)` but treats a missing file (ENOENT) as a failure, where `readAddressBook` itself returns `[]` (see [address-book.md](address-book.md)).
+- `loadAddressBook` is wired by the daemon: it reads the node's address book (`addressBookPath`, default `DEFAULT_ADDRESS_BOOK_PATH`) with `readAddressBook(addressBookPath, network, { missing: 'error' })`, so a missing file (ENOENT) is a failure where the default reading returns `[]` (see [address-book.md](address-book.md)).
 - Expected by daemon to be deterministic and side-effect-free apart from the window memory.
 
 **Notes / gotchas:**

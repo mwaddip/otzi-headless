@@ -641,12 +641,14 @@ describe('runRestore', () => {
     // against an existing directory yields EISDIR, which propagates out of
     // the placement loop and triggers the rollback path.
     //
-    // The first file the loop tries to place is `etc/otzi/daemon.toml`
-    // (by tar entry order — see backup.ts fileSet); the last one before the
-    // generated meta.json is `var/lib/otzi/vault-pubkey.json`. Sabotage that
-    // last one to fail; assert that everything placed before it was rolled
-    // back (no file at `<restoreRoot>/etc/otzi/daemon.toml`, share, identity
-    // or pubkeys) so NO files anywhere under restoreRoot survive.
+    // The loop places files in tar entry order (see backup.ts fileSet):
+    // `etc/otzi/daemon.toml` first, then the share, pubkeys and identity,
+    // `var/lib/otzi/vault-pubkey.json`, the address book, and the generated
+    // meta.json last (never written). Sabotage vault-pubkey.json; assert that
+    // everything placed before it was rolled back (no file at
+    // `<restoreRoot>/etc/otzi/daemon.toml`, share, identity or pubkeys) and
+    // that nothing after it was placed, so NO files anywhere under
+    // restoreRoot survive.
     const backupRoot = join(tmp, 'src');
     const f = await buildBackupFixture(backupRoot);
     const backup = await runBackup({
@@ -694,6 +696,7 @@ describe('runRestore', () => {
     expect(await pathExists(resolve(restoreRoot, shareRel))).toBe(false);
     expect(await pathExists(resolve(restoreRoot, identityRel))).toBe(false);
     expect(await pathExists(resolve(restoreRoot, pubkeysRel))).toBe(false);
+    expect(await pathExists(resolve(restoreRoot, ADDRESS_BOOK_TAR))).toBe(false);
   });
 
   it('magic mismatch error fires before pre-flight checks against existing config (cheap precheck order)', async () => {

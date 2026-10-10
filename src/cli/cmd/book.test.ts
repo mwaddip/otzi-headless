@@ -94,6 +94,20 @@ describe('otzi book', () => {
       expect(out).toBe(`a b\t${ADDR_A}\tx y z`);
     });
 
+    it('shows no control character of a label or note, and leaves the stored book as it was', async () => {
+      const label = '\u001b[2Jtreasury\u0007\u009b31m';
+      const note = 'ok\u001b]0;pwned\u0007\u007f\u0085end';
+      await writeAddressBook(o.bookPath!, 'testnet4', [{ label, address: ADDR_A, note }]);
+      const stored = await readFile(o.bookPath!, 'utf8');
+
+      const out = await bookList(o);
+
+      expect(out).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+      expect(out).toBe(`[2Jtreasury31m\t${ADDR_A}\tok]0;pwnedend`);
+      expect(await readFile(o.bookPath!, 'utf8')).toBe(stored);
+      expect(await book()).toEqual([{ label, address: ADDR_A, note }]);
+    });
+
     it('fails on a book for another network, naming the file', async () => {
       await writeFile(
         o.bookPath!,
@@ -192,6 +206,19 @@ describe('otzi book', () => {
       expect(await book()).toEqual([{ label: 'treasury', address: ADDR_A }]);
     });
 
+    it('reads a key that is an address as that address first, even when it is also another entry\'s label', async () => {
+      await writeAddressBook(o.bookPath!, 'testnet4', [
+        { label: ADDR_B, address: ADDR_A }, // an address-shaped label
+        { label: 'exchange', address: ADDR_B },
+      ]);
+      await bookRemove({ ...o, key: ADDR_B });
+      expect(await book()).toEqual([{ label: ADDR_B, address: ADDR_A }]);
+
+      // The label stays reachable through the address it points to.
+      await bookRemove({ ...o, key: ADDR_A });
+      expect(await book()).toEqual([]);
+    });
+
     it('fails when nothing matches', async () => {
       const before = await readFile(o.bookPath!, 'utf8');
       await expect(bookRemove({ ...o, key: 'nobody' })).rejects.toThrow("no address book entry matches 'nobody'");
@@ -268,7 +295,7 @@ describe('otzi book', () => {
       const file = await bookFile('mainnet.otzi.json', [{ label: 'm', address: MAINNET_ADDR }], 'mainnet');
       for (const replace of [false, true]) {
         await expect(bookImport({ ...o, file, replace })).rejects.toThrow(
-          new RegExp(`${file}.*Address book is for mainnet, this vault is on testnet4`),
+          new RegExp(`^cannot import: address book ${file}: Address book is for mainnet, this vault is on testnet4`),
         );
       }
       expect(await readFile(o.bookPath!, 'utf8')).toBe(before);
@@ -284,7 +311,9 @@ describe('otzi book', () => {
       await expect(bookImport({ ...o, file: badEntry, replace: false })).rejects.toThrow(/Entry 1: not a valid testnet4 address/);
 
       const absent = join(tmp, 'absent.json');
-      await expect(bookImport({ ...o, file: absent, replace: false })).rejects.toThrow(absent);
+      await expect(bookImport({ ...o, file: absent, replace: false })).rejects.toThrow(
+        new RegExp(`^cannot import: address book ${absent}: cannot be read: ENOENT`),
+      );
 
       expect(await readFile(o.bookPath!, 'utf8')).toBe(before);
     });

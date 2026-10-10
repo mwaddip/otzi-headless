@@ -21,6 +21,7 @@ import { broadcastTx, chainApiUrl, getBalance, getFeeRates, getUtxos } from '../
 import { labelFor } from '../../otzi/lib/address-book';
 import { analyzeProposal, explorerTxUrl, formatBtc, type ProposalAnalysis } from '../../otzi/lib/bitcoin';
 import type { AddressBookEntry, SendProposal } from '../../otzi/lib/vault-types';
+import { displayText, errorReason } from '../../util/text';
 import { DaemonClient } from '../daemon-client';
 import { formatSats, parseBtcAmount, type BtcUnit } from '../units';
 
@@ -73,16 +74,8 @@ async function loadContext(configPath: string, vaultPath?: string): Promise<Cont
 
 // ─── Esplora errors ─────────────────────────────────────────────────────────
 
-/** The reason behind a failed Esplora call; `fetch` hides connection errors in `cause`. */
-function reason(err: unknown): string {
-  if (!(err instanceof Error)) return String(err);
-  const cause = err.cause as { message?: string; code?: string } | undefined;
-  if (err.message === 'fetch failed' && cause) return cause.message || cause.code || err.message;
-  return err.message;
-}
-
 function esploraError(base: string, err: unknown): Error {
-  return new Error(`Esplora ${base}: ${reason(err)}`, { cause: err });
+  return new Error(`Esplora ${base}: ${errorReason(err)}`, { cause: err });
 }
 
 async function viaEsplora<T>(base: string, call: Promise<T>): Promise<T> {
@@ -122,7 +115,7 @@ async function signProposal(
   try {
     signed = btc.Transaction.fromRaw(hex.decode(signedTxHex), { allowUnknownOutputs: true });
   } catch (err) {
-    throw new Error(`the signed transaction in the daemon's reply cannot be decoded: ${reason(err)}`, { cause: err });
+    throw new Error(`the signed transaction in the daemon's reply cannot be decoded: ${errorReason(err)}`, { cause: err });
   }
   if (signed.id !== txid) {
     throw new Error(`daemon reply is inconsistent: it names txid ${txid} but its signed transaction is ${signed.id}`);
@@ -256,7 +249,7 @@ async function readProposal(path: string): Promise<SendProposal> {
   try {
     text = await readFile(path, 'utf8');
   } catch (err) {
-    throw new Error(`cannot read proposal file ${path}: ${reason(err)}`, { cause: err });
+    throw new Error(`cannot read proposal file ${path}: ${errorReason(err)}`, { cause: err });
   }
   let raw: unknown;
   try {
@@ -267,7 +260,7 @@ async function readProposal(path: string): Promise<SendProposal> {
   try {
     return parseProposal(raw);
   } catch (err) {
-    throw new Error(`proposal file ${path}: ${reason(err)}`, { cause: err });
+    throw new Error(`proposal file ${path}: ${errorReason(err)}`, { cause: err });
   }
 }
 
@@ -275,7 +268,7 @@ async function readProposal(path: string): Promise<SendProposal> {
 function summarize(analysis: ProposalAnalysis, network: NetworkName, book: AddressBookEntry[]): string {
   const output = (o: ProposalAnalysis['outputs'][number]): string => {
     const label = labelFor(book, o.address);
-    return `  ${o.address}  ${money(o.amount)}${o.isChange ? '  change' : ''}${label !== undefined ? `  "${label}"` : ''}`;
+    return `  ${o.address}  ${money(o.amount)}${o.isChange ? '  change' : ''}${label !== undefined ? `  "${displayText(label)}"` : ''}`;
   };
   return [
     `network: ${network}`,
@@ -299,14 +292,14 @@ export async function btcSign(
   try {
     analysis = analyzeProposal(proposal, vault.vaultKey, vault.network);
   } catch (err) {
-    throw new Error(`proposal refused: ${reason(err)}`, { cause: err });
+    throw new Error(`proposal refused: ${errorReason(err)}`, { cause: err });
   }
   // The book only labels the summary here, as it labels the daemon's specs: an unreadable one means no labels.
   let book: AddressBookEntry[] = [];
   try {
     book = await readAddressBook(opts.bookPath ?? DEFAULT_ADDRESS_BOOK_PATH, vault.network);
   } catch (err) {
-    warn(`warning: outputs are shown without labels: ${reason(err)}`);
+    warn(`warning: outputs are shown without labels: ${errorReason(err)}`);
   }
   const summary = summarize(analysis, vault.network, book);
   (deps.summary ?? console.error)(summary);

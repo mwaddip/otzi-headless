@@ -12,32 +12,38 @@
 import { randomBytes } from 'node:crypto';
 import { open, readFile, rename, rm } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
+import { NETWORK_NAMES } from '../otzi/backend/types';
 import { addressBookFile, parseAddressBookFile, validateEntries } from '../otzi/lib/address-book';
 import { isValidAddress } from '../otzi/lib/bitcoin';
 import type { AddressBookEntry, NetworkName } from '../otzi/lib/vault-types';
+import { errorReason } from '../util/text';
 
 export const DEFAULT_ADDRESS_BOOK_PATH = '/etc/otzi/address-book.otzi.json';
 
 const BOOK_MODE = 0o640;
-
-const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 function isNotFound(err: unknown): boolean {
   return typeof err === 'object' && err !== null && (err as { code?: string }).code === 'ENOENT';
 }
 
 /**
- * The validated entries of the book at `path`. A missing file is an empty book;
- * anything else wrong with it (unreadable, not JSON, not an Ötzi address book,
- * an invalid entry, another network) throws an error that names the file.
+ * The validated entries of the book at `path`: the one reader of an address-book
+ * file. A missing file is an empty book, or with `missing: 'error'` an error like
+ * any other unreadable file. Anything else wrong with it (unreadable, not JSON,
+ * not an Ötzi address book, an invalid entry, another network) throws an error
+ * that names the file.
  */
-export async function readAddressBook(path: string, network: NetworkName): Promise<AddressBookEntry[]> {
+export async function readAddressBook(
+  path: string,
+  network: NetworkName,
+  opts: { missing?: 'empty' | 'error' } = {},
+): Promise<AddressBookEntry[]> {
   let text: string;
   try {
     text = await readFile(path, 'utf8');
   } catch (err) {
-    if (isNotFound(err)) return [];
-    throw new Error(`address book ${path}: cannot be read: ${reason(err)}`, { cause: err });
+    if (isNotFound(err) && opts.missing !== 'error') return [];
+    throw new Error(`address book ${path}: cannot be read: ${errorReason(err)}`, { cause: err });
   }
   let json: unknown;
   try {
@@ -48,7 +54,7 @@ export async function readAddressBook(path: string, network: NetworkName): Promi
   try {
     return parseAddressBookFile(json, network);
   } catch (err) {
-    throw new Error(`address book ${path}: ${reason(err)}`, { cause: err });
+    throw new Error(`address book ${path}: ${errorReason(err)}`, { cause: err });
   }
 }
 
@@ -78,7 +84,8 @@ export async function writeAddressBook(
     }
     await rename(temp, path);
   } catch (err) {
-    await rm(temp, { force: true });
+    // A failed cleanup must not hide the failure that caused it.
+    await rm(temp, { force: true }).catch(() => {});
     throw err;
   }
 }
@@ -86,11 +93,20 @@ export async function writeAddressBook(
 /**
  * The address a `btc send` recipient names: the first entry whose label equals
  * `labelOrAddress` exactly, else `labelOrAddress` itself when it is a valid
- * address for `network`.
+ * address for `network`. A label that is itself an address (on any supported
+ * network) must name that same address: otherwise sending to the address would
+ * pay somewhere else, so the call fails.
  */
 export function resolveRecipient(entries: AddressBookEntry[], labelOrAddress: string, network: NetworkName): string {
   const entry = entries.find(e => e.label === labelOrAddress);
-  if (entry) return entry.address;
+  if (entry) {
+    if (entry.address !== labelOrAddress && NETWORK_NAMES.some(n => isValidAddress(labelOrAddress, n))) {
+      throw new Error(
+        `'${labelOrAddress}' is both an address and the label of ${entry.address}; rename or remove that label to send to the address`,
+      );
+    }
+    return entry.address;
+  }
   if (isValidAddress(labelOrAddress, network)) return labelOrAddress;
   throw new Error(`unknown label or invalid address: ${labelOrAddress}`);
 }

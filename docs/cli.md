@@ -48,7 +48,7 @@ through Esplora.
   ```
 
 - `otzi btc send <label|address> <amount[unit]|max> [--fee-rate N] [--config <path>]` — send from the vault. Prints the txid and the explorer URL.
-  - `<label|address>`: a label from this node's address book (exact match) or a valid address for the configured network.
+  - `<label|address>`: a label from this node's address book (exact match) or a valid address for the configured network. A label that is itself an address but names a different address is refused, so a send to an address never pays another one; rename or remove that label.
   - `<amount[unit]>`: a number with an optional unit, `sats` (default), `btc`, `mbtc` or `ubtc` (`50000`, `0.001btc`). Fractional sats are rejected. `max` spends every confirmed UTXO with no change.
   - `--fee-rate N`: sat/vB, more than 0 and at most 10000. Default: Esplora's `normal` estimate; an Esplora estimate outside that range is refused (naming the Esplora URL) and you pass `--fee-rate` instead.
 
@@ -64,9 +64,9 @@ Each node has its own address book at `/etc/otzi/address-book.otzi.json` (Ötzi'
 
 **Reading needs `otzi` group membership; writing needs root** (`sudo otzi book add …`), because the book can widen a policy allowlist and so carries the same privilege as editing `daemon.toml`. Every write validates the whole book and replaces the file atomically.
 
-- `otzi book list` — one line per entry on stdout: label, address, note, separated by tabs.
+- `otzi book list` — one line per entry on stdout: label, address, note, separated by tabs. Control characters in a label or note are not shown; the stored book is not changed.
 - `otzi book add <label> <address> [--note <text>]` — add an entry, or update the label and note of the entry with the same address (an update without `--note` clears the note).
-- `otzi book remove <label|address>` — remove the entry whose label or address matches. Fails when nothing matches, or when a label matches more than one entry (remove it by address).
+- `otzi book remove <label|address>` — remove the entry whose address matches, or else the one whose label matches. Fails when nothing matches, or when a label matches more than one entry (remove it by address).
 - `otzi book import <file> [--replace]` — merge an Ötzi address-book file (default) or replace the book with it. Prints `added <a>, updated <u>, unchanged <n>` on stdout. A file for another network is refused and nothing is written.
 - `otzi book export [path]` — write the book as an Ötzi address-book file (stdout without a path).
 

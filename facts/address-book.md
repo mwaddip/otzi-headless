@@ -12,19 +12,19 @@
 **Public surface:**
 - `const DEFAULT_ADDRESS_BOOK_PATH = '/etc/otzi/address-book.otzi.json'`
 
-- `async readAddressBook(path: string, network: NetworkName): Promise<AddressBookEntry[]>`
+- `async readAddressBook(path: string, network: NetworkName, opts?: { missing?: 'empty' | 'error' }): Promise<AddressBookEntry[]>`
   - **Pre:** `network` is the configured network.
-  - **Post:** Returns the validated entries (`parseAddressBookFile(JSON, network)`). Returns `[]` when `path` does not exist (ENOENT); the CLI and spec labelling rely on this. The policy loader (`loadAddressBook`) does not: it treats a missing file as a failure (see below).
-  - **Throws:** `Error('address book <path>: <reason>')` for an unreadable file (`cannot be read: <filesystem error>`), invalid JSON (`not valid JSON`), wrong `kind` / `version`, any invalid entry, or a file network ≠ `network` (`<reason>` is then the message from `parseAddressBookFile`). Every error names the book that failed.
+  - **Post:** Returns the validated entries (`parseAddressBookFile(JSON, network)`). It is the only reader of an address-book file: the daemon, the CLI verbs and `book import` all use it. A path that does not exist (ENOENT) is `[]` with `missing: 'empty'` (the default; the CLI and spec labelling rely on it) and an error with `missing: 'error'`, which the daemon's policy loader (`loadAddressBook`) and the incoming file of `book import` use.
+  - **Throws:** `Error('address book <path>: <reason>')` for an unreadable file (`cannot be read: <filesystem error>`; a missing file with `missing: 'error'` is this case, the error being ENOENT), invalid JSON (`not valid JSON`), wrong `kind` / `version`, any invalid entry, or a file network ≠ `network` (`<reason>` is then the message from `parseAddressBookFile`). Every error names the book that failed.
 
 - `async writeAddressBook(path: string, network: NetworkName, entries: AddressBookEntry[]): Promise<void>`
   - **Pre:** Caller has write access to the directory (root on a `.deb` install).
   - **Post:** `validateEntries(entries, network)` passes; `addressBookFile(validated, network)` is written as pretty JSON to a temporary file in the same directory with mode 0640, then renamed over `path`. Readers see either the old book or the new one, never a partial file.
-  - **Throws:** On the first invalid entry (`validateEntries` message) — nothing is written — or on a filesystem error (the temporary file is removed).
+  - **Throws:** On the first invalid entry (`validateEntries` message) — nothing is written — or on a filesystem error (the temporary file is removed; a failure to remove it never replaces the error that is thrown).
 
 - `resolveRecipient(entries: AddressBookEntry[], labelOrAddress: string, network: NetworkName): string`
-  - **Post:** The address of the first entry whose `label` equals `labelOrAddress` exactly; otherwise `labelOrAddress` itself when it is a valid address for `network`.
-  - **Throws:** `Error('unknown label or invalid address: <labelOrAddress>')`.
+  - **Post:** The address of the first entry whose `label` equals `labelOrAddress` exactly; otherwise `labelOrAddress` itself when it is a valid address for `network`. An address-shaped label never redirects a send: when `labelOrAddress` is a valid address on any supported network (`mainnet`, `testnet4`, `signet`) and the first entry labelled `labelOrAddress` has a different address, the call fails. A label entry whose address is `labelOrAddress` itself is fine.
+  - **Throws:** `Error('unknown label or invalid address: <labelOrAddress>')`; `Error("'<labelOrAddress>' is both an address and the label of <address>; rename or remove that label to send to the address")`.
 
 **Invariants:**
 - The file network always equals the configured network; a mismatched book is an error, never silently ignored.
@@ -34,9 +34,9 @@
 - The book is Ötzi's file format: `otzi book export` output imports into web Ötzi and Ötzi exports import here.
 
 **Cross-component contracts:**
-- Depends on: `validateEntries`, `parseAddressBookFile`, `addressBookFile` (`src/otzi/lib/address-book.ts`), `isValidAddress` (`src/otzi/lib/bitcoin.ts`).
+- Depends on: `validateEntries`, `parseAddressBookFile`, `addressBookFile` (`src/otzi/lib/address-book.ts`), `isValidAddress` (`src/otzi/lib/bitcoin.ts`), `errorReason` (`src/util/text.ts`: an error's message, or the connection error behind a `fetch failed`; shared with `btc.ts`).
 - Used by:
-  - `Daemon`: `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)` for the orchestrator and leader (spec labels via `labelFor`), and `loadAddressBook` for `PolicyGate`: the entries' addresses, throwing when the file does not exist (ENOENT) or is invalid, so `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
+  - `Daemon`: `addressBook = () => readAddressBook(addressBookPath, network)` for the orchestrator and leader (spec labels via `labelFor`), and `loadAddressBook` for `PolicyGate`: the entries' addresses from `readAddressBook(addressBookPath, network, { missing: 'error' })`, throwing when the file does not exist (ENOENT) or is invalid, so `allowed_recipients = "address-book"` rejects every signing spec on a node without a book. `addressBookPath` is `DEFAULT_ADDRESS_BOOK_PATH` unless a test passes another.
   - `src/cli/cmd/book.ts` (all verbs), `src/cli/cmd/btc.ts` (`resolveRecipient` for `btc send`, labels in the `btc send` / `btc sign` summaries; `bookPath` option, default `DEFAULT_ADDRESS_BOOK_PATH`).
   - `src/cli/cmd/backup.ts` / `restore.ts` (tar path `etc/otzi/address-book.otzi.json`, restored at 0640).
 
@@ -45,3 +45,4 @@
 - In the daemon, a missing or invalid book means no labels for spec building and a reject for the `"address-book"` policy rule (strict by default). In `btc sign`, an unreadable book means no labels and a warning; in `btc send`, it is an error naming the book (a missing file is an empty book).
 - The `"address-book"` rule compares addresses by exact string (see [gate.md](gate.md)): a book entry in another letter case than the lowercase bech32 the analysis produces never matches.
 - Labels are not required to be unique; `resolveRecipient` takes the first match, so keep labels unique for `btc send`.
+- Labels and notes are stored as given and shown with control characters (U+0000–U+001F, U+007F–U+009F) removed — a tab or line break becomes a space — so an imported label cannot inject terminal escape sequences into `book list` or a `btc` summary (`displayText`, `src/util/text.ts`).

@@ -8,12 +8,13 @@
  * (the book can widen a policy allowlist).
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import { DEFAULT_ADDRESS_BOOK_PATH, readAddressBook, writeAddressBook } from '../../address-book/store';
 import { loadDaemonConfig } from '../../config/load';
 import type { NetworkName } from '../../config/types';
-import { addressBookFile, mergeAddressBooks, parseAddressBookFile, validateEntries } from '../../otzi/lib/address-book';
+import { addressBookFile, mergeAddressBooks, validateEntries } from '../../otzi/lib/address-book';
 import type { AddressBookEntry } from '../../otzi/lib/vault-types';
+import { displayText, errorReason } from '../../util/text';
 
 export interface BookOpts {
   /** The daemon config: the network comes from it. */
@@ -36,12 +37,9 @@ async function loadBook(o: BookOpts, network?: NetworkName): Promise<Book> {
   return { network: net, path, entries: await readAddressBook(path, net) };
 }
 
-/** A tab or line break inside a label or note would break the one-line-per-entry listing. */
-const oneLine = (text: string): string => text.replace(/[\t\r\n]+/g, ' ');
-
 export async function bookList(o: BookOpts): Promise<string> {
   const { entries } = await loadBook(o);
-  return entries.map(e => [e.label, e.address, e.note ?? ''].map(oneLine).join('\t')).join('\n');
+  return entries.map(e => [displayText(e.label), e.address, displayText(e.note ?? '')].join('\t')).join('\n');
 }
 
 export async function bookAdd(o: BookOpts & { label: string; address: string; note?: string }): Promise<void> {
@@ -53,8 +51,7 @@ export async function bookAdd(o: BookOpts & { label: string; address: string; no
     validateEntries([entry], network);
   } catch (err) {
     // The entry alone, so its position in the whole list would only confuse.
-    const why = err instanceof Error ? err.message : String(err);
-    throw new Error(`cannot save '${o.label}': ${why.replace(/^Entry \d+: /, '')}`, { cause: err });
+    throw new Error(`cannot save '${displayText(o.label)}': ${errorReason(err).replace(/^Entry \d+: /, '')}`, { cause: err });
   }
   const at = entries.findIndex(e => e.address === address);
   const next = at < 0 ? [...entries, entry] : entries.map((e, i) => (i === at ? entry : e));
@@ -63,7 +60,9 @@ export async function bookAdd(o: BookOpts & { label: string; address: string; no
 
 export async function bookRemove(o: BookOpts & { key: string }): Promise<void> {
   const { network, path, entries } = await loadBook(o);
-  const matches = entries.filter(e => e.label === o.key || e.address === o.key);
+  // Addresses are unique, so an address match is the entry; only without one is `key` read as a label.
+  const byAddress = entries.filter(e => e.address === o.key);
+  const matches = byAddress.length > 0 ? byAddress : entries.filter(e => e.label === o.key);
   if (matches.length === 0) throw new Error(`no address book entry matches '${o.key}'`);
   if (matches.length > 1) {
     throw new Error(`'${o.key}' matches ${matches.length} entries; remove the one you mean by its address`);
@@ -71,34 +70,13 @@ export async function bookRemove(o: BookOpts & { key: string }): Promise<void> {
   await writeAddressBook(path, network, entries.filter(e => e !== matches[0]));
 }
 
-/** The entries of an Ötzi address-book file for `network`; every error names the file. */
-async function readBookFile(file: string, network: NetworkName): Promise<AddressBookEntry[]> {
-  const fail = (why: string, cause: unknown): Error => new Error(`address book file ${file}: ${why}`, { cause });
-  const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-  let text: string;
-  try {
-    text = await readFile(file, 'utf8');
-  } catch (err) {
-    throw fail(`cannot be read: ${reason(err)}`, err);
-  }
-  let json: unknown;
-  try {
-    json = JSON.parse(text);
-  } catch (err) {
-    throw fail('not valid JSON', err);
-  }
-  try {
-    return parseAddressBookFile(json, network);
-  } catch (err) {
-    throw fail(reason(err), err);
-  }
-}
-
 export async function bookImport(
   o: BookOpts & { file: string; replace: boolean },
 ): Promise<{ added: number; updated: number; unchanged: number }> {
   const network = await networkOf(o);
-  const incoming = await readBookFile(o.file, network);
+  const incoming = await readAddressBook(o.file, network, { missing: 'error' }).catch((err: unknown) => {
+    throw new Error(`cannot import: ${errorReason(err)}`, { cause: err });
+  });
   const { path, entries } = await loadBook(o, network);
   const merged = mergeAddressBooks(entries, incoming);
   await writeAddressBook(path, network, o.replace ? incoming : merged.entries);
