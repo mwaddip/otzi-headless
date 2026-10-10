@@ -319,7 +319,7 @@ The signing fields come straight from `analyzeProposal`; all amounts are safe
 integers. `label` is taken from this node's own address book when the address is in
 it. Exec and webhook approvers receive the spec as JSON.
 
-### 6.3 Policy rules (`[gate.params]`, strategy `policy`)
+### 6.3 Policy rules (`[gate]` keys, strategy `policy`)
 
 | Key | Rule |
 |---|---|

@@ -78,7 +78,7 @@
   - **Post:** `'approve'` iff every active rule passes; `'reject'` otherwise. Never `'pending'`. Never throws.
   - **Signing rules:**
 
-    | Key (`[gate.params]`) | Field | Rule |
+    | Key (`[gate]`) | Field | Rule |
     |---|---|---|
     | `max_sats_per_tx` | `maxSatsPerTx` | `spec.amount` ≤ cap. |
     | `max_sats_per_24h` | `maxSatsPer24h` | Sum of `amount` over this node's approvals in the last 24 h, plus `spec.amount`, ≤ cap. |
@@ -92,7 +92,7 @@
   - **Windows:** every rule is evaluated first; only when the final decision is approve is the approval recorded in the hourly window (timestamp) and the 24 h window (`{ at: now(), amount }`). Entries older than 3 600 000 ms / 86 400 000 ms are pruned. The checks and the records happen in one synchronous section (after any address-book load), so concurrent evaluations cannot both pass a cap.
 
 - `parsePolicyParams(params: Record<string, unknown>): PolicyConfig`
-  - **Pre:** Raw TOML `[gate.params]` table.
+  - **Pre:** The `params` of `GateConfig`: every key of the `[gate]` table except `strategy`.
   - **Post:** Validated `PolicyConfig`.
   - **Validation:**
     - `max_sats_per_tx`, `max_sats_per_24h`, `max_fee_sats`: non-negative safe integers, given as a TOML integer or a decimal string.
@@ -166,7 +166,7 @@
   - **Post:** JSON string; any bigint is rendered as a decimal string. Bitcoin specs carry only safe-integer and finite numbers, so amounts, fee and fee rate appear as JSON numbers.
 
 - `parseExecParams(params)` — function
-  - **Pre:** Raw TOML `[gate.params]` table.
+  - **Pre:** The `params` of `GateConfig`: every key of the `[gate]` table except `strategy`.
   - **Post:** Validated `ExecGateConfig`.
   - **Throws:** `ConfigError` for invalid command, missing timeout_sec, bad env, etc.
   - **Validation:**
@@ -190,7 +190,7 @@
 **Notes / gotchas:**
 - Command is spawned every time `approve()` is called (no caching; idempotency is delegate's responsibility).
 - Working directory defaults to daemon's cwd if omitted.
-- Environment is merged (not replaced); delegate sees `process.env` + `[gate.params].env`.
+- Environment is merged (not replaced); delegate sees `process.env` + the `[gate]` table's `env`.
 - Timeout is hard wall (SIGTERM); no grace period for cleanup.
 - stderr truncated to 500 chars in error message for readability.
 
@@ -226,7 +226,7 @@
   - **Timeout:** AbortController signal aborted after `timeoutSec * 1000` ms; fetch rejects with AbortError.
 
 - `parseWebhookParams(params)` — function
-  - **Pre:** Raw TOML `[gate.params]` table.
+  - **Pre:** The `params` of `GateConfig`: every key of the `[gate]` table except `strategy`.
   - **Post:** Validated `WebhookGateConfig`.
   - **Throws:** `ConfigError` for invalid url, missing timeout_sec, bad bearer_token_env, etc.
 

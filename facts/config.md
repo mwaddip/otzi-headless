@@ -123,7 +123,7 @@
 
 **Invariants:**
 - All section paths use snake_case (e.g., `share.password_env`); coerced to camelCase in types.
-- `gate.params` and `triggers[i].params` stay raw `Record<string, unknown>` here; the gate and trigger builders narrow them.
+- The `params` of `[gate]` (every key beside `strategy`) and of `[[triggers]]` (every key beside `kind`) stay raw `Record<string, unknown>` here; the gate and trigger builders narrow them. Strategy params are flat keys directly under `[gate]`.
 - Deadlines default to 5 min / 15 min if the section is missing.
 - `transport.url` required for relay; `transport.advertised_endpoint` optional at parse time for peer-mesh (transport-factory hard-errors if missing).
 - Peers must have at least one entry; each entry has a canonical `endpoint`.

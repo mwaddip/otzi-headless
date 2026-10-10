@@ -50,9 +50,9 @@ Blobs use the same payload layouts as web Ötzi (`frost-r1`, `frost-r2`,
   authenticated node it was pulled from. For signing blobs, every entry's FROST
   identifier equals that party ID + 1. A mismatch aborts the ceremony with a
   reason naming the sender.
-- **Retry.** A blob that is not available yet is retried with exponential backoff
-  (1 s up to a 30 s cap, at most 5 attempts per blob). A blob that stays
-  unavailable fails the ceremony.
+- **Pull until the deadline.** A blob that is not available yet is pulled again
+  until it arrives or the ceremony deadline (`[deadlines]`) passes. A blob that is
+  still unavailable at the deadline fails the ceremony.
 - **Retention.** When a ceremony ends on a node (either role, any outcome), the
   node clears its blobs 5 minutes later for signing, 15 minutes later for DKG, so
   lagging peers can still pull. DKG secret shares never outlive that window.

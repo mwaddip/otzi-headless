@@ -229,7 +229,14 @@ machine-only values regardless of strategy:
 | Strategy | Signing deadline | DKG deadline | Guidance |
 |---|---|---|---|
 | `auto`, `policy` | 5 min (default) | 15 min (default) | Machine-only — don't let phantom ceremonies linger. |
-| `exec`, `webhook` | set to the review window, e.g. 24 h | set likewise | A human approves. Raise `signing_ms` / `dkg_ms` in `[deadlines]` above `timeout_sec`, or the ceremony ends while the operator is still reviewing. |
+| `exec`, `webhook` | set to the review window, e.g. 24 h | set likewise | A human approves. Raise `signing_ms` / `dkg_ms` in `[deadlines]` to cover the slowest approver. |
+
+Every ceremony's pulls run until the ceremony deadline. With `exec` and `webhook`
+gates, **every signer's decision must therefore arrive within the ceremony
+deadline**: the leader waits for each participant's blobs only that long, and a
+participant that approves after the deadline has missed the ceremony. Operators
+using human approvals should raise `signing_ms` (and `dkg_ms`) on every node to
+cover the slowest approver, and keep each gate's `timeout_sec` within it.
 
 ## Building your own hook
 

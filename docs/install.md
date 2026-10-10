@@ -72,10 +72,15 @@ follow up with `sudo apt -f install` to resolve.)
    ```
    The daemon reads the share password from the environment variable named by
    `[share].password_env` (default `OTZI_SHARE_PASSWORD`) and refuses to start
-   without it, even before a vault exists. Provide it to the unit before the first
-   start, for example with a root-only `EnvironmentFile=` in a drop-in created by
-   `sudo systemctl edit otzi`. The password encrypts this node's share file; each
-   node picks its own, and web Ötzi asks for it when it opens the share.
+   without it, even before a vault exists. The unit loads it from
+   `/etc/otzi/otzi.env`, so create that file **before the first start**: owner
+   `root:root`, mode `0600`, one line:
+   ```
+   OTZI_SHARE_PASSWORD=<a strong password>
+   ```
+   (systemd reads the file as root, before it drops to the `otzi` user.) The
+   password encrypts this node's share file; each node picks its own, and web Ötzi
+   asks for it when it opens the share.
 
    A node with no share starts in **setup mode**: it joins ceremonies and runs the
    DKG, but `sign` returns `409`.
@@ -131,8 +136,9 @@ sudo dpkg-reconfigure otzi-headless
 | `/usr/bin/otzi` | CLI wrapper | root:root 755 |
 | `/usr/lib/otzi/entrypoint.mjs` | esbuild bundle | root:root 644 |
 | `/lib/systemd/system/otzi.service` | systemd unit | root:root 644 |
-| `/etc/otzi/` | config dir (setgid) | root:otzi 2770 |
+| `/etc/otzi/` | config dir (setgid; only root writes, group otzi reads) | root:otzi 2750 |
 | `/etc/otzi/daemon.toml` | rendered config (preserved across upgrades) | root:otzi 640 |
+| `/etc/otzi/otzi.env` | share password for the unit (`OTZI_SHARE_PASSWORD=…`) | root:root 600 |
 | `/etc/otzi/address-book.otzi.json` | this node's address book (optional) | root:otzi 640 |
 | `/var/lib/otzi/` | data dir (setgid; group otzi can write) | root:otzi 2770 |
 | `/var/lib/otzi/identity.json` | ECDH identity | written 660 |
@@ -299,8 +305,9 @@ Restore places each file at its canonical path with these modes:
 | pubkey-book file | 0644 |
 | `/var/lib/otzi/vault-pubkey.json` | 0644 |
 
-Set the share password in the daemon's environment as in the walkthrough, then
-start the daemon; it loads the restored share.
+The archive does not contain `/etc/otzi/otzi.env`. Recreate it with the share
+password as in the walkthrough, then start the daemon; it loads the restored
+share.
 
 **Restore refuses if:**
 
@@ -315,6 +322,8 @@ start the daemon; it loads the restored share.
 #### What the archive does NOT contain
 
 - Other federation members' shares — you can only sign for your own slot.
+- The share password file `/etc/otzi/otzi.env` — keep the password in your own
+  password manager.
 - Blockchain state — vault funds live on-chain, not in the backup.
 - The `.deb` package itself — download from releases for the install.
 

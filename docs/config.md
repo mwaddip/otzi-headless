@@ -66,7 +66,7 @@ canonicalization happens once at parse and is stored normalized in
 | Key | Type | Notes |
 |---|---|---|
 | `path` | string | Absolute path to the Ötzi v4 encrypted share JSON file (mode `0600`). A share written here opens in web Ötzi, and a web Ötzi share can be placed here. While a DKG runs, the new share is staged at `<path>.pending` and renamed to `path` only after every node confirmed. No file at startup → the daemon runs in setup mode: no vault is loaded, `sign` returns `409`, and `otzi generate` can run the DKG. |
-| `password_env` | string | Name of the env var holding the share-file password. The password itself is never stored in the config. The variable must be set in the daemon's environment even on a node that holds no vault yet, because the DKG encrypts the new share with it. |
+| `password_env` | string | Name of the env var holding the share-file password. The password itself is never stored in the config. The variable must be set in the daemon's environment even on a node that holds no vault yet, because the DKG encrypts the new share with it. On a .deb install, the unit loads `/etc/otzi/otzi.env` (`root:root`, mode `0600`, one line `OTZI_SHARE_PASSWORD=…`). |
 
 At startup the daemon decrypts the share, checks it against `[network].name`,
 and checks its `partyId` and `parties` against the pubkey book. Any mismatch
@@ -243,8 +243,9 @@ bearer_token_env = "OTZI_WEBHOOK_TOKEN"
 
 ## `[deadlines]` (optional)
 
-Ceremony-wide safety-net timeouts. Per-request retry (1s→30s backoff, 5
-attempts) is separate and not configurable via the TOML yet.
+Ceremony-wide timeouts. A node pulls the blobs it needs from its peers until
+they arrive or the ceremony deadline passes; a blob still missing at the
+deadline fails the ceremony.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -252,9 +253,10 @@ attempts) is separate and not configurable via the TOML yet.
 | `dkg_ms` | integer ≥ 1 | `900_000` (15 min) | DKG ceremony deadline. |
 
 The defaults suit `auto` and `policy` gates (machine-only; phantom ceremonies
-should not linger). `exec` and `webhook` gates wait on a human, so set the
-deadlines to the review window on those daemons: `signing_ms = 86400000`
-(24 h) or similar.
+should not linger). With `exec` and `webhook` gates, every signer's decision must
+arrive within the ceremony deadline. Operators using human approvals should raise
+`signing_ms` (and `dkg_ms`) to cover the slowest approver on every node:
+`signing_ms = 86400000` (24 h) or similar.
 
 After a ceremony ends on a node, the node keeps its blobs for a fixed 5 min
 (signing) or 15 min (DKG), independent of these deadlines, so lagging peers can

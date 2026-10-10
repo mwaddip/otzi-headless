@@ -216,9 +216,9 @@ from your debconf "Other peers" answer at install time.
 
 The daemon reads the share password from the env var named by
 `[share].password_env` (default `OTZI_SHARE_PASSWORD`) and refuses to start
-without it. Provide it to the systemd unit (for example, a root-only
-`EnvironmentFile=` in a drop-in from `sudo systemctl edit otzi`), then **on every
-node**:
+without it. The systemd unit loads it from `/etc/otzi/otzi.env`: create that file
+(owner `root:root`, mode `0600`) with the single line
+`OTZI_SHARE_PASSWORD=<a strong password>`, then **on every node**:
 
 ```bash
 sudo systemctl enable --now otzi
