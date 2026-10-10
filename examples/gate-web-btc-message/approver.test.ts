@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebhookGate } from '../../src/gate/webhook';
 import type { CeremonySpec } from '../../src/gate/types';
 import { legacyMessageHash } from '../../src/otzi/backend/btc-message';
-import { createApprover, type Approver, type ApproverOptions } from './approver';
+import { createApprover, isLoopbackHost, type Approver, type ApproverOptions } from './approver';
 
 /** A legacy signmessage / BIP-137 signature (compressed P2WPKH header) over `message`. */
 function signMessage(message: string, priv: Uint8Array): string {
@@ -323,6 +323,40 @@ describe('approver', () => {
       for (const host of [`127.0.0.1:${port}`, `localhost:${port}`, `LOCALHOST:${port}`, `[::1]:${port}`]) {
         expect((await rawRequest(port, 'GET', '/pending', { host })).status, host).toBe(200);
       }
+    });
+
+    // The Host check must never switch itself off because a loopback bind was spelled unusually.
+    it('recognises every spelling of a loopback address', () => {
+      for (const host of [
+        '127.0.0.1', '127.1.2.3', '127.255.255.254',
+        'localhost', 'LOCALHOST', 'localhost.',
+        '::1', '[::1]', '0:0:0:0:0:0:0:1', '0000:0000:0000:0000:0000:0000:0000:0001', '::0001', '0::1', '::1%lo',
+        '::ffff:127.0.0.1', '::ffff:7f00:1', '::FFFF:7F00:0001', '0:0:0:0:0:ffff:127.1.2.3', '[::ffff:127.0.0.1]',
+      ]) {
+        expect(isLoopbackHost(host), host).toBe(true);
+      }
+      for (const host of [
+        '', '0.0.0.0', '::', '10.0.0.5', '192.168.1.1', '128.0.0.1', '126.255.255.255', '8.8.8.8',
+        '::2', '::ffff:10.0.0.1', '::ffff:0a00:1', '::ffff:128.0.0.1', 'fe80::1', '2001:db8::1',
+        'example.com', 'localhost.evil.example', '127.0.0.1.evil.example', 'my-localhost',
+      ]) {
+        expect(isLoopbackHost(host), host).toBe(false);
+      }
+    });
+
+    it('keeps the Host check on for a loopback bind spelled as a long IPv6 form or an IPv4-mapped address', async () => {
+      // Listening happens on 127.0.0.1 (this sandbox may lack IPv6); the spelling is what the check reads.
+      for (const spelled of ['0:0:0:0:0:0:0:1', '::ffff:127.0.0.1', '[::1]']) {
+        const { port } = await start({ host: spelled });
+        expect((await rawRequest(port, 'GET', '/pending', { host: 'evil.example' })).status, spelled).toBe(403);
+        expect((await rawRequest(port, 'GET', '/pending', { host: `localhost:${port}` })).status, spelled).toBe(200);
+      }
+    });
+
+    it('keeps the Host check on when the address it actually bound is loopback, whatever it was called', async () => {
+      // The caller names a host the classifier does not know, but the OS binds 127.0.0.1.
+      const { port } = await start({ host: 'not-a-known-spelling' }, '127.0.0.1');
+      expect((await rawRequest(port, 'GET', '/pending', { host: 'evil.example' })).status).toBe(403);
     });
 
     it('on a non-loopback bind leaves the Host header alone', async () => {

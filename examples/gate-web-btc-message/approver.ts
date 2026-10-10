@@ -36,7 +36,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { BlockList, isIP, type AddressInfo } from 'node:net';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isValidSignInAddress } from '../../src/otzi/backend/btc-message.ts';
 import { decisionMessage, verifyDecision } from './decision.ts';
@@ -54,9 +54,10 @@ export interface ApproverOptions {
   /** When set, `POST /webhook` requires `Authorization: Bearer <token>`. */
   token?: string;
   /**
-   * The host the server will listen on (default `127.0.0.1`). On a loopback host the
-   * approver also refuses requests whose `Host` header is not a loopback name for its
-   * port, which stops DNS rebinding from reading `/pending` through a browser.
+   * The host the server will listen on (default `127.0.0.1`). When this is a loopback
+   * address in any spelling, or the address the server actually bound is, the approver
+   * also refuses requests whose `Host` header is not a loopback name for its port, which
+   * stops DNS rebinding from reading `/pending` through a browser.
    */
   host?: string;
   /** The operator page. Defaults to the sibling `index.html`. */
@@ -85,7 +86,13 @@ export function createApprover(opts: ApproverOptions): Approver {
   if (!isValidSignInAddress(address)) throw new Error(`not a valid Bitcoin address: '${address}'`);
   const html = opts.html ?? readFileSync(fileURLToPath(new URL('./index.html', import.meta.url)), 'utf8');
   const log = opts.log ?? ((line: string) => console.log(line));
-  const loopbackOnly = isLoopbackHost(opts.host ?? '127.0.0.1');
+  const spelledLoopback = isLoopbackHost(opts.host ?? '127.0.0.1');
+  /** Also true when the OS bound a loopback address the caller named some other way (`127.1`). */
+  const loopbackOnly = (): boolean => {
+    if (spelledLoopback) return true;
+    const bound = server.address();
+    return bound !== null && typeof bound === 'object' && isLoopbackHost(bound.address);
+  };
 
   /** nonce → held webhook request. A nonce is deleted when its decision lands, so it works once. */
   const pending = new Map<string, Pending>();
@@ -150,7 +157,7 @@ export function createApprover(opts: ApproverOptions): Approver {
    */
   function browserBoundary(req: IncomingMessage): string | undefined {
     const host = req.headers.host?.toLowerCase();
-    if (loopbackOnly) {
+    if (loopbackOnly()) {
       const port = (server.address() as AddressInfo | null)?.port;
       const names = ['localhost', '127.0.0.1', '[::1]'];
       const allowed = new Set(names.map((n) => `${n}:${port}`));
@@ -281,10 +288,24 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/** localhost, 127.0.0.0/8 or ::1. */
-function isLoopbackHost(host: string): boolean {
-  const h = host.toLowerCase();
-  return h === 'localhost' || h === '::1' || /^127(\.\d{1,3}){3}$/.test(h);
+const LOOPBACK = new BlockList();
+LOOPBACK.addSubnet('127.0.0.0', 8, 'ipv4');
+LOOPBACK.addAddress('::1', 'ipv6');
+
+/**
+ * True for `localhost`, anything in 127.0.0.0/8, and every spelling of `::1`
+ * (`0:0:0:0:0:0:0:1`, `::0001`, `[::1]`, `::1%lo`) including its IPv4-mapped forms
+ * (`::ffff:127.0.0.1`, `::ffff:7f00:1`). `node:net` parses the address, so the
+ * spelling cannot matter. Anything else, including a name that merely starts with
+ * `localhost`, is false.
+ */
+export function isLoopbackHost(host: string): boolean {
+  let h = host.trim().toLowerCase();
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  h = h.split('%')[0]!; // an IPv6 zone id
+  if (h === 'localhost' || h === 'localhost.') return true;
+  const family = isIP(h);
+  return family !== 0 && LOOPBACK.check(h, family === 4 ? 'ipv4' : 'ipv6');
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

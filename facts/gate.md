@@ -128,6 +128,21 @@
 
 ---
 
+### `timeout.ts`
+**Purpose:** The `timeout_sec` check shared by the `exec` and `webhook` gates.
+
+**Public surface:**
+- `MAX_GATE_TIMEOUT_SEC` — `MAX_DEADLINE_MS / 1000` = 2147483.647.
+- `parseGateTimeoutSec(value: unknown): number`
+  - **Pre:** `value` is the raw `timeout_sec` of the `[gate]` table.
+  - **Post:** Returns `value` when it is a finite number with `0 < value <= MAX_GATE_TIMEOUT_SEC`.
+  - **Throws:** `ConfigError('gate.timeout_sec', …)` for anything else; above the maximum the message reads `must be <= 2147483.647 (the longest Node.js timer, 2147483647 ms; got <value>)`.
+
+**Invariants:**
+- `timeoutSec * 1000 <= 2147483647` for every accepted value, so the gate's one `setTimeout` is never clamped by Node to fire at once. The `[deadlines]` section applies the same limit to `signing_ms` / `dkg_ms` (src/config/parse.ts, `MAX_DEADLINE_MS`).
+
+---
+
 ### `exec.ts`
 **Purpose:** Operator-in-the-loop approval via spawned subprocess.
 
@@ -135,7 +150,7 @@
 - `ExecGateConfig` — interface
   - **Pre:**
     - `command` non-empty array of strings; `command[0]` is executable.
-    - `timeoutSec` positive number.
+    - `timeoutSec` positive number, at most 2147483.647 (`MAX_GATE_TIMEOUT_SEC`, the longest Node timer in seconds).
     - `workingDir` optional absolute path.
     - `env` optional key-value table (merged into `process.env`).
   - **Post:** Configuration for subprocess spawning.
@@ -169,10 +184,10 @@
 - `parseExecParams(params)` — function
   - **Pre:** The `params` of `GateConfig`: every key of the `[gate]` table except `strategy`.
   - **Post:** Validated `ExecGateConfig`.
-  - **Throws:** `ConfigError` for invalid command, missing timeout_sec, bad env, etc.
+  - **Throws:** `ConfigError` for invalid command, missing or out-of-range timeout_sec, bad env, etc.
   - **Validation:**
     - `command` must be non-empty string array.
-    - `timeout_sec` must be positive number.
+    - `timeout_sec` must be a positive number and at most 2147483.647 (`parseGateTimeoutSec`); a larger value is a `ConfigError` naming `gate.timeout_sec`, because a `setTimeout` delay above 2147483647 ms fires at once.
     - `working_dir` optional string.
     - `env` optional key-value table (all values must be strings).
 
@@ -204,7 +219,7 @@
 - `WebhookGateConfig` — interface
   - **Pre:**
     - `url` non-empty string (HTTP endpoint).
-    - `timeoutSec` positive number.
+    - `timeoutSec` positive number, at most 2147483.647 (`MAX_GATE_TIMEOUT_SEC`).
     - `bearerTokenEnv` optional env var name (for `Authorization: Bearer` header).
   - **Post:** Configuration for HTTP approval request.
 
@@ -224,12 +239,12 @@
     5. Expect JSON `{"decision": "approve" | "reject"}`; return the decision.
   - **Returns:** `'approve'` or `'reject'` from response.decision.
   - **Throws:** Error on HTTP failure, timeout, a connection closed before the body ended, a 2xx body over 64 KiB, non-JSON response, missing/invalid decision field, or non-2xx HTTP status.
-  - **Timeout:** `timeoutSec` is ONE deadline covering connect, response headers and the whole body read. On expiry the request is destroyed and the call throws `WebhookGate: timed out after <timeoutSec>s`. Early headers, trickled bytes or a stalled body do not extend it. Values above 2 147 483 647 ms (the longest timer Node can set) are capped to it.
+  - **Timeout:** `timeoutSec` is ONE deadline covering connect, response headers and the whole body read. On expiry the request is destroyed and the call throws `WebhookGate: timed out after <timeoutSec>s`. Early headers, trickled bytes or a stalled body do not extend it. The timer is armed once the request exists, so a request Node refuses to create (a header value with CR/LF or a non-latin1 character, such as a Bearer token read from a CRLF env file) rejects with `WebhookGate: request failed: <reason>` and leaves no timer behind.
 
 - `parseWebhookParams(params)` — function
   - **Pre:** The `params` of `GateConfig`: every key of the `[gate]` table except `strategy`.
   - **Post:** Validated `WebhookGateConfig`.
-  - **Throws:** `ConfigError` for invalid url, missing timeout_sec, bad bearer_token_env, etc.
+  - **Throws:** `ConfigError` for invalid url, missing or out-of-range timeout_sec (above 2147483.647, as for `ExecGate`), bad bearer_token_env, etc.
 
 **Invariants:**
 - POST body is the JSON-serialized spec (`serializeSpec`, as with `ExecGate`).
@@ -315,7 +330,7 @@
 
 **Invariants:**
 - The signed message binds the decision to one ceremony and one approver-issued nonce, so a signature cannot be replayed for another ceremony or the other decision.
-- Browser boundary: the daemon sends no `Origin` header, and the operator page's same-origin requests send their own. A request that carries an `Origin` whose host is not its `Host` header is refused with `403` on every route (blocks cross-site `text/plain` POSTs to `/webhook` and `/decide`). When the server is bound to a loopback host (`localhost`, `127.0.0.0/8`, `::1`; the default), a request whose `Host` header is not `localhost`, `127.0.0.1` or `[::1]` with the server's port is refused with `403` (blocks DNS rebinding of `GET /pending`). On any other bind address the `Host` header is not checked; use `APPROVER_TOKEN` and a reverse proxy.
+- Browser boundary: the daemon sends no `Origin` header, and the operator page's same-origin requests send their own. A request that carries an `Origin` whose host is not its `Host` header is refused with `403` on every route (blocks cross-site `text/plain` POSTs to `/webhook` and `/decide`). When the server is bound to a loopback address (the default) — `host` names `localhost`, an address in `127.0.0.0/8` or any spelling of `::1` (`0:0:0:0:0:0:0:1`, `[::1]`, `::ffff:127.0.0.1`, `::ffff:7f00:1`), parsed by `node:net`, or the address the server actually bound is one — a request whose `Host` header is not `localhost`, `127.0.0.1` or `[::1]` with the server's port is refused with `403` (blocks DNS rebinding of `GET /pending`). On any other bind address the `Host` header is not checked; use `APPROVER_TOKEN` and a reverse proxy.
 - A request target that is not a URL answers `400`; an unexpected error in a handler answers `500`; neither stops the server.
 - A nonce is deleted when its decision lands, so it works once. Requests are keyed by nonce, so two nodes holding the same `ceremonyId` do not collide.
 - The approver imports the lifted `src/otzi/backend/btc-message.ts`; the daemon never does. The daemon sees only `{"decision": …}` from the webhook.

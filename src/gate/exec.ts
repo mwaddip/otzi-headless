@@ -23,6 +23,7 @@
 
 import { spawn } from 'node:child_process';
 import { ConfigError } from '../config/parse';
+import { parseGateTimeoutSec } from './timeout';
 import type { ApprovalGate, CeremonySpec, Decision } from './types';
 
 export interface ExecGateConfig {
@@ -115,9 +116,7 @@ export function parseExecParams(params: Record<string, unknown>): ExecGateConfig
     return item;
   });
 
-  if (typeof params.timeout_sec !== 'number' || !Number.isFinite(params.timeout_sec) || params.timeout_sec <= 0)
-    throw new ConfigError('gate.timeout_sec', 'must be a positive number (seconds)');
-  const timeoutSec = params.timeout_sec;
+  const timeoutSec = parseGateTimeoutSec(params.timeout_sec);
 
   const out: ExecGateConfig = { command, timeoutSec };
 

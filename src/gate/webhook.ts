@@ -20,16 +20,15 @@
  * every human approval at 5 minutes.
  */
 
-import { request as httpRequest } from 'node:http';
+import { request as httpRequest, type ClientRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { ConfigError } from '../config/parse';
 import { serializeSpec } from './exec';
+import { parseGateTimeoutSec } from './timeout';
 import type { ApprovalGate, CeremonySpec, Decision } from './types';
 
 /** Response bodies are `{"decision": …}`; anything past this is a misbehaving approver. */
 const MAX_RESPONSE_BYTES = 64 * 1024;
-/** The longest timer Node can set. A larger `timeout_sec` is capped to it instead of firing at once. */
-const MAX_TIMER_MS = 2_147_483_647;
 
 export interface WebhookGateConfig {
   url: string;
@@ -101,6 +100,10 @@ function postJson(
       return;
     }
 
+    // Declared first and assigned below, so `fail` is safe to call at any point: before the
+    // request exists it has nothing to destroy, and before the timer exists nothing to clear.
+    let req: ClientRequest | undefined;
+    let timer: NodeJS.Timeout | undefined;
     let done = false;
     const finish = (settle: () => void): void => {
       if (done) return;
@@ -110,50 +113,52 @@ function postJson(
     };
     const fail = (message: string): void =>
       finish(() => {
-        req.destroy();
+        req?.destroy();
         reject(new Error(message));
       });
 
-    const timer = setTimeout(
-      () => fail(`WebhookGate: timed out after ${timeoutSec}s`),
-      Math.min(timeoutSec * 1000, MAX_TIMER_MS),
-    );
-
-    const req = send(
-      target,
-      // A fresh connection per ceremony: no pooled socket to go stale during a long hold.
-      { method: 'POST', agent: false, headers: { ...headers, 'content-length': Buffer.byteLength(payload) } },
-      (res) => {
-        const status = res.statusCode ?? 0;
-        const chunks: Buffer[] = [];
-        let size = 0;
-        res.on('data', (chunk: Buffer) => {
-          size += chunk.length;
-          if (size <= MAX_RESPONSE_BYTES) {
-            chunks.push(chunk);
-            return;
-          }
-          // Too much. An error status still reports itself, truncated; a 2xx body is refused.
-          if (status >= 200 && status <= 299) fail(`WebhookGate: response body exceeds ${MAX_RESPONSE_BYTES} bytes`);
-          else
-            finish(() => {
-              req.destroy();
-              resolve({ status, statusText: res.statusMessage ?? '', body: Buffer.concat(chunks).toString('utf8') });
-            });
-        });
-        res.on('end', () =>
-          finish(() =>
-            resolve({ status, statusText: res.statusMessage ?? '', body: Buffer.concat(chunks).toString('utf8') }),
-          ),
-        );
-        res.on('error', (err) => fail(`WebhookGate: request failed: ${err.message}`));
-        res.on('close', () => {
-          if (!res.complete) fail('WebhookGate: request failed: connection closed before the response ended');
-        });
-      },
-    );
-    req.on('error', (err) => fail(`WebhookGate: request failed: ${err.message}`));
-    req.end(payload);
+    try {
+      // `request` throws at once on a header value Node refuses (a token read from a CRLF env
+      // file, a non-latin1 character). The deadline is armed only after it has succeeded.
+      req = send(
+        target,
+        // A fresh connection per ceremony: no pooled socket to go stale during a long hold.
+        { method: 'POST', agent: false, headers: { ...headers, 'content-length': Buffer.byteLength(payload) } },
+        (res) => {
+          const status = res.statusCode ?? 0;
+          const chunks: Buffer[] = [];
+          let size = 0;
+          res.on('data', (chunk: Buffer) => {
+            size += chunk.length;
+            if (size <= MAX_RESPONSE_BYTES) {
+              chunks.push(chunk);
+              return;
+            }
+            // Too much. An error status still reports itself, truncated; a 2xx body is refused.
+            if (status >= 200 && status <= 299) fail(`WebhookGate: response body exceeds ${MAX_RESPONSE_BYTES} bytes`);
+            else
+              finish(() => {
+                req?.destroy();
+                resolve({ status, statusText: res.statusMessage ?? '', body: Buffer.concat(chunks).toString('utf8') });
+              });
+          });
+          res.on('end', () =>
+            finish(() =>
+              resolve({ status, statusText: res.statusMessage ?? '', body: Buffer.concat(chunks).toString('utf8') }),
+            ),
+          );
+          res.on('error', (err) => fail(`WebhookGate: request failed: ${err.message}`));
+          res.on('close', () => {
+            if (!res.complete) fail('WebhookGate: request failed: connection closed before the response ended');
+          });
+        },
+      );
+      timer = setTimeout(() => fail(`WebhookGate: timed out after ${timeoutSec}s`), timeoutSec * 1000);
+      req.on('error', (err) => fail(`WebhookGate: request failed: ${err.message}`));
+      req.end(payload);
+    } catch (err) {
+      fail(`WebhookGate: request failed: ${(err as Error).message}`);
+    }
   });
 }
 
@@ -167,12 +172,9 @@ export function parseWebhookParams(params: Record<string, unknown>): WebhookGate
 
   if (typeof params.url !== 'string' || params.url.length === 0)
     throw new ConfigError('gate.url', 'must be a non-empty string');
-  if (typeof params.timeout_sec !== 'number' || !Number.isFinite(params.timeout_sec) || params.timeout_sec <= 0)
-    throw new ConfigError('gate.timeout_sec', 'must be a positive number (seconds)');
-
   const out: WebhookGateConfig = {
     url: params.url,
-    timeoutSec: params.timeout_sec,
+    timeoutSec: parseGateTimeoutSec(params.timeout_sec),
   };
   if (params.bearer_token_env !== undefined) {
     if (typeof params.bearer_token_env !== 'string')

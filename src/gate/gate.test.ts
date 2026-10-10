@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ConfigError } from '../config/parse';
 import { buildDkgSpec, buildSigningSpec, resolveLeaderId } from '../orchestrator/spec-builder';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
@@ -1033,6 +1033,40 @@ describe('createGate', () => {
       .toThrow(/gate\.unknown/);
   });
 
+  // setTimeout cannot hold more than 2147483647 ms; a longer delay fires at once. The gates
+  // refuse such a timeout_sec at construction, naming gate.timeout_sec.
+  it('ExecGate and WebhookGate accept timeout_sec up to the longest Node timer and refuse more', () => {
+    const max = 2_147_483.647;
+    expect(() => createGate({ strategy: 'exec', params: { command: ['/bin/true'], timeout_sec: max } })).not.toThrow();
+    expect(() => createGate({ strategy: 'webhook', params: { url: 'http://x', timeout_sec: max } })).not.toThrow();
+    for (const timeout_sec of [2_147_483.648, 86_400 * 365, Number.MAX_SAFE_INTEGER]) {
+      expect(() => createGate({ strategy: 'exec', params: { command: ['/bin/true'], timeout_sec } }), `exec ${timeout_sec}`)
+        .toThrow(/gate\.timeout_sec.*<= 2147483\.647.*longest Node\.js timer/);
+      expect(() => createGate({ strategy: 'webhook', params: { url: 'http://x', timeout_sec } }), `webhook ${timeout_sec}`)
+        .toThrow(/gate\.timeout_sec.*<= 2147483\.647.*longest Node\.js timer/);
+    }
+  });
+
+  it('ExecGate at the largest timeout_sec runs to completion instead of timing out at once', async () => {
+    const gate = createGate({
+      strategy: 'exec',
+      params: { command: [process.execPath, '-e', 'setTimeout(()=>process.stdout.write("approve\\n"),200)'], timeout_sec: 2_147_483.647 },
+    });
+    expect(await gate.approve(signing())).toBe('approve');
+  });
+
+  it('WebhookGate at the largest timeout_sec waits for a held response instead of timing out at once', async () => {
+    const approver = await serve((_req, res) => {
+      setTimeout(() => res.end(JSON.stringify({ decision: 'approve' })), 200);
+    });
+    try {
+      const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 2_147_483.647 } });
+      expect(await gate.approve(signing())).toBe('approve');
+    } finally {
+      await approver.close();
+    }
+  });
+
   it('creates WebhookGate for strategy="webhook" and returns the approver decision', async () => {
     const approver = await serve((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -1238,6 +1272,31 @@ describe('createGate', () => {
       expect(sent).toBeLessThan(2 * 1024 * 1024);
     } finally {
       await approver.close();
+    }
+  });
+
+  // http.request throws synchronously on a header value Node refuses (a token read from a CRLF
+  // env file, a non-latin1 character). That must reject the call and leave no timer behind: a
+  // leaked deadline timer would fire later inside the daemon process.
+  it('WebhookGate rejects cleanly, with no timer left, when the request cannot be created', async () => {
+    const envName = 'OTZI_TEST_WEBHOOK_BAD_TOKEN';
+    const gate = createGate({
+      strategy: 'webhook',
+      params: { url: 'http://127.0.0.1:9/webhook', timeout_sec: 30, bearer_token_env: envName },
+    });
+    vi.useFakeTimers();
+    try {
+      for (const token of ['s3cret\r\n', 's3cret\r', 'sn\u2603wman']) {
+        process.env[envName] = token;
+        await expect(gate.approve(signing()), JSON.stringify(token))
+          .rejects.toThrow(/WebhookGate: request failed: .*header/i);
+        expect(vi.getTimerCount(), 'timers left after the rejection').toBe(0);
+        // Past the deadline nothing fires (the old code threw a ReferenceError from the timer here).
+        vi.advanceTimersByTime(60_000);
+      }
+    } finally {
+      vi.useRealTimers();
+      delete process.env[envName];
     }
   });
 

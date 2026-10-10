@@ -195,20 +195,42 @@ must exit 0 with the first line of stdout being either `approve` or `reject`.
 Any other output, non-zero exit or timeout rejects the ceremony (a participant
 drops it silently; the leader returns `403`).
 
+`timeout_sec` is at most 2147483.647 (about 24.8 days), the longest timer Node.js can
+hold; a larger value is refused at startup (`gate.timeout_sec`).
+
 The promise only resolves when the command exits — ideal for human-in-the-loop
 setups where the operator's script blocks (e.g. `inotifywait` on a decision file,
 polling a queue) until the operator responds.
 
 **Worked example:** `examples/gate-file-approver.sh` implements the file-drop
 pattern. The script names the request `<key>` = `<ceremonyId>.<first 16 hex of the
-spec's SHA-256>`, writes the spec to `/var/otzi/pending/<key>.json` and blocks until
-the operator drops a decision file at `/var/otzi/decisions/<key>` (the pending
+spec's SHA-256>`, writes the spec to `<pending dir>/<key>.json` and blocks until
+the operator drops a decision file at `<decisions dir>/<key>` (the pending
 file's name without `.json`) with content `approve` or `reject`. The digest makes a
 decision apply only to the exact spec it was made for: a decision file left over
 from an earlier ceremony with the same id does not match a new spec. The script
 deletes the decision file when it uses it, so a decision applies once. A web UI is
-just a directory listing over `/var/otzi/pending/` with buttons that write to
-`/var/otzi/decisions/`.
+just a directory listing over the pending directory with buttons that write to the
+decisions directory.
+
+The directories come from the environment variables `OTZI_GATE_PENDING_DIR` and
+`OTZI_GATE_DECISIONS_DIR`, defaulting to `/var/otzi/pending` and
+`/var/otzi/decisions`. The packaged systemd unit runs the daemon, and so the script,
+with `ProtectSystem=strict` and `ReadWritePaths=/var/lib/otzi`: it can write only
+under `/var/lib/otzi`, and the `/var/otzi` defaults are read-only to it. On a
+packaged install set both variables through the gate's `env`:
+
+```toml
+[gate]
+strategy    = "exec"
+command     = ["/etc/otzi/gate-file-approver.sh"]
+timeout_sec = 86400
+env         = { OTZI_GATE_PENDING_DIR = "/var/lib/otzi/gate/pending", OTZI_GATE_DECISIONS_DIR = "/var/lib/otzi/gate/decisions" }
+```
+
+The script creates the directories on its first run, owned by `otzi` with group
+`otzi` and mode 0770, so operators in the `otzi` group can write decision files
+there.
 
 ### `webhook` — POST spec to an HTTP endpoint
 
@@ -225,7 +247,9 @@ The daemon POSTs the spec JSON to `url`. The approver endpoint must respond with
 the connection open for up to `timeout_sec`; long-polling is fine. `timeout_sec`
 is one deadline for the whole exchange (connect, headers and the full body), so
 an approver that sends headers early or trickles bytes does not extend it. The
-response body is capped at 64 KiB and redirects are not followed. Non-200
+response body is capped at 64 KiB and redirects are not followed. `timeout_sec`
+is at most 2147483.647 (about 24.8 days), the longest timer Node.js can hold; a
+larger value is refused at startup (`gate.timeout_sec`). Non-200
 responses, a timeout, or missing/unexpected decision fields are treated as errors
 (→ reject).
 

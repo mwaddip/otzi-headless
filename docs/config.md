@@ -205,7 +205,7 @@ Details:
 | Key | Type | Notes |
 |---|---|---|
 | `command` | string[] | argv. `command[0]` is the executable. |
-| `timeout_sec` | number > 0 | Hard cap on child lifetime (seconds). |
+| `timeout_sec` | number, 0 < n <= 2147483.647 | Hard cap on child lifetime (seconds). The upper bound is the longest timer Node.js can hold (2147483647 ms, about 24.8 days); a larger value is refused at startup. |
 | `working_dir` | string, optional | cwd for the child. |
 | `env` | table, optional | Extra environment (added to the daemon's env). |
 
@@ -225,7 +225,7 @@ timeout_sec = 3600
 | Key | Type | Notes |
 |---|---|---|
 | `url` | string | Full POST URL. |
-| `timeout_sec` | number > 0 | One deadline (seconds) for the whole request: connect, response headers and the full response body. A response that starts early but does not finish in time is a reject. |
+| `timeout_sec` | number, 0 < n <= 2147483.647 | One deadline (seconds) for the whole request: connect, response headers and the full response body. A response that starts early but does not finish in time is a reject. The upper bound is the longest timer Node.js can hold (2147483647 ms, about 24.8 days); a larger value is refused at startup. |
 | `bearer_token_env` | string, optional | Env var holding a Bearer token for outgoing auth. |
 
 The daemon POSTs the spec JSON and expects `{ "decision": "approve" | "reject" }`.
