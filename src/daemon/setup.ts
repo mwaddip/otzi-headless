@@ -177,7 +177,7 @@ function announceComplete(fingerprint: string, config: DaemonConfig, note?: stri
   console.error(`  otzi: setup complete — ${nodeId}`);
   console.error(`  fingerprint: ${fingerprint}`);
   console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.error('  ⚠ Verify this fingerprint is identical on EVERY other node.');
+  console.error('  ⚠ Compare this fingerprint with EVERY other operator out of band (voice call, signed message) before running any DKG.');
   console.error('  If any node reports a different value, someone tampered with');
   console.error('  the bootstrap exchange. Delete pubkey books on every node and');
   console.error('  re-run setup.');
