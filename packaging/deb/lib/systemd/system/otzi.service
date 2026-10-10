@@ -10,8 +10,14 @@ Type=simple
 User=otzi
 Group=otzi
 # UMask 0007 → files daemon creates land at 0660 (group-readable). Combined
-# with parent-dir setgid (root:otzi 2770), new files inherit group otzi.
+# with the setgid data dir (/var/lib/otzi, root:otzi 2770), new files inherit
+# group otzi.
 UMask=0007
+# Share password: OTZI_SHARE_PASSWORD=... in /etc/otzi/otzi.env (root:root 0600).
+# systemd reads the file as root before it drops to User=otzi. The leading "-"
+# makes the file optional at the unit level; the daemon itself refuses to start
+# without the password.
+EnvironmentFile=-/etc/otzi/otzi.env
 ExecStart=/usr/bin/otzi daemon /etc/otzi/daemon.toml
 Restart=on-failure
 RestartSec=5

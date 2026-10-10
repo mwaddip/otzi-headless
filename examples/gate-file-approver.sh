@@ -5,13 +5,12 @@
 # How it fits in: the daemon is configured with
 #
 #   [gate]
-#   strategy = "exec"
-#   [gate.params]
-#   command = ["/etc/otzi/gate-file-approver.sh"]
+#   strategy    = "exec"
+#   command     = ["/etc/otzi/gate-file-approver.sh"]
 #   timeout_sec = 86400   # 24h
 #
-# and spawns this script per pending ceremony, writing the CeremonySpec JSON
-# on our stdin. We:
+# (gate parameters sit directly under [gate], next to `strategy`) and spawns this
+# script per ceremony, writing the CeremonySpec JSON on our stdin. We:
 #
 #   1. Parse the ceremonyId out of the spec.
 #   2. Drop the spec as /var/otzi/pending/<ceremonyId>.json for the operator
@@ -22,6 +21,31 @@
 #
 # Clean-up: the pending file is removed after the decision is read. The
 # decision file is left in place for audit.
+#
+# What the operator sees in the pending file. The node built the spec from its own
+# analysis of the proposal, so none of it is the leader's say-so (facts/gate.md):
+#
+#   Signing spec (kind = "signing"):
+#     ceremonyId, leader, role ("leader" | "participant"), network, txid,
+#     inputs   [{ txid, vout, amount }]
+#     outputs  [{ address, amount, isChange, label? }]  every output, in order;
+#              isChange is true for an output paying this node's own vault;
+#              label is present when the address is in this node's address book
+#     amount   sats sent to non-change outputs
+#     totalIn, totalOut, fee (sats), vsize, feeRate (sat/vB, may be fractional)
+#
+#   DKG spec (kind = "dkg"):
+#     ceremonyId, leader, role, network, threshold, parties, peerIds
+#
+# Review the outputs, not just `amount`. For example:
+#
+#   jq -r '.outputs[] | "\(.address)  \(.amount) sats  \(.label // "(no label)")  \(if .isChange then "change" else "" end)"' pending/<ceremonyId>.json
+#   jq '{txid, amount, fee, feeRate}' pending/<ceremonyId>.json
+#
+# Under the packaged systemd unit the daemon (and so this script) can write only
+# under /var/lib/otzi. Point both directories there with the gate's `env`:
+#
+#   env = { OTZI_GATE_PENDING_DIR = "/var/lib/otzi/gate/pending", OTZI_GATE_DECISIONS_DIR = "/var/lib/otzi/gate/decisions" }
 #
 # Requirements on the host: bash, jq, inotify-tools. If inotifywait is
 # unavailable, replace the block with a polling loop (`while ! test -f "$DECISION"; do sleep 2; done`).

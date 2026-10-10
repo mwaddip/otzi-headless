@@ -20,14 +20,6 @@ if [ "$RET" = "true" ]; then
   exit 0
 fi
 
-# Pre-seed defaults conditionally
-db_get otzi-headless/network || true
-case "$RET" in
-  mainnet) db_set otzi-headless/opnet-rpc "https://api.opnet.org" ;;
-  testnet) db_set otzi-headless/opnet-rpc "https://testnet.opnet.org" ;;
-  regtest) db_set otzi-headless/opnet-rpc "http://127.0.0.1:9001" ;;
-esac
-
 db_get otzi-headless/node-id || true
 [ -z "$RET" ] && db_set otzi-headless/node-id "$(hostname -s 2>/dev/null || hostname)"
 
@@ -35,6 +27,7 @@ db_get otzi-headless/node-id || true
 db_input high otzi-headless/role || true
 db_input high otzi-headless/operators || true
 db_input high otzi-headless/network || true
+db_input medium otzi-headless/esplora-url || true
 db_input high otzi-headless/transport || true
 
 db_go || true
@@ -59,7 +52,6 @@ else
 fi
 
 # Other medium-priority prompts.
-db_input medium otzi-headless/opnet-rpc || true
 db_input medium otzi-headless/node-id || true
 
 db_go || true

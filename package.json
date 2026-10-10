@@ -1,7 +1,7 @@
 {
   "name": "otzi-headless",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Headless daemon variant of Ötzi: a FROST threshold-signing Bitcoin vault for automated and federated systems.",
   "scripts": {

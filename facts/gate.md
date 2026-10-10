@@ -303,8 +303,15 @@
 - `verifyDecision(p: { address: string; decision: 'approve' | 'reject'; ceremonyId: string; nonce: string; signature: string }): boolean`
   - **Post:** `verifyBitcoinMessage(p.address, decisionMessage(p.decision, p.ceremonyId, p.nonce), p.signature)` — BIP-322 simple for P2WPKH / P2TR, legacy / BIP-137 for older types. Never throws.
 
+**Approver (`approver.ts`):**
+- Environment: `APPROVER_ADDRESS` (required; must satisfy `isValidSignInAddress`, otherwise the approver exits 1), `APPROVER_LISTEN` (`host:port`, default `127.0.0.1:8181`), `APPROVER_TOKEN` (optional; when set, `POST /webhook` requires `Authorization: Bearer <token>`).
+- `POST /webhook` is the daemon's webhook gate. The body is the spec JSON; `ceremonyId` must match `^[A-Za-z0-9._:-]{1,128}$` and `kind` must be `signing` or `dkg`, else `400`. The approver answers `200` at once with the headers only, then sends a space every 30 s (leading whitespace is valid JSON) so the daemon's HTTP client does not abandon a silent response after its 5-minute headers and body timeouts. The request is held under a fresh random 16-byte hex nonce until `/decide` ends the body with `{"decision": …}`, the daemon hangs up, or shutdown ends it with `{"error": …}` (no `decision`, so the gate rejects).
+- `GET /pending` returns `{ address, pending: [{ nonce, ceremonyId, receivedAt, spec, messages: { approve, reject } }] }`, where `messages` holds the `decisionMessage` text for each decision.
+- `POST /decide` takes `{ nonce, decision, signature }`. It resolves the held request only when `verifyDecision` holds for the pinned address, that request's ceremony id and the nonce. A signature that does not verify answers `403` and leaves the request pending; an unknown or used nonce answers `404`.
+
 **Invariants:**
 - The signed message binds the decision to one ceremony and one approver-issued nonce, so a signature cannot be replayed for another ceremony or the other decision.
+- A nonce is deleted when its decision lands, so it works once. Requests are keyed by nonce, so two nodes holding the same `ceremonyId` do not collide.
 - The approver imports the lifted `src/otzi/backend/btc-message.ts`; the daemon never does. The daemon sees only `{"decision": …}` from the webhook.
 
 ### `examples/gate-file-approver.sh`
