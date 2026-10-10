@@ -15,7 +15,7 @@
 - `async readAddressBook(path: string, network: NetworkName): Promise<AddressBookEntry[]>`
   - **Pre:** `network` is the configured network.
   - **Post:** Returns the validated entries (`parseAddressBookFile(JSON, network)`). Returns `[]` when `path` does not exist (ENOENT); the CLI and spec labelling rely on this. The policy loader (`loadAddressBook`) does not: it treats a missing file as a failure (see below).
-  - **Throws:** On unreadable file, invalid JSON, wrong `kind` / `version`, any invalid entry, or a file network ≠ `network` (messages from `parseAddressBookFile`).
+  - **Throws:** `Error('address book <path>: <reason>')` for an unreadable file (`cannot be read: <filesystem error>`), invalid JSON (`not valid JSON`), wrong `kind` / `version`, any invalid entry, or a file network ≠ `network` (`<reason>` is then the message from `parseAddressBookFile`). Every error names the book that failed.
 
 - `async writeAddressBook(path: string, network: NetworkName, entries: AddressBookEntry[]): Promise<void>`
   - **Pre:** Caller has write access to the directory (root on a `.deb` install).
@@ -37,10 +37,11 @@
 - Depends on: `validateEntries`, `parseAddressBookFile`, `addressBookFile` (`src/otzi/lib/address-book.ts`), `isValidAddress` (`src/otzi/lib/bitcoin.ts`).
 - Used by:
   - `Daemon`: `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)` for the orchestrator and leader (spec labels via `labelFor`), and `loadAddressBook` for `PolicyGate`: the entries' addresses, throwing when the file does not exist (ENOENT) or is invalid, so `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
-  - `src/cli/cmd/book.ts` (all verbs), `src/cli/cmd/btc.ts` (`resolveRecipient` for `btc send`, labels in `btc sign` summaries).
+  - `src/cli/cmd/book.ts` (all verbs), `src/cli/cmd/btc.ts` (`resolveRecipient` for `btc send`, labels in the `btc send` / `btc sign` summaries; `bookPath` option, default `DEFAULT_ADDRESS_BOOK_PATH`).
   - `src/cli/cmd/backup.ts` / `restore.ts` (tar path `etc/otzi/address-book.otzi.json`, restored at 0640).
 
 **Notes / gotchas:**
 - The daemon reads the book at each use (each spec build, each `"address-book"` policy evaluation); edits take effect without a restart.
-- In the daemon, a missing or invalid book means no labels for spec building and a reject for the `"address-book"` policy rule (strict by default).
+- In the daemon, a missing or invalid book means no labels for spec building and a reject for the `"address-book"` policy rule (strict by default). In `btc sign`, an unreadable book means no labels and a warning; in `btc send`, it is an error naming the book (a missing file is an empty book).
+- The `"address-book"` rule compares addresses by exact string (see [gate.md](gate.md)): a book entry in another letter case than the lowercase bech32 the analysis produces never matches.
 - Labels are not required to be unique; `resolveRecipient` takes the first match, so keep labels unique for `btc send`.

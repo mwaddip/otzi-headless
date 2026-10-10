@@ -1,4 +1,5 @@
 import type { GateConfig } from '../config/types';
+import type { Logger } from '../orchestrator/types';
 import { ExecGate, parseExecParams } from './exec';
 import { parsePolicyParams, PolicyGate } from './policy';
 import type { ApprovalGate, CeremonySpec, Decision } from './types';
@@ -10,12 +11,23 @@ export class AutoGate implements ApprovalGate {
   }
 }
 
-export function createGate(config: GateConfig): ApprovalGate {
+/**
+ * `deps.loadAddressBook` returns this node's address book addresses for
+ * `allowed_recipients = "address-book"` (rejecting when there is no usable
+ * book); `deps.logger` receives the policy gate's warnings.
+ */
+export function createGate(
+  config: GateConfig,
+  deps: { loadAddressBook?: () => Promise<string[]>; logger?: Logger } = {},
+): ApprovalGate {
   switch (config.strategy) {
     case 'auto':
       return new AutoGate();
     case 'policy':
-      return new PolicyGate(parsePolicyParams(config.params ?? {}));
+      return new PolicyGate(parsePolicyParams(config.params ?? {}), {
+        loadAddressBook: deps.loadAddressBook,
+        logger: deps.logger,
+      });
     case 'exec':
       return new ExecGate(parseExecParams(config.params ?? {}));
     case 'webhook':

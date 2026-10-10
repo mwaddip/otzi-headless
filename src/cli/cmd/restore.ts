@@ -65,6 +65,7 @@ const execFile = promisify(execFileCb);
  */
 const FIXED_FILE_MODES: Record<string, number> = {
   'etc/otzi/daemon.toml': 0o640,
+  'etc/otzi/address-book.otzi.json': 0o640,
   'var/lib/otzi/vault-pubkey.json': 0o644,
 };
 

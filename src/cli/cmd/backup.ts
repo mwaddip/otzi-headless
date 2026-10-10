@@ -1,8 +1,8 @@
 /**
  * `otzi backup` — produce a single password-protected archive of full daemon
- * state (config + share + identity + pubkey-book + vault-pubkey + meta) so an
- * operator who loses their host can recover into a fresh `.deb` install via
- * `otzi restore`.
+ * state (config + share + identity + pubkey-book + vault-pubkey + address book
+ * + meta) so an operator who loses their host can recover into a fresh `.deb`
+ * install via `otzi restore`.
  *
  * The archive layout is a versioned, magic-prefixed binary file:
  *
@@ -37,7 +37,9 @@ import { hostname, homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { create as tarCreate } from 'tar';
 import { parse as parseToml } from 'smol-toml';
+import { DEFAULT_ADDRESS_BOOK_PATH } from '../../address-book/store';
 
+export { DEFAULT_ADDRESS_BOOK_PATH };
 export const DEFAULT_DAEMON_CONFIG_PATH = '/etc/otzi/daemon.toml';
 export const DEFAULT_SHARE_PATH = '/var/lib/otzi/share.json';
 export const DEFAULT_IDENTITY_PATH = '/var/lib/otzi/identity.json';
@@ -112,6 +114,7 @@ export interface BackupOptions {
    */
   pathOverrides?: {
     vaultPubkey?: string;
+    addressBook?: string;
   };
 }
 
@@ -162,6 +165,8 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
 
   const vaultPubkeySource =
     opts.pathOverrides?.vaultPubkey ?? DEFAULT_VAULT_PUBKEY_PATH;
+  const addressBookSource =
+    opts.pathOverrides?.addressBook ?? DEFAULT_ADDRESS_BOOK_PATH;
 
   // --- Step 2: assemble the file table. Tar paths are RELATIVE (no leading
   // slash) so restore can `chroot`-style place them back at the corresponding
@@ -182,6 +187,11 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
     {
       tarPath: 'var/lib/otzi/vault-pubkey.json',
       sourcePath: vaultPubkeySource,
+      required: false,
+    },
+    {
+      tarPath: stripLeadingSlash(DEFAULT_ADDRESS_BOOK_PATH),
+      sourcePath: addressBookSource,
       required: false,
     },
   ];

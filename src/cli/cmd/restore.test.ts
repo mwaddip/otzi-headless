@@ -6,6 +6,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -35,10 +36,25 @@ interface Fixture {
   identityPath: string;
   pubkeyBookPath: string;
   vaultPubkeyPath: string;
+  addressBookPath: string;
 }
+
+/** The fixed paths backup reads that daemon.toml does not name. */
+function overridesFrom(f: Fixture) {
+  return { vaultPubkey: f.vaultPubkeyPath, addressBook: f.addressBookPath };
+}
+
+const ADDRESS_BOOK_TAR = 'etc/otzi/address-book.otzi.json';
+const ADDRESS_BOOK_JSON = JSON.stringify({
+  kind: 'otzi-address-book',
+  version: 1,
+  network: 'testnet4',
+  entries: [{ label: 'treasury', address: 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx' }],
+});
 
 interface FixtureOpts {
   skipVaultPubkey?: boolean;
+  skipAddressBook?: boolean;
   /**
    * If set, encode the share/identity/pubkeys at relative paths under this
    * tar-encoded prefix. The fixture writes the actual files under the root
@@ -60,6 +76,7 @@ async function buildBackupFixture(
   const identityPath = join(varDir, 'identity.json');
   const pubkeyBookPath = join(varDir, 'pubkeys.json');
   const vaultPubkeyPath = join(varDir, 'vault-pubkey.json');
+  const addressBookPath = join(etcDir, 'address-book.otzi.json');
 
   const tomlText = `
 [share]
@@ -99,6 +116,11 @@ strategy = "auto"
       mode: 0o644,
     });
   }
+  if (!opts.skipAddressBook) {
+    // Looser than the restored mode, to show restore sets the mode itself.
+    await writeFile(addressBookPath, ADDRESS_BOOK_JSON);
+    await chmod(addressBookPath, 0o666);
+  }
 
   return {
     configPath,
@@ -106,6 +128,7 @@ strategy = "auto"
     identityPath,
     pubkeyBookPath,
     vaultPubkeyPath,
+    addressBookPath,
   };
 }
 
@@ -187,7 +210,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: outDir,
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     // Restore into a fresh root.
@@ -220,8 +243,10 @@ describe('runRestore', () => {
     expect(restoredPaths.has(restored(pubkeysRel))).toBe(true);
     expect(restoredPaths.has(restored('var/lib/otzi/vault-pubkey.json'))).toBe(true);
 
+    expect(restoredPaths.has(restored(ADDRESS_BOOK_TAR))).toBe(true);
+
     // Exactly the vault's file set, nothing else.
-    expect(restoredPaths.size).toBe(5);
+    expect(restoredPaths.size).toBe(6);
 
     // meta.json is NOT restored to disk.
     expect(restoredPaths.has(restored('meta.json'))).toBe(false);
@@ -251,7 +276,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: outDir,
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     const restoreRoot = join(tmp, 'dst');
@@ -283,10 +308,59 @@ describe('runRestore', () => {
       : f.pubkeyBookPath;
     expect(await modeOf(restored(pubkeysRel))).toBe(0o644);
     expect(await modeOf(restored('var/lib/otzi/vault-pubkey.json'))).toBe(0o644);
+    expect(await modeOf(restored(ADDRESS_BOOK_TAR))).toBe(0o640);
 
     // Result-reported modes match on-disk modes.
     expect(got.get(restored('etc/otzi/daemon.toml'))).toBe(0o640);
     expect(got.get(restored(shareRel))).toBe(0o600);
+    expect(got.get(restored(ADDRESS_BOOK_TAR))).toBe(0o640);
+  });
+
+  it('backup includes the address book and restore sets 0640', async () => {
+    const f = await buildBackupFixture(join(tmp, 'src'));
+    expect(await modeOf(f.addressBookPath)).toBe(0o666);
+
+    const backup = await runBackup({
+      configPath: f.configPath,
+      outputDir: join(tmp, 'archive'),
+      pathOverrides: overridesFrom(f),
+    });
+    expect(backup.filesIncluded).toContain(ADDRESS_BOOK_TAR);
+
+    const restoreRoot = join(tmp, 'dst');
+    const result = await runRestore({
+      archivePath: backup.path,
+      password: backup.password,
+      rootOverride: restoreRoot,
+      configExistsCheck: NEVER_EXISTS,
+      daemonStatusCheck: NEVER_RUNNING,
+    });
+
+    const restoredBook = resolve(restoreRoot, ADDRESS_BOOK_TAR);
+    expect(result.restoredFiles).toContainEqual({ path: restoredBook, mode: 0o640 });
+    expect(await modeOf(restoredBook)).toBe(0o640);
+    expect(await readFile(restoredBook, 'utf8')).toBe(ADDRESS_BOOK_JSON);
+  });
+
+  it('restores a backup that holds no address book without one', async () => {
+    const f = await buildBackupFixture(join(tmp, 'src'), { skipAddressBook: true });
+    const backup = await runBackup({
+      configPath: f.configPath,
+      outputDir: join(tmp, 'archive'),
+      pathOverrides: overridesFrom(f),
+    });
+    expect(backup.filesIncluded).not.toContain(ADDRESS_BOOK_TAR);
+
+    const restoreRoot = join(tmp, 'dst');
+    const result = await runRestore({
+      archivePath: backup.path,
+      password: backup.password,
+      rootOverride: restoreRoot,
+      configExistsCheck: NEVER_EXISTS,
+      daemonStatusCheck: NEVER_RUNNING,
+    });
+    expect(result.restoredFiles).toHaveLength(5);
+    expect(await pathExists(resolve(restoreRoot, ADDRESS_BOOK_TAR))).toBe(false);
   });
 
   it('wrong password → friendly error', async () => {
@@ -295,7 +369,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     await expect(
@@ -315,7 +389,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     // Flip 1 byte mid-ciphertext (well after the magic + header).
@@ -375,7 +449,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     const dstRoot = join(tmp, 'dst');
@@ -422,7 +496,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     await expect(
@@ -444,7 +518,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     const result = await runRestore({
@@ -460,11 +534,11 @@ describe('runRestore', () => {
 
   it('restores an archive built without the optional vault-pubkey file', async () => {
     const backupRoot = join(tmp, 'src');
-    const f = await buildBackupFixture(backupRoot, { skipVaultPubkey: true });
+    const f = await buildBackupFixture(backupRoot, { skipVaultPubkey: true, skipAddressBook: true });
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     const restoreRoot = join(tmp, 'dst');
@@ -522,7 +596,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     const restoreRoot = join(tmp, 'dst');
@@ -546,7 +620,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     const result = await runRestore({
@@ -578,7 +652,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     const restoreRoot = join(tmp, 'dst-rollback');
@@ -742,7 +816,7 @@ describe('passwordStdin', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     // Use the stdinStream seam so we don't have to monkey-patch
@@ -771,7 +845,7 @@ describe('passwordStdin', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     const fakeStdin = Readable.from([
@@ -794,7 +868,7 @@ describe('passwordStdin', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
+      pathOverrides: overridesFrom(f),
     });
 
     const half = Math.floor(backup.password.length / 2);

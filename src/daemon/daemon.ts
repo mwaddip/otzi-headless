@@ -4,10 +4,12 @@
  * Wires:
  *   - blob infrastructure (`BlobStore`, `BlobServer`, `BlobPuller`) into one
  *     `CeremonyIo`;
- *   - the approval gate (from `DaemonConfig.gate`);
+ *   - the approval gate (from `DaemonConfig.gate`), with this node's address
+ *     book for `allowed_recipients = "address-book"`;
  *   - the participant-side `Orchestrator` and the leader-side
- *     `LeaderDispatcher`, sharing the I/O, the gate and the vault, with the
- *     orchestrator holding the node's ceremony slots for both;
+ *     `LeaderDispatcher`, sharing the I/O, the gate, the vault and this node's
+ *     address book (output labels in gate specs), with the orchestrator
+ *     holding the node's ceremony slots for both;
  *   - triggers (HTTP, UDS, cron, from `DaemonConfig.triggers`) and the
  *     operator API handler (`vault-info`, `dkg`, `sign`).
  *
@@ -16,7 +18,9 @@
  * returned to the caller, which broadcasts them.
  */
 
+import { access } from 'node:fs/promises';
 import type { Rng } from '@mwaddip/frots';
+import { DEFAULT_ADDRESS_BOOK_PATH, readAddressBook } from '../address-book/store';
 import type { PullOpts } from '../core/blob-puller';
 import { BlobPuller } from '../core/blob-puller';
 import { BlobServer } from '../core/blob-server';
@@ -24,7 +28,7 @@ import { BlobStore } from '../core/blob-store';
 import type { CeremonyIo } from '../core/ceremony-io';
 import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
-import type { TriggerEntry } from '../config/types';
+import type { NetworkName, TriggerEntry } from '../config/types';
 import { createGate } from '../gate/factory';
 import { Orchestrator } from '../orchestrator/orchestrator';
 import { NOOP_LOGGER, type CeremonyOutcome, type Logger } from '../orchestrator/types';
@@ -61,6 +65,20 @@ export interface DaemonDeps {
   env?: Readonly<Record<string, string | undefined>>;
   /** Where a DKG commit writes `vault-pubkey.json`; the path given to `loadAndValidate`. */
   vaultPubkeyPath?: string;
+  /** This node's address book; default `DEFAULT_ADDRESS_BOOK_PATH`. Tests point it at a temporary file. */
+  addressBookPath?: string;
+}
+
+/**
+ * The addresses of the address book at `path`, for the policy gate's
+ * `allowed_recipients = "address-book"`. Unlike `readAddressBook`, which reads a
+ * missing file as an empty book, a missing file is an error here: a node without
+ * a book has no recipients to allow, so its policy rejects every signing spec.
+ */
+async function bookAddresses(path: string, network: NetworkName): Promise<string[]> {
+  const entries = await readAddressBook(path, network);
+  if (entries.length === 0) await access(path); // throws ENOENT when the empty answer meant "no file"
+  return entries.map(e => e.address);
 }
 
 export class Daemon {
@@ -80,7 +98,11 @@ export class Daemon {
     const store = new BlobStore();
     this.server = new BlobServer(transport, store);
     const io: CeremonyIo = { transport, store, puller: new BlobPuller(transport, store), pullOpts: deps.pullOpts };
-    const gate = createGate(config.gate);
+    const bookPath = deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH;
+    const gate = createGate(config.gate, {
+      loadAddressBook: () => bookAddresses(bookPath, network),
+      logger: this.log,
+    });
     const node = { id: config.node.id, partyId: selfPartyId };
     const sharePath = config.share.path;
     const vaultExists = async () => state.share !== undefined || (await vaultFileExists(sharePath));
@@ -104,6 +126,7 @@ export class Daemon {
       createStager,
       rng,
       ceremonyDeadlines: config.deadlines,
+      addressBook: () => readAddressBook(bookPath, network),
       logger: this.log,
     };
 

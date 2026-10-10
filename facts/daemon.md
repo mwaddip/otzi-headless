@@ -257,13 +257,13 @@
   state: LoadedDaemonState; transport: Transport; selfPartyId: number;
   peersById: ReadonlyMap<PartyId, string>; rng: Rng; pullOpts: PullOpts; logger?: Logger;
   httpHandler?: HttpHandler; cronHandlers?: ReadonlyMap<string, CronHandler>;
-  env?: Readonly<Record<string, string | undefined>>; vaultPubkeyPath?: string;
+  env?: Readonly<Record<string, string | undefined>>; vaultPubkeyPath?: string; addressBookPath?: string;
   ```
-  - **Pre:** `selfPartyId` and `peersById` come from `TransportBundle` (book lookup by pubkey); `transport.partyId === selfPartyId`. `vaultPubkeyPath` is where a DKG commit writes `vault-pubkey.json` (default `DEFAULT_VAULT_PUBKEY_PATH`); pass the same path given to `loadAndValidate`.
+  - **Pre:** `selfPartyId` and `peersById` come from `TransportBundle` (book lookup by pubkey); `transport.partyId === selfPartyId`. `vaultPubkeyPath` is where a DKG commit writes `vault-pubkey.json` (default `DEFAULT_VAULT_PUBKEY_PATH`); pass the same path given to `loadAndValidate`. `addressBookPath` is this node's address book (default `DEFAULT_ADDRESS_BOOK_PATH`); production passes nothing, tests point it at a temporary file.
 
 - `class Daemon`
   - **`constructor(deps: DaemonDeps)`**
-    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)`; the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file and returns its addresses, but throws when the file does not exist (ENOENT) as well as when it is invalid — unlike `readAddressBook`, which returns `[]` on ENOENT — so `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
+    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook, logger })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(addressBookPath, network)` (`addressBookPath` = `deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH`); the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file and returns its addresses, but throws when the file does not exist (ENOENT) as well as when it is invalid — unlike `readAddressBook`, which returns `[]` on ENOENT — so `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
     - **Invariant:** Does NOT start anything. The share password reaches only the share stager; it is never logged or returned.
   - **`async start(): Promise<void>`** — starts the orchestrator and every trigger. Reentrant.
   - **`async stop(): Promise<void>`** — stops triggers, the orchestrator, and closes the blob server. Reentrant.
@@ -377,8 +377,8 @@
 | `otzi book export [path]` | Write the book file (stdout without a path). |
 | `otzi backup` / `otzi restore <archive> [--password-stdin]` | Archive and restore node state. |
 
-- `--config` defaults to `/etc/otzi/daemon.toml`.
-- CLI verbs other than `daemon` keep `NOOP_LOGGER` and write machine output to stdout only; banners, summaries and errors go to stderr. Stdout per verb: `vault` the text or JSON; `btc balance` the two balance lines; `btc send` the txid, then the explorer URL; `btc sign` the txid, then the signed hex, then (with `--broadcast`) the explorer URL. `generate` prints only to stderr.
+- `--config` defaults to `/etc/otzi/daemon.toml`. Every `book` verb takes it too, to learn the network.
+- CLI verbs other than `daemon` keep `NOOP_LOGGER` and write machine output to stdout only; banners, summaries and errors go to stderr. Stdout per verb: `vault` the text or JSON; `btc balance` the two balance lines; `btc send` the txid, then the explorer URL; `btc sign` the txid, then the signed hex, then (with `--broadcast`) the explorer URL; `book list` one tab-separated line per entry; `book import` the line `added <a>, updated <u>, unchanged <n>`; `book export` the book file when no path is given. `generate`, `book add` and `book remove` print only to stderr, as does `book export <path>`.
 - `parseVerbArgs(args, { values?, booleans? }): { positional: string[]; flags: Map<string, string> }` — positionals and `--flags` in any order. A `values` flag takes the next argument (`flag '--x' needs a value` when it is missing or starts with `--`); a `booleans` flag takes none (so `btc sign --broadcast <file>` works); any other `--flag` is `unknown flag '--x'`, so a typo never falls back to a default.
 - `reportCliError(err, write?)` — the message on stderr. A `BroadcastFailedError` also prints a line naming the txid and saying the transaction is signed but not broadcast, then the signed transaction hex as the last line, so the operator can broadcast it by other means. The process exits 1 on any error.
 - `otzi generate` takes no positional argument; a positional (the pre-0.3 `otzi generate <config.toml>`) fails with a hint to use `--config`. Its banner (stderr) prints the ceremony ID, network, vault address, share path and `Restart every daemon to load its share before signing.`
@@ -506,23 +506,23 @@
 - `btcBalance(opts: { configPath: string; vaultPath?: string; unit?: BtcUnit }): Promise<string>`
   - **Post:** `getBalance(base, vault.address)`; returns `"confirmed: X\nunconfirmed: Y"` formatted in `unit` (default sats).
 
-- `btcSend(opts: { configPath: string; vaultPath?: string; to: string; amount: string; feeRate?: number }, deps?: CliDeps): Promise<{ txid: string; explorerUrl: string }>`
+- `btcSend(opts: { configPath: string; vaultPath?: string; bookPath?: string; to: string; amount: string; feeRate?: number }, deps?: CliDeps): Promise<{ txid: string; explorerUrl: string }>`
   1. Read `vault-pubkey.json` and the config (Esplora base: `esplora_url` or the `chainApiUrl` default).
-  2. Resolve `to` with `resolveRecipient(readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network), to, network)`. Until the address book lands, `to` must be an address valid for the vault's network: otherwise `Error("'<to>' is not a valid <network> address")`.
+  2. Resolve `to` with `resolveRecipient(await readAddressBook(bookPath, network), to, network)` (`bookPath` defaults to `DEFAULT_ADDRESS_BOOK_PATH`): a label of this node's book, or an address valid for the vault's network; anything else is `Error('unknown label or invalid address: <to>')`. A book that cannot be read or validated is an error naming the book path; a missing book file is an empty book.
   3. Local checks, before Esplora or the daemon is touched: `amount` is `'max'` (case-insensitive) or `parseBtcAmount(amount).sats`, and a sats amount below `MIN_SEND_SATS` (546) is `Error('amount <n> sats is below the minimum send of 546 sats')`; a given `feeRate` must be finite, greater than 0 and at most `MAX_FEE_RATE` (`Error('fee rate must be more than 0 and at most 10000 sat/vB (got <n>)')`); the daemon connection is built from the config (`deps.client` or `DaemonClient.fromParsed`).
   4. `getUtxos`, keeping confirmed ones only; fee rate is `feeRate` or `getFeeRates(base).normal`. An Esplora `normal` rate that is not a finite number greater than 0 and at most `MAX_FEE_RATE` is `Error('Esplora <base> returned an unusable fee rate (<value> sat/vB; expected more than 0 and at most 10000); pass --fee-rate to choose one')`, before any daemon call.
   5. `buildSend({ utxos, vault: vaultKey, network, to, amount, feeRate })`. `InsufficientFundsError` becomes `Error('insufficient funds: <available> sats (<btc> BTC) confirmed, <needed> sats (<btc> BTC) needed at <rate> sat/vB')`, plus `; a further <n> sats (<btc> BTC) is unconfirmed and is not spent until it confirms` when unconfirmed coins exist.
   6. More than 255 prevouts → `Error('this send needs <k> inputs; at most 255 fit in one transaction — consolidate first')` before any daemon call.
-  7. `analyzeProposal` on the built proposal gives the summary (format under `btcSign`), written through `deps.summary` (default stderr) before the daemon is asked to sign. A send refused in steps 1–6 prints no summary.
+  7. `analyzeProposal` on the built proposal gives the summary (format under `btcSign`, labels from the book read in step 2), written through `deps.summary` (default stderr) before the daemon is asked to sign. A send refused in steps 1–6 prints no summary.
   8. Daemon `{ op: 'sign', proposal: { network, tx, prevouts } }`, then the reply check (below).
   9. `broadcastTx(base, signedTxHex)`; on failure throw `BroadcastFailedError('broadcast failed — Esplora <base>: <reason>', txid, signedTxHex)`. The txid Esplora answers only cross-checks the daemon's: when it differs, `deps.warn` gets `warning: Esplora <base> answered txid '<x>' for the broadcast, but the signed transaction is <txid>` and the send still succeeds.
   - **Reply check (`btcSend` and `btcSign`, before anything is broadcast or returned):** the reply must carry a string `txid` and hex `signedTxHex` (`Error("daemon reply to 'sign' has no signed transaction (txid, signedTxHex)")`), and `signedTxHex` must decode as a transaction (`the signed transaction in the daemon's reply cannot be decoded: …`) whose txid equals the reply's `txid` (`daemon reply is inconsistent: it names txid <a> but its signed transaction is <b>`), equals `analyzeProposal`'s txid for the proposal, and whose serialization without witnesses equals `proposal.tx` (`daemon signed a different transaction than the proposal (proposal <a>, signed <b>); not broadcasting it`), and every input must carry witness data (`the daemon's signed transaction has no signature for input <i>; not broadcasting it`). Anything else is thrown and nothing is broadcast; a txid alone proves nothing, because a segwit txid ignores witnesses.
   - **Post:** Returns the daemon's txid and `explorerTxUrl(base, txid)`.
   - **Throws:** recipient, amount, fee-rate, Esplora, `InsufficientFundsError` (as above), input-limit, daemon (`DaemonClientError`), reply-check and broadcast errors.
 
-- `btcSign(opts: { configPath: string; vaultPath?: string; proposalPath: string; broadcast: boolean }, deps?: CliDeps): Promise<{ txid: string; signedTxHex: string; summary: string; explorerUrl?: string }>`
-  - **Post:** Reads a `SendProposal` JSON file and checks it with `parseProposal` (so more than 255 prevouts is refused with the daemon's text); `analyzeProposal` against `vault-pubkey.json`'s `vaultKey` and network gives `summary`, which is written through `deps.summary` (default stderr) before the daemon is asked to sign and is also returned; daemon `{ op: 'sign', proposal }` and the reply check (see `btcSend`); broadcasts only when `broadcast` is true (`explorerUrl` then set; a failure throws `BroadcastFailedError`; a differing txid from Esplora is a warning).
-  - **`summary`:** `network: <n>`, `inputs: <k>, <sats> sats (<btc> BTC)`, `outputs:` and one line per output (`<address>  <sats> sats (<btc> BTC)`, `  change` appended for a change output), `fee: <sats> sats (<btc> BTC), <rate> sat/vB`. Address-book labels join the output lines with the address book.
+- `btcSign(opts: { configPath: string; vaultPath?: string; bookPath?: string; proposalPath: string; broadcast: boolean }, deps?: CliDeps): Promise<{ txid: string; signedTxHex: string; summary: string; explorerUrl?: string }>`
+  - **Post:** Reads a `SendProposal` JSON file and checks it with `parseProposal` (so more than 255 prevouts is refused with the daemon's text); `analyzeProposal` against `vault-pubkey.json`'s `vaultKey` and network gives `summary`, which is written through `deps.summary` (default stderr) before the daemon is asked to sign and is also returned; the output labels come from `readAddressBook(bookPath, network)` (default `DEFAULT_ADDRESS_BOOK_PATH`) through `labelFor`, as the daemon labels its specs, and a book that cannot be read means no labels and one `deps.warn` line naming the book; daemon `{ op: 'sign', proposal }` and the reply check (see `btcSend`); broadcasts only when `broadcast` is true (`explorerUrl` then set; a failure throws `BroadcastFailedError`; a differing txid from Esplora is a warning).
+  - **`summary`:** `network: <n>`, `inputs: <k>, <sats> sats (<btc> BTC)`, `outputs:` and one line per output (`<address>  <sats> sats (<btc> BTC)`, `  change` appended for a change output, then `  "<label>"` when the address is in the book), `fee: <sats> sats (<btc> BTC), <rate> sat/vB`.
   - **Throws:** file errors (`cannot read proposal file <path>: …`), `proposal file <path> is not valid JSON`, shape errors (`proposal file <path>: <parseProposal message>`), analysis errors (`proposal refused: <analyzeProposal message>`, before any daemon call), daemon errors, `BroadcastFailedError`.
 
 **Invariants:**
@@ -534,11 +534,11 @@
 
 **Public surface:**
 - `interface BookOpts { configPath: string; bookPath?: string }` — network from the config; `bookPath` defaults to `DEFAULT_ADDRESS_BOOK_PATH`.
-- `bookList(o: BookOpts): Promise<string>` — one line per entry: label, address, note.
-- `bookAdd(o: BookOpts & { label: string; address: string; note?: string }): Promise<void>` — adds the entry, or updates the label and note of the entry with the same address; the result must pass `validateEntries`; written with `writeAddressBook`.
-- `bookRemove(o: BookOpts & { key: string }): Promise<void>` — removes the entry whose label or address equals `key`. **Throws** when nothing matches.
-- `bookImport(o: BookOpts & { file: string; replace: boolean }): Promise<{ added: number; updated: number; unchanged: number }>` — `parseAddressBookFile` on the file for the configured network; merges with `mergeAddressBooks` (default) or makes the file's entries the book (`replace`); writes; returns the counts `mergeAddressBooks(current, incoming)` reports.
-- `bookExport(o: BookOpts & { out?: string }): Promise<string>` — `addressBookFile(entries, network)` as pretty JSON; also written to `out` when given.
+- `bookList(o: BookOpts): Promise<string>` — one line per entry: label, address, note, separated by tabs (a tab or line break inside a label or note is shown as a space); empty string for an empty book.
+- `bookAdd(o: BookOpts & { label: string; address: string; note?: string }): Promise<void>` — adds the entry, or updates the label and note of the entry with the same address (an omitted `note` clears the note); the result must pass `validateEntries`; written with `writeAddressBook`. **Throws** `Error("cannot save '<label>': <reason>")` for an invalid entry (`<reason>` is the `validateEntries` message without its `Entry <n>:` prefix); nothing is written then.
+- `bookRemove(o: BookOpts & { key: string }): Promise<void>` — removes the entry whose label or address equals `key`. **Throws** when nothing matches, or when a label matches more than one entry (remove it by address); nothing is written then.
+- `bookImport(o: BookOpts & { file: string; replace: boolean }): Promise<{ added: number; updated: number; unchanged: number }>` — `parseAddressBookFile` on the file for the configured network (`Error('address book file <file>: <reason>')` for unreadable, invalid or other-network files; nothing is written); merges with `mergeAddressBooks` (default) or makes the file's entries the book (`replace`); writes; returns the counts `mergeAddressBooks(current, incoming)` reports.
+- `bookExport(o: BookOpts & { out?: string }): Promise<string>` — `addressBookFile(entries, network)` as pretty JSON (no trailing newline); also written to `out` (with a trailing newline) when given.
 
 **Invariants:**
 - Every write goes through `writeAddressBook` (validation, atomic replace, mode 0640). Writing needs the same privilege as editing `daemon.toml`.
@@ -560,7 +560,7 @@
   - `outputDir?: string` — archive destination directory (default `os.homedir()`).
   - `passwordOverride?: string` — bypasses the generated 32-char base62 password. Production callers MUST NOT set this; tests use it for determinism.
   - `now?: () => Date` — clock seam for the filename timestamp.
-  - `pathOverrides?` — test seam for the fixed paths not derived from daemon.toml (`vault-pubkey.json`, the address book).
+  - `pathOverrides?: { vaultPubkey?: string; addressBook?: string }` — test seam for the fixed paths not derived from daemon.toml (`vault-pubkey.json`, the address book).
 
 - `BackupResult`
   - `path: string` — absolute path to the written archive.
@@ -574,7 +574,7 @@
 - `runBackup` is pure-ish: filesystem I/O + crypto only, no logging, no `process.exit`, no banner.
 
 **Cross-component contracts:**
-- Depends on: `node:crypto` (PBKDF2-SHA256, AES-256-GCM, randomBytes), `tar` (gzip), `smol-toml` (loose parse for share/identity/pubkey paths).
+- Depends on: `node:crypto` (PBKDF2-SHA256, AES-256-GCM, randomBytes), `tar` (gzip), `smol-toml` (loose parse for share/identity/pubkey paths), `DEFAULT_ADDRESS_BOOK_PATH` (`src/address-book/store.ts`).
 - Used by: `entrypoint.ts`.
 - Exports the wire-format constants `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_SALT_LEN`, `BACKUP_IV_LEN`, `BACKUP_TAG_LEN`, `BACKUP_HEADER_LEN`, `BACKUP_PBKDF2_ITERATIONS`, the default file paths and `stripLeadingSlash` — `restore.ts` consumes all of these.
 
@@ -648,7 +648,7 @@ Wire layout, version 1:
 
 Bumping the format requires changing the magic to `OTZI-BACKUP-V2` (or similar) so old restores reject the new format cleanly. The strict NUL-padding check on bytes 14..32 means future versions cannot reuse the 32-byte magic block without a clean break.
 
-Constants exported by `backup.ts`: `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_SALT_LEN`, `BACKUP_IV_LEN`, `BACKUP_TAG_LEN`, `BACKUP_HEADER_LEN`, `BACKUP_PBKDF2_ITERATIONS`.
+Constants exported by `backup.ts`: `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_SALT_LEN`, `BACKUP_IV_LEN`, `BACKUP_TAG_LEN`, `BACKUP_HEADER_LEN`, `BACKUP_PBKDF2_ITERATIONS`, and the default paths `DEFAULT_DAEMON_CONFIG_PATH`, `DEFAULT_SHARE_PATH`, `DEFAULT_IDENTITY_PATH`, `DEFAULT_PUBKEY_BOOK_PATH`, `DEFAULT_VAULT_PUBKEY_PATH` and `DEFAULT_ADDRESS_BOOK_PATH` (the last is re-exported from `src/address-book/store.ts`, which owns it).
 
 ---
 

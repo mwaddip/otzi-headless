@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigError } from '../config/parse';
 import { buildDkgSpec, buildSigningSpec, resolveLeaderId } from '../orchestrator/spec-builder';
+import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 import type { ProposalAnalysis } from '../otzi/lib/bitcoin';
 import { AutoGate, createGate } from './factory';
 import { parsePolicyParams, PolicyGate } from './policy';
@@ -175,6 +176,184 @@ describe('PolicyGate — allowed_recipients', () => {
   it('rejects when the spec carries no outputs array (strict-by-default)', async () => {
     const broken = { ...signing(), outputs: undefined } as unknown as SigningSpec;
     expect(await gate.approve(broken)).toBe('reject');
+  });
+});
+
+describe('PolicyGate — allowed_recipients = "address-book"', () => {
+  interface Captured {
+    warnings: string[];
+    logger: Logger;
+  }
+
+  function capture(): Captured {
+    const warnings: string[] = [];
+    return { warnings, logger: { ...NOOP_LOGGER, warn: (msg) => void warnings.push(msg) } };
+  }
+
+  const book = (addresses: string[]) => async () => addresses;
+
+  it('address-book policy approves listed recipients and rejects others', async () => {
+    const gate = new PolicyGate(
+      { allowedRecipients: 'address-book' },
+      { loadAddressBook: book([RECIPIENT_A, RECIPIENT_B]) },
+    );
+    expect(await gate.approve(signing({ recipient: RECIPIENT_A }))).toBe('approve');
+    expect(await gate.approve(signing({ recipient: RECIPIENT_EVIL }))).toBe('reject');
+    const mixed = signing({
+      outputs: [
+        { address: RECIPIENT_A, amount: 5_000, isChange: false },
+        { address: RECIPIENT_B, amount: 6_000, isChange: false },
+        { address: RECIPIENT_EVIL, amount: 1, isChange: false },
+      ],
+    });
+    expect(await gate.approve(mixed)).toBe('reject');
+    expect(await gate.approve(signing({ recipient: RECIPIENT_A.toUpperCase() }))).toBe('reject'); // exact string
+  });
+
+  it('ignores change outputs', async () => {
+    const gate = new PolicyGate({ allowedRecipients: 'address-book' }, { loadAddressBook: book([RECIPIENT_A]) });
+    expect(await gate.approve(signing({ recipient: RECIPIENT_A, change: 70_000 }))).toBe('approve');
+    const consolidation = signing({ outputs: [{ address: VAULT, amount: 99_000, isChange: true }] });
+    expect(await gate.approve(consolidation)).toBe('approve');
+  });
+
+  it('reads the book at each evaluation', async () => {
+    let current = [RECIPIENT_A];
+    let loads = 0;
+    const gate = new PolicyGate(
+      { allowedRecipients: 'address-book' },
+      {
+        loadAddressBook: async () => {
+          loads++;
+          return current;
+        },
+      },
+    );
+    expect(await gate.approve(signing({ recipient: RECIPIENT_B }))).toBe('reject');
+    current = [RECIPIENT_A, RECIPIENT_B];
+    expect(await gate.approve(signing({ recipient: RECIPIENT_B }))).toBe('approve');
+    current = [];
+    expect(await gate.approve(signing({ recipient: RECIPIENT_B }))).toBe('reject');
+    expect(loads).toBe(3);
+  });
+
+  it('an empty book rejects every external output and still approves a change-only spec', async () => {
+    const gate = new PolicyGate({ allowedRecipients: 'address-book' }, { loadAddressBook: book([]) });
+    expect(await gate.approve(signing())).toBe('reject');
+    expect(await gate.approve(signing({ outputs: [{ address: VAULT, amount: 99_000, isChange: true }] }))).toBe('approve');
+  });
+
+  it('address-book policy rejects when the book file is invalid, and logs the cause', async () => {
+    const { warnings, logger } = capture();
+    const gate = new PolicyGate(
+      { allowedRecipients: 'address-book' },
+      {
+        loadAddressBook: async () => {
+          throw new Error('address book /etc/otzi/address-book.otzi.json: Entry 2: duplicate address');
+        },
+        logger,
+      },
+    );
+    expect(await gate.approve(signing({ recipient: RECIPIENT_A }))).toBe('reject');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('Entry 2: duplicate address');
+    expect(warnings[0]).toMatch(/address book/);
+  });
+
+  it('rejects when the book file is missing (the daemon loader throws ENOENT)', async () => {
+    const { warnings, logger } = capture();
+    const gate = new PolicyGate(
+      { allowedRecipients: 'address-book' },
+      {
+        loadAddressBook: async () => {
+          throw Object.assign(new Error("ENOENT: no such file or directory, access '/etc/otzi/address-book.otzi.json'"), {
+            code: 'ENOENT',
+          });
+        },
+        logger,
+      },
+    );
+    expect(await gate.approve(signing())).toBe('reject');
+    expect(warnings[0]).toContain('ENOENT');
+  });
+
+  it('a failed load rejects even a spec whose outputs are all change', async () => {
+    const gate = new PolicyGate(
+      { allowedRecipients: 'address-book' },
+      {
+        loadAddressBook: async () => {
+          throw new Error('EACCES');
+        },
+      },
+    );
+    const consolidation = signing({ outputs: [{ address: VAULT, amount: 99_000, isChange: true }] });
+    expect(await gate.approve(consolidation)).toBe('reject');
+  });
+
+  it('rejects, with a warning, when no address book loader was given', async () => {
+    const { warnings, logger } = capture();
+    const gate = new PolicyGate({ allowedRecipients: 'address-book' }, { logger });
+    expect(await gate.approve(signing({ recipient: RECIPIENT_A }))).toBe('reject');
+    const consolidation = signing({ outputs: [{ address: VAULT, amount: 99_000, isChange: true }] });
+    expect(await gate.approve(consolidation)).toBe('reject');
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toMatch(/no address book loader/);
+  });
+
+  it('does not warn when the book loads', async () => {
+    const { warnings, logger } = capture();
+    const gate = new PolicyGate({ allowedRecipients: 'address-book' }, { loadAddressBook: book([RECIPIENT_A]), logger });
+    expect(await gate.approve(signing({ recipient: RECIPIENT_A }))).toBe('approve');
+    expect(await gate.approve(signing({ recipient: RECIPIENT_EVIL }))).toBe('reject');
+    expect(warnings).toEqual([]);
+  });
+
+  it('never loads the book for a DKG spec or for an explicit address list', async () => {
+    let loads = 0;
+    const loadAddressBook = async () => {
+      loads++;
+      return [RECIPIENT_A];
+    };
+    const book1 = new PolicyGate({ allowedRecipients: 'address-book' }, { loadAddressBook });
+    expect(await book1.approve(dkgSpec())).toBe('approve');
+    const list = new PolicyGate({ allowedRecipients: [RECIPIENT_A] }, { loadAddressBook });
+    expect(await list.approve(signing({ recipient: RECIPIENT_A }))).toBe('approve');
+    expect(loads).toBe(0);
+  });
+
+  it('a failed load records nothing in the windows', async () => {
+    let failing = true;
+    const gate = new PolicyGate(
+      { allowedRecipients: 'address-book', maxCeremoniesPerHour: 1, maxSatsPer24h: 100 },
+      {
+        loadAddressBook: async () => {
+          if (failing) throw new Error('unreadable');
+          return [RECIPIENT_A];
+        },
+      },
+    );
+    expect(await gate.approve(signing({ external: 100 }))).toBe('reject');
+    failing = false;
+    expect(await gate.approve(signing({ external: 100 }))).toBe('approve'); // neither window was consumed
+    expect(await gate.approve(signing({ external: 1 }))).toBe('reject');
+  });
+
+  it('checks and records the windows in one synchronous section after the load', async () => {
+    const gate = new PolicyGate(
+      { allowedRecipients: 'address-book', maxSatsPer24h: 100_000 },
+      {
+        loadAddressBook: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return [RECIPIENT_A];
+        },
+      },
+    );
+    const decisions = await Promise.all([
+      gate.approve(signing({ external: 60_000, ceremonyId: 'c-a' })),
+      gate.approve(signing({ external: 60_000, ceremonyId: 'c-b' })),
+      gate.approve(signing({ external: 40_000, ceremonyId: 'c-c' })),
+    ]);
+    expect(decisions).toEqual(['approve', 'reject', 'approve']);
   });
 });
 
@@ -539,6 +718,19 @@ describe('parsePolicyParams', () => {
       );
     });
 
+    it('accepts the string "address-book"', () => {
+      expect(parsePolicyParams({ allowed_recipients: 'address-book' })).toEqual({ allowedRecipients: 'address-book' });
+    });
+
+    it('rejects any other string, naming the key', () => {
+      for (const bad of ['', 'address_book', 'Address-Book', ' address-book', 'any']) {
+        expect(() => parsePolicyParams({ allowed_recipients: bad }), JSON.stringify(bad)).toThrow(ConfigError);
+        expect(() => parsePolicyParams({ allowed_recipients: bad }), JSON.stringify(bad)).toThrow(
+          /gate\.allowed_recipients.*"address-book"/,
+        );
+      }
+    });
+
     it('copies the array', () => {
       const input = [RECIPIENT_A];
       const parsed = parsePolicyParams({ allowed_recipients: input });
@@ -719,6 +911,23 @@ describe('createGate', () => {
     expect(await gate.approve(signing({ external: 500 }))).toBe('approve');
     expect(await gate.approve(signing({ external: 2000 }))).toBe('reject');
     expect(await gate.approve(signing({ external: 500, recipient: RECIPIENT_EVIL }))).toBe('reject');
+  });
+
+  it('hands the address book loader and the logger to the PolicyGate', async () => {
+    const warnings: string[] = [];
+    const logger: Logger = { ...NOOP_LOGGER, warn: (msg) => void warnings.push(msg) };
+    const gate = createGate(
+      { strategy: 'policy', params: { allowed_recipients: 'address-book' } },
+      { loadAddressBook: async () => [RECIPIENT_A], logger },
+    );
+    expect(gate).toBeInstanceOf(PolicyGate);
+    expect(await gate.approve(signing({ recipient: RECIPIENT_A }))).toBe('approve');
+    expect(await gate.approve(signing({ recipient: RECIPIENT_EVIL }))).toBe('reject');
+    expect(warnings).toEqual([]);
+
+    const noBook = createGate({ strategy: 'policy', params: { allowed_recipients: 'address-book' } }, { logger });
+    expect(await noBook.approve(signing({ recipient: RECIPIENT_A }))).toBe('reject');
+    expect(warnings).toHaveLength(1);
   });
 
   it('creates PolicyGate with no params (empty rules = approve everything)', async () => {

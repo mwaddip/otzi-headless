@@ -16,6 +16,7 @@ import { decryptShareFile, encryptShareFile } from '../otzi/lib/share-file';
 import type { NetworkName, SendProposal } from '../otzi/lib/vault-types';
 import { makeProposal, testVault } from '../testing/proposal';
 import type { HttpTrigger } from '../triggers/http';
+import { writeAddressBook } from '../address-book/store';
 import { NO_VAULT_MESSAGE } from './api';
 import { loadAndValidate } from './config-merge';
 import { Daemon } from './daemon';
@@ -34,6 +35,8 @@ interface NodeFiles {
   configPath: string;
   sharePath: string;
   vaultPubkeyPath: string;
+  /** Where this node's daemon reads its address book; absent until a test writes it. */
+  addressBookPath: string;
 }
 
 interface Booted {
@@ -105,6 +108,7 @@ async function cluster(opts: { gates?: Record<number, string>; triggers?: string
       configPath: join(nodeDir, 'daemon.toml'),
       sharePath: join(nodeDir, 'state', 'share.json'),
       vaultPubkeyPath: join(nodeDir, 'meta', 'vault-pubkey.json'),
+      addressBookPath: join(nodeDir, 'address-book.otzi.json'),
     };
     await writeFile(files.configPath, toml(i, files.sharePath, opts.gates?.[i] ?? AUTO_GATE, opts.triggers ?? HTTP_TRIGGER));
     nodes.push(files);
@@ -142,6 +146,7 @@ async function cluster(opts: { gates?: Record<number, string>; triggers?: string
             rng,
             pullOpts: PULLS,
             vaultPubkeyPath: nodes[i]!.vaultPubkeyPath,
+            addressBookPath: nodes[i]!.addressBookPath,
             logger,
           }),
         );
@@ -388,6 +393,124 @@ describe('Daemon API: DKG and signing', () => {
     const res = await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-gated', proposal: makeProposal(tv.vaultKey, NET) });
     expect(res).toEqual({ status: 403, json: { error: 'gate rejected', decision: 'reject', ceremonyId: 'pay-gated' } });
     expect(broadcast).not.toHaveBeenCalled();
+  });
+});
+
+describe('Daemon address book', () => {
+  const TREASURY = 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx';
+  const OTHER = 'tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7';
+  const BOOK_GATE = '[gate]\nstrategy = "policy"\nallowed_recipients = "address-book"';
+
+  const pay = (tv: ReturnType<typeof testVault>, address: string): SendProposal =>
+    makeProposal(tv.vaultKey, NET, { outputs: [{ address, amount: 50_000 }] });
+
+  const gateRejected = (ceremonyId: string) => ({
+    status: 403,
+    json: { error: 'gate rejected', decision: 'reject', ceremonyId },
+  });
+
+  it('allowed_recipients = "address-book" signs for a listed recipient and rejects the others, reading the book at each request', async () => {
+    const c = await cluster({ gates: { 0: BOOK_GATE } });
+    const tv = await writeShares(c);
+    const { urls, transports } = await c.boot();
+    const broadcast = vi.spyOn(transports[0]!, 'broadcast');
+
+    await writeAddressBook(c.nodes[0]!.addressBookPath, NET, [{ label: 'treasury', address: TREASURY }]);
+    expect(await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-unlisted', proposal: pay(tv, OTHER) })).toEqual(
+      gateRejected('pay-unlisted'),
+    );
+    expect(broadcast).not.toHaveBeenCalled();
+
+    const listed = await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-listed', proposal: pay(tv, TREASURY) });
+    expect(listed.status).toBe(200);
+    expect(listed.json).toMatchObject({ ceremonyId: 'pay-listed', status: 'done' });
+
+    // An edit takes effect without a restart.
+    await writeAddressBook(c.nodes[0]!.addressBookPath, NET, [{ label: 'other', address: OTHER }]);
+    expect(await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-edited', proposal: pay(tv, TREASURY) })).toEqual(
+      gateRejected('pay-edited'),
+    );
+    const edited = await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-edited-ok', proposal: pay(tv, OTHER) });
+    expect(edited.status).toBe(200);
+    expect(c.transcript.filter(l => l.startsWith('warn') && /address book/i.test(l))).toEqual([]);
+  });
+
+  it('allowed_recipients = "address-book" rejects every signing spec on a node without a book, and warns', async () => {
+    const c = await cluster({ gates: { 0: BOOK_GATE } });
+    const tv = await writeShares(c);
+    const { urls, transports } = await c.boot();
+    const broadcast = vi.spyOn(transports[0]!, 'broadcast');
+
+    expect(await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-nobook', proposal: pay(tv, TREASURY) })).toEqual(
+      gateRejected('pay-nobook'),
+    );
+    // Even a transaction that pays only the vault back to itself.
+    const consolidation = makeProposal(tv.vaultKey, NET, { outputs: [], change: 99_000 });
+    expect(await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-consolidate', proposal: consolidation })).toEqual(
+      gateRejected('pay-consolidate'),
+    );
+    expect(broadcast).not.toHaveBeenCalled();
+
+    const warnings = c.transcript.filter(l => l.startsWith('warn') && /address book/i.test(l));
+    expect(warnings.length).toBeGreaterThanOrEqual(2);
+    expect(warnings.every(l => l.includes('ENOENT'))).toBe(true);
+  });
+
+  it('allowed_recipients = "address-book" rejects when the book file is invalid, and warns with the reason', async () => {
+    const c = await cluster({ gates: { 0: BOOK_GATE } });
+    const tv = await writeShares(c);
+    const { urls } = await c.boot();
+
+    const file = c.nodes[0]!.addressBookPath;
+    await writeFile(file, '{ not json');
+    expect(await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-garbage', proposal: pay(tv, TREASURY) })).toEqual(
+      gateRejected('pay-garbage'),
+    );
+    await writeFile(file, JSON.stringify({ kind: 'otzi-address-book', version: 1, network: 'mainnet', entries: [] }));
+    expect(await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-mainnet', proposal: pay(tv, TREASURY) })).toEqual(
+      gateRejected('pay-mainnet'),
+    );
+
+    const warnings = c.transcript.filter(l => l.startsWith('warn') && /address book/i.test(l));
+    expect(warnings.some(l => l.includes('not valid JSON') && l.includes(file))).toBe(true);
+    expect(warnings.some(l => l.includes('Address book is for mainnet'))).toBe(true);
+  });
+
+  it('gate specs carry the labels of the leader\'s own book', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'otzi-daemon-spec-'));
+    const specFile = join(dir, 'spec.json');
+    try {
+      const c = await cluster({
+        gates: { 0: `[gate]\nstrategy = "exec"\ncommand = ["sh", "-c", "cat > ${specFile}; echo approve"]\ntimeout_sec = 10` },
+      });
+      const tv = await writeShares(c);
+      const { urls } = await c.boot();
+      await writeAddressBook(c.nodes[0]!.addressBookPath, NET, [{ label: 'treasury', address: TREASURY }]);
+
+      const res = await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-labelled', proposal: pay(tv, TREASURY) });
+      expect(res.status).toBe(200);
+
+      const spec = JSON.parse(await readFile(specFile, 'utf8')) as {
+        outputs: Array<{ address: string; isChange: boolean; label?: string }>;
+      };
+      expect(spec.outputs.find(o => !o.isChange)).toMatchObject({ address: TREASURY, label: 'treasury' });
+      expect(spec.outputs.find(o => o.isChange)?.label).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a missing or invalid book only means unlabelled specs for a gate that does not use it', async () => {
+    const c = await cluster({ gates: { 0: '[gate]\nstrategy = "policy"\nmax_sats_per_tx = 100000' } });
+    const tv = await writeShares(c);
+    const { urls } = await c.boot();
+
+    const absent = await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-absent', proposal: pay(tv, TREASURY) });
+    expect(absent.status).toBe(200);
+
+    await writeFile(c.nodes[0]!.addressBookPath, 'garbage');
+    const invalid = await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-invalid', proposal: pay(tv, TREASURY) });
+    expect(invalid.status).toBe(200);
   });
 });
 

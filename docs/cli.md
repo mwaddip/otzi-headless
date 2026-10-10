@@ -52,7 +52,7 @@ through Esplora.
   - `<amount[unit]>`: a number with an optional unit, `sats` (default), `btc`, `mbtc` or `ubtc` (`50000`, `0.001btc`). Fractional sats are rejected. `max` spends every confirmed UTXO with no change.
   - `--fee-rate N`: sat/vB, more than 0 and at most 10000. Default: Esplora's `normal` estimate; an Esplora estimate outside that range is refused (naming the Esplora URL) and you pass `--fee-rate` instead.
 
-  The steps: resolve the recipient, fetch **confirmed** UTXOs, build the proposal (largest UTXOs first; change under 330 sats goes to the fee; a send below 546 sats is refused), refuse a send that needs more than 255 inputs (consolidate UTXOs first), print the summary (outputs, change, fee, fee rate) to stderr, call the daemon's `sign` op, check that the reply is the transaction that was built and is signed on every input, broadcast it. The node you run it on is the ceremony leader.
+  The steps: resolve the recipient, fetch **confirmed** UTXOs, build the proposal (largest UTXOs first; change under 330 sats goes to the fee; a send below 546 sats is refused), refuse a send that needs more than 255 inputs (consolidate UTXOs first), print the summary (outputs with their address-book labels, change, fee, fee rate) to stderr, call the daemon's `sign` op, check that the reply is the transaction that was built and is signed on every input, broadcast it. The node you run it on is the ceremony leader.
 
 - `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` — sign a proposal someone else built. `proposal.json` holds `{ "network", "tx", "prevouts" }` (see [`api.md`](./api.md) § `op: "sign"`). Analysis runs locally first, so a proposal this vault would not sign fails before any daemon call. The analysis summary (outputs with their address-book labels, change, fee, fee rate) goes to stderr before the daemon is asked to sign; stdout gets the txid and the signed hex. Without `--broadcast` nothing is posted; with it, the CLI posts the transaction and prints the explorer URL as a third stdout line.
 
@@ -64,11 +64,13 @@ Each node has its own address book at `/etc/otzi/address-book.otzi.json` (Ötzi'
 
 **Reading needs `otzi` group membership; writing needs root** (`sudo otzi book add …`), because the book can widen a policy allowlist and so carries the same privilege as editing `daemon.toml`. Every write validates the whole book and replaces the file atomically.
 
-- `otzi book list` — one line per entry: label, address, note.
-- `otzi book add <label> <address> [--note <text>]` — add an entry, or update the label and note of the entry with the same address.
-- `otzi book remove <label|address>` — remove the entry whose label or address matches. Fails when nothing matches.
-- `otzi book import <file> [--replace]` — merge an Ötzi address-book file (default) or replace the book with it. Prints how many entries were added, updated and unchanged.
+- `otzi book list` — one line per entry on stdout: label, address, note, separated by tabs.
+- `otzi book add <label> <address> [--note <text>]` — add an entry, or update the label and note of the entry with the same address (an update without `--note` clears the note).
+- `otzi book remove <label|address>` — remove the entry whose label or address matches. Fails when nothing matches, or when a label matches more than one entry (remove it by address).
+- `otzi book import <file> [--replace]` — merge an Ötzi address-book file (default) or replace the book with it. Prints `added <a>, updated <u>, unchanged <n>` on stdout. A file for another network is refused and nothing is written.
 - `otzi book export [path]` — write the book as an Ötzi address-book file (stdout without a path).
+
+Every `book` verb takes `--config <path>` (default `/etc/otzi/daemon.toml`) and reads the network from it. Confirmations go to stderr; errors exit 1.
 
 Entry rules: trimmed label of 1 to 64 characters, an address valid for the configured network, unique addresses, a note of at most 256 characters, at most 1000 entries. The file's network must equal the configured network. Labels are not required to be unique, but `btc send` takes the first match, so keep them unique. Export and import files move between nodes and web Ötzi unchanged.
 

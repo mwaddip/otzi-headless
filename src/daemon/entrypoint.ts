@@ -6,8 +6,9 @@
  *   otzi generate [--config <path>] [...]       — run the DKG through the local daemon
  *   otzi vault [--json]                         — print vault metadata
  *   otzi btc balance [--unit ...]               — vault balance from Esplora
- *   otzi btc send <addr> <amount>[unit]|max     — build, sign and broadcast a vault transfer
+ *   otzi btc send <addr|label> <amount>[unit]|max — build, sign and broadcast a vault transfer
  *   otzi btc sign <proposal.json> [--broadcast] — sign a caller-built proposal
+ *   otzi book list|add|remove|import|export     — manage this node's address book
  *   otzi backup                                 — write password-protected archive of daemon state
  *   otzi restore <path> [--password-stdin]      — recover daemon state from an archive
  *
@@ -53,6 +54,9 @@ export async function main(argv: readonly string[]): Promise<void> {
     case 'btc':
       await runBtcCommand(rest);
       return;
+    case 'book':
+      await runBookCommand(rest);
+      return;
     case 'backup':
       await runBackupCommand(rest);
       return;
@@ -72,8 +76,13 @@ function usage(): string {
     '  otzi generate [--config <path>] [--ceremony-id <id>]',
     '  otzi vault [--json]',
     '  otzi btc balance [--unit sats|btc|mbtc|ubtc] [--config <path>]',
-    '  otzi btc send <address> <amount>[unit]|max [--fee-rate <sat/vB>] [--config <path>]',
+    '  otzi btc send <address|label> <amount>[unit]|max [--fee-rate <sat/vB>] [--config <path>]',
     '  otzi btc sign <proposal.json> [--broadcast] [--config <path>]',
+    '  otzi book list [--config <path>]',
+    '  otzi book add <label> <address> [--note <text>] [--config <path>]',
+    '  otzi book remove <label|address> [--config <path>]',
+    '  otzi book import <file> [--replace] [--config <path>]',
+    '  otzi book export [path] [--config <path>]',
     '  otzi backup',
     '  otzi restore <archive-path> [--password-stdin]',
   ].join('\n');
@@ -301,7 +310,7 @@ async function runBtcCommand(args: string[]): Promise<void> {
   }
   if (sub === 'send') {
     const { positional, flags } = parseVerbArgs(rest, { values: ['fee-rate', 'config'] });
-    if (positional.length !== 2) throw new Error('usage: otzi btc send <address> <amount>[unit]|max [--fee-rate <sat/vB>]');
+    if (positional.length !== 2) throw new Error('usage: otzi btc send <address|label> <amount>[unit]|max [--fee-rate <sat/vB>]');
     const [to, amount] = positional as [string, string];
     const feeRate = flags.get('fee-rate');
     const { btcSend } = await import('../cli/cmd/btc');
@@ -332,6 +341,72 @@ async function runBtcCommand(args: string[]): Promise<void> {
     return;
   }
   throw new Error(usage());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi book {list|add|remove|import|export} ...`
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * `bookPath` is a test seam: the verbs work on `DEFAULT_ADDRESS_BOOK_PATH`
+ * (`/etc/otzi/address-book.otzi.json`) and take no flag for another file.
+ */
+export async function runBookCommand(args: string[], bookPath?: string): Promise<void> {
+  const [verb, ...rest] = args;
+  const book = (flags: Map<string, string>) => ({
+    configPath: flags.get('config') ?? DEFAULT_DAEMON_CONFIG_PATH,
+    ...(bookPath !== undefined ? { bookPath } : {}),
+  });
+
+  switch (verb) {
+    case 'list': {
+      const { positional, flags } = parseVerbArgs(rest, { values: ['config'] });
+      noPositional(positional);
+      const { bookList } = await import('../cli/cmd/book');
+      const lines = await bookList(book(flags));
+      if (lines === '') console.error('address book is empty');
+      else console.log(lines);
+      return;
+    }
+    case 'add': {
+      const { positional, flags } = parseVerbArgs(rest, { values: ['config', 'note'] });
+      if (positional.length !== 2) throw new Error('usage: otzi book add <label> <address> [--note <text>]');
+      const [label, address] = positional as [string, string];
+      const note = flags.get('note');
+      const { bookAdd } = await import('../cli/cmd/book');
+      await bookAdd({ ...book(flags), label, address, ...(note !== undefined ? { note } : {}) });
+      console.error(`address book: saved '${label}' ${address.trim()}`);
+      return;
+    }
+    case 'remove': {
+      const { positional, flags } = parseVerbArgs(rest, { values: ['config'] });
+      if (positional.length !== 1) throw new Error('usage: otzi book remove <label|address>');
+      const { bookRemove } = await import('../cli/cmd/book');
+      await bookRemove({ ...book(flags), key: positional[0]! });
+      console.error(`address book: removed '${positional[0]}'`);
+      return;
+    }
+    case 'import': {
+      const { positional, flags } = parseVerbArgs(rest, { values: ['config'], booleans: ['replace'] });
+      if (positional.length !== 1) throw new Error('usage: otzi book import <file> [--replace]');
+      const { bookImport } = await import('../cli/cmd/book');
+      const r = await bookImport({ ...book(flags), file: positional[0]!, replace: flags.has('replace') });
+      console.log(`added ${r.added}, updated ${r.updated}, unchanged ${r.unchanged}`);
+      return;
+    }
+    case 'export': {
+      const { positional, flags } = parseVerbArgs(rest, { values: ['config'] });
+      if (positional.length > 1) throw new Error('usage: otzi book export [path]');
+      const out = positional[0];
+      const { bookExport } = await import('../cli/cmd/book');
+      const text = await bookExport({ ...book(flags), ...(out !== undefined ? { out } : {}) });
+      if (out === undefined) console.log(text);
+      else console.error(`address book: wrote ${out}`);
+      return;
+    }
+    default:
+      throw new Error(usage());
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

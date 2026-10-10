@@ -10,6 +10,7 @@
 import { readFile } from 'node:fs/promises';
 import { hex } from '@scure/base';
 import * as btc from '@scure/btc-signer';
+import { DEFAULT_ADDRESS_BOOK_PATH, readAddressBook, resolveRecipient } from '../../address-book/store';
 import { loadDaemonConfig } from '../../config/load';
 import type { DaemonConfig, NetworkName } from '../../config/types';
 import { MAX_INPUTS } from '../../core/messages';
@@ -17,14 +18,9 @@ import { parseProposal } from '../../daemon/api';
 import { DEFAULT_VAULT_PUBKEY_PATH, readVaultPubkeyFile, type VaultPubkeyFile } from '../../daemon/vault-pubkey';
 import { buildSend, InsufficientFundsError, MIN_SEND_SATS, type PreparedSend } from '../../otzi/backend/bitcoin';
 import { broadcastTx, chainApiUrl, getBalance, getFeeRates, getUtxos } from '../../otzi/backend/esplora';
-import {
-  analyzeProposal,
-  explorerTxUrl,
-  formatBtc,
-  isValidAddress,
-  type ProposalAnalysis,
-} from '../../otzi/lib/bitcoin';
-import type { SendProposal } from '../../otzi/lib/vault-types';
+import { labelFor } from '../../otzi/lib/address-book';
+import { analyzeProposal, explorerTxUrl, formatBtc, type ProposalAnalysis } from '../../otzi/lib/bitcoin';
+import type { AddressBookEntry, SendProposal } from '../../otzi/lib/vault-types';
 import { DaemonClient } from '../daemon-client';
 import { formatSats, parseBtcAmount, type BtcUnit } from '../units';
 
@@ -201,14 +197,15 @@ function insufficientFunds(err: InsufficientFundsError, feeRate: number, unconfi
 }
 
 export async function btcSend(
-  opts: { configPath: string; vaultPath?: string; to: string; amount: string; feeRate?: number },
+  opts: { configPath: string; vaultPath?: string; bookPath?: string; to: string; amount: string; feeRate?: number },
   deps: CliDeps = {},
 ): Promise<{ txid: string; explorerUrl: string }> {
   const { config, vault, base } = await loadContext(opts.configPath, opts.vaultPath);
   const network: NetworkName = vault.network;
 
   // Everything that can be checked locally is checked before Esplora or the daemon is touched.
-  if (!isValidAddress(opts.to, network)) throw new Error(`'${opts.to}' is not a valid ${network} address`);
+  const book = await readAddressBook(opts.bookPath ?? DEFAULT_ADDRESS_BOOK_PATH, network);
+  const to = resolveRecipient(book, opts.to, network);
   const amount = opts.amount.trim().toLowerCase() === 'max' ? ('max' as const) : parseBtcAmount(opts.amount).sats;
   if (amount !== 'max' && amount < MIN_SEND_SATS) {
     throw new Error(`amount ${amount} sats is below the minimum send of ${MIN_SEND_SATS} sats`);
@@ -229,7 +226,7 @@ export async function btcSend(
       utxos: confirmed.map(({ txid, vout, value }) => ({ txid, vout, value })),
       vault: vault.vaultKey,
       network,
-      to: opts.to,
+      to,
       amount,
       feeRate,
     });
@@ -245,7 +242,7 @@ export async function btcSend(
 
   const proposal: SendProposal = { network, tx: built.tx, prevouts: built.prevouts };
   const analysis = analyzeProposal(proposal, vault.vaultKey, network);
-  (deps.summary ?? console.error)(summarize(analysis, network));
+  (deps.summary ?? console.error)(summarize(analysis, network, book));
 
   const signed = await signProposal(client, proposal, analysis.txid);
   await broadcast(base, signed, deps.warn ?? console.error);
@@ -274,22 +271,28 @@ async function readProposal(path: string): Promise<SendProposal> {
   }
 }
 
-function summarize(analysis: ProposalAnalysis, network: NetworkName): string {
+/** The analysis as text; an output whose address is in `book` is followed by its label. */
+function summarize(analysis: ProposalAnalysis, network: NetworkName, book: AddressBookEntry[]): string {
+  const output = (o: ProposalAnalysis['outputs'][number]): string => {
+    const label = labelFor(book, o.address);
+    return `  ${o.address}  ${money(o.amount)}${o.isChange ? '  change' : ''}${label !== undefined ? `  "${label}"` : ''}`;
+  };
   return [
     `network: ${network}`,
     `inputs: ${analysis.inputs.length}, ${money(analysis.totalIn)}`,
     'outputs:',
-    ...analysis.outputs.map(o => `  ${o.address}  ${money(o.amount)}${o.isChange ? '  change' : ''}`),
+    ...analysis.outputs.map(output),
     `fee: ${money(analysis.fee)}, ${analysis.feeRate.toFixed(1)} sat/vB`,
   ].join('\n');
 }
 
 export async function btcSign(
-  opts: { configPath: string; vaultPath?: string; proposalPath: string; broadcast: boolean },
+  opts: { configPath: string; vaultPath?: string; bookPath?: string; proposalPath: string; broadcast: boolean },
   deps: CliDeps = {},
 ): Promise<{ txid: string; signedTxHex: string; summary: string; explorerUrl?: string }> {
   const { config, vault, base } = await loadContext(opts.configPath, opts.vaultPath);
   const client = deps.client ?? DaemonClient.fromParsed(config);
+  const warn = deps.warn ?? console.error;
 
   const proposal = await readProposal(opts.proposalPath);
   let analysis: ProposalAnalysis;
@@ -298,11 +301,18 @@ export async function btcSign(
   } catch (err) {
     throw new Error(`proposal refused: ${reason(err)}`, { cause: err });
   }
-  const summary = summarize(analysis, vault.network);
+  // The book only labels the summary here, as it labels the daemon's specs: an unreadable one means no labels.
+  let book: AddressBookEntry[] = [];
+  try {
+    book = await readAddressBook(opts.bookPath ?? DEFAULT_ADDRESS_BOOK_PATH, vault.network);
+  } catch (err) {
+    warn(`warning: outputs are shown without labels: ${reason(err)}`);
+  }
+  const summary = summarize(analysis, vault.network, book);
   (deps.summary ?? console.error)(summary);
 
   const signed = await signProposal(client, proposal, analysis.txid);
   if (!opts.broadcast) return { ...signed, summary };
-  await broadcast(base, signed, deps.warn ?? console.error);
+  await broadcast(base, signed, warn);
   return { ...signed, summary, explorerUrl: explorerTxUrl(base, signed.txid) };
 }

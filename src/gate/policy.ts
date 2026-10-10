@@ -15,6 +15,8 @@
  *   max_sats_per_24h = 1000000            # rolling 24 h, this node's approvals
  *   allowed_recipients = ["bc1q...", "bc1p..."]
  *                                         # every non-change output must be listed
+ *   allowed_recipients = "address-book"   # ... or be in this node's address book,
+ *                                         # read at each evaluation
  *   max_fee_sats = 20000
  *   max_fee_rate = 25.5                   # sat/vB, may be fractional
  *   max_ceremonies_per_hour = 10          # rolling hour, this node's approvals
@@ -27,6 +29,7 @@
  */
 
 import { ConfigError } from '../config/parse';
+import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 import type { ApprovalGate, CeremonySpec, Decision, DkgSpec, SigningSpec } from './types';
 
 export interface PolicyConfig {
@@ -34,8 +37,11 @@ export interface PolicyConfig {
   maxSatsPerTx?: number;
   /** Cap on the 24 h sum of `amount` over this node's approvals plus the spec under test. */
   maxSatsPer24h?: number;
-  /** Every non-change output address must be in this list. Change outputs are ignored. */
-  allowedRecipients?: string[];
+  /**
+   * Every non-change output address must be in this list, or in the node's
+   * address book with `'address-book'`. Change outputs are ignored.
+   */
+  allowedRecipients?: string[] | 'address-book';
   /** Cap on `spec.fee` (sats). */
   maxFeeSats?: number;
   /** Cap on `spec.feeRate` (sat/vB, may be fractional). */
@@ -49,6 +55,13 @@ export interface PolicyConfig {
 export interface PolicyGateOptions {
   /** Clock in ms since epoch; defaults to `Date.now`. Injectable for window tests. */
   now?: () => number;
+  /**
+   * The addresses in this node's address book, for `allowedRecipients === 'address-book'`.
+   * Rejects when the book cannot be loaded, a missing book file included.
+   */
+  loadAddressBook?: () => Promise<string[]>;
+  /** Receives the warning for an address-book rule that rejects for want of a book. Default: none. */
+  logger?: Logger;
 }
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -73,15 +86,40 @@ export class PolicyGate implements ApprovalGate {
   /** Approved amounts for the rolling 24 h sats window. */
   private daily: SatApproval[] = [];
   private readonly now: () => number;
+  private readonly loadAddressBook: (() => Promise<string[]>) | undefined;
+  private readonly log: Logger;
 
   constructor(private readonly config: PolicyConfig, opts: PolicyGateOptions = {}) {
     this.now = opts.now ?? Date.now;
+    this.loadAddressBook = opts.loadAddressBook;
+    this.log = opts.logger ?? NOOP_LOGGER;
   }
 
   async approve(spec: CeremonySpec): Promise<Decision> {
-    // No await: every rule is checked and the approval recorded in one synchronous
-    // section, so concurrent evaluations cannot both pass a cap.
-    return spec.kind === 'dkg' ? this.approveDkg(spec) : this.approveSigning(spec);
+    if (spec.kind === 'dkg') return this.approveDkg(spec);
+    // The address book is read before, never during, the rules: every rule is checked
+    // and the approval recorded in one synchronous section (`approveSigning`), so
+    // concurrent evaluations cannot both pass a cap.
+    const book = this.config.allowedRecipients === 'address-book' ? await this.readBook(spec) : undefined;
+    return this.approveSigning(spec, book);
+  }
+
+  /** This node's address book addresses, or `null` (with a warning) when there is no usable book. */
+  private async readBook(spec: SigningSpec): Promise<string[] | null> {
+    const why = (cause: string) =>
+      this.log.warn(`policy: signing ${spec.ceremonyId} rejected: allowed_recipients = "address-book" but ${cause}`, {
+        ceremonyId: spec.ceremonyId,
+      });
+    if (!this.loadAddressBook) {
+      why('no address book loader is configured');
+      return null;
+    }
+    try {
+      return await this.loadAddressBook();
+    } catch (err) {
+      why(`the address book cannot be loaded: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
   }
 
   private approveDkg(spec: DkgSpec): Decision {
@@ -90,7 +128,8 @@ export class PolicyGate implements ApprovalGate {
     return 'approve';
   }
 
-  private approveSigning(spec: SigningSpec): Decision {
+  /** `book` is the loaded address book (`null` when it could not be) when `allowedRecipients` is `'address-book'`. */
+  private approveSigning(spec: SigningSpec, book: string[] | null | undefined): Decision {
     const c = this.config;
     const now = this.now();
     this.hourly = this.hourly.filter((at) => at >= now - HOUR_MS);
@@ -107,10 +146,11 @@ export class PolicyGate implements ApprovalGate {
     }
 
     if (c.allowedRecipients !== undefined) {
-      if (!Array.isArray(spec.outputs)) return 'reject';
+      const allowed = c.allowedRecipients === 'address-book' ? book : c.allowedRecipients;
+      if (!allowed || !Array.isArray(spec.outputs)) return 'reject';
       for (const out of spec.outputs) {
         if (out.isChange === true) continue;
-        if (typeof out.address !== 'string' || !c.allowedRecipients.includes(out.address)) return 'reject';
+        if (typeof out.address !== 'string' || !allowed.includes(out.address)) return 'reject';
       }
     }
 
@@ -174,7 +214,7 @@ export function parsePolicyParams(params: Record<string, unknown>): PolicyConfig
     out.maxSatsPer24h = coerceSats(params.max_sats_per_24h, 'gate.max_sats_per_24h');
   }
   if (params.allowed_recipients !== undefined) {
-    out.allowedRecipients = coerceAddressArray(params.allowed_recipients, 'gate.allowed_recipients');
+    out.allowedRecipients = coerceRecipients(params.allowed_recipients, 'gate.allowed_recipients');
   }
   if (params.max_fee_sats !== undefined) {
     out.maxFeeSats = coerceSats(params.max_fee_sats, 'gate.max_fee_sats');
@@ -254,9 +294,17 @@ function coerceStringArray(v: unknown, path: string): string[] {
   });
 }
 
+/** An array of addresses, or the string `"address-book"`. */
+function coerceRecipients(v: unknown, path: string): string[] | 'address-book' {
+  if (v === 'address-book') return v;
+  if (typeof v === 'string')
+    throw new ConfigError(path, `must be an array of addresses or the string "address-book" (got '${v}')`);
+  return coerceAddressArray(v, path);
+}
+
 function coerceAddressArray(v: unknown, path: string): string[] {
   if (!Array.isArray(v))
-    throw new ConfigError(path, `must be an array of addresses (got ${describe(v)})`);
+    throw new ConfigError(path, `must be an array of addresses or the string "address-book" (got ${describe(v)})`);
   return v.map((item, i) => {
     if (typeof item !== 'string')
       throw new ConfigError(`${path}[${i}]`, `must be a string (got ${describe(item)})`);

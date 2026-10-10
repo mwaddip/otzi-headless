@@ -66,9 +66,10 @@
   ```
   - **Post:** Parsed policy state; a rule is active iff its field is set.
 
-- `interface PolicyGateOptions { now?: () => number; loadAddressBook?: () => Promise<string[]> }`
+- `interface PolicyGateOptions { now?: () => number; loadAddressBook?: () => Promise<string[]>; logger?: Logger }`
   - `now` defaults to `Date.now` (injectable for window tests).
   - `loadAddressBook` returns the addresses in this node's address book; required for `allowedRecipients === 'address-book'`. It rejects (throws) when the book cannot be loaded, including when the book file does not exist.
+  - `logger` (`Logger` / `NOOP_LOGGER` from `src/orchestrator/types.ts`, default `NOOP_LOGGER`) receives the warning the `"address-book"` rule logs when it rejects for a missing dependency or a failed load.
 
 - `class PolicyGate implements ApprovalGate`
   - **Constructor:** `new PolicyGate(config: PolicyConfig, opts?: PolicyGateOptions)`. Never throws.
@@ -88,7 +89,7 @@
     | `max_ceremonies_per_hour` | `maxCeremoniesPerHour` | Signing approvals by this node in the last hour < cap. |
 
   - **DKG rule:** `dkg_leader_allowlist` (`dkgLeaderAllowlist`) — `spec.leader` must be in the list. Signing rules never apply to a `DkgSpec`; the DKG rule never applies to a `SigningSpec`.
-  - **Strict by default:** a configured rule whose input is missing rejects. With `"address-book"`, a missing book file, an invalid book file, any other failed load, or no `loadAddressBook` dependency rejects every signing spec — even one whose outputs are all change — and a warning is logged.
+  - **Strict by default:** a configured rule whose input is missing rejects. With `"address-book"`, a missing book file, an invalid book file, any other failed load, or no `loadAddressBook` dependency rejects every signing spec — even one whose outputs are all change — and `PolicyGate` logs a warning through its `logger` naming the cause (`no address book loader`, or the load error's message).
   - **Windows:** every rule is evaluated first; only when the final decision is approve is the approval recorded in the hourly window (timestamp) and the 24 h window (`{ at: now(), amount }`). Entries older than 3 600 000 ms / 86 400 000 ms are pruned. The checks and the records happen in one synchronous section (after any address-book load), so concurrent evaluations cannot both pass a cap.
 
 - `parsePolicyParams(params: Record<string, unknown>): PolicyConfig`
@@ -97,7 +98,7 @@
   - **Validation:**
     - `max_sats_per_tx`, `max_sats_per_24h`, `max_fee_sats`: non-negative safe integers, given as a TOML integer or a decimal string.
     - `max_fee_rate`: non-negative number (may be fractional) or decimal string.
-    - `allowed_recipients`: an array of non-empty address strings, or the string `"address-book"`.
+    - `allowed_recipients`: an array of non-empty address strings, or the string `"address-book"`; any other string is a `ConfigError`.
     - `max_ceremonies_per_hour`: positive integer.
     - `dkg_leader_allowlist`: array of strings.
     - Unknown keys are rejected.
@@ -266,12 +267,12 @@
   - **Post:** Returns `Promise<'approve'>`.
   - **Throws:** Never.
 
-- `createGate(config: GateConfig, deps?: { loadAddressBook?: () => Promise<string[]> }): ApprovalGate`
+- `createGate(config: GateConfig, deps?: { loadAddressBook?: () => Promise<string[]>; logger?: Logger }): ApprovalGate`
   - **Pre:** `config` is validated `GateConfig` with strategy ∈ `GATE_STRATEGIES`.
   - **Post:** Returns `ApprovalGate` (one of AutoGate, PolicyGate, ExecGate, WebhookGate).
   - **Dispatch table:**
     - `'auto'` → `new AutoGate()`.
-    - `'policy'` → `new PolicyGate(parsePolicyParams(config.params ?? {}), { loadAddressBook: deps?.loadAddressBook })`.
+    - `'policy'` → `new PolicyGate(parsePolicyParams(config.params ?? {}), { loadAddressBook: deps?.loadAddressBook, logger: deps?.logger })`.
     - `'exec'` → `new ExecGate(parseExecParams(config.params ?? {}))`.
     - `'webhook'` → `new WebhookGate(parseWebhookParams(config.params ?? {}))`.
     - Fallback → Throw "unreachable" (exhaustive check via TypeScript `never`).
@@ -282,7 +283,7 @@
 - Each strategy's `parseFooParams()` is called here; errors abort daemon startup.
 
 **Cross-component contracts:**
-- Called by `Daemon` at construction, with `loadAddressBook` reading this node's address book (a missing file is a failure).
+- Called by `Daemon` at construction, with `loadAddressBook` reading this node's address book (a missing file is a failure) and the daemon's `logger`.
 - Gate instance persists for daemon lifetime (stateful for rate windows).
 
 **Notes / gotchas:**
