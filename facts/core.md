@@ -69,8 +69,8 @@
 
   - `pull(key: BlobKey) → Promise<Uint8Array | null>`
     - **Pre:** `key.from` is a valid peer in the ring; key identifies a blob expected to be produced by that peer.
-    - **Post:** Returns blob bytes if the peer serves it; returns `null` if the peer hasn't produced it yet, or will not serve it to this node (caller retries with backoff); throws if `key.from` is not in peers array.
-    - **Throws:** On peer-not-found, network error, or other transport failure (retryable by caller).
+    - **Post:** Returns blob bytes if the peer serves it; returns `null` if the peer hasn't produced it yet, will not serve it to this node, or cannot be reached right now — offline, the request could not be sent, the connection closed while waiting, or no response in time (caller retries with backoff); throws if `key.from` is not in peers array.
+    - **Throws:** Only when `key.from` is not in `peers` (a configuration error; `BlobPuller` treats a throw as fatal for the ceremony). A stopping transport may also reject its pending pulls.
     - **Concurrency:** Safe to call concurrently; null returns are interpreted as "not yet ready" (BlobPuller retries).
 
   - `servePulls(handler: (from: PartyId, key: BlobKey) → Uint8Array | null) → Unsubscribe`

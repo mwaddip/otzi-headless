@@ -21,6 +21,9 @@
  *     switches over to the decrypt+dispatch path for all subsequent frames.
  *   - Processing is serialized per-connection (via an async chain) so
  *     concurrent arriving frames don't race the RecordSession counter.
+ *   - Sending is serialized per-connection too: each `send` seals and hands
+ *     its frame to `ws.send` only after the previous one did, so frames reach
+ *     the wire in counter order however long each seal takes.
  */
 
 import { EventEmitter } from 'node:events';
@@ -61,6 +64,8 @@ export class PeerConnection {
   private bufferedAppMessages: AppMessage[] = [];
   /** Serializes per-connection processing so concurrent arrivals don't race the record counter. */
   private processingChain: Promise<void> = Promise.resolve();
+  /** Serializes seal-then-send, so frames reach the wire in send-counter order. */
+  private sendChain: Promise<void> = Promise.resolve();
   private closed = false;
 
   private constructor(opts: PeerConnectionOptions) {
@@ -148,10 +153,30 @@ export class PeerConnection {
   async send(msg: AppMessage): Promise<void> {
     if (this.closed) throw new Error('PeerConnection: cannot send on closed connection');
     const plaintext = new TextEncoder().encode(JSON.stringify(msg));
-    const ct = await this.session.seal(plaintext);
-    await new Promise<void>((resolve, reject) => {
-      this.ws.send(ct, (err) => (err ? reject(err) : resolve()));
+    let written: Promise<void> | undefined;
+    // This frame's turn: seal (taking the next counter) and hand it to ws.send
+    // before the next frame may seal. The write itself completes outside the chain.
+    const turn = this.sendChain.then(async () => {
+      if (this.closed) throw new Error('PeerConnection: cannot send on closed connection');
+      const ct = await this.session.seal(plaintext);
+      if (this.closed) throw new Error('PeerConnection: connection closed while sending');
+      written = new Promise<void>((resolve, reject) => {
+        this.ws.send(ct, (err) => (err ? reject(err) : resolve()));
+      });
     });
+    this.sendChain = turn.catch(() => {});
+    try {
+      await turn;
+      await written;
+    } catch (err) {
+      // A sealed frame that never reached the peer leaves a gap in the counter
+      // sequence: every later frame would fail to open there. Start over.
+      if (!this.closed) {
+        this.handleTeardown();
+        this.ws.close();
+      }
+      throw err;
+    }
   }
 
   onMessage(handler: (msg: AppMessage) => void): Unsubscribe {

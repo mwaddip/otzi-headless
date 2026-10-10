@@ -104,7 +104,8 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 
 ### Transport encryption
 - **Noise-KK** over ECDH P-256. Four DH outputs (ss, es, se, ee) → HKDF-SHA-256 → 72-byte expand → 2× 32B keys + 2× 4B salts. Authentication is IMPLICIT in DH math; **NO transcript signatures**.
-- **`RecordSession`** AES-256-GCM with `salt(4B) ‖ counter(8B)` nonce. Counter is strictly monotonic per direction. Concurrent decrypt on a single session is undefined behavior — peer-mesh `connection.ts` serializes via `processingChain`.
+- **`RecordSession`** AES-256-GCM with `salt(4B) ‖ counter(8B)` nonce. Counter is strictly monotonic per direction, and the receiver opens strictly in counter order. Both transports serialise each session in both directions: seal-then-send in call order (frames of any size reach the wire in counter order) and open in arrival order (peer-mesh `processingChain`, relay per-peer queue).
+- **Transient means `null`.** `Transport.pull` returns `null` — never throws — when the producer is offline, the request cannot be sent, the connection closes while it waits, or it times out; it throws only for a producer outside the ring. A relay pair whose session breaks re-handshakes (initiator-driven).
 - **Don't use `once('message')`** as the sole handshake consumer; use `HandshakeQueue`-style persistent listener.
 - **Don't force-close (`closeAllConnections`)** the bootstrap master after completion; graceful `server.close()` lets in-flight responses flush.
 

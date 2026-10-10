@@ -125,7 +125,7 @@
   - **Pre:** Session is not closed. Plaintext can be any length. AAD (additional authenticated data) is optional.
   - **Post:** Increments send counter synchronously before async crypto call; constructs nonce = salt(4B) || counter_be64(8B); returns AES-256-GCM ciphertext + auth tag.
   - **Throws:** `Error` if send counter exhausted (>= 2^64).
-  - **Concurrency:** Safe to call in parallel; counter is incremented atomically before each crypto op.
+  - **Concurrency:** Concurrent calls get distinct nonces (the counter is taken synchronously), but their ciphertexts can complete out of call order. A transport that needs wire order must serialise seal-then-send per session: the receiver opens strictly in counter order.
 
 - `open(ciphertext: Uint8Array, aad?: Uint8Array): Promise<Uint8Array>`
   - **Pre:** Ciphertext is at least 16 bytes (tag). Nonce/counter expected in order (no replays).
@@ -163,8 +163,8 @@
 
 **Notes / gotchas:**
 - Per TLS 1.3 convention; nonce construction prevents direction-confusion attacks.
-- Concurrent `seal` calls are safe (counter bumped atomically before crypto); concurrent `open` is NOT (assumes ordered delivery).
-- Per-connection serialization (in peer-mesh connection.ts) enforces single-threaded recv to prevent counter race.
+- Concurrent `seal` calls never reuse a nonce, but they complete in any order; concurrent `open` is NOT safe (assumes ordered delivery).
+- Both transports serialise seal-then-send per session (peer-mesh `PeerConnection.send`, relay per-peer send chain) and open per session in arrival order (peer-mesh `processingChain`, relay per-peer queue).
 - If counter exhausted, session is unrecoverable; session layer must re-key before soft limit.
 
 ---
@@ -250,7 +250,7 @@
 **Purpose:** Single peer-to-peer WebSocket connection with Noise-KK handshake (cleartext ephemeral exchange), AES-GCM record layer, and persistent message queue during handshake.
 
 **Public surface:**
-- `PeerConnection` — Immutable endpoint for one peer pair; ready to send/receive encrypted AppMessages after construction. Internal serialization via `processingChain` prevents counter race.
+- `PeerConnection` — Immutable endpoint for one peer pair; ready to send/receive encrypted AppMessages after construction. A send chain serialises seal-then-send and `processingChain` serialises open, so both counters see frames in order.
 
 - `PeerConnection.dial(options): Promise<PeerConnection>`
   - **Pre:** `options.me` has identity and partyId. `options.peerPartyId` is target peer's partyId. `options.peerPublicKey` is 65-byte peer's static pubkey. `options.url` is WebSocket URL. `options.wsCtor` is WebSocket constructor (normally the `ws` library).
@@ -266,9 +266,9 @@
 
 - `send(msg: AppMessage): Promise<void>`
   - **Pre:** Connection is not closed. AppMessage is a valid broadcast, pull-req, or pull-resp.
-  - **Post:** JSON-encodes message, seals via RecordSession, sends ciphertext over WebSocket.
-  - **Throws:** `Error` if connection is closed or WebSocket send fails.
-  - **Concurrency:** Safe to call in parallel (RecordSession.seal is concurrent-safe for send side).
+  - **Post:** JSON-encodes message; on its turn in the connection's send chain, seals via RecordSession and hands the ciphertext to `ws.send`; resolves when the write completes.
+  - **Throws:** `Error` if connection is closed (before or while queued) or the seal or WebSocket write fails. A failure after the seal tears the connection down: its send counter is consumed, so the peer could not open any later frame.
+  - **Concurrency:** Safe to call in parallel: calls take their turn in call order, so frames reach the wire in counter order whatever their sizes (the receiver opens strictly in order and tears down on a mismatch).
 
 - `onMessage(handler: (msg: AppMessage) => void): Unsubscribe`
   - **Pre:** handler is a function.
@@ -291,6 +291,7 @@
 - `HandshakeQueue` attaches a persistent `ws.on('message')` listener *before* sending/awaiting hs1/hs2 to capture in-flight frames.
 - All frames arriving during handshake (before RecordSession creation) are buffered; replayed through the processing chain after construction.
 - Per-connection async processing chain (`processingChain` promise) serializes decryption to prevent `RecordSession.open` counter race.
+- Per-connection send chain serializes seal-then-`ws.send`; the handshake frames (hs1 / hs2) are written before the connection exists, so they precede every record.
 - Record auth failure closes the connection immediately (no attempt to recover).
 - `bufferedAppMessages` are flushed to the first `onMessage` subscriber (idempotent single flush).
 - `isClosed` flag prevents re-entrance and use-after-close.
@@ -303,7 +304,7 @@
 
 **Notes / gotchas:**
 - `HandshakeQueue` is critical: any frame arriving on the wire during async handshake awaits is captured, then replayed. Without it, early frames would be lost if they arrive before `onMessage` subscriber registers.
-- Per-connection serialization (via `processingChain`) is MANDATORY: concurrent decrypts would race the `RecordSession.recvCounter`.
+- Per-connection serialization (via `processingChain`) is MANDATORY: concurrent decrypts would race the `RecordSession.recvCounter`. Send-side serialization is MANDATORY too: a large frame's seal finishes after a small one started later, so unserialised frames would reach the wire out of counter order.
 - Handshake timeout is 10s; should be sufficient for local/LAN links.
 - Record auth failure does NOT try to retry; caller must close and reconnect.
 - `onClose` handlers are called exactly once; idempotent teardown.
@@ -389,8 +390,8 @@
 
 - `pull(key: BlobKey): Promise<Uint8Array | null>` (Transport interface)
   - **Pre:** key.from is in the peer list.
-  - **Post:** If peer is offline, returns null immediately ("not yet available"). Otherwise, sends pull-req with unique requestId, waits up to `pullTimeoutMs` (default 30s) for pull-resp. Returns blob or null on timeout.
-  - **Throws:** `Error` if key.from is not in peer list (config error).
+  - **Post:** If peer is offline, returns null immediately ("not yet available"). Otherwise, sends pull-req with unique requestId, waits up to `pullTimeoutMs` (default 30s) for pull-resp. Returns blob, or null when the request cannot be sent, the connection it was sent on closes, or the timeout passes — all transient.
+  - **Throws:** `Error` if key.from is not in peer list (config error). Pending pulls reject when the transport stops.
 
 - `servePulls(handler: (from: PartyId, key: BlobKey) => Uint8Array | null): Unsubscribe`
   - **Pre:** handler not already registered.
@@ -402,7 +403,7 @@
 - Initiator side redials on disconnect with exponential backoff: 1s, 2s, 4s, 8s, capped at 10s.
 - Responder side waits passively for peer to reconnect; no active redial.
 - Broadcast fans out to all connected peers; each peer session encrypts independently.
-- Pull timeout is per-request; transient timeout returns null (not throw); BlobPuller's retry handles retries.
+- Pull timeout is per-request; transient timeout returns null (not throw); BlobPuller's retry handles retries. A failed request send, or the close of the connection a request went out on, also resolves the pull with null at once.
 - Offline peers are silently skipped (broadcast) or return null (pull); no error.
 - All peer connections are closed gracefully on stop(); pending pulls are rejected.
 - `partyId` is immutable; peers list is derived from options and cannot change post-construction.
@@ -448,7 +449,7 @@
 
 **Invariants:**
 - `hello` message: ringId (string), partyId (non-negative integer).
-- `frame` message: to (non-negative integer), payloadHex (hex string, opaque).
+- `frame` message: to (non-negative integer), payloadHex (hex string, opaque; may be empty — relay-transport's re-handshake request).
 - `ack` response: roster (array of partyIds, excluding sender).
 - `peer-joined` / `peer-left` events: partyId.
 - `incoming` message: from (partyId), payloadHex (opaque).
@@ -551,8 +552,8 @@
 
 - `pull(key: BlobKey): Promise<Uint8Array | null>`
   - **Pre:** key.from is in peer list.
-  - **Post:** If peer is not connected, returns null. Otherwise sends pull-req, waits up to `pullTimeoutMs` (default 30s), returns blob or null on timeout.
-  - **Throws:** `Error` if key.from is not in peer list.
+  - **Post:** If peer is not connected, returns null (an initiator first starts a fresh handshake to an online peer that is disconnected, or whose handshake is older than 10 s). Otherwise sends pull-req, waits up to `pullTimeoutMs` (default 30s), returns blob, or null when the request cannot be sent, the peer's session ends (record failure, re-handshake, `peer-left`, relay close) or the timeout passes — all transient.
+  - **Throws:** `Error` if key.from is not in peer list. Pending pulls reject when the transport stops.
 
 - `servePulls(handler: (from: PartyId, key: BlobKey) => Uint8Array | null): Unsubscribe`
   - **Pre:** handler not already registered.
@@ -563,21 +564,27 @@
 - Role: lower partyId is initiator (sends hs1 when peer appears), higher is responder (waits for hs1).
 - Peer status: disconnected → waiting-for-hs1 (responder) or waiting-for-hs2 (initiator after hs1) → connected.
 - Per-peer `processing` flag + `pending` FIFO queue serialize handshake and message dispatch (prevent counter race).
-- Handshake: initiator sends message1 (raw ephemeral, not encrypted), responder replies with message2 (also raw), then both derive AES-GCM session.
-- Peer roster discovered via relay's ack + peer-joined/peer-left events. Initiators trigger handshake on roster update.
+- Per-peer send chain serializes every frame to that peer — hs1, hs2 and seal-then-send of records — so frames reach the relay in counter order. A responder enqueues hs2 in the same synchronous step that makes the session usable, so no record overtakes it. A record queued under a session that has since been replaced is dropped, not sent.
+- Handshake: initiator sends message1 (raw 65-byte ephemeral, not encrypted), responder replies with message2 (also raw), then both derive AES-GCM session.
+- Peer roster discovered via relay's ack + peer-joined/peer-left events. Initiators trigger handshake on roster update (a join restarts any handshake in flight).
 - Relay reconnect is NOT implemented; operator restart on relay drop.
 - Broadcast is fan-out with independent encryption per peer.
 - Pull timeout returning null is transient; BlobPuller's retry handles retries.
-- Record auth failure disconnects the peer (status = disconnected); peer can re-handshake on next relay frame.
+- **Re-handshake.** A peer whose session breaks is re-keyed by a fresh handshake, always started by the initiator:
+  - An initiator whose record open fails (or whose seal-then-send fails) drops the session and sends a new hs1 at once; it also starts one on the next send or pull to an online peer that is disconnected or whose handshake is older than 10 s, and on a re-handshake request.
+  - A responder accepts a 65-byte handshake frame from the peer in any state: when a frame fails to open under the current session and has the handshake shape, it is a fresh hs1 and the responder answers it with hs2 and a new session. A responder whose record open fails on any other frame, or that receives a record while it has no session, drops it and sends a **re-handshake request** — a frame with an empty payload — to the initiator.
+  - While waiting for hs2, an initiator drops frames that do not have the handshake shape (records the peer sent under the old session).
+  - Every session end (record failure, re-handshake, `peer-left`, relay close) resolves the peer's pending pulls with null.
 
 **Cross-component contracts:**
 - Depends on: WebSocket, handshake (Noise-KK), RecordSession, relay wire format.
 - Used by: ceremony daemon as relay-based transport layer.
-- Wire/byte format: Single WebSocket to relay; per-peer handshake frames (cleartext ephemeral), then AES-GCM encrypted app messages routed via relay frames.
+- Wire/byte format: Single WebSocket to relay; per-peer handshake frames (cleartext 65-byte ephemeral), AES-GCM encrypted app messages, and empty re-handshake requests (responder → initiator), all routed via relay frames.
 
 **Notes / gotchas:**
 - Role is symmetric (lower dials, higher listens) but implemented via relay routing. Initiator sends hs1 as frame(to=partyId, payload=hs1); responder receives incoming(from=partyId, payload=hs1).
 - Per-peer `processing` flag is CRITICAL: without it, concurrent incoming frames could race the handshake state machine.
+- The re-handshake request is unauthenticated (it carries nothing); whoever can inject relay frames can force re-handshakes, which is no more than the relay can do by dropping frames.
 - Broadcast and pull are independent per-peer; one peer's failure doesn't affect others.
 
 **Reconnect behavior (operator-facing):** No automatic reconnect. If the relay WebSocket drops mid-session, `handleRelayClose()` sets all peers to disconnected and clears sessions; subsequent broadcasts silently no-op (offline peers are skipped) and pulls return null. The daemon does NOT re-dial. Operators recover via `systemctl restart otzi`. Acceptable for short-lived federations; production federations that need stability should use peer-mesh transport, which has initiator-side exponential-backoff reconnect built in.
