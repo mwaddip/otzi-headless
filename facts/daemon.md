@@ -127,28 +127,48 @@
 
 **Public surface:**
 - `class RequestError extends Error { constructor(readonly status: 400 | 409, message: string) }`
+- `const NO_VAULT_MESSAGE = 'no vault loaded — run otzi generate, then restart the daemon'` — the 409 text for every op that needs a loaded vault (`vault-info`, `sign`).
 - `interface LeaderSignRequest { ceremonyId: string; signers: PartyId[]; proposal: SendProposal }`
 
 - `defaultCeremonyId(op: 'dkg' | 'sign'): string`
   - **Post:** `` `${op}-${crypto.randomUUID()}` `` (matches `CEREMONY_ID_RE`).
 
+- `parseVaultInfoRequest(body: Record<string, unknown>): void`
+  - **Post:** Allowed key: `op`.
+  - **Throws:** `RequestError(400, "unknown field '<key>'")` on any other key.
+
 - `parseDkgRequest(body: Record<string, unknown>): { ceremonyId: string }`
   - **Pre:** `body` is the JSON request object (`op === 'dkg'`).
   - **Post:** Allowed keys: `op`, `ceremonyId`. `ceremonyId` must satisfy `isCeremonyId` when present; `defaultCeremonyId('dkg')` when absent.
-  - **Throws:** `RequestError(400, …)` on any other key or an invalid `ceremonyId`.
+  - **Throws:** `RequestError(400, …)` on any other key or an invalid `ceremonyId` (texts below).
 
 - `parseSignRequest(body: Record<string, unknown>, ring: { partyIds: readonly PartyId[]; self: PartyId; minSigners: number }): LeaderSignRequest`
   - **Pre:** `body` is the JSON request object (`op === 'sign'`); `ring.partyIds` = every ring member; `ring.minSigners` = the loaded share's threshold.
   - **Post:** Allowed keys: `op`, `ceremonyId`, `signers`, `proposal`.
     - `ceremonyId`: `isCeremonyId` when present; `defaultCeremonyId('sign')` when absent.
-    - `signers`: defaults to all of `ring.partyIds` (ascending); otherwise an array of integers, unique, each in `ring.partyIds`, containing `ring.self`, with at least `ring.minSigners` entries.
-    - `proposal`: an object with string `tx` and array `prevouts`; hex fields (`tx`, `prevouts[].txid`, `prevouts[].script`) are lowercased, then the result must pass `isProposalShape` (1–255 prevouts).
+    - `signers`: defaults to all of `ring.partyIds` (ascending); otherwise an array of safe integers, unique, each in `ring.partyIds`, containing `ring.self`, with at least `ring.minSigners` entries.
+    - `proposal`: an object with string `tx` and array `prevouts` of at most `MAX_INPUTS` (255) entries; hex fields (`tx`, `prevouts[].txid`, `prevouts[].script`) that are strings are lowercased into a new object (the request body is not mutated), then the result must pass `isProposalShape` (1–255 prevouts).
   - **Throws:** `RequestError(400, <reason>)` on any violation.
   - **Notes:** Shape and ring rules only; `analyzeProposal` runs in `LeaderDispatcher.sign`.
 
+- **Error texts** (`RequestError(400, …)`, exact; checked in this order: keys, `ceremonyId`, `signers`, `proposal`):
+
+  | Rule | Text |
+  |---|---|
+  | key other than the allowed ones | `unknown field '<key>'` |
+  | `ceremonyId` fails `isCeremonyId` | `ceremonyId must match ^[A-Za-z0-9._:-]{1,128}$` |
+  | `signers` not an array of safe integers | `signers must be an array of party ids` |
+  | duplicate signer | `signers must be unique` |
+  | signer not in `ring.partyIds` | `signer <id> is not in the ring` |
+  | `ring.self` missing | `signers must include this node (party <self>)` |
+  | fewer than `ring.minSigners` | `signers needs at least <minSigners> entries, got <n>` |
+  | `proposal` not an object with string `tx` and array `prevouts` | `proposal must be an object with string tx and array prevouts` |
+  | more than 255 prevouts | `proposal has <k> inputs; at most 255 fit in one transaction` |
+  | `isProposalShape` fails | `proposal does not have the expected shape { network, tx, prevouts: [{ txid, vout, amount, script }] }` |
+
 **Cross-component contracts:**
 - Depends on: `isCeremonyId`, `isProposalShape`, `MAX_INPUTS` (`src/core/messages.ts`).
-- Used by: `buildDefaultHttpHandler`.
+- Used by: `buildDefaultHttpHandler`, `LeaderDispatcher` (`RequestError`, `NO_VAULT_MESSAGE`).
 
 ---
 
@@ -157,47 +177,61 @@
 
 **Public surface:**
 - `class GateRejection extends Error { constructor(readonly ceremonyId: string, readonly decision: Decision) }`
-  - **Post:** Thrown when the leader's own gate does not approve; the handler maps it to 403. Nothing was announced.
+  - **Post:** Thrown when the leader's own gate does not approve (`reject`, `pending`, or a gate that throws, which counts as `reject` and is logged at warn); the handler maps it to 403. Nothing was announced.
+
+- `interface LocalCeremonySlots`
+  ```ts
+  beginLocalDkg(ceremonyId: string): { signal: AbortSignal; end(): void } | null;
+  beginLocalSigning(ceremonyId: string): { end(): void } | null;
+  ```
+  - **Post:** This node's DKG slot and its led-signing id reservations (see [orchestrator.md](orchestrator.md), `beginLocalDkg` / `beginLocalSigning`). Implemented by `Orchestrator`; the daemon passes its one orchestrator.
 
 - `interface LeaderDeps`
   ```ts
   io: CeremonyIo; gate: ApprovalGate; node: { id: string; partyId: PartyId };
   peersById: ReadonlyMap<PartyId, string>; network: NetworkName; vault?: DecryptedShare;
   vaultExists: () => Promise<boolean>; createStager: () => ShareStager; rng: Rng;
+  ceremonyDeadlines: { signingMs: number; dkgMs: number };   // config.deadlines
+  slots: LocalCeremonySlots;
   blobRetentionMs?: { signing: number; dkg: number };   // default BLOB_RETENTION_MS
   addressBook?: () => Promise<AddressBookEntry[]>; logger?: Logger;
   ```
-  - **Pre:** Same meaning as the matching `OrchestratorDeps` fields; the daemon passes the same values to both.
+  - **Pre:** Same meaning as the matching `OrchestratorDeps` fields; the daemon passes the same values to both, and `slots` is the same orchestrator.
+
+- **Leader pulls:** each ceremony the leader runs uses `{ ...io, pullOpts: { ...io.pullOpts, deadlineMs, maxAttempts: Number.MAX_SAFE_INTEGER } }` with `deadlineMs` = `ceremonyDeadlines.signingMs` or `ceremonyDeadlines.dkgMs` — pulls retry with backoff until the ceremony deadline, as on participants; `io.pullOpts` supplies only the backoff (`initialDelayMs`, `maxDelayMs`).
 
 - `class LeaderDispatcher`
   - **`constructor(deps: LeaderDeps)`**
 
   - **`runDkg(req: { ceremonyId: string }): Promise<{ ceremonyId: string; address: string; internalKey: string; network: NetworkName }>`**
-    1. `deps.vault` set or `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`.
-    2. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })`; non-approve (or a gate error) → `GateRejection`.
-    3. Random 32-byte session ID; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, createStager())`.
-    4. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
-    - **Throws:** `RequestError`, `GateRejection`, or the `runDkgCeremony` error (which already broadcast `signoff-aborted`).
-    - **Post:** Success and failure both `scheduleClear` the ceremony with the DKG retention. The new vault is on disk but not loaded; signing on it needs a daemon restart.
+    1. `deps.vault` set → `RequestError(409, 'this node already holds a vault')`.
+    2. `slots.beginLocalDkg(ceremonyId)`; `null` → `RequestError(409, 'a DKG is already running on this node')`. From here on, `end()` runs in a `finally`.
+    3. `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`. Checked while the slot is held, so a DKG this node joined and committed meanwhile is seen.
+    4. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })` (`peerIds` = every `peersById` label in party order); non-approve → `GateRejection`.
+    5. `createStager()`; random 32-byte session ID from `rng`; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, stager, slot.signal)`.
+    6. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
+    - **Throws:** `RequestError`, `GateRejection`, or the `runDkgCeremony` error (which already broadcast `signoff-aborted`, unless the slot's signal aborted it).
+    - **Post:** From the announce on, success and failure both `scheduleClear` the ceremony with the DKG retention. The new vault is on disk but not loaded; signing on it needs a daemon restart.
 
-  - **`sign(req: LeaderSignRequest): Promise<{ ceremonyId: string; txid: string; signedTxHex: string; signaturesHex: string[] }>`**
-    1. No vault → `RequestError(409, 'no vault loaded — run otzi generate, then restart the daemon')`.
+  - **`sign(req: LeaderSignRequest): Promise<{ ceremonyId: string; txid: string; signedTxHex: string; signaturesHex: string[] }>`** — in this order:
+    1. No vault → `RequestError(409, NO_VAULT_MESSAGE)`.
     2. `analysis = analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), network)`; a throw → `RequestError(400, <message>)`.
-    3. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)` (labels from `addressBook` when present); non-approve (or a gate error) → `GateRejection`.
-    4. `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal)` — this broadcasts `announce-sign`.
-    5. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` → signed hex and txid.
-    6. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`.
-    - **Failure after the announce:** broadcast `signoff-aborted {ceremonyId, reason}` and rethrow (handler → 500).
-    - **Post:** Settle and failure both `scheduleClear` the ceremony with the signing retention.
+    3. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)` (labels from `addressBook` when present; a rejected `addressBook()` means no labels and one warn line); non-approve → `GateRejection`.
+    4. `slots.beginLocalSigning(ceremonyId)`; `null` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. From here on, `end()` and `scheduleClear` (signing retention) run in a `finally`.
+    5. `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal)` — this broadcasts `announce-sign`.
+    6. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` (`src/otzi/backend/bitcoin.ts`) → signed hex and txid.
+    7. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`. A failed `signoff-done` broadcast is logged at warn and the signed transaction is still returned (participants settle `timeout` at their deadline).
+    - **Failure in steps 5–6:** broadcast `signoff-aborted {ceremonyId, reason}` (`reason` = the error message, at most 1024 characters; the broadcast is best-effort) and rethrow (handler → 500).
 
 **Invariants:**
-- Nothing is announced unless the leader's own analysis and gate passed (400 / 403 leave peers untouched).
+- Nothing is announced unless the leader's own analysis and gate passed (400 / 403 leave peers untouched) and this node holds the ceremony's slot (409 otherwise).
 - The leader never broadcasts the transaction; it returns it.
 - The leader's own gate is evaluated once per request.
 - Signoffs come only from the leader for signing; DKG aborts come from whichever node fails.
+- The slot is released (`end()`) on every exit path once taken.
 
 **Cross-component contracts:**
-- Depends on: `runDkgCeremony`, `leadSigning`, `encodeMessage`, `analyzeProposal` / `toVaultKey` / `vaultPayment` / `labelFor` (`src/otzi/lib`), `finalizeSend` (`src/otzi/backend/bitcoin.ts`), `spec-builder.ts`, `scheduleClear`.
+- Depends on: `runDkgCeremony`, `leadSigning`, `encodeMessage`, `analyzeProposal` / `toVaultKey` / `vaultPayment` / `labelFor` (`src/otzi/lib`), `finalizeSend` (`src/otzi/backend/bitcoin.ts`), `spec-builder.ts`, `scheduleClear`, `LocalCeremonySlots` (`Orchestrator`), `api.ts` (`RequestError`, `NO_VAULT_MESSAGE`).
 - Used by: `Daemon` (one instance; the handler dispatches to it).
 
 ---
@@ -213,12 +247,12 @@
   httpHandler?: HttpHandler; cronHandlers?: ReadonlyMap<string, CronHandler>;
   env?: Readonly<Record<string, string | undefined>>; vaultPubkeyPath?: string;
   ```
-  - **Pre:** `selfPartyId` and `peersById` come from `TransportBundle` (book lookup by pubkey); `transport.partyId === selfPartyId`.
+  - **Pre:** `selfPartyId` and `peersById` come from `TransportBundle` (book lookup by pubkey); `transport.partyId === selfPartyId`. `vaultPubkeyPath` is where a DKG commit writes `vault-pubkey.json` (default `DEFAULT_VAULT_PUBKEY_PATH`); pass the same path given to `loadAndValidate`.
 
 - `class Daemon`
   - **`constructor(deps: DaemonDeps)`**
-    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo`; the gate via `createGate(config.gate, { loadAddressBook })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists = () => vaultFileExists(config.share.path)`, `createStager = () => createShareStager({ path, password, network, partyId: selfPartyId, vaultPubkeyPath })`, `rng`, and `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)`; trigger sources from `config.triggers`. `loadAddressBook` reads the same file and returns its addresses, but throws when the file does not exist (ENOENT) as well as when it is invalid — unlike `readAddressBook`, which returns `[]` on ENOENT — so `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
-    - **Invariant:** Does NOT start anything.
+    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)`; the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file and returns its addresses, but throws when the file does not exist (ENOENT) as well as when it is invalid — unlike `readAddressBook`, which returns `[]` on ENOENT — so `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
+    - **Invariant:** Does NOT start anything. The share password reaches only the share stager; it is never logged or returned.
   - **`async start(): Promise<void>`** — starts the orchestrator and every trigger. Reentrant.
   - **`async stop(): Promise<void>`** — stops triggers, the orchestrator, and closes the blob server. Reentrant.
   - **`onCompleted(handler): Unsubscribe`** — forwards orchestrator outcomes.
@@ -235,20 +269,26 @@
 
     | Op | Request | 200 response |
     |---|---|---|
-    | `vault-info` | `{ op }` | `{ partyIds, threshold, parties, network, address, internalKey, outputKey }` — `partyIds` ascending from `peersById`; key fields as in `vault-pubkey.json`. 409 when no vault is loaded. |
-    | `dkg` | `{ op, ceremonyId? }` | `{ ceremonyId, status: 'done', address, internalKey, network }`. `parties` = ring size, `threshold` = `parties`. 409 when this node already holds a vault. |
-    | `sign` | `{ op, ceremonyId?, signers?, proposal }` | `{ ceremonyId, status: 'done', txid, signedTxHex, signaturesHex }`. 409 when no vault is loaded. |
+    | `vault-info` | `{ op }` | `{ partyIds, threshold, parties, network, address, internalKey, outputKey }` — `partyIds` ascending from `peersById`; `threshold` / `parties` from the share; key fields as in `vault-pubkey.json` (`vaultPubkeyFromPackage`). 409 `NO_VAULT_MESSAGE` when no vault is loaded. |
+    | `dkg` | `{ op, ceremonyId? }` | `{ ceremonyId, status: 'done', address, internalKey, network }`. `parties` = ring size, `threshold` = `parties`. 409 when this node already holds a vault or a DKG is running. |
+    | `sign` | `{ op, ceremonyId?, signers?, proposal }` | `{ ceremonyId, status: 'done', txid, signedTxHex, signaturesHex }`. 409 `NO_VAULT_MESSAGE` when no vault is loaded (checked before the body is parsed); 409 when the `ceremonyId` is in use on this node. |
 
-  - `dkg` runs `parseDkgRequest` then `leader.runDkg`; `sign` runs `parseSignRequest(body, { partyIds, self: selfPartyId, minSigners: share.threshold })` then `leader.sign`.
-  - **Status codes:** 400 for a malformed body, an unknown op, an unknown top-level field, bad input, or a proposal rejected by analysis (message from `analyzeProposal`); `RequestError` → its status with `{ error }`; `GateRejection` → 403 `{ error: 'gate rejected', decision, ceremonyId }`; anything else → 500 `{ error, ceremonyId }`.
+  - `vault-info` runs `parseVaultInfoRequest`; `dkg` runs `parseDkgRequest` then `leader.runDkg`; `sign` runs `parseSignRequest(body, { partyIds, self: selfPartyId, minSigners: share.threshold })` then `leader.sign`.
+  - **Status codes:**
+    - 405 `{ error: 'method not allowed' }` for anything but POST;
+    - 400 `{ error }` for a body that is not a JSON object (`body must be a JSON object`), a missing op (`missing 'op' field`), an unknown op (`unknown op '<op>'`), an unknown top-level field, bad input, or a proposal rejected by analysis (message from `analyzeProposal`);
+    - `RequestError` → its status with `{ error }`;
+    - `GateRejection` → 403 `{ error: 'gate rejected', decision, ceremonyId }`;
+    - anything else → 500 `{ error, ceremonyId }`, logged at error level.
 
 **Invariants:**
 - One gate, one orchestrator, one leader dispatcher, one blob server per daemon.
 - The daemon makes no chain requests; Esplora and broadcast are used only by CLI verbs.
 - The HTTP trigger is loopback-only (enforced by the config parser); the UDS socket is the default operator API.
+- A vault created by a DKG is loaded only by a restart: until then `vault-info` and `sign` answer 409 `NO_VAULT_MESSAGE` and `dkg` answers 409.
 
 **Cross-component contracts:**
-- Depends on: all of `src/core`, `src/gate`, `src/orchestrator`, `src/triggers`, `src/address-book/store.ts`, `vault-share.ts`, `api.ts`, `leader.ts`.
+- Depends on: all of `src/core`, `src/gate`, `src/orchestrator`, `src/triggers`, `src/address-book/store.ts`, `vault-share.ts`, `vault-pubkey.ts`, `api.ts`, `leader.ts`.
 - Used by: `entrypoint.ts` (after state and transport are ready).
 
 ---
@@ -330,7 +370,7 @@
 - `BroadcastFailedError` → the signed transaction hex is printed to stderr (so the operator can broadcast it by other means) and the process exits 1. Any other error → message on stderr, exit 1.
 
 - **`runDaemonCommand`**
-  - **Post:** `loadAndValidate(configPath, { logger })` → `buildTransportFromFiles` → `Daemon` → `start`; SIGINT/SIGTERM stop the daemon and the transport, then exit 0. The startup line names the mode: signing (vault loaded) or setup (no vault). In setup mode it states that signing is refused until `otzi generate` completes and the daemon restarts. The stale-`.pending` warning and the `vault-pubkey.json` rewrite come from `loadAndValidate` (through the logger passed in); `runDaemonCommand` does not warn a second time.
+  - **Post:** `loadAndValidate(configPath, { logger })` → `buildTransportFromFiles` → `Daemon` → `start`; SIGINT/SIGTERM stop the daemon and the transport, then exit 0. The startup line names the mode: signing (vault loaded) or setup (no vault). In setup mode it states that signing requests are rejected until the DKG runs (`otzi generate`) and every daemon restarts to load its share. The ceremony pull backoff comes from `pullOpts` (`initialDelayMs` 100, `maxDelayMs` 2 000); orchestrator and leader replace its `deadlineMs` and `maxAttempts` with the ceremony deadlines. The stale-`.pending` warning and the `vault-pubkey.json` rewrite come from `loadAndValidate` (through the logger passed in); `runDaemonCommand` does not warn a second time.
 
 **Invariants:**
 - The daemon is the only long-lived verb; every other verb talks to it over the daemon client (UDS by default) or works on local files.

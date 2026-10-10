@@ -107,7 +107,7 @@
   - **`beginLocalSigning(ceremonyId: string): { end(): void } | null`**
     - **Post:** Returns `null` when `ceremonyId` is taken (see *Ids this node leads*). Otherwise reserves `ceremonyId` as a signing ceremony this node leads and returns its slot; `end()` releases it and is idempotent (it never releases a later reservation of the same id). Any number of local signing ceremonies with distinct ids can be live.
     - **Throws:** Never.
-    - **Used by:** `LeaderDispatcher.sign` (refuses the request on `null`; calls `end()` in `finally`).
+    - **Used by:** `LeaderDispatcher.sign` (409 `ceremony id <id> is already in use on this node` on `null`; calls `end()` in `finally`).
 
 **At most one live DKG per node.** Two concurrent DKGs would share one `.pending` path and could commit a share that never passed the all-N confirmation. A DKG is live while a local DKG slot is held, while a DKG tracker exists, and while a joined DKG's `runDkgCeremony` has not settled — its `stage`, `commit` or `discard` can outlast the tracker (an abort or deadline settles the tracker at once), so the slot is held until the ceremony promise settles, also after `stop()`. `beginLocalDkg` returns `null` and `announce-dkg` is dropped while a DKG is live.
 
@@ -165,7 +165,7 @@ Every announce first passes the duplicate checks: no tracker exists for the `cer
 
 **Cross-component contracts:**
 - Depends on: `Transport.onBroadcast`, `parseMessage`, `runDkgCeremony`, `participateInSigning`, `analyzeProposal` / `toVaultKey` / `vaultPayment` / `labelFor` (`src/otzi/lib`), frots `verifySignature`, `ApprovalGate.approve`, `scheduleClear`.
-- Used by: `Daemon` (instantiated once; `onCompleted` wired for logging), `LeaderDispatcher` (`beginLocalDkg`, `beginLocalSigning`).
+- Used by: `Daemon` (instantiated once; `onCompleted` forwarded by `Daemon.onCompleted`; passed to the leader as its `LocalCeremonySlots`), `LeaderDispatcher` (`beginLocalDkg`, `beginLocalSigning`).
 
 **Notes / gotchas:**
 - A node that completes a DKG keeps running without the new vault loaded; signing on it starts after a daemon restart. Its `vaultExists()` is true from the commit on, so a second DKG is refused.

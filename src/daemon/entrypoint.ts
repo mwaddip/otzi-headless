@@ -12,9 +12,9 @@
  *
  * The `daemon` subcommand loads config + share + identity + pubkey book and
  * starts the transport + Daemon. SIGINT/SIGTERM trigger graceful shutdown.
- * If the configured share file is missing, the daemon comes up in DKG-only
- * mode (signing rejected; DKG works) — operator runs `otzi generate` against
- * it from another shell, then restarts to load the persisted share.
+ * If the configured share file is missing, the daemon comes up in setup
+ * mode (signing rejected; DKG works) — the operator runs `otzi generate` on
+ * one node, then restarts every daemon to load its new share.
  *
  * Operator-facing commands (vault/btc/...) talk to the local daemon
  * over a Unix domain socket (typically /var/run/otzi/otzi.sock). The default
@@ -87,17 +87,16 @@ async function runDaemonCommand(args: string[]): Promise<void> {
 
   // The daemon path is the only entrypoint that needs a real Logger — all other
   // verbs are short-lived CLI commands talking to the daemon over UDS. Ship the
-  // logger to both the transport (for peer-mesh allowlist warns picked up by
-  // fail2ban via journald) and to the Daemon (for orchestrator/leader/triggers
-  // info+error context). stderr only — stdout is reserved for CLI machine output.
-  // CLI subcommands (vault/btc/...) deliberately keep `NOOP_LOGGER`
-  // and MUST stay that way: their stdout is consumed by shell scripts piping tx
-  // IDs, vault metadata, balances into `xargs`/`opnet broadcast`/etc., so any
-  // log line on stdout would corrupt the downstream parser. Wire log output to
-  // stderr if a future CLI verb genuinely needs it; never to stdout.
+  // logger to config loading (stale `.pending` share warning, vault-pubkey.json
+  // rewrite failures), the transport (peer-mesh allowlist warns picked up by
+  // fail2ban via journald) and the Daemon (orchestrator/leader/triggers).
+  // stderr only — stdout is reserved for CLI machine output. CLI subcommands
+  // (vault/btc/...) deliberately keep `NOOP_LOGGER` and MUST stay that way:
+  // their stdout is consumed by shell scripts, so any log line on stdout would
+  // corrupt the downstream parser.
   const logger = createConsoleLogger();
 
-  const state = await loadAndValidate(configPath);
+  const state = await loadAndValidate(configPath, { logger });
   const bundle = await buildTransportFromFiles(state, { logger });
   await bundle.start();
 
@@ -111,6 +110,8 @@ async function runDaemonCommand(args: string[]): Promise<void> {
         crypto.getRandomValues(dest);
       },
     },
+    // Backoff only: orchestrator and leader pull until the ceremony deadline
+    // (`[deadlines]`), replacing `deadlineMs` and `maxAttempts`.
     pullOpts: {
       maxAttempts: 200,
       initialDelayMs: 100,
@@ -134,16 +135,16 @@ async function runDaemonCommand(args: string[]): Promise<void> {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-  const mode = state.share ? 'signing+DKG' : 'DKG-only (no share file present)';
+  const mode = state.share ? 'signing (vault loaded)' : 'setup (no vault)';
   console.error(
-    `otzi daemon started — nodeId=${state.config.node.id} partyId=${bundle.selfPartyId} ringId=${bundle.ringId.slice(0, 16)}... mode=${mode}`,
+    `otzi daemon started — nodeId=${state.config.node.id} partyId=${bundle.selfPartyId} ringId=${bundle.ringId.slice(0, 16)}... network=${state.config.network.name} mode=${mode}`,
   );
   if (!state.share) {
     console.error(
-      `otzi daemon: signing requests will be rejected until DKG runs. From another shell on the leader node:`,
+      'otzi daemon: no vault loaded — signing requests are rejected until the DKG runs and every daemon restarts.',
     );
-    console.error(`  otzi generate ${state.config.share.path === '/dev/null' ? '<config.toml>' : '<your config.toml>'}`);
-    console.error('Then SIGINT this daemon and restart to load the persisted share.');
+    console.error('  1. With every daemon in the ring running, on one node: otzi generate');
+    console.error(`  2. Restart every daemon so it loads its new share from ${state.config.share.path}.`);
   }
 }
 

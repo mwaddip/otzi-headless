@@ -200,6 +200,8 @@ describe('RelayTransport — 3-peer mesh via relay', () => {
     await server.start();
 
     nodes = await buildRelayRing(3, `ws://127.0.0.1:${port}`, 'ring-tri');
+    // `peers` is the whole ring, self included.
+    for (const n of nodes) expect(n.transport.peers).toEqual([0, 1, 2]);
     await Promise.all(nodes.map((n) => n.transport.start()));
     await waitForRing(nodes);
 

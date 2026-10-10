@@ -90,8 +90,9 @@ describe('PeerMeshTransport — 2-peer basics', () => {
     nodes = await buildRing(2);
     await Promise.all(nodes.map((n) => n.transport.start()));
     await waitForRing(nodes);
-    expect(nodes[0]!.transport.peers).toEqual([1]);
-    expect(nodes[1]!.transport.peers).toEqual([0]);
+    // `peers` is the whole ring, self included.
+    expect(nodes[0]!.transport.peers).toEqual([0, 1]);
+    expect(nodes[1]!.transport.peers).toEqual([0, 1]);
   }, 15_000);
 
   it('broadcast from peer 0 reaches peer 1', async () => {
@@ -172,7 +173,7 @@ describe('PeerMeshTransport — 3-peer mesh', () => {
     await Promise.all(nodes.map((n) => n.transport.start()));
     await waitForRing(nodes);
 
-    for (const n of nodes) expect(n.transport.peers).toHaveLength(2);
+    for (const n of nodes) expect(n.transport.peers).toEqual([0, 1, 2]);
   }, 20_000);
 
   it('broadcast from peer 1 reaches both peer 0 and peer 2', async () => {

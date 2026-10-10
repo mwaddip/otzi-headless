@@ -1,6 +1,5 @@
-import { ThresholdMLDSA } from '@btc-vision/post-quantum/threshold-ml-dsa.js';
-import { type Rng } from '@mwaddip/frots';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import type { Rng } from '@mwaddip/frots';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,24 +7,21 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { buildBook, type PubkeyBook } from '../bootstrap/pubkey-book';
 import type { PullOpts } from '../core/blob-puller';
 import type { PartyId } from '../core/types';
-import type { DkgPersistenceSink } from '../orchestrator/types';
-import { RelayServer } from '../transport/relay/server';
+import type { CeremonyOutcome, Logger } from '../orchestrator/types';
+import { finalizeSend } from '../otzi/backend/bitcoin';
+import { vaultPayment } from '../otzi/lib/bitcoin';
+import { toVaultKey } from '../otzi/lib/dkg';
+import { toHex } from '../otzi/lib/hex';
+import type { NetworkName } from '../otzi/lib/vault-types';
+import { makeProposal } from '../testing/proposal';
 import { generateIdentity, type IdentityKeyPair } from '../transport/identity';
-import { getKL } from '../wire/dkg';
-import { toHex } from '../wire/hex';
-import {
-  decryptShareFile,
-  type DecryptedShare,
-  type ShareFile,
-} from '../wire/share-crypto';
-import type { DaemonConfig } from '../config/types';
-import { buildStateFromShare, validateLoaded, type LoadedDaemonState } from './config-merge';
+import { loadAndValidate } from './config-merge';
 import { Daemon } from './daemon';
-import { persistCombinedDkgShare } from './share-persistence';
-import {
-  buildTransportFromMemory,
-  type TransportBundle,
-} from './transport-factory';
+import { buildTransportFromMemory, type TransportBundle } from './transport-factory';
+
+const NET: NetworkName = 'testnet4';
+const PASSWORD = 'integration-test-share-password';
+const ENV = { OTZI_SHARE_PASSWORD: PASSWORD };
 
 const SYSTEM_RNG: Rng = {
   fillBytes(dest) {
@@ -33,37 +29,18 @@ const SYSTEM_RNG: Rng = {
   },
 };
 
-/**
- * Per-peer logger — defaults to no-op. Set `OTZI_TEST_LOG=1` in the env to
- * enable stderr printing while debugging transport issues locally.
- */
-function makeLogger(prefix: string) {
-  if (process.env.OTZI_TEST_LOG !== '1') {
-    return {
-      debug: () => {},
-      info: () => {},
-      warn: () => {},
-      error: () => {},
-    };
-  }
-  const log = (level: string, msg: string, extra?: Record<string, unknown>) => {
-    const extraStr = extra ? ' ' + JSON.stringify(extra) : '';
-    process.stderr.write(`[${prefix}] ${level} ${msg}${extraStr}\n`);
-  };
-  return {
-    debug: (msg: string, extra?: Record<string, unknown>) => log('DEBUG', msg, extra),
-    info: (msg: string, extra?: Record<string, unknown>) => log('INFO', msg, extra),
-    warn: (msg: string, extra?: Record<string, unknown>) => log('WARN', msg, extra),
-    error: (msg: string, extra?: Record<string, unknown>) => log('ERROR', msg, extra),
-  };
-}
+/** Ceremony backoff on loopback; orchestrator and leader pull until the ceremony deadline. */
+const PULLS: PullOpts = { maxAttempts: 500, initialDelayMs: 20, maxDelayMs: 300, deadlineMs: 120_000 };
 
-const DKG_PULL_OPTS: PullOpts = {
-  maxAttempts: 500,
-  initialDelayMs: 20,
-  maxDelayMs: 300,
-  deadlineMs: 120_000,
-};
+/** No-op unless `OTZI_TEST_LOG=1`, which prints to stderr while debugging transport issues. */
+function makeLogger(prefix: string): Logger {
+  if (process.env.OTZI_TEST_LOG !== '1') {
+    return { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+  }
+  const log = (level: string) => (msg: string, extra?: Record<string, unknown>) =>
+    process.stderr.write(`[${prefix}] ${level} ${msg}${extra ? ` ${JSON.stringify(extra)}` : ''}\n`);
+  return { debug: log('DEBUG'), info: log('INFO'), warn: log('WARN'), error: log('ERROR') };
+}
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -82,48 +59,7 @@ async function freePort(): Promise<number> {
   });
 }
 
-function dealerKeygen(t: number, n: number, level = 44): DecryptedShare[] {
-  const tm = ThresholdMLDSA.create(level, t, n);
-  const { publicKey, shares } = tm.keygen();
-  const publicKeyHex = toHex(publicKey);
-  const { K, L } = getKL(level);
-  return shares.map((ks) => ({
-    publicKey: publicKeyHex,
-    partyId: ks.id,
-    threshold: t,
-    parties: n,
-    level,
-    shareBytes: new Uint8Array(0),
-    keyShare: ks,
-    K,
-    L,
-  }));
-}
-
-function makeIntegrationConfig(args: {
-  nodeId: string;
-  peerEndpoints: ReadonlyArray<string>;
-  transport:
-    | { kind: 'peer-mesh'; advertisedEndpoint: string }
-    | { kind: 'relay'; url: string };
-  httpBind: string;
-}): DaemonConfig {
-  return {
-    share: { path: '/dev/null', passwordEnv: 'UNUSED' },
-    node: { id: args.nodeId },
-    network: { name: 'testnet', opnetRpc: 'https://testnet.opnet.org' },
-    transport: args.transport,
-    peers: args.peerEndpoints.map((endpoint) => ({ endpoint })),
-    gate: { strategy: 'auto' },
-    deadlines: { signingMs: 60_000, dkgMs: 180_000 },
-    triggers: [{ kind: 'http', params: { bind: args.httpBind } }],
-  };
-}
-
-async function buildBookFromIdentities(
-  identities: IdentityKeyPair[],
-  advertisedEndpoints: ReadonlyArray<string>,
-): Promise<PubkeyBook> {
+function buildBookFromIdentities(identities: IdentityKeyPair[], advertisedEndpoints: readonly string[]): PubkeyBook {
   return buildBook(
     identities.map((id, i) => ({
       partyId: i,
@@ -133,481 +69,189 @@ async function buildBookFromIdentities(
   );
 }
 
-interface Harness {
-  daemons: Daemon[];
-  bundles: TransportBundle[];
-  httpAddrs: string[];
-  teardown: () => Promise<void>;
-}
-
-async function buildPeerMeshHarness(n: number): Promise<Harness> {
-  const identities = await Promise.all(Array.from({ length: n }, () => generateIdentity(true)));
-  const listenPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
-  const httpPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
-  const shares = dealerKeygen(2, n);
-  const advertised = listenPorts.map((p) => `127.0.0.1:${p}`);
-  const book = await buildBookFromIdentities(identities, advertised);
-
-  const daemons: Daemon[] = [];
-  const bundles: TransportBundle[] = [];
-  for (let i = 0; i < n; i++) {
-    const peerEndpoints: string[] = [];
-    for (let j = 0; j < n; j++) {
-      if (i === j) continue;
-      peerEndpoints.push(advertised[j]!);
-    }
-    const cfg = makeIntegrationConfig({
-      nodeId: `node-${i}`,
-      peerEndpoints,
-      transport: { kind: 'peer-mesh', advertisedEndpoint: advertised[i]! },
-      httpBind: `127.0.0.1:${httpPorts[i]}`,
-    });
-    const state = buildStateFromShare(cfg, shares[i]!);
-    const logger = makeLogger(`peer${i}`);
-    const bundle = await buildTransportFromMemory(state, identities[i]!, book, { logger });
-    await bundle.start();
-    const daemon = new Daemon({
-      state,
-      transport: bundle.transport,
-      selfPartyId: bundle.selfPartyId,
-      peersById: bundle.peersById,
-      rng: SYSTEM_RNG,
-      pullOpts: DKG_PULL_OPTS,
-      logger,
-    });
-    bundles.push(bundle);
-    daemons.push(daemon);
-  }
-
-  for (const d of daemons) await d.start();
-
-  const httpAddrs = httpPorts.map((p) => `http://127.0.0.1:${p}`);
-
-  return {
-    daemons,
-    bundles,
-    httpAddrs,
-    teardown: async () => {
-      for (const d of daemons) await d.stop();
-      for (const b of bundles) await b.stop();
-    },
-  };
-}
-
-async function buildRelayHarness(n: number): Promise<{ harness: Harness; relay: RelayServer }> {
-  const relayPort = await freePort();
-  const relay = new RelayServer({ listen: `127.0.0.1:${relayPort}` });
-  await relay.start();
-
-  const identities = await Promise.all(Array.from({ length: n }, () => generateIdentity(true)));
-  const httpPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
-  const shares = dealerKeygen(2, n);
-  // Relay path doesn't dial peer endpoints, but the book still needs canonical
-  // advertisedEndpoint values (parser/builder requires them post-Phase-F);
-  // synth from a stable port range so they don't collide.
-  const advertised = Array.from({ length: n }, (_, i) => `127.0.0.1:${20000 + i}`);
-  const book = await buildBookFromIdentities(identities, advertised);
-
-  const daemons: Daemon[] = [];
-  const bundles: TransportBundle[] = [];
-  for (let i = 0; i < n; i++) {
-    const cfg = makeIntegrationConfig({
-      nodeId: `node-${i}`,
-      peerEndpoints: [],
-      transport: { kind: 'relay', url: `ws://127.0.0.1:${relayPort}` },
-      httpBind: `127.0.0.1:${httpPorts[i]}`,
-    });
-    const state = buildStateFromShare(cfg, shares[i]!);
-    const bundle = await buildTransportFromMemory(state, identities[i]!, book);
-    await bundle.start();
-    const daemon = new Daemon({
-      state,
-      transport: bundle.transport,
-      selfPartyId: bundle.selfPartyId,
-      peersById: bundle.peersById,
-      rng: SYSTEM_RNG,
-      pullOpts: DKG_PULL_OPTS,
-    });
-    bundles.push(bundle);
-    daemons.push(daemon);
-  }
-
-  for (const d of daemons) await d.start();
-
-  const httpAddrs = httpPorts.map((p) => `http://127.0.0.1:${p}`);
-
-  return {
-    harness: {
-      daemons,
-      bundles,
-      httpAddrs,
-      teardown: async () => {
-        for (const d of daemons) await d.stop();
-        for (const b of bundles) await b.stop();
-        await relay.stop();
-      },
-    },
-    relay,
-  };
-}
-
 async function waitUntilConnected(bundle: TransportBundle, expectedPeers: number, timeoutMs = 10_000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const states = (bundle.transport as unknown as {
       peerStates: Map<PartyId, { status?: string; connection?: unknown }>;
     }).peerStates;
-    let connectedCount = 0;
-    for (const s of states.values()) {
-      if (s.status === 'connected' || s.connection) connectedCount++;
-    }
-    if (connectedCount === expectedPeers) return;
-    await new Promise((r) => setTimeout(r, 30));
+    let connected = 0;
+    for (const s of states.values()) if (s.status === 'connected' || s.connection) connected++;
+    if (connected === expectedPeers) return;
+    await new Promise(r => setTimeout(r, 30));
   }
   throw new Error(`timeout waiting for ${expectedPeers} peer connections`);
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Peer-mesh integration
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('Daemon integration — peer-mesh transport', () => {
-  let harness: Harness | null = null;
-  afterEach(async () => {
-    if (harness) await harness.teardown();
-    harness = null;
-  });
-
-  it('3-peer ring: combined DKG completes via HTTP over peer-mesh', async () => {
-    harness = await buildPeerMeshHarness(3);
-    // Wait for the transport mesh to come up before firing ceremonies.
-    for (const b of harness.bundles) await waitUntilConnected(b, 2);
-
-    const ceremonyId = 'integration-peer-mesh-dkg';
-    const res = await fetch(`${harness.httpAddrs[0]}/`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'dkg-combined', ceremonyId }),
+function outcomeOf(d: Daemon, ceremonyId: string): Promise<CeremonyOutcome> {
+  return new Promise(resolve => {
+    const off = d.onCompleted(o => {
+      if (o.ceremonyId !== ceremonyId) return;
+      off();
+      resolve(o);
     });
-    const bodyText = await res.text();
-    if (res.status !== 200) {
-      throw new Error(`peer-mesh DKG returned ${res.status}: ${bodyText}`);
-    }
-    const json = JSON.parse(bodyText) as {
-      ceremonyId: string;
-      status: string;
-      mldsaPublicKeyHex: string;
-      frostVerifyingKeyHex: string;
-    };
-    expect(json.ceremonyId).toBe(ceremonyId);
-    expect(json.status).toBe('done');
-    expect(json.mldsaPublicKeyHex.length).toBeGreaterThan(0);
-    expect(json.frostVerifyingKeyHex).toHaveLength(66);
-  }, 240_000);
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// Persistence + restart
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('Daemon integration — DKG persistence + restart', () => {
-  let tmpDir: string | null = null;
-  let envCleanup: Array<() => void> = [];
-  let firstHarness: Harness | null = null;
-  let secondHarness: Harness | null = null;
-
-  afterEach(async () => {
-    if (firstHarness) await firstHarness.teardown();
-    if (secondHarness) await secondHarness.teardown();
-    firstHarness = null;
-    secondHarness = null;
-    for (const fn of envCleanup) fn();
-    envCleanup = [];
-    if (tmpDir) {
-      await rm(tmpDir, { recursive: true, force: true });
-      tmpDir = null;
-    }
   });
+}
 
-  it(
-    '3-peer ring: combined DKG persists shares to disk; restarted daemons sign with reloaded keys',
-    async () => {
-      tmpDir = await mkdtemp(join(tmpdir(), 'otzi-persistence-'));
-      const n = 3;
-      const password = 'integration-test-share-pw';
-
-      // Setup that survives across both restarts: identities, ports, pubkey book.
-      const identities = await Promise.all(
-        Array.from({ length: n }, () => generateIdentity(true)),
-      );
-      const listenPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
-      const httpPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
-      const advertised = listenPorts.map((p) => `127.0.0.1:${p}`);
-      const book = await buildBookFromIdentities(identities, advertised);
-
-      // Per-daemon share path + password env var (suffixed with random
-      // string to avoid collisions with concurrent test runs).
-      const runTag = Math.random().toString(36).slice(2);
-      const sharePaths: string[] = [];
-      const passwordEnvs: string[] = [];
-      for (let i = 0; i < n; i++) {
-        sharePaths.push(join(tmpDir, `share-${i}.json`));
-        const envName = `OTZI_TEST_SHARE_PWD_${i}_${runTag}`;
-        passwordEnvs.push(envName);
-        process.env[envName] = password;
-        envCleanup.push(() => {
-          delete process.env[envName];
-        });
-      }
-
-      const configs: DaemonConfig[] = Array.from({ length: n }, (_, i) => {
-        const peers: Array<{ endpoint: string }> = [];
-        for (let j = 0; j < n; j++) {
-          if (i === j) continue;
-          peers.push({ endpoint: advertised[j]! });
-        }
-        return {
-          share: { path: sharePaths[i]!, passwordEnv: passwordEnvs[i]! },
-          node: { id: `node-${i}` },
-          network: { name: 'testnet' as const, opnetRpc: 'https://testnet.opnet.org' },
-          transport: {
-            kind: 'peer-mesh' as const,
-            advertisedEndpoint: advertised[i]!,
-          },
-          peers,
-          gate: { strategy: 'auto' as const },
-          deadlines: { signingMs: 60_000, dkgMs: 180_000 },
-          triggers: [
-            { kind: 'http' as const, params: { bind: `127.0.0.1:${httpPorts[i]}` } },
-          ],
-        };
-      });
-
-      // ── Round 1: bootstrap daemons with NO share file (real "first DKG"
-      // flow). validateLoaded hits ENOENT → state.share = undefined,
-      // persistDkgShare bound and ready for the post-DKG write.
-      const round1States: LoadedDaemonState[] = await Promise.all(
-        configs.map((cfg) => validateLoaded(cfg, { env: process.env })),
-      );
-      for (let i = 0; i < n; i++) {
-        // Sanity: no share at round 1, but persistence sink is set.
-        expect(round1States[i]!.share).toBeUndefined();
-        expect(round1States[i]!.persistDkgShare).toBeDefined();
-      }
-
-      const round1Daemons: Daemon[] = [];
-      const round1Bundles: TransportBundle[] = [];
-      for (let i = 0; i < n; i++) {
-        const bundle = await buildTransportFromMemory(
-          round1States[i]!,
-          identities[i]!,
-          book,
-        );
-        await bundle.start();
-        const daemon = new Daemon({
-          state: round1States[i]!,
-          transport: bundle.transport,
-          selfPartyId: bundle.selfPartyId,
-          peersById: bundle.peersById,
-          rng: SYSTEM_RNG,
-          pullOpts: DKG_PULL_OPTS,
-        });
-        await daemon.start();
-        round1Bundles.push(bundle);
-        round1Daemons.push(daemon);
-      }
-      firstHarness = {
-        daemons: round1Daemons,
-        bundles: round1Bundles,
-        httpAddrs: httpPorts.map((p) => `http://127.0.0.1:${p}`),
-        teardown: async () => {
-          for (const d of round1Daemons) await d.stop();
-          for (const b of round1Bundles) await b.stop();
-        },
-      };
-
-      for (const b of round1Bundles) await waitUntilConnected(b, n - 1);
-
-      // Subscribe to participant outcomes BEFORE firing DKG so we don't
-      // miss the settle event.
-      const participantDone = round1Daemons.slice(1).map(
-        (d) =>
-          new Promise<void>((resolve, reject) => {
-            const off = d.onCompleted((outcome) => {
-              if (outcome.kind !== 'dkg-combined') return;
-              off();
-              if (outcome.status === 'done') resolve();
-              else reject(new Error(`participant settled ${outcome.status}, expected done`));
-            });
-          }),
-      );
-
-      // Trigger DKG on daemon 0 (the leader).
-      const dkgRes = await fetch(`http://127.0.0.1:${httpPorts[0]}/`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          op: 'dkg-combined',
-          ceremonyId: 'integration-persistence-dkg',
-        }),
-      });
-      const dkgBodyText = await dkgRes.text();
-      if (dkgRes.status !== 200) {
-        throw new Error(`DKG returned ${dkgRes.status}: ${dkgBodyText}`);
-      }
-      const dkgJson = JSON.parse(dkgBodyText) as {
-        ceremonyId: string;
-        status: string;
-        mldsaPublicKeyHex: string;
-        frostVerifyingKeyHex: string;
-      };
-      expect(dkgJson.status).toBe('done');
-
-      // Leader's persist runs synchronously inside runCombinedDkg; participants
-      // settle async via the orchestrator.
-      await Promise.all(participantDone);
-
-      // Verify all share files match the DKG output.
-      for (let i = 0; i < n; i++) {
-        const fileText = await readFile(sharePaths[i]!, 'utf8');
-        const sharefile = JSON.parse(fileText) as ShareFile & { frostPublicKey?: string };
-        expect(sharefile.version).toBe(3);
-        expect(sharefile.publicKey).toBe(dkgJson.mldsaPublicKeyHex);
-        expect(sharefile.frostPublicKey).toBe(dkgJson.frostVerifyingKeyHex);
-        expect(sharefile.partyId).toBe(i);
-        expect(sharefile.threshold).toBe(3);
-        expect(sharefile.parties).toBe(3);
-        expect(sharefile.level).toBe(44);
-        // Decrypt round-trip — proves password + V3 deserialize work.
-        const decrypted = await decryptShareFile(sharefile, password);
-        expect(decrypted.partyId).toBe(i);
-        expect(decrypted.frostKeyPackage).toBeDefined();
-      }
-
-      // ── Stop round 1, then start round 2 with persisted shares. ──
-      await firstHarness.teardown();
-      firstHarness = null;
-
-      const round2States: LoadedDaemonState[] = await Promise.all(
-        configs.map((cfg) => validateLoaded(cfg, { env: process.env })),
-      );
-      // Sanity: state.share carries the DKG-produced public key, not a
-      // dealer placeholder.
-      for (let i = 0; i < n; i++) {
-        expect(round2States[i]!.share!.publicKey).toBe(dkgJson.mldsaPublicKeyHex);
-        expect(round2States[i]!.share!.partyId).toBe(i);
-        // Persistence sink is now bound by validateLoaded.
-        expect(round2States[i]!.persistDkgShare).toBeDefined();
-      }
-
-      const round2Daemons: Daemon[] = [];
-      const round2Bundles: TransportBundle[] = [];
-      for (let i = 0; i < n; i++) {
-        const bundle = await buildTransportFromMemory(
-          round2States[i]!,
-          identities[i]!,
-          book,
-        );
-        await bundle.start();
-        const daemon = new Daemon({
-          state: round2States[i]!,
-          transport: bundle.transport,
-          selfPartyId: bundle.selfPartyId,
-          peersById: bundle.peersById,
-          rng: SYSTEM_RNG,
-          pullOpts: DKG_PULL_OPTS,
-        });
-        await daemon.start();
-        round2Bundles.push(bundle);
-        round2Daemons.push(daemon);
-      }
-      secondHarness = {
-        daemons: round2Daemons,
-        bundles: round2Bundles,
-        httpAddrs: httpPorts.map((p) => `http://127.0.0.1:${p}`),
-        teardown: async () => {
-          for (const d of round2Daemons) await d.stop();
-          for (const b of round2Bundles) await b.stop();
-        },
-      };
-
-      for (const b of round2Bundles) await waitUntilConnected(b, n - 1);
-
-      // Sign with the reloaded share — ML-DSA first (scheme='mldsa'), then FROST.
-      const message = new Uint8Array(32);
-      crypto.getRandomValues(message);
-      const signRes = await fetch(`http://127.0.0.1:${httpPorts[0]}/`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          op: 'sign',
-          scheme: 'mldsa',
-          protocol: 'raw',
-          ceremonyId: 'integration-persistence-sign',
-          messageHex: toHex(message),
-          signers: [0, 1, 2],
-        }),
-      });
-      const signBodyText = await signRes.text();
-      if (signRes.status !== 200) {
-        throw new Error(`sign mldsa returned ${signRes.status}: ${signBodyText}`);
-      }
-      const signJson = JSON.parse(signBodyText) as {
-        ceremonyId: string;
-        status: string;
-        scheme: string;
-        signatureHex: string;
-      };
-      expect(signJson.status).toBe('done');
-      expect(signJson.scheme).toBe('mldsa');
-      expect(signJson.signatureHex.length).toBeGreaterThan(0);
-
-      // FROST key-path sign-via-deprecated-opnet path was here in phase 8;
-      // removed in phase 9a.4 because `protocol:'opnet'` now returns 400
-      // (un-verifiable raw-tx surface). Reloaded-share-produces-valid-sigs
-      // is already verified by the ML-DSA sign above; phase B2 has the
-      // dedicated FROST sign coverage via `protocol:'btc'` construction
-      // params.
-    },
-    300_000,
-  );
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// Relay integration
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('Daemon integration — relay transport', () => {
-  let harness: Harness | null = null;
-  afterEach(async () => {
-    if (harness) await harness.teardown();
-    harness = null;
+async function post(url: string, body: unknown): Promise<{ status: number; json: Record<string, unknown> }> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
   });
+  const text = await res.text();
+  return { status: res.status, json: JSON.parse(text) as Record<string, unknown> };
+}
 
-  it('3-peer ring: combined DKG completes via HTTP over relay', async () => {
-    const built = await buildRelayHarness(3);
-    harness = built.harness;
-    for (const b of harness.bundles) await waitUntilConnected(b, 2);
+interface Node {
+  configPath: string;
+  vaultPubkeyPath: string;
+  identity: IdentityKeyPair;
+  url: string;
+}
 
-    const ceremonyId = 'integration-relay-dkg';
-    const res = await fetch(`${harness.httpAddrs[0]}/`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'dkg-combined', ceremonyId }),
+interface Running {
+  daemons: Daemon[];
+  bundles: TransportBundle[];
+}
+
+/** Start every node from its config files: loadAndValidate, real peer-mesh transport, Daemon. */
+async function boot(nodes: Node[], book: PubkeyBook): Promise<Running> {
+  const daemons: Daemon[] = [];
+  const bundles: TransportBundle[] = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i]!;
+    const logger = makeLogger(`node-${i}`);
+    const state = await loadAndValidate(node.configPath, { env: ENV, vaultPubkeyPath: node.vaultPubkeyPath, logger });
+    const bundle = await buildTransportFromMemory(state, node.identity, book, { logger });
+    await bundle.start();
+    bundles.push(bundle);
+    const daemon = new Daemon({
+      state,
+      transport: bundle.transport,
+      selfPartyId: bundle.selfPartyId,
+      peersById: bundle.peersById,
+      rng: SYSTEM_RNG,
+      pullOpts: PULLS,
+      logger,
+      vaultPubkeyPath: node.vaultPubkeyPath,
     });
-    const bodyText = await res.text();
-    if (res.status !== 200) {
-      throw new Error(`relay DKG returned ${res.status}: ${bodyText}`);
+    await daemon.start();
+    daemons.push(daemon);
+  }
+  for (const b of bundles) await waitUntilConnected(b, nodes.length - 1);
+  return { daemons, bundles };
+}
+
+async function shutdown(r: Running | null): Promise<void> {
+  if (!r) return;
+  for (const d of r.daemons) await d.stop();
+  for (const b of r.bundles) await b.stop();
+}
+
+describe('Daemon integration: peer-mesh on loopback', () => {
+  let dir: string | null = null;
+  let running: Running | null = null;
+
+  afterEach(async () => {
+    await shutdown(running);
+    running = null;
+    if (dir) await rm(dir, { recursive: true, force: true });
+    dir = null;
+  });
+
+  it('three daemons over peer-mesh run DKG, restart and sign a proposal', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'otzi-integration-'));
+    const n = 3;
+    const identities = await Promise.all(Array.from({ length: n }, () => generateIdentity(true)));
+    const meshPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
+    const httpPorts = await Promise.all(Array.from({ length: n }, () => freePort()));
+    const advertised = meshPorts.map(p => `127.0.0.1:${p}`);
+    const book = buildBookFromIdentities(identities, advertised);
+
+    const nodes: Node[] = [];
+    for (let i = 0; i < n; i++) {
+      const nodeDir = join(dir, `node-${i}`);
+      await mkdir(nodeDir, { recursive: true });
+      const configPath = join(nodeDir, 'daemon.toml');
+      const peers = advertised
+        .filter((_, j) => j !== i)
+        .map(e => `[[peers]]\nendpoint = "${e}"\n`)
+        .join('\n');
+      await writeFile(
+        configPath,
+        `
+[share]
+path = "${join(nodeDir, 'share.json')}"
+password_env = "OTZI_SHARE_PASSWORD"
+
+[node]
+id = "node-${i}"
+
+[network]
+name = "${NET}"
+
+[transport]
+kind = "peer-mesh"
+advertised_endpoint = "${advertised[i]}"
+
+${peers}
+
+[gate]
+strategy = "auto"
+
+[deadlines]
+signing_ms = 60000
+dkg_ms = 120000
+
+[[triggers]]
+kind = "http"
+bind = "127.0.0.1:${httpPorts[i]}"
+`,
+      );
+      nodes.push({
+        configPath,
+        vaultPubkeyPath: join(nodeDir, 'vault-pubkey.json'),
+        identity: identities[i]!,
+        url: `http://127.0.0.1:${httpPorts[i]}/`,
+      });
     }
-    const json = JSON.parse(bodyText) as {
-      ceremonyId: string;
-      status: string;
-      mldsaPublicKeyHex: string;
-      frostVerifyingKeyHex: string;
-    };
-    expect(json.ceremonyId).toBe(ceremonyId);
-    expect(json.status).toBe('done');
-    expect(json.mldsaPublicKeyHex.length).toBeGreaterThan(0);
-    expect(json.frostVerifyingKeyHex).toHaveLength(66);
-  }, 240_000);
+
+    // Setup mode: no share anywhere; node 0 runs the DKG.
+    running = await boot(nodes, book);
+    const joined = running.daemons.slice(1).map(d => outcomeOf(d, 'gen-mesh'));
+    const dkg = await post(nodes[0]!.url, { op: 'dkg', ceremonyId: 'gen-mesh' });
+    expect(dkg.status, JSON.stringify(dkg.json)).toBe(200);
+    const address = dkg.json.address as string;
+    expect(dkg.json).toMatchObject({ ceremonyId: 'gen-mesh', status: 'done', network: NET });
+    for (const o of await Promise.all(joined)) expect(o).toMatchObject({ kind: 'dkg', status: 'done', address });
+
+    // Restart every daemon (and transport) so the new shares load.
+    await shutdown(running);
+    running = null;
+    running = await boot(nodes, book);
+
+    const info = await post(nodes[1]!.url, { op: 'vault-info' });
+    expect(info.status).toBe(200);
+    expect(info.json).toMatchObject({ partyIds: [0, 1, 2], threshold: n, parties: n, network: NET, address });
+
+    // Any node can lead: node 2 signs a two-input proposal.
+    const state = await loadAndValidate(nodes[2]!.configPath, { env: ENV, vaultPubkeyPath: nodes[2]!.vaultPubkeyPath });
+    const vaultKey = toVaultKey(state.share!.publicKeyPackage);
+    const proposal = makeProposal(vaultKey, NET, { inputs: [{ amount: 70_000 }, { amount: 30_000 }], change: 48_000 });
+    const signed = [running.daemons[0]!, running.daemons[1]!].map(d => outcomeOf(d, 'pay-mesh'));
+    const res = await post(nodes[2]!.url, { op: 'sign', ceremonyId: 'pay-mesh', proposal });
+    expect(res.status, JSON.stringify(res.json)).toBe(200);
+    const { txid, signedTxHex, signaturesHex } = res.json as { txid: string; signedTxHex: string; signaturesHex: string[] };
+    expect(res.json).toEqual({ ceremonyId: 'pay-mesh', status: 'done', txid, signedTxHex, signaturesHex });
+
+    const finalized = finalizeSend(
+      proposal.tx,
+      proposal.prevouts,
+      signaturesHex.map((signature, index) => ({ index, signature })),
+      vaultPayment(vaultKey, NET).outputKey,
+    );
+    expect(finalized).toEqual({ hex: signedTxHex, txid });
+    for (const o of await Promise.all(signed)) expect(o).toMatchObject({ kind: 'signing', status: 'done', signaturesHex });
+  }, 120_000);
 });

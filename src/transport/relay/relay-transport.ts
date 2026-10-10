@@ -110,7 +110,8 @@ export class RelayTransport implements Transport {
   constructor(options: RelayTransportOptions) {
     this.self = options.self;
     this.partyId = options.self.partyId;
-    this.peers = options.peers.map((p) => p.partyId);
+    // Every ring member, self included (the Transport contract); `options.peers` lists the others.
+    this.peers = [this.partyId, ...options.peers.map((p) => p.partyId)].sort((a, b) => a - b);
     this.relayUrl = options.relayUrl;
     this.ringId = options.ringId;
     this.wsCtor = options.wsCtor ?? WebSocket;

@@ -95,7 +95,8 @@ export class PeerMeshTransport implements Transport {
   constructor(options: PeerMeshOptions) {
     this.self = options.self;
     this.partyId = options.self.partyId;
-    this.peers = options.peers.map((p) => p.partyId);
+    // Every ring member, self included (the Transport contract); `options.peers` lists the others.
+    this.peers = [this.partyId, ...options.peers.map((p) => p.partyId)].sort((a, b) => a - b);
     this.wsCtor = options.wsCtor ?? WebSocket;
     this.log = options.logger ?? NOOP_LOGGER;
     this.pullTimeoutMs = options.pullTimeoutMs ?? DEFAULT_PULL_TIMEOUT_MS;

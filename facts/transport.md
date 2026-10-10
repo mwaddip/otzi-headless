@@ -362,7 +362,7 @@
 
 - `constructor(options: PeerMeshOptions)`
   - **Pre:** `options.listen` is valid "host:port". `options.self.partyId` is not in peer list. For each peer where `peer.partyId > self.partyId` (initiator role), `peer.endpoint` must be provided.
-  - **Post:** Initializes transport state (peer states, broadcast/pull handlers, pending pulls). Does not start listening yet.
+  - **Post:** Initializes transport state (peer states, broadcast/pull handlers, pending pulls). Does not start listening yet. `peers` = every ring member, self included, ascending (the `Transport` contract in [core.md](core.md)): `options.peers` plus `options.self.partyId`.
   - **Throws:** `Error` if self is in peer list or an initiator peer lacks endpoint.
 
 - `start(): Promise<void>`
@@ -531,7 +531,7 @@
 
 - `constructor(options: RelayTransportOptions)`
   - **Pre:** `options.self.partyId` not in peer list. ringId is non-empty string (derived from pubkey book).
-  - **Post:** Initializes transport state (peer states with status, pending pulls). Does not connect to relay yet.
+  - **Post:** Initializes transport state (peer states with status, pending pulls). Does not connect to relay yet. `peers` = every ring member, self included, ascending (the `Transport` contract in [core.md](core.md)): `options.peers` plus `options.self.partyId`.
   - **Throws:** `Error` if self is in peer list.
 
 - `start(): Promise<void>`

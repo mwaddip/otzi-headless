@@ -1,613 +1,276 @@
 /**
- * Leader-side ceremony dispatcher.
+ * Leader-side ceremony dispatcher (facts/daemon.md, `leader.ts`; spec §5.3 and
+ * §5.4, leader side).
  *
- * Counterpart to `Orchestrator` (which is participant-side). Called by the
- * trigger layer when this daemon is the initiating node: builds a
- * `CeremonySpec` with real intent, evaluates the gate, invokes the runner's
- * leader method, broadcasts the signoff on success, and surfaces the result.
+ * The counterpart of the participant-side `Orchestrator`, called by the API
+ * handler on the node whose trigger fired:
  *
- * A gate `reject` or `pending` decision throws `GateRejection` (the ceremony
- * never even announces — no side effect on peers). Other failures propagate
- * from the runner (which handles its own signoff-aborted broadcast).
+ *   - `runDkg` checks that this node holds no vault, takes the node's single
+ *     DKG slot, gates, announces and runs the symmetric DKG like any other
+ *     node; it only generated the session ID.
+ *   - `sign` analyses the proposal against this node's own key, gates on that
+ *     analysis, reserves the ceremony id, leads both signing rounds,
+ *     aggregates, finalizes the transaction and sends the signoff. It returns
+ *     the signed transaction; it never broadcasts it to the chain.
+ *
+ * Refusals before the announce (409, 400, a gate non-approve) leave peers
+ * untouched. Ceremony pulls retry until the ceremony deadline.
  */
 
-import type { DKGResult } from '@btc-vision/post-quantum/threshold-ml-dsa.js';
-import type { KeyPackage, PublicKeyPackage, Rng } from '@mwaddip/frots';
-import {
-  buildBtcTxFromParams,
-  extractBtcSighashes,
-  type BtcSighashInput,
-  type BtcUtxo,
-  type DecodedBtcOutput,
-} from '../broadcast/btc-vault';
-import { captureOpnetSighashes, type OpnetCaptureContext } from '../broadcast/opnet-capture';
-import {
-  deriveVaultP2tr,
-  serializeOpnetParams,
-} from '../broadcast/opnet-params-reconstruct';
-import { broadcastOpnetTx } from '../broadcast/opnet-broadcast';
-import type { ChallengeSolution } from '@btc-vision/transaction';
-import type { UTXO as OpnetUtxo } from 'opnet';
-import type { PullOpts } from '../core/blob-puller';
-import type { CeremonyRunner, CombinedDkgResult } from '../core/ceremony-runner';
-import type { NetworkName } from '../node/types';
+import type { Rng } from '@mwaddip/frots';
+import { BLOB_RETENTION_MS, scheduleClear } from '../core/blob-retention';
+import type { CeremonyIo } from '../core/ceremony-io';
+import { runDkgCeremony, type ShareStager } from '../core/dkg-ceremony';
+import { encodeMessage, type CeremonyMessage } from '../core/messages';
+import { leadSigning } from '../core/sign-ceremony';
 import type { PartyId } from '../core/types';
 import type { ApprovalGate, CeremonySpec, Decision } from '../gate/types';
-import { NOOP_LOGGER, type DkgPersistenceSink, type Logger } from '../orchestrator/types';
-import { toHex } from '../wire/hex';
-import type { DecryptedShare } from '../wire/share-crypto';
+import { buildDkgSpec, buildSigningSpec } from '../orchestrator/spec-builder';
+import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
+import { finalizeSend } from '../otzi/backend/bitcoin';
+import { labelFor } from '../otzi/lib/address-book';
+import { analyzeProposal, vaultPayment, type ProposalAnalysis } from '../otzi/lib/bitcoin';
+import { toVaultKey } from '../otzi/lib/dkg';
+import { fromHex, toHex } from '../otzi/lib/hex';
+import type { DecryptedShare } from '../otzi/lib/share-file';
+import type { AddressBookEntry, NetworkName } from '../otzi/lib/vault-types';
+import { NO_VAULT_MESSAGE, RequestError, type LeaderSignRequest } from './api';
 
-export interface LeaderDeps {
-  runner: CeremonyRunner;
-  gate: ApprovalGate;
-  node: { id: string; partyId: PartyId };
-  peersById: ReadonlyMap<PartyId, string>;
-  /**
-   * Decrypted share for this party. Optional: a DKG-only daemon (no share
-   * file at startup) leaves this undefined; signing methods then throw a
-   * clear error before doing any side-effecting work.
-   */
-  share?: DecryptedShare;
-  frostKeyPackage?: KeyPackage;
-  frostPublicKeyPackage?: PublicKeyPackage;
-  rng: Rng;
-  pullOpts: PullOpts;
-  /**
-   * When set, combined DKG runs the key-link FROST sign phase (producing
-   * `frostLegacySig` on every peer) before persistence. Undefined (e.g.
-   * regtest daemons) skips key-link — OPNet contract calls then won't work
-   * against the resulting vault, but other ceremonies are unaffected.
-   */
-  network?: NetworkName;
-  /**
-   * V3 key-link FROST sig for `opnet-params` capture — replayed by the
-   * OPNet SDK during contract-call construction against a V3 vault. Read
-   * from the share envelope by `config-merge`. Required when the leader
-   * handles `LeaderSignOpnetParamsRequest`; absence produces a clear error.
-   */
-  frostLegacySig?: Uint8Array;
-  /**
-   * OPNet JSON-RPC provider for UTXO + challenge fetches during the
-   * `opnet-params` flow. Tests inject a stub; production wires the real
-   * `JSONRpcProvider` via `daemon.ts`. The type is intentionally loose —
-   * the SDK's full `JSONRpcProvider` type leaks many internal fields we
-   * don't need here.
-   */
-  opnetProvider?: {
-    utxoManager: { getUTXOs: (args: { address: string }) => Promise<unknown[]> };
-    getChallenge: () => Promise<unknown>;
-  };
-  /**
-   * CSPRNG used to fill the 32B rnd-bytes seed the leader asserts on-wire
-   * for the deterministic `opnet-params` capture. Defaults to WebCrypto when
-   * not supplied. Tests inject a deterministic fill for reproducibility.
-   */
-  opnetSeedFill?: (buf: Uint8Array) => void;
-  /**
-   * Persists this party's combined-DKG result after the protocol completes.
-   * Errors propagate to the caller (HTTP 500) — leader stops short of
-   * returning success when its own share didn't make it to disk.
-   */
-  persistDkgShare?: DkgPersistenceSink;
-  logger?: Logger;
-}
+/** Longest `reason` a `signoff-aborted` may carry (messages.ts parser rule). */
+const MAX_REASON_LENGTH = 1024;
+const SESSION_ID_LENGTH = 32;
+const VAULT_HELD = 'this node already holds a vault';
 
-export interface LeaderDkgRequest {
-  ceremonyId: string;
-  threshold: number;
-  parties: number;
-}
-
-export interface LeaderMldsaLikeDkgRequest extends LeaderDkgRequest {
-  level: number;
-}
-
-/**
- * Unified `/sign` request, discriminated by (scheme, protocol).
- *
- * **BTC (construction params).** Operator sends the parameters needed to
- * deterministically build the unsigned vault-transfer tx: destination,
- * amount, fee rate, self P2TR + pubkey, and an asserted UTXO snapshot.
- * Every daemon (leader + participants) builds the same tx locally and
- * signs its own sighashes — participants verify by matching their
- * rebuild against the leader's asserted sighashes. If the leader lies
- * about UTXOs, Bitcoin consensus rejects at broadcast (BIP-341 commits
- * to real prevout scripts + values) — worst case is wasted ceremony.
- *
- * **OPNet (raw-tx + hints).** Operator-side tooling uses the OPNet SDK to
- * build the full funding + interaction tx bundle and POSTs raw bytes +
- * prevout info. Daemon extracts BIP-341 sighashes from the bytes;
- * participants re-extract and compare. Gate policy runs against
- * operator-supplied `hints` (contractAddress, method, amountTokenAtomic)
- * which are advisory — matches Ötzi's federation-trust posture.
- * Construction-params for OPNet is deferred (needs SDK-level UTXO
- * fetcher control to be deterministic).
- *
- * **ML-DSA (raw message).** Operator POSTs opaque bytes to sign.
- */
-interface LeaderSignRequestBase {
-  ceremonyId: string;
-  signers: PartyId[];
-}
-
-export interface LeaderSignBtcRequest extends LeaderSignRequestBase {
-  scheme: 'frost';
-  protocol: 'btc';
-  btc: {
-    to: string;
-    amountSat: bigint;
-    feeRate: number;
-    network: NetworkName;
-    frostP2tr: string;
-    /** 33B SEC1 compressed untweaked FROST aggregate pubkey. */
-    frostUntweakedPubKey: Uint8Array;
-    /** UTXOs the operator asserts the vault holds. */
-    utxos: readonly BtcUtxo[];
-  };
-}
-
-export interface LeaderSignOpnetRequest extends LeaderSignRequestBase {
-  scheme: 'frost';
-  protocol: 'opnet';
-  unsignedTx: Uint8Array;
-  inputs: readonly BtcSighashInput[];
-  /** Advisory hints for policy gate (unverified). */
-  hints?: {
-    contractAddress?: string;
-    method?: string;
-    amountTokenAtomic?: string;
-  };
-}
-
-/**
- * OPNet construction-params flow. Operator POSTs contract + method + params
- * + pre-computed ML-DSA threshold sig. Daemon fetches UTXOs + challenge,
- * generates the rnd-bytes seed, runs capture, asserts everything on-wire,
- * runs FROST ceremony, broadcasts. Participants rebuild the exact capture
- * and verify sighashes match — gate policy then evaluates structurally-
- * verified `contractAddress` + `method`.
- */
-export interface LeaderSignOpnetParamsRequest extends LeaderSignRequestBase {
-  scheme: 'frost';
-  protocol: 'opnet-params';
-  contractAddress: string;
-  method: string;
-  params: readonly unknown[];
-  paramTypes?: readonly ('address' | 'u256' | 'bytes')[];
-  /** ML-DSA threshold sig over `sha256(calldata)`. Operator pre-computes. */
-  mldsaThresholdSignature: Uint8Array;
-  feeRate?: number;
-  priorityFee?: bigint;
-  maximumAllowedSatToSpend?: bigint;
-  /** Advisory hints for policy gate (amountTokenAtomic remains advisory). */
-  hints?: {
-    amountTokenAtomic?: string;
-  };
-}
-
-export interface LeaderSignMldsaRequest extends LeaderSignRequestBase {
-  scheme: 'mldsa';
-  protocol: 'raw';
-  /** Opaque bytes to sign. */
-  message: Uint8Array;
-}
-
-export type LeaderSignRequest =
-  | LeaderSignBtcRequest
-  | LeaderSignOpnetRequest
-  | LeaderSignOpnetParamsRequest
-  | LeaderSignMldsaRequest;
-
-export type LeaderSignResult =
-  | { scheme: 'mldsa'; signature: Uint8Array }
-  | {
-      scheme: 'frost';
-      signatures: Uint8Array[];
-      /** Populated iff the daemon broadcast the tx internally (OPNet construction-params flow). */
-      transactionId?: string;
-    };
-
-type SigningOperation = 'btc-transfer' | 'opnet-call' | 'generic';
-
-function operationFromSignReq(req: LeaderSignRequest): SigningOperation {
-  if (req.scheme === 'mldsa') return 'generic';
-  if (req.protocol === 'btc') return 'btc-transfer';
-  if (req.protocol === 'opnet') return 'opnet-call';
-  if (req.protocol === 'opnet-params') return 'opnet-call';
-  return 'generic';
-}
-
+/** Thrown when the leader's own gate does not approve; nothing was announced. */
 export class GateRejection extends Error {
   constructor(
-    public readonly ceremonyId: string,
-    public readonly decision: Exclude<Decision, 'approve'>,
+    readonly ceremonyId: string,
+    readonly decision: Decision,
   ) {
-    super(`leader: gate ${decision} for ceremony '${ceremonyId}'`);
+    super(`gate ${decision} for ceremony ${ceremonyId}`);
     this.name = 'GateRejection';
   }
 }
 
+/** This node's DKG slot and led-signing id reservations; implemented by `Orchestrator`. */
+export interface LocalCeremonySlots {
+  beginLocalDkg(ceremonyId: string): { signal: AbortSignal; end(): void } | null;
+  beginLocalSigning(ceremonyId: string): { end(): void } | null;
+}
+
+export interface LeaderDeps {
+  /** The daemon's ceremony I/O, shared with the orchestrator. */
+  io: CeremonyIo;
+  gate: ApprovalGate;
+  node: { id: string; partyId: PartyId };
+  /** Every ring member's label, self included (`size` = ring size). */
+  peersById: ReadonlyMap<PartyId, string>;
+  network: NetworkName;
+  /** The share loaded at startup; undefined on a node without a vault. */
+  vault?: DecryptedShare;
+  /** Whether a file exists at the share path. */
+  vaultExists: () => Promise<boolean>;
+  /** A fresh stager for the share path. */
+  createStager: () => ShareStager;
+  rng: Rng;
+  /** `config.deadlines`: the leader's pulls run until them. */
+  ceremonyDeadlines: { signingMs: number; dkgMs: number };
+  /** The daemon's orchestrator. */
+  slots: LocalCeremonySlots;
+  /** Blob retention after a ceremony ends here; default `BLOB_RETENTION_MS`. */
+  blobRetentionMs?: { signing: number; dkg: number };
+  /** This node's address-book entries, for output labels; a rejection means no labels. */
+  addressBook?: () => Promise<AddressBookEntry[]>;
+  logger?: Logger;
+}
+
+export interface LeaderDkgResult {
+  ceremonyId: string;
+  address: string;
+  internalKey: string;
+  network: NetworkName;
+}
+
+export interface LeaderSignResult {
+  ceremonyId: string;
+  txid: string;
+  signedTxHex: string;
+  signaturesHex: string[];
+}
+
+type CeremonyKind = 'signing' | 'dkg';
+
 export class LeaderDispatcher {
+  private readonly deps: LeaderDeps;
   private readonly log: Logger;
-  constructor(private readonly deps: LeaderDeps) {
+
+  constructor(deps: LeaderDeps) {
+    this.deps = deps;
     this.log = deps.logger ?? NOOP_LOGGER;
   }
 
-  async runCombinedDkg(req: LeaderMldsaLikeDkgRequest): Promise<CombinedDkgResult> {
-    await this.requireApprove(this.dkgSpec('combined', req));
-    this.log.info('leader: runCombinedDkg', { ceremonyId: req.ceremonyId });
-    const result = await this.deps.runner.runCombinedDkg(
-      {
-        ceremonyId: req.ceremonyId,
-        threshold: req.threshold,
-        parties: req.parties,
-        level: req.level,
-        rng: this.deps.rng,
-        ...(this.deps.network ? { network: this.deps.network } : {}),
-      },
-      this.deps.pullOpts,
-    );
-    if (this.deps.persistDkgShare) {
-      await this.deps.persistDkgShare(result, {
-        threshold: req.threshold,
-        parties: req.parties,
-        level: req.level,
+  async runDkg(req: { ceremonyId: string }): Promise<LeaderDkgResult> {
+    const { ceremonyId } = req;
+    const { network, peersById, rng } = this.deps;
+    if (this.deps.vault) throw new RequestError(409, VAULT_HELD);
+
+    const slot = this.deps.slots.beginLocalDkg(ceremonyId);
+    if (!slot) throw new RequestError(409, 'a DKG is already running on this node');
+    try {
+      // Checked while the slot is held: a DKG this node joined and committed meanwhile is seen.
+      if (await this.deps.vaultExists()) throw new RequestError(409, VAULT_HELD);
+
+      const parties = peersById.size;
+      const threshold = parties;
+      const peerIds = [...peersById.entries()].sort(([a], [b]) => a - b).map(([, id]) => id);
+      await this.approve(buildDkgSpec(this.specBase(ceremonyId), { threshold, parties, network, peerIds }));
+
+      const stager = this.deps.createStager();
+      const sessionId = new Uint8Array(SESSION_ID_LENGTH);
+      rng.fillBytes(sessionId);
+      this.log.info(`leader: dkg ${ceremonyId}: announcing a ${threshold}-of-${parties} DKG on ${network}`, {
+        ceremonyId,
       });
-    }
-    return result;
-  }
-
-  async runMldsaDkg(req: LeaderMldsaLikeDkgRequest): Promise<DKGResult> {
-    await this.requireApprove(this.dkgSpec('mldsa', req));
-    this.log.info('leader: runMldsaDkg', { ceremonyId: req.ceremonyId });
-    return this.deps.runner.runMldsaDkg(
-      { ceremonyId: req.ceremonyId, threshold: req.threshold, parties: req.parties, level: req.level },
-      this.deps.pullOpts,
-    );
-  }
-
-  async runFrostDkg(req: LeaderDkgRequest): Promise<{
-    keyPackage: KeyPackage;
-    publicKeyPackage: PublicKeyPackage;
-  }> {
-    await this.requireApprove(this.dkgSpec('frost', req));
-    this.log.info('leader: runFrostDkg', { ceremonyId: req.ceremonyId });
-    return this.deps.runner.runFrostDkg(
-      { ceremonyId: req.ceremonyId, threshold: req.threshold, parties: req.parties, rng: this.deps.rng },
-      this.deps.pullOpts,
-    );
-  }
-
-  /**
-   * Unified `/sign` entry. BTC: build tx from construction params, extract
-   * sighashes, run ceremony. OPNet: extract sighashes from supplied raw tx,
-   * run ceremony. ML-DSA raw: sign the supplied message bytes.
-   */
-  async sign(req: LeaderSignRequest): Promise<LeaderSignResult> {
-    this.assertInSigners(req.signers);
-    const operation = operationFromSignReq(req);
-    this.log.info('leader: sign', {
-      ceremonyId: req.ceremonyId,
-      scheme: req.scheme,
-      protocol: req.protocol,
-    });
-
-    if (req.scheme === 'mldsa') {
-      await this.requireApprove(this.signingSpecMldsa(req, operation));
-      if (!this.deps.share)
-        throw new Error(
-          'leader: sign scheme=mldsa requires a share — daemon started in DKG-only mode',
+      try {
+        await this.deps.io.transport.broadcast(
+          encodeMessage({ v: 2, kind: 'announce-dkg', ceremonyId, sessionIdHex: toHex(sessionId), threshold, parties, network }),
         );
-      const sig = await this.deps.runner.signAsLeader(
-        {
-          ceremonyId: req.ceremonyId,
-          message: req.message,
-          signers: req.signers,
-          share: this.deps.share,
-        },
-        this.deps.pullOpts,
-      );
-      await this.deps.runner.sendSigningDoneSignoff(req.ceremonyId, sig);
-      return { scheme: 'mldsa', signature: sig };
-    }
-
-    // scheme === 'frost'
-    if (!this.deps.frostKeyPackage || !this.deps.frostPublicKeyPackage)
-      throw new Error('leader: FROST signing requested but no FROST key material loaded');
-
-    if (req.protocol === 'btc') {
-      const built = buildBtcTxFromParams({
-        to: req.btc.to,
-        amountSat: req.btc.amountSat,
-        feeRate: req.btc.feeRate,
-        network: req.btc.network,
-        frostP2tr: req.btc.frostP2tr,
-        frostUntweakedPubKey: req.btc.frostUntweakedPubKey,
-        utxos: req.btc.utxos,
-      });
-      await this.requireApprove(this.signingSpecBtc(req, built.outputs));
-
-      const sigs = await this.deps.runner.signFrostAsLeader(
-        {
-          ceremonyId: req.ceremonyId,
-          sighashes: built.sighashes.map((s) => ({ hash: s.hash, tweaked: s.tweaked })),
-          signers: req.signers,
-          keyPackage: this.deps.frostKeyPackage,
-          publicKeyPackage: this.deps.frostPublicKeyPackage,
-          rng: this.deps.rng,
-        },
-        this.deps.pullOpts,
-        {
-          protocol: 'btc',
-          btcParams: {
-            to: req.btc.to,
-            amountSat: req.btc.amountSat.toString(),
-            feeRate: req.btc.feeRate,
-            network: req.btc.network,
-            frostP2tr: req.btc.frostP2tr,
-            frostUntweakedPubKeyHex: toHex(req.btc.frostUntweakedPubKey),
-            utxos: req.btc.utxos.map((u) => ({
-              transactionId: u.transactionId,
-              outputIndex: u.outputIndex,
-              valueSat: u.value.toString(),
-            })),
-          },
-        },
-      );
-      await this.deps.runner.sendFrostSigningDoneSignoff(req.ceremonyId, sigs);
-      return { scheme: 'frost', signatures: sigs };
-    }
-
-    if (req.protocol === 'opnet-params') {
-      return this.signOpnetParams(req);
-    }
-
-    // protocol === 'opnet'
-    if (req.inputs.length === 0)
-      throw new Error(`leader: scheme='frost' protocol='opnet' requires non-empty 'inputs' array`);
-
-    await this.requireApprove(this.signingSpecOpnet(req));
-
-    const unsignedTxHex = toHex(req.unsignedTx);
-    const extracted = extractBtcSighashes(unsignedTxHex, req.inputs);
-
-    const sigs = await this.deps.runner.signFrostAsLeader(
-      {
-        ceremonyId: req.ceremonyId,
-        sighashes: extracted.map((s) => ({ hash: s.hash, tweaked: s.tweaked })),
-        signers: req.signers,
-        keyPackage: this.deps.frostKeyPackage,
-        publicKeyPackage: this.deps.frostPublicKeyPackage,
-        rng: this.deps.rng,
-      },
-      this.deps.pullOpts,
-      {
-        protocol: 'opnet',
-        unsignedTxHex,
-        inputs: req.inputs,
-        ...(req.hints ? { hints: { ...req.hints } } : {}),
-      },
-    );
-    await this.deps.runner.sendFrostSigningDoneSignoff(req.ceremonyId, sigs);
-    return { scheme: 'frost', signatures: sigs };
-  }
-
-  /**
-   * OPNet construction-params leader flow: fetches UTXOs + challenge from
-   * provider, generates the rnd-bytes seed, runs capture, announces with
-   * the full wire blob, runs the FROST ceremony, then broadcasts the tx.
-   * Returns the txid alongside signatures because the daemon owns the
-   * captureContext — operator has no way to broadcast externally.
-   */
-  private async signOpnetParams(req: LeaderSignOpnetParamsRequest): Promise<LeaderSignResult> {
-    const { share, frostKeyPackage, frostPublicKeyPackage, frostLegacySig, network, opnetProvider } = this.deps;
-    if (!share) throw new Error("leader: protocol='opnet-params' requires share");
-    if (!frostKeyPackage || !frostPublicKeyPackage) throw new Error("leader: protocol='opnet-params' requires FROST key material");
-    if (!frostLegacySig) throw new Error("leader: protocol='opnet-params' requires frostLegacySig (V3 share)");
-    if (!network) throw new Error("leader: protocol='opnet-params' requires network");
-    if (!opnetProvider) throw new Error("leader: protocol='opnet-params' requires opnetProvider");
-
-    const mldsaPubKey = new Uint8Array(Buffer.from(share.publicKey, 'hex'));
-    const frostTweakedPubKey = frostPublicKeyPackage.verifyingKey;
-    const frostUntweakedPubKey = frostPublicKeyPackage.untweakedVerifyingKey;
-    const refundAddress = deriveVaultP2tr(frostUntweakedPubKey, network);
-
-    // Fetch UTXOs + challenge before seed generation so the async I/O fault
-    // lane runs first; seed + subsequent capture are local-only.
-    const rawUtxos = await opnetProvider.utxoManager.getUTXOs({ address: refundAddress });
-    const utxos = rawUtxos as OpnetUtxo[];
-    const challenge = (await opnetProvider.getChallenge()) as ChallengeSolution;
-
-    const rndBytesSeed = new Uint8Array(32);
-    const fill = this.deps.opnetSeedFill ?? ((buf: Uint8Array) => {
-      if (typeof globalThis.crypto?.getRandomValues !== 'function') {
-        throw new Error('leader: no globalThis.crypto.getRandomValues — provide opnetSeedFill');
+        const spec = { ceremonyId, sessionId, threshold, parties, network, rng };
+        const { publicKeyPackage } = await runDkgCeremony(this.ceremonyIo('dkg'), spec, stager, slot.signal);
+        const vaultKey = toVaultKey(publicKeyPackage);
+        const address = vaultPayment(vaultKey, network).address;
+        this.log.info(`leader: dkg ${ceremonyId} done: vault ${address}`, { ceremonyId, address });
+        return { ceremonyId, address, internalKey: vaultKey.untweakedVerifyingKey, network };
+      } catch (err) {
+        this.log.warn(`leader: dkg ${ceremonyId} failed: ${errorMessage(err)}`, { ceremonyId });
+        throw err;
+      } finally {
+        this.clearLater(ceremonyId, 'dkg');
       }
-      globalThis.crypto.getRandomValues(buf);
-    });
-    fill(rndBytesSeed);
-
-    const feeRate = req.feeRate ?? 10;
-    const priorityFee = req.priorityFee ?? 1000n;
-    const maximumAllowedSatToSpend = req.maximumAllowedSatToSpend ?? 100000n;
-
-    const captured = await captureOpnetSighashes({
-      contractAddress: req.contractAddress,
-      method: req.method,
-      params: [...req.params],
-      ...(req.paramTypes ? { paramTypes: [...req.paramTypes] } : {}),
-      network,
-      mldsaThresholdSignature: req.mldsaThresholdSignature,
-      mldsaPubKey,
-      frostTweakedPubKey,
-      frostUntweakedPubKey,
-      frostLegacySig,
-      refundAddress,
-      feeRate,
-      priorityFee,
-      maximumAllowedSatToSpend,
-      utxos,
-      challenge,
-      rndBytesSeed,
-    });
-
-    await this.requireApprove(this.signingSpecOpnetParams(req));
-
-    const announceExtras = {
-      protocol: 'opnet-params' as const,
-      opnetParams: serializeOpnetParams({
-        contractAddress: req.contractAddress,
-        method: req.method,
-        params: req.params,
-        ...(req.paramTypes ? { paramTypes: req.paramTypes } : {}),
-        refundAddress,
-        feeRate,
-        priorityFee,
-        maximumAllowedSatToSpend,
-        randomBytesSeed: rndBytesSeed,
-        mldsaThresholdSignature: req.mldsaThresholdSignature,
-        utxos,
-        challenge,
-        ...(req.hints ? { hints: { ...req.hints } } : {}),
-      }),
-    };
-
-    const sigs = await this.deps.runner.signFrostAsLeader(
-      {
-        ceremonyId: req.ceremonyId,
-        sighashes: captured.sighashes.map((s) => ({
-          hash: new Uint8Array(Buffer.from(s.hash, 'hex')),
-          tweaked: s.type === 'key-path',
-        })),
-        signers: req.signers,
-        keyPackage: frostKeyPackage,
-        publicKeyPackage: frostPublicKeyPackage,
-        rng: this.deps.rng,
-      },
-      this.deps.pullOpts,
-      announceExtras,
-    );
-    await this.deps.runner.sendFrostSigningDoneSignoff(req.ceremonyId, sigs);
-
-    const broadcast = await broadcastOpnetTx({
-      captureContext: captured.captureContext,
-      frostSignatures: captured.sighashes.map((s, i) => ({
-        hash: s.hash,
-        signature: toHex(sigs[i]!),
-      })),
-      frostTweakedPubKey,
-      frostUntweakedPubKey,
-      network,
-    });
-    return { scheme: 'frost', signatures: sigs, transactionId: broadcast.transactionId };
+    } finally {
+      slot.end();
+    }
   }
 
-  private signingSpecMldsa(
-    req: LeaderSignMldsaRequest,
-    operation: SigningOperation,
-  ): CeremonySpec {
-    return {
-      kind: 'signing',
-      ceremonyId: req.ceremonyId,
-      leader: this.deps.node.id,
-      role: 'leader',
-      operation,
-    };
+  async sign(req: LeaderSignRequest): Promise<LeaderSignResult> {
+    const { ceremonyId, signers, proposal } = req;
+    const { vault, network } = this.deps;
+    if (!vault) throw new RequestError(409, NO_VAULT_MESSAGE);
+
+    const vaultKey = toVaultKey(vault.publicKeyPackage);
+    let analysis: ProposalAnalysis;
+    try {
+      analysis = analyzeProposal(proposal, vaultKey, network);
+    } catch (err) {
+      throw new RequestError(400, errorMessage(err));
+    }
+    const label = await this.labeler(ceremonyId);
+    await this.approve(buildSigningSpec(analysis, this.specBase(ceremonyId), network, label));
+
+    const slot = this.deps.slots.beginLocalSigning(ceremonyId);
+    if (!slot) throw new RequestError(409, `ceremony id ${ceremonyId} is already in use on this node`);
+    try {
+      let result: LeaderSignResult;
+      try {
+        const spec = {
+          ceremonyId,
+          signers,
+          sighashes: analysis.sighashes.map(s => fromHex(s.hash)),
+          keyPackage: vault.keyPackage,
+          publicKeyPackage: vault.publicKeyPackage,
+          rng: this.deps.rng,
+        };
+        this.log.info(`leader: signing ${ceremonyId}: ${analysis.inputs.length} inputs, signers ${signers.join(',')}`, {
+          ceremonyId,
+          txid: analysis.txid,
+        });
+        const signatures = await leadSigning(this.ceremonyIo('signing'), spec, proposal);
+        const signaturesHex = signatures.map(s => toHex(s));
+        const finalized = finalizeSend(
+          proposal.tx,
+          proposal.prevouts,
+          signaturesHex.map((signature, index) => ({ index, signature })),
+          vaultPayment(vaultKey, network).outputKey,
+        );
+        result = { ceremonyId, txid: finalized.txid, signedTxHex: finalized.hex, signaturesHex };
+      } catch (err) {
+        const reason = errorMessage(err);
+        this.log.warn(`leader: signing ${ceremonyId} failed: ${reason}`, { ceremonyId });
+        await this.broadcastBestEffort({ v: 2, kind: 'signoff-aborted', ceremonyId, reason: reason.slice(0, MAX_REASON_LENGTH) });
+        throw err;
+      }
+      await this.broadcastBestEffort({ v: 2, kind: 'signoff-done', ceremonyId, signaturesHex: result.signaturesHex });
+      this.log.info(`leader: signing ${ceremonyId} done: txid ${result.txid}`, { ceremonyId, txid: result.txid });
+      return result;
+    } finally {
+      slot.end();
+      this.clearLater(ceremonyId, 'signing');
+    }
   }
 
-  private signingSpecBtc(
-    req: LeaderSignBtcRequest,
-    outputs: readonly DecodedBtcOutput[],
-  ): CeremonySpec {
-    // Filter out self (change back to the vault's own P2TR). Policy rules
-    // evaluate over the external-facing outputs only — paying yourself is
-    // not a policy-relevant action.
-    const nonSelf = outputs.filter((o) => o.address !== req.btc.frostP2tr);
-    const amount = nonSelf.reduce((sum, o) => sum + o.amountSat, 0n);
-    const destination = nonSelf.find((o) => o.address !== null)?.address ?? undefined;
-    return {
-      kind: 'signing',
-      ceremonyId: req.ceremonyId,
-      leader: this.deps.node.id,
-      role: 'leader',
-      operation: 'btc-transfer',
-      amount,
-      ...(destination !== undefined ? { destination } : {}),
-      outputs: nonSelf.map((o) => ({ address: o.address, amountSat: o.amountSat })),
-    };
+  // ─── Helpers ─────────────────────────────────────────────────────────────
+
+  private specBase(ceremonyId: string) {
+    return { ceremonyId, leader: this.deps.node.id, role: 'leader' as const };
   }
 
-  private signingSpecOpnet(
-    req: LeaderSignOpnetRequest,
-  ): CeremonySpec {
-    const hints = req.hints ?? {};
-    const amount = hints.amountTokenAtomic !== undefined ? BigInt(hints.amountTokenAtomic) : undefined;
-    return {
-      kind: 'signing',
-      ceremonyId: req.ceremonyId,
-      leader: this.deps.node.id,
-      role: 'leader',
-      operation: 'opnet-call',
-      ...(hints.contractAddress !== undefined ? { destination: hints.contractAddress } : {}),
-      ...(hints.method !== undefined ? { method: hints.method } : {}),
-      ...(amount !== undefined ? { amount } : {}),
-    };
-  }
-
-  private signingSpecOpnetParams(
-    req: LeaderSignOpnetParamsRequest,
-  ): CeremonySpec {
-    const amount = req.hints?.amountTokenAtomic !== undefined
-      ? BigInt(req.hints.amountTokenAtomic) : undefined;
-    return {
-      kind: 'signing',
-      ceremonyId: req.ceremonyId,
-      leader: this.deps.node.id,
-      role: 'leader',
-      operation: 'opnet-call',
-      // Verified structurally: leader runs capture from these exact inputs,
-      // participants rebuild + match. Policy rules `allowed_contracts` +
-      // `method_allowlist` evaluate trusted data.
-      destination: req.contractAddress,
-      method: req.method,
-      ...(amount !== undefined ? { amount } : {}),
-    };
-  }
-
-  // ─────────────────────────────────────────────────────────────────────
-
-  private dkgSpec(
-    protocol: 'mldsa' | 'frost' | 'combined',
-    req: LeaderDkgRequest,
-  ): CeremonySpec {
-    return {
-      kind: 'dkg',
-      ceremonyId: req.ceremonyId,
-      leader: this.deps.node.id,
-      role: 'leader',
-      protocol,
-      threshold: req.threshold,
-      parties: req.parties,
-      peerIds: [...this.deps.peersById.values()],
-    };
-  }
-
-  private async requireApprove(spec: CeremonySpec): Promise<void> {
+  /** Gate once. Anything but approve (a throw counts as reject) is a `GateRejection`. */
+  private async approve(spec: CeremonySpec): Promise<void> {
     let decision: Decision;
     try {
       decision = await this.deps.gate.approve(spec);
     } catch (err) {
-      throw new Error(
-        `leader: gate threw: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      this.log.warn(`leader: ${spec.kind} ${spec.ceremonyId}: gate error, treated as reject: ${errorMessage(err)}`, {
+        ceremonyId: spec.ceremonyId,
+      });
+      throw new GateRejection(spec.ceremonyId, 'reject');
     }
-    if (decision !== 'approve') throw new GateRejection(spec.ceremonyId, decision);
+    if (decision !== 'approve') {
+      this.log.info(`leader: ${spec.kind} ${spec.ceremonyId}: gate decision ${decision}`, { ceremonyId: spec.ceremonyId });
+      throw new GateRejection(spec.ceremonyId, decision);
+    }
   }
 
-  private assertInSigners(signers: PartyId[]): void {
-    if (!signers.includes(this.deps.node.partyId))
-      throw new Error(
-        `leader: self (partyId=${this.deps.node.partyId}) is not in signers [${signers.join(',')}]`,
+  /** Output labels from this node's address book; a failed read means no labels. */
+  private async labeler(ceremonyId: string): Promise<((address: string) => string | undefined) | undefined> {
+    const { addressBook } = this.deps;
+    if (!addressBook) return undefined;
+    try {
+      const entries = await addressBook();
+      return address => labelFor(entries, address);
+    } catch (err) {
+      this.log.warn(
+        `leader: signing ${ceremonyId}: address book read failed, the gate sees no output labels: ${errorMessage(err)}`,
+        { ceremonyId },
       );
+      return undefined;
+    }
   }
+
+  /** Signoffs are best-effort: peers that miss one settle at their ceremony deadline. */
+  private async broadcastBestEffort(msg: CeremonyMessage): Promise<void> {
+    try {
+      await this.deps.io.transport.broadcast(encodeMessage(msg));
+    } catch (err) {
+      this.log.warn(`leader: ${msg.kind} broadcast for ${msg.ceremonyId} failed: ${errorMessage(err)}`, {
+        ceremonyId: msg.ceremonyId,
+      });
+    }
+  }
+
+  private clearLater(ceremonyId: string, kind: CeremonyKind): void {
+    const retention = (this.deps.blobRetentionMs ?? BLOB_RETENTION_MS)[kind];
+    scheduleClear(this.deps.io.store, ceremonyId, retention);
+  }
+
+  /** The ceremony's I/O: pulls bounded by the ceremony deadline, not an attempt count. */
+  private ceremonyIo(kind: CeremonyKind): CeremonyIo {
+    const { io, ceremonyDeadlines } = this.deps;
+    const deadlineMs = kind === 'signing' ? ceremonyDeadlines.signingMs : ceremonyDeadlines.dkgMs;
+    return { ...io, pullOpts: { ...io.pullOpts, deadlineMs, maxAttempts: Number.MAX_SAFE_INTEGER } };
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

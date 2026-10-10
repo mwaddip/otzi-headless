@@ -67,7 +67,7 @@ a fresh one.
 | `401` | `{ "error": "unauthorized" }` | HTTP trigger with `auth_token_env`, token missing or wrong. |
 | `403` | `{ "error": "gate rejected", "decision": "reject"\|"pending", "ceremonyId": "…" }` | This daemon's own gate did not approve. Nothing was announced to peers. See [`gates.md`](./gates.md). |
 | `405` | `{ "error": "method not allowed" }` | Non-POST method. |
-| `409` | `{ "error": "<detail>" }` | `vault-info` / `sign`: no vault is loaded. `dkg`: this node already holds a vault. |
+| `409` | `{ "error": "<detail>" }` | `vault-info` / `sign`: no vault is loaded (`no vault loaded — run otzi generate, then restart the daemon`). `dkg`: this node already holds a vault, or a DKG is already running on this node. `sign`: the `ceremonyId` is already in use on this node. Nothing was announced to peers. |
 | `500` | `{ "error": "<detail>", "ceremonyId": "…" }` | Ceremony failure after the announce: a peer dropped, rejected or timed out, a blob failed sender binding, a signature failed verification. Check the daemon logs; the cause names the offending party where one is known. |
 
 ## `op: "vault-info"`
@@ -144,6 +144,8 @@ Preconditions and failures:
 - `409` (`this node already holds a vault`) when the receiving node itself holds
   a vault; nothing is announced. Replacing a vault is an operator action: move
   the share file away and restart the daemon.
+- `409` (`a DKG is already running on this node`) while the node leads or takes
+  part in another DKG; nothing is announced.
 - `403` when the receiving node's gate does not approve the DKG spec.
 - `500` when the ceremony fails or times out (`[deadlines].dkg_ms`). Every node
   deletes its staged `<share path>.pending` file.
@@ -217,7 +219,9 @@ over the wire: each node computes them from the proposal. BIP341 sighashes
 commit to every input amount and script, so a proposal with false prevout data
 produces signatures that are invalid on chain.
 
-On the leader a rejected proposal is a `400` and nothing is announced. On a
+On the leader a rejected proposal is a `400` and nothing is announced. A
+`ceremonyId` that a live ceremony on the leader already uses is a `409`, also
+before the announce. On a
 participant it is a silent drop with a log line; to the leader the participant
 is indistinguishable from an offline node, and the leader's ceremony fails (`500`).
 

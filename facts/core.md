@@ -232,6 +232,7 @@
     - `deadlineMs: number` — wall-clock deadline from `pullAll` start.
   - **Pre:** All fields positive.
   - **Post:** Passed to `pullAll`; controls retry behavior and timeout.
+  - **Ceremonies:** the daemon's `CeremonyIo.pullOpts` supplies the backoff (`initialDelayMs`, `maxDelayMs`). Every ceremony — leader (`LeaderDispatcher`) and participant (`Orchestrator`) — runs with `deadlineMs` = the ceremony deadline (`[deadlines].signing_ms` or `dkg_ms`) and `maxAttempts = Number.MAX_SAFE_INTEGER`, so pulls retry with backoff until the ceremony deadline: they are bounded by the deadline, not by an attempt count.
 
 - `class BlobPuller`
   - **Pre:** Constructed with Transport and BlobStore (long-lived).
