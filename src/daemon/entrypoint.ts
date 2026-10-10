@@ -274,10 +274,10 @@ async function runVaultCommand(args: string[]): Promise<void> {
 
 const BTC_UNITS: readonly BtcUnit[] = ['sats', 'btc', 'mbtc', 'ubtc'];
 
+/** The number behind `--fee-rate`; `btcSend` enforces the range. */
 function parseFeeRate(raw: string): number {
   const rate = Number(raw);
-  if (raw.trim() === '' || !Number.isFinite(rate) || rate <= 0)
-    throw new Error(`--fee-rate must be a positive number of sat/vB (got '${raw}')`);
+  if (raw.trim() === '' || Number.isNaN(rate)) throw new Error(`--fee-rate must be a number of sat/vB (got '${raw}')`);
   return rate;
 }
 
@@ -324,7 +324,7 @@ async function runBtcCommand(args: string[]): Promise<void> {
       proposalPath: positional[0]!,
       broadcast: flags.has('broadcast'),
     });
-    console.error(result.summary);
+    // The summary was already written to stderr, before the daemon was asked to sign.
     if (result.explorerUrl === undefined) console.error('not broadcast; run again with --broadcast to post it');
     console.log(result.txid);
     console.log(result.signedTxHex);

@@ -20,7 +20,7 @@ import { fromVaultKey } from '../../otzi/lib/dkg';
 import type { SendProposal } from '../../otzi/lib/vault-types';
 import { startMockEsplora, type MockEsplora } from '../../testing/mock-esplora';
 import { makeProposal } from '../../testing/proposal';
-import { BroadcastFailedError, btcBalance, btcSend, btcSign } from './btc';
+import { BroadcastFailedError, btcBalance, btcSend, btcSign, type CliDeps } from './btc';
 
 const NETWORK = 'testnet4' as const;
 const DEST = 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx';
@@ -29,28 +29,51 @@ const MAINNET_DEST = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4';
 const { vault, tweakedSecret } = makeTestVault(2, 3);
 const outputKey = vaultPayment(vault, NETWORK).outputKey;
 
+interface SignReply {
+  ceremonyId: string;
+  status: string;
+  txid: string;
+  signedTxHex: string;
+  signaturesHex: string[];
+}
+
 /** Stands in for the daemon's `sign` op: analyses, signs every sighash with the vault key, finalizes. */
 class FakeDaemon {
   requests: Array<{ op: string; proposal: SendProposal }> = [];
+  /** What the daemon answered, in order. */
+  replies: SignReply[] = [];
+  /** Everything that happened, in order: `summary` (CLI), `sign` (daemon request). */
+  events: string[] = [];
   fail: Error | null = null;
   reply: unknown = undefined;
+  /** Rewrites the honest reply, as a broken or hostile daemon would. */
+  tamper: ((reply: SignReply, proposal: SendProposal) => SignReply) | null = null;
 
   get lastProposal(): SendProposal {
     return this.requests[this.requests.length - 1]!.proposal;
   }
 
-  async request<T>(body: unknown): Promise<T> {
-    const req = body as { op: string; proposal: SendProposal };
-    this.requests.push(req);
-    if (this.fail) throw this.fail;
-    if (this.reply !== undefined) return this.reply as T;
-    const analysis = analyzeProposal(req.proposal, vault, NETWORK);
+  /** The reply an honest daemon gives for `proposal`. */
+  signed(proposal: SendProposal): SignReply {
+    const analysis = analyzeProposal(proposal, vault, NETWORK);
     const signatures = analysis.sighashes.map(s => ({
       index: s.index,
       signature: hex.encode(schnorr.sign(hex.decode(s.hash), tweakedSecret)),
     }));
-    const { hex: signedTxHex, txid } = finalizeSend(req.proposal.tx, req.proposal.prevouts, signatures, outputKey);
-    return { ceremonyId: 'sign-test', status: 'done', txid, signedTxHex, signaturesHex: signatures.map(s => s.signature) } as T;
+    const { hex: signedTxHex, txid } = finalizeSend(proposal.tx, proposal.prevouts, signatures, outputKey);
+    return { ceremonyId: 'sign-test', status: 'done', txid, signedTxHex, signaturesHex: signatures.map(s => s.signature) };
+  }
+
+  async request<T>(body: unknown): Promise<T> {
+    const req = body as { op: string; proposal: SendProposal };
+    this.events.push('sign');
+    this.requests.push(req);
+    if (this.fail) throw this.fail;
+    if (this.reply !== undefined) return this.reply as T;
+    const honest = this.signed(req.proposal);
+    const reply = this.tamper ? this.tamper(honest, req.proposal) : honest;
+    this.replies.push(reply);
+    return reply as T;
   }
 }
 
@@ -84,6 +107,18 @@ describe('otzi btc', () => {
   let address: string;
   let esplora: MockEsplora;
   let client: FakeDaemon;
+  let summaries: string[];
+  let warnings: string[];
+
+  /** The CLI's seams: the fake daemon, and the summary/warning writers captured in order with its requests. */
+  const deps = (): CliDeps => ({
+    client,
+    summary: text => {
+      client.events.push('summary');
+      summaries.push(text);
+    },
+    warn: text => warnings.push(text),
+  });
 
   beforeEach(async () => {
     tmp = await mkdtemp(join(tmpdir(), 'otzi-btc-test-'));
@@ -95,6 +130,8 @@ describe('otzi btc', () => {
     esplora = await startMockEsplora();
     await writeFile(configPath, configToml(esplora.url));
     client = new FakeDaemon();
+    summaries = [];
+    warnings = [];
   });
 
   afterEach(async () => {
@@ -137,7 +174,7 @@ describe('otzi btc', () => {
       esplora.fund(address, 80_000);
       esplora.fund(address, 30_000, { confirmed: false });
 
-      const r = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client });
+      const r = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps());
 
       expect(esplora.broadcasts).toHaveLength(1);
       expect(client.requests).toHaveLength(1);
@@ -147,21 +184,45 @@ describe('otzi btc', () => {
       expect(client.lastProposal.prevouts[0]!.amount).toBe(80_000);
       expect(r.txid).toMatch(/^[0-9a-f]{64}$/);
       expect(r.explorerUrl).toBe(`${esplora.url}/tx/${r.txid}`);
-      expect(btc.Transaction.fromRaw(hex.decode(esplora.broadcasts[0]!)).id).toBe(r.txid);
+      // What reached Esplora is the daemon's signed transaction, byte for byte: the txid of a segwit
+      // transaction ignores witnesses, so comparing txids alone would pass for the unsigned body.
+      expect(client.replies).toHaveLength(1);
+      expect(esplora.broadcasts[0]).toBe(client.replies[0]!.signedTxHex);
+      expect(esplora.broadcasts[0]).not.toBe(client.lastProposal.tx);
+      expect(r.txid).toBe(client.replies[0]!.txid);
+      expect(btc.Transaction.fromRaw(hex.decode(esplora.broadcasts[0]!)).getInput(0).finalScriptWitness).toHaveLength(1);
 
       const analysis = analyzeProposal(client.lastProposal, vault, NETWORK);
       expect(analysis.outputs.find(o => !o.isChange)).toMatchObject({ address: DEST, amount: 50_000 });
       expect(analysis.outputs.filter(o => o.isChange)).toHaveLength(1);
     });
 
+    it('prints the summary to the summary writer before the daemon is asked to sign', async () => {
+      esplora.fund(address, 80_000);
+      await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps());
+
+      expect(client.events).toEqual(['summary', 'sign']);
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]).toContain(DEST);
+      expect(summaries[0]).toContain('50000 sats');
+      expect(summaries[0]).toMatch(/\bchange\b/);
+      expect(summaries[0]).toMatch(/fee: \d+ sats \(0\.\d{8} BTC\), 5\.\d sat\/vB/);
+    });
+
+    it('does not print a summary for a send it refuses', async () => {
+      esplora.fund(address, 1_000);
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps())).rejects.toThrow(/insufficient/);
+      expect(summaries).toEqual([]);
+    });
+
     it('uses the Esplora normal fee rate by default and --fee-rate when given', async () => {
       esplora.fund(address, 500_000);
-      await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client });
+      await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps());
       const normal = analyzeProposal(client.lastProposal, vault, NETWORK).feeRate;
       expect(normal).toBeGreaterThanOrEqual(5);
       expect(normal).toBeLessThan(5.5);
 
-      await btcSend({ configPath, vaultPath, to: DEST, amount: '50000', feeRate: 20 }, { client });
+      await btcSend({ configPath, vaultPath, to: DEST, amount: '50000', feeRate: 20 }, deps());
       const custom = analyzeProposal(client.lastProposal, vault, NETWORK).feeRate;
       expect(custom).toBeGreaterThanOrEqual(20);
       expect(custom).toBeLessThan(20.5);
@@ -169,7 +230,7 @@ describe('otzi btc', () => {
 
     it('takes amounts with units', async () => {
       esplora.fund(address, 500_000);
-      await btcSend({ configPath, vaultPath, to: DEST, amount: '0.0005btc' }, { client });
+      await btcSend({ configPath, vaultPath, to: DEST, amount: '0.0005btc' }, deps());
       const analysis = analyzeProposal(client.lastProposal, vault, NETWORK);
       expect(analysis.outputs.find(o => !o.isChange)!.amount).toBe(50_000);
     });
@@ -179,7 +240,7 @@ describe('otzi btc', () => {
       esplora.fund(address, 40_000);
       esplora.fund(address, 30_000, { confirmed: false });
 
-      await btcSend({ configPath, vaultPath, to: DEST, amount: 'max' }, { client });
+      await btcSend({ configPath, vaultPath, to: DEST, amount: 'max' }, deps());
 
       const analysis = analyzeProposal(client.lastProposal, vault, NETWORK);
       expect(analysis.inputs).toHaveLength(2);
@@ -191,11 +252,12 @@ describe('otzi btc', () => {
     it('send refuses before signing when more than 255 inputs are needed', async () => {
       for (let i = 0; i < 300; i++) esplora.fund(address, 1_000);
 
-      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: 'max' }, { client })).rejects.toThrow(
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: 'max' }, deps())).rejects.toThrow(
         'this send needs 300 inputs; at most 255 fit in one transaction — consolidate first',
       );
       expect(client.requests).toHaveLength(0);
       expect(esplora.broadcasts).toHaveLength(0);
+      expect(summaries).toEqual([]);
     });
 
     it('send fails before signing when Esplora is unreachable', async () => {
@@ -203,7 +265,7 @@ describe('otzi btc', () => {
       await dead.close();
       await writeFile(configPath, configToml(dead.url));
 
-      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client })).rejects.toThrow(
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps())).rejects.toThrow(
         new RegExp(`Esplora ${dead.url}`),
       );
       expect(client.requests).toHaveLength(0);
@@ -213,7 +275,7 @@ describe('otzi btc', () => {
       esplora.fund(address, 80_000);
       esplora.rejectBroadcasts('bad-txns-inputs-missingorspent');
 
-      const err = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client }).then(
+      const err = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps()).then(
         () => null,
         (e: unknown) => e,
       );
@@ -233,7 +295,7 @@ describe('otzi btc', () => {
       esplora.fund(address, 1_000);
       esplora.fund(address, 90_000, { confirmed: false });
 
-      const err = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client }).then(
+      const err = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps()).then(
         () => null,
         (e: unknown) => e as Error,
       );
@@ -248,7 +310,7 @@ describe('otzi btc', () => {
 
     it('refuses a send below the minimum amount', async () => {
       esplora.fund(address, 80_000);
-      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '545' }, { client })).rejects.toThrow(/546 sats/);
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '545' }, deps())).rejects.toThrow(/546 sats/);
       expect(client.requests).toHaveLength(0);
     });
 
@@ -257,7 +319,7 @@ describe('otzi btc', () => {
       await dead.close();
       await writeFile(configPath, configToml(dead.url));
       for (const to of ['not-an-address', MAINNET_DEST]) {
-        await expect(btcSend({ configPath, vaultPath, to, amount: '50000' }, { client })).rejects.toThrow(
+        await expect(btcSend({ configPath, vaultPath, to, amount: '50000' }, deps())).rejects.toThrow(
           /not a valid testnet4 address/,
         );
       }
@@ -266,18 +328,116 @@ describe('otzi btc', () => {
 
     it('refuses bad amounts and fee rates', async () => {
       esplora.fund(address, 80_000);
-      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: 'lots' }, { client })).rejects.toThrow(/invalid amount/);
-      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '0.5sats' }, { client })).rejects.toThrow(/integer/);
-      for (const feeRate of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-        await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000', feeRate }, { client })).rejects.toThrow(/fee rate/);
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: 'lots' }, deps())).rejects.toThrow(/invalid amount/);
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '0.5sats' }, deps())).rejects.toThrow(/integer/);
+      for (const feeRate of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 10_001]) {
+        await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000', feeRate }, deps())).rejects.toThrow(/fee rate/);
       }
       expect(client.requests).toHaveLength(0);
+    });
+
+    it('accepts a fee rate of exactly 10000 sat/vB and no more', async () => {
+      esplora.fund(address, 5_000_000);
+      await btcSend({ configPath, vaultPath, to: DEST, amount: '50000', feeRate: 10_000 }, deps());
+      expect(analyzeProposal(client.lastProposal, vault, NETWORK).feeRate).toBeGreaterThanOrEqual(10_000);
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000', feeRate: 10_001 }, deps())).rejects.toThrow(
+        /at most 10000/,
+      );
+      expect(client.requests).toHaveLength(1);
+    });
+
+    it('refuses an unusable Esplora fee rate, naming the URL, before any daemon call', async () => {
+      // One mock per value: the Esplora client caches fee rates per base URL for a minute.
+      for (const halfHourFee of [0, -3, null, 'fast', 20_000, 10_001]) {
+        const mock = await startMockEsplora();
+        try {
+          mock.fund(address, 80_000);
+          mock.setFeeRates({ fastestFee: 10, halfHourFee, hourFee: 2 });
+          await writeFile(configPath, configToml(mock.url));
+          const err = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps()).then(
+            () => null,
+            (e: unknown) => e as Error,
+          );
+          expect(err, `halfHourFee ${String(halfHourFee)}`).toBeInstanceOf(Error);
+          expect(err!.message).toContain(`Esplora ${mock.url}`);
+          expect(err!.message).toContain(`(${String(halfHourFee)} sat/vB;`);
+          expect(err!.message).toMatch(/unusable fee rate/);
+          expect(err!.message).toMatch(/--fee-rate/);
+          expect(mock.broadcasts).toHaveLength(0);
+        } finally {
+          await mock.close();
+        }
+      }
+      expect(client.requests).toHaveLength(0);
+      expect(summaries).toEqual([]);
+    });
+
+    it('an explicit --fee-rate does not depend on the Esplora estimate', async () => {
+      esplora.fund(address, 80_000);
+      esplora.setFeeRates({ fastestFee: 10, halfHourFee: 0, hourFee: 2 });
+      await btcSend({ configPath, vaultPath, to: DEST, amount: '50000', feeRate: 3 }, deps());
+      expect(client.requests).toHaveLength(1);
+    });
+
+    describe('the daemon reply is checked against the proposal before anything is broadcast', () => {
+      async function refused(): Promise<Error> {
+        esplora.fund(address, 80_000);
+        const err = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps()).then(
+          () => null,
+          (e: unknown) => e as Error,
+        );
+        expect(err).toBeInstanceOf(Error);
+        expect(client.requests).toHaveLength(1);
+        expect(esplora.broadcasts).toEqual([]);
+        return err!;
+      }
+
+      it('a signed transaction for a different proposal', async () => {
+        const other = client.signed(makeProposal(vault, NETWORK));
+        client.tamper = reply => ({ ...reply, txid: other.txid, signedTxHex: other.signedTxHex });
+        expect((await refused()).message).toMatch(/different transaction than the proposal/);
+      });
+
+      it('a txid that is not the txid of its own signed transaction', async () => {
+        client.tamper = reply => ({ ...reply, txid: 'ab'.repeat(32) });
+        const err = await refused();
+        expect(err.message).toMatch(/names txid abab/);
+        expect(err.message).toMatch(/signed transaction is [0-9a-f]{64}/);
+      });
+
+      it('the unsigned proposal returned as if it were signed', async () => {
+        client.tamper = (reply, proposal) => ({ ...reply, signedTxHex: proposal.tx });
+        expect((await refused()).message).toMatch(/no signature for input 0/);
+      });
+
+      it('a signed transaction that cannot be decoded', async () => {
+        client.tamper = reply => ({ ...reply, signedTxHex: 'abcdef' });
+        expect((await refused()).message).toMatch(/cannot be decoded/);
+      });
+
+      it('an honest reply is broadcast', async () => {
+        esplora.fund(address, 80_000);
+        await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps());
+        expect(esplora.broadcasts).toHaveLength(1);
+        expect(warnings).toEqual([]);
+      });
+    });
+
+    it('warns, and still succeeds, when Esplora answers a different txid', async () => {
+      esplora.fund(address, 80_000);
+      esplora.answerBroadcastsWith('cd'.repeat(32));
+      const r = await btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps());
+      expect(r.txid).toBe(client.replies[0]!.txid);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('cd'.repeat(32));
+      expect(warnings[0]).toContain(r.txid);
+      expect(warnings[0]).toContain(esplora.url);
     });
 
     it('passes a daemon refusal through and broadcasts nothing', async () => {
       esplora.fund(address, 80_000);
       client.fail = new DaemonClientError(403, 'gate rejected');
-      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client })).rejects.toMatchObject({
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps())).rejects.toMatchObject({
         status: 403,
         message: 'gate rejected',
       });
@@ -287,7 +447,7 @@ describe('otzi btc', () => {
     it('rejects a daemon reply without a signed transaction', async () => {
       esplora.fund(address, 80_000);
       client.reply = { ceremonyId: 'sign-x', status: 'done' };
-      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, { client })).rejects.toThrow(
+      await expect(btcSend({ configPath, vaultPath, to: DEST, amount: '50000' }, deps())).rejects.toThrow(
         /daemon reply/,
       );
       expect(esplora.broadcasts).toHaveLength(0);
@@ -309,7 +469,7 @@ describe('otzi btc', () => {
       });
       const proposalPath = await writeProposal(proposal);
 
-      const dry = await btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, { client });
+      const dry = await btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, deps());
 
       expect(esplora.broadcasts).toHaveLength(0);
       expect(client.requests).toHaveLength(1);
@@ -324,16 +484,51 @@ describe('otzi btc', () => {
       expect(dry.summary).toMatch(/fee: 1000 sats \(0\.00001000 BTC\)/);
       expect(dry.summary).toMatch(/\d+(\.\d+)? sat\/vB/);
 
-      const wet = await btcSign({ configPath, vaultPath, proposalPath, broadcast: true }, { client });
+      const wet = await btcSign({ configPath, vaultPath, proposalPath, broadcast: true }, deps());
 
       expect(esplora.broadcasts).toEqual([wet.signedTxHex]);
       expect(wet.explorerUrl).toBe(`${esplora.url}/tx/${wet.txid}`);
     });
 
+    it('prints the summary before the daemon is asked to sign, and keeps it in the result', async () => {
+      const proposalPath = await writeProposal(makeProposal(vault, NETWORK, { outputs: [{ address: DEST, amount: 50_000 }] }));
+      const r = await btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, deps());
+      expect(client.events).toEqual(['summary', 'sign']);
+      expect(summaries).toEqual([r.summary]);
+      expect(r.summary).toContain(DEST);
+    });
+
+    it('does not print a summary for a proposal it refuses', async () => {
+      const proposalPath = await writeProposal(makeProposal(makeTestVault(2, 3).vault, NETWORK));
+      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: true }, deps())).rejects.toThrow(/refused/);
+      expect(summaries).toEqual([]);
+      expect(client.events).toEqual([]);
+    });
+
+    it('does not broadcast a reply that is not the proposal, with or without --broadcast', async () => {
+      const proposalPath = await writeProposal(makeProposal(vault, NETWORK));
+      const other = client.signed(makeProposal(vault, NETWORK));
+      client.tamper = reply => ({ ...reply, txid: other.txid, signedTxHex: other.signedTxHex });
+      for (const broadcast of [false, true]) {
+        await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast }, deps())).rejects.toThrow(
+          /different transaction than the proposal/,
+        );
+      }
+      expect(esplora.broadcasts).toEqual([]);
+    });
+
+    it('warns when Esplora answers a different txid for a broadcast proposal', async () => {
+      const proposalPath = await writeProposal(makeProposal(vault, NETWORK));
+      esplora.answerBroadcastsWith('cd'.repeat(32));
+      const r = await btcSign({ configPath, vaultPath, proposalPath, broadcast: true }, deps());
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(r.txid);
+    });
+
     it('a rejected broadcast of a signed proposal surfaces the signed hex', async () => {
       const proposalPath = await writeProposal(makeProposal(vault, NETWORK));
       esplora.rejectBroadcasts('txn-mempool-conflict');
-      const err = await btcSign({ configPath, vaultPath, proposalPath, broadcast: true }, { client }).then(
+      const err = await btcSign({ configPath, vaultPath, proposalPath, broadcast: true }, deps()).then(
         () => null,
         (e: unknown) => e,
       );
@@ -344,7 +539,7 @@ describe('otzi btc', () => {
     it('fails analysis before any daemon call for a proposal this vault would not sign', async () => {
       const other = makeTestVault(2, 3).vault;
       const proposalPath = await writeProposal(makeProposal(other, NETWORK));
-      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, { client })).rejects.toThrow(
+      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, deps())).rejects.toThrow(
         /does not spend a coin of this vault/,
       );
       expect(client.requests).toHaveLength(0);
@@ -352,7 +547,7 @@ describe('otzi btc', () => {
 
     it('refuses a proposal for another network before any daemon call', async () => {
       const proposalPath = await writeProposal(makeProposal(vault, 'mainnet'));
-      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, { client })).rejects.toThrow(
+      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, deps())).rejects.toThrow(
         /mainnet.*testnet4/,
       );
       expect(client.requests).toHaveLength(0);
@@ -365,7 +560,7 @@ describe('otzi btc', () => {
         change: 0,
       });
       const proposalPath = await writeProposal(proposal);
-      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, { client })).rejects.toThrow(
+      await expect(btcSign({ configPath, vaultPath, proposalPath, broadcast: false }, deps())).rejects.toThrow(
         'proposal has 256 inputs; at most 255 fit in one transaction',
       );
       expect(client.requests).toHaveLength(0);
@@ -373,16 +568,16 @@ describe('otzi btc', () => {
 
     it('names the file when it is missing, not JSON, or not a proposal', async () => {
       const missing = join(tmp, 'absent.json');
-      await expect(btcSign({ configPath, vaultPath, proposalPath: missing, broadcast: false }, { client })).rejects.toThrow(
+      await expect(btcSign({ configPath, vaultPath, proposalPath: missing, broadcast: false }, deps())).rejects.toThrow(
         /absent\.json/,
       );
       const notJson = join(tmp, 'garbage.json');
       await writeFile(notJson, '{nope');
-      await expect(btcSign({ configPath, vaultPath, proposalPath: notJson, broadcast: false }, { client })).rejects.toThrow(
+      await expect(btcSign({ configPath, vaultPath, proposalPath: notJson, broadcast: false }, deps())).rejects.toThrow(
         /garbage\.json.*JSON/,
       );
       const wrongShape = await writeProposal({ network: NETWORK });
-      await expect(btcSign({ configPath, vaultPath, proposalPath: wrongShape, broadcast: false }, { client })).rejects.toThrow(
+      await expect(btcSign({ configPath, vaultPath, proposalPath: wrongShape, broadcast: false }, deps())).rejects.toThrow(
         /proposal must be/,
       );
       expect(client.requests).toHaveLength(0);

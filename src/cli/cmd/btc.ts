@@ -8,6 +8,8 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import { hex } from '@scure/base';
+import * as btc from '@scure/btc-signer';
 import { loadDaemonConfig } from '../../config/load';
 import type { DaemonConfig, NetworkName } from '../../config/types';
 import { MAX_INPUTS } from '../../core/messages';
@@ -26,9 +28,17 @@ import type { SendProposal } from '../../otzi/lib/vault-types';
 import { DaemonClient } from '../daemon-client';
 import { formatSats, parseBtcAmount, type BtcUnit } from '../units';
 
-/** Test seam: the CLI's connection to the daemon (default: `DaemonClient` from the config). */
+/** The most the CLI accepts as a fee rate, from Esplora or from `--fee-rate`: sat/vB. */
+export const MAX_FEE_RATE = 10_000;
+
+/** Test seams: the CLI's connection to the daemon and its writers. */
 export interface CliDeps {
+  /** Default: `DaemonClient` from the config. */
   client?: { request<T>(body: unknown): Promise<T> };
+  /** Receives the analysis summary before the daemon is asked to sign. Default: stderr. */
+  summary?: (text: string) => void;
+  /** Receives non-fatal warnings. Default: stderr. */
+  warn?: (text: string) => void;
 }
 
 /**
@@ -91,10 +101,16 @@ async function viaEsplora<T>(base: string, call: Promise<T>): Promise<T> {
 
 const money = (sats: bigint | number): string => `${sats} sats (${formatBtc(Number(sats))} BTC)`;
 
-/** Asks the daemon to sign `proposal`. */
+/**
+ * Asks the daemon to sign `proposal` and checks the reply against it. The
+ * reply must be the proposal's own transaction with a signature on every
+ * input: nothing else is ever handed to the caller, so nothing else is
+ * broadcast. `proposalTxid` is the txid `analyzeProposal` computed for it.
+ */
 async function signProposal(
   client: NonNullable<CliDeps['client']>,
   proposal: SendProposal,
+  proposalTxid: string,
 ): Promise<{ txid: string; signedTxHex: string }> {
   const reply = await client.request<{ txid?: unknown; signedTxHex?: unknown }>({ op: 'sign', proposal });
   if (
@@ -104,19 +120,49 @@ async function signProposal(
   ) {
     throw new Error("daemon reply to 'sign' has no signed transaction (txid, signedTxHex)");
   }
-  return { txid: reply.txid, signedTxHex: reply.signedTxHex };
+  const { txid, signedTxHex } = reply;
+
+  let signed: btc.Transaction;
+  try {
+    signed = btc.Transaction.fromRaw(hex.decode(signedTxHex), { allowUnknownOutputs: true });
+  } catch (err) {
+    throw new Error(`the signed transaction in the daemon's reply cannot be decoded: ${reason(err)}`, { cause: err });
+  }
+  if (signed.id !== txid) {
+    throw new Error(`daemon reply is inconsistent: it names txid ${txid} but its signed transaction is ${signed.id}`);
+  }
+  if (signed.id !== proposalTxid || hex.encode(signed.unsignedTx) !== proposal.tx) {
+    throw new Error(
+      `daemon signed a different transaction than the proposal (proposal ${proposalTxid}, signed ${signed.id}); not broadcasting it`,
+    );
+  }
+  for (let i = 0; i < signed.inputsLength; i++) {
+    if (!signed.getInput(i).finalScriptWitness?.length) {
+      throw new Error(`the daemon's signed transaction has no signature for input ${i}; not broadcasting it`);
+    }
+  }
+  return { txid, signedTxHex };
 }
 
 /** Posts a signed transaction; a failure carries the transaction out in a `BroadcastFailedError`. */
-async function broadcast(base: string, signed: { txid: string; signedTxHex: string }): Promise<void> {
+async function broadcast(
+  base: string,
+  signed: { txid: string; signedTxHex: string },
+  warn: NonNullable<CliDeps['warn']>,
+): Promise<void> {
+  let reported: string;
   try {
-    await broadcastTx(base, signed.signedTxHex);
+    reported = await broadcastTx(base, signed.signedTxHex);
   } catch (err) {
     throw new BroadcastFailedError(
       `broadcast failed — ${esploraError(base, err).message}`,
       signed.txid,
       signed.signedTxHex,
     );
+  }
+  // The txid the daemon returned is the one the caller gets; Esplora's answer only cross-checks it.
+  if (reported !== signed.txid) {
+    warn(`warning: Esplora ${base} answered txid '${reported}' for the broadcast, but the signed transaction is ${signed.txid}`);
   }
 }
 
@@ -133,6 +179,17 @@ export async function btcBalance(opts: { configPath: string; vaultPath?: string;
 }
 
 // ─── otzi btc send ──────────────────────────────────────────────────────────
+
+const usableFeeRate = (rate: unknown): rate is number =>
+  typeof rate === 'number' && Number.isFinite(rate) && rate > 0 && rate <= MAX_FEE_RATE;
+
+/** Esplora's `normal` estimate, or an error naming Esplora when it is not a usable rate. */
+function esploraFeeRate(base: string, rate: unknown): number {
+  if (usableFeeRate(rate)) return rate;
+  throw new Error(
+    `Esplora ${base} returned an unusable fee rate (${String(rate)} sat/vB; expected more than 0 and at most ${MAX_FEE_RATE}); pass --fee-rate to choose one`,
+  );
+}
 
 function insufficientFunds(err: InsufficientFundsError, feeRate: number, unconfirmed: number): Error {
   let message =
@@ -156,15 +213,15 @@ export async function btcSend(
   if (amount !== 'max' && amount < MIN_SEND_SATS) {
     throw new Error(`amount ${amount} sats is below the minimum send of ${MIN_SEND_SATS} sats`);
   }
-  if (opts.feeRate !== undefined && !(Number.isFinite(opts.feeRate) && opts.feeRate > 0)) {
-    throw new Error(`fee rate must be a positive number of sat/vB (got ${opts.feeRate})`);
+  if (opts.feeRate !== undefined && !usableFeeRate(opts.feeRate)) {
+    throw new Error(`fee rate must be more than 0 and at most ${MAX_FEE_RATE} sat/vB (got ${opts.feeRate})`);
   }
   const client = deps.client ?? DaemonClient.fromParsed(config);
 
   const coins = await viaEsplora(base, getUtxos(base, vault.address));
   const confirmed = coins.filter(c => c.confirmed);
   const unconfirmed = coins.filter(c => !c.confirmed).reduce((sum, c) => sum + c.value, 0);
-  const feeRate = opts.feeRate ?? (await viaEsplora(base, getFeeRates(base))).normal;
+  const feeRate = opts.feeRate ?? esploraFeeRate(base, (await viaEsplora(base, getFeeRates(base))).normal);
 
   let built: PreparedSend;
   try {
@@ -186,8 +243,12 @@ export async function btcSend(
     );
   }
 
-  const signed = await signProposal(client, { network, tx: built.tx, prevouts: built.prevouts });
-  await broadcast(base, signed);
+  const proposal: SendProposal = { network, tx: built.tx, prevouts: built.prevouts };
+  const analysis = analyzeProposal(proposal, vault.vaultKey, network);
+  (deps.summary ?? console.error)(summarize(analysis, network));
+
+  const signed = await signProposal(client, proposal, analysis.txid);
+  await broadcast(base, signed, deps.warn ?? console.error);
   return { txid: signed.txid, explorerUrl: explorerTxUrl(base, signed.txid) };
 }
 
@@ -238,9 +299,10 @@ export async function btcSign(
     throw new Error(`proposal refused: ${reason(err)}`, { cause: err });
   }
   const summary = summarize(analysis, vault.network);
+  (deps.summary ?? console.error)(summary);
 
-  const signed = await signProposal(client, proposal);
+  const signed = await signProposal(client, proposal, analysis.txid);
   if (!opts.broadcast) return { ...signed, summary };
-  await broadcast(base, signed);
+  await broadcast(base, signed, deps.warn ?? console.error);
   return { ...signed, summary, explorerUrl: explorerTxUrl(base, signed.txid) };
 }

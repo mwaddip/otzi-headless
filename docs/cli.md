@@ -19,6 +19,7 @@ through Esplora.
   `/var/lib/otzi/vault-pubkey.json`.
 - Machine output (addresses, txids, signed hex, JSON) goes to stdout. Banners and
   errors go to stderr. Errors exit with status 1.
+- The CLI broadcasts only the daemon's own signed version of the transaction it asked about; a reply for a different transaction, or one missing a signature, is refused and nothing is posted.
 - If a broadcast fails after signing, the CLI prints the signed transaction hex
   to stderr and exits 1, so the operator can broadcast it by other means.
 - Esplora defaults to mempool.space for the configured network
@@ -49,11 +50,11 @@ through Esplora.
 - `otzi btc send <label|address> <amount[unit]|max> [--fee-rate N] [--config <path>]` — send from the vault. Prints the txid and the explorer URL.
   - `<label|address>`: a label from this node's address book (exact match) or a valid address for the configured network.
   - `<amount[unit]>`: a number with an optional unit, `sats` (default), `btc`, `mbtc` or `ubtc` (`50000`, `0.001btc`). Fractional sats are rejected. `max` spends every confirmed UTXO with no change.
-  - `--fee-rate N`: sat/vB. Default: Esplora's `normal` estimate.
+  - `--fee-rate N`: sat/vB, more than 0 and at most 10000. Default: Esplora's `normal` estimate; an Esplora estimate outside that range is refused (naming the Esplora URL) and you pass `--fee-rate` instead.
 
-  The steps: resolve the recipient, fetch **confirmed** UTXOs, build the proposal (largest UTXOs first; change under 330 sats goes to the fee; a send below 546 sats is refused), refuse a send that needs more than 255 inputs (consolidate UTXOs first), call the daemon's `sign` op, broadcast the signed transaction. The node you run it on is the ceremony leader.
+  The steps: resolve the recipient, fetch **confirmed** UTXOs, build the proposal (largest UTXOs first; change under 330 sats goes to the fee; a send below 546 sats is refused), refuse a send that needs more than 255 inputs (consolidate UTXOs first), print the summary (outputs, change, fee, fee rate) to stderr, call the daemon's `sign` op, check that the reply is the transaction that was built and is signed on every input, broadcast it. The node you run it on is the ceremony leader.
 
-- `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` — sign a proposal someone else built. `proposal.json` holds `{ "network", "tx", "prevouts" }` (see [`api.md`](./api.md) § `op: "sign"`). Analysis runs locally first, so a proposal this vault would not sign fails before any daemon call. The analysis summary (outputs with their address-book labels, change, fee, fee rate) goes to stderr; stdout gets the txid and the signed hex. Without `--broadcast` nothing is posted; with it, the CLI posts the transaction and prints the explorer URL as a third stdout line.
+- `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` — sign a proposal someone else built. `proposal.json` holds `{ "network", "tx", "prevouts" }` (see [`api.md`](./api.md) § `op: "sign"`). Analysis runs locally first, so a proposal this vault would not sign fails before any daemon call. The analysis summary (outputs with their address-book labels, change, fee, fee rate) goes to stderr before the daemon is asked to sign; stdout gets the txid and the signed hex. Without `--broadcast` nothing is posted; with it, the CLI posts the transaction and prints the explorer URL as a third stdout line.
 
 Every node in the signer set analyses the proposal against its own key and runs its own gate. If a node declines, the leader's ceremony fails and the command exits with the daemon's `500` error.
 

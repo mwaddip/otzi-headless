@@ -10,14 +10,28 @@ import { hex } from '@scure/base';
 import * as btc from '@scure/btc-signer';
 
 export interface MockEsplora {
-  /** Esplora base URL, no trailing slash (`http://127.0.0.1:<port>`). */
+  /**
+   * Esplora base URL, no trailing slash: `http://127.0.0.1:<port>/<random>`.
+   * The random path segment makes every instance's base unique, so the Esplora
+   * client's per-base fee-rate cache never carries rates from one mock to
+   * another that happens to reuse the port.
+   */
   url: string;
   /** Raw transaction hex of every accepted `POST /tx`, in order. */
   broadcasts: string[];
   /** Adds a coin to `address` (confirmed unless `opts.confirmed` is false) and returns its outpoint. */
   fund(address: string, value: number, opts?: { confirmed?: boolean }): { txid: string; vout: number };
-  /** While set, `POST /tx` fails with status 400 and this message; `null` accepts broadcasts again. */
+  /**
+   * `POST /tx` accepts only a transaction that carries witness data for every
+   * input (an unsigned transaction is refused, as a node would refuse it).
+   * While `rejectBroadcasts` is set it fails with status 400 and that message;
+   * `null` accepts broadcasts again.
+   */
   rejectBroadcasts(message: string | null): void;
+  /** While set, an accepted `POST /tx` answers with this txid instead of the transaction's own; `null` restores that. */
+  answerBroadcastsWith(txid: string | null): void;
+  /** Replaces the `GET /v1/fees/recommended` body (default `{ fastestFee: 10, halfHourFee: 5, hourFee: 2 }`). */
+  setFeeRates(rates: { fastestFee: unknown; halfHourFee: unknown; hourFee: unknown }): void;
   close(): Promise<void>;
 }
 
@@ -32,6 +46,9 @@ export async function startMockEsplora(): Promise<MockEsplora> {
   const coins = new Map<string, Coin[]>();
   const broadcasts: string[] = [];
   let rejection: string | null = null;
+  let answer: string | null = null;
+  let feeRates: unknown = { fastestFee: 10, halfHourFee: 5, hourFee: 2 };
+  const prefix = `/${randomBytes(4).toString('hex')}`;
 
   const fund: MockEsplora['fund'] = (address, value, opts = {}) => {
     const coin: Coin = {
@@ -65,18 +82,23 @@ export async function startMockEsplora(): Promise<MockEsplora> {
 
   const route = (method: string, path: string, body: string, res: http.ServerResponse) => {
     if (method === 'GET' && path === '/v1/fees/recommended') {
-      return sendJson(res, { fastestFee: 10, halfHourFee: 5, hourFee: 2 });
+      return sendJson(res, feeRates);
     }
     if (method === 'POST' && path === '/tx') {
       if (rejection !== null) return send(res, 400, rejection);
-      let txid: string;
+      let tx: btc.Transaction;
       try {
-        txid = btc.Transaction.fromRaw(hex.decode(body.trim()), { allowUnknownOutputs: true }).id;
+        tx = btc.Transaction.fromRaw(hex.decode(body.trim()), { allowUnknownOutputs: true });
       } catch {
         return send(res, 400, 'sendrawtransaction RPC error: TX decode failed');
       }
+      for (let i = 0; i < tx.inputsLength; i++) {
+        if (!tx.getInput(i).finalScriptWitness?.length) {
+          return send(res, 400, 'sendrawtransaction RPC error: mandatory-script-verify-flag-failed (Witness program was passed an empty witness)');
+        }
+      }
       broadcasts.push(body.trim());
-      return send(res, 200, txid);
+      return send(res, 200, answer ?? tx.id);
     }
     if (method === 'POST' && path === '/_fund') {
       let req: { address: string; value: number; confirmed?: boolean };
@@ -104,8 +126,9 @@ export async function startMockEsplora(): Promise<MockEsplora> {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
-      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
-      route(req.method ?? 'GET', path, Buffer.concat(chunks).toString('utf8'), res);
+      const full = new URL(req.url ?? '/', 'http://localhost').pathname;
+      if (!full.startsWith(`${prefix}/`)) return send(res, 404, 'not found');
+      route(req.method ?? 'GET', full.slice(prefix.length), Buffer.concat(chunks).toString('utf8'), res);
     });
   });
   await new Promise<void>((resolve, reject) => {
@@ -115,11 +138,17 @@ export async function startMockEsplora(): Promise<MockEsplora> {
   const { port } = server.address() as AddressInfo;
 
   return {
-    url: `http://127.0.0.1:${port}`,
+    url: `http://127.0.0.1:${port}${prefix}`,
     broadcasts,
     fund,
     rejectBroadcasts(message) {
       rejection = message;
+    },
+    answerBroadcastsWith(txid) {
+      answer = txid;
+    },
+    setFeeRates(rates) {
+      feeRates = rates;
     },
     close() {
       return new Promise<void>((resolve, reject) => {
