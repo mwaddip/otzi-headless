@@ -225,7 +225,7 @@ timeout_sec = 3600
 | Key | Type | Notes |
 |---|---|---|
 | `url` | string | Full POST URL. |
-| `timeout_sec` | number > 0 | AbortController timeout (seconds). |
+| `timeout_sec` | number > 0 | One deadline (seconds) for the whole request: connect, response headers and the full response body. A response that starts early but does not finish in time is a reject. |
 | `bearer_token_env` | string, optional | Env var holding a Bearer token for outgoing auth. |
 
 The daemon POSTs the spec JSON and expects `{ "decision": "approve" | "reject" }`.

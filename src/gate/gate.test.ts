@@ -1,3 +1,5 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
 import { ConfigError } from '../config/parse';
 import { buildDkgSpec, buildSigningSpec, resolveLeaderId } from '../orchestrator/spec-builder';
@@ -6,6 +8,31 @@ import type { ProposalAnalysis } from '../otzi/lib/bitcoin';
 import { AutoGate, createGate } from './factory';
 import { parsePolicyParams, PolicyGate } from './policy';
 import type { CeremonyRole, DkgSpec, SigningSpec, SpecOutput } from './types';
+
+/** A real local HTTP server for the webhook gate tests; `close()` drops open connections. */
+async function serve(
+  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createServer((req, res) => {
+    void Promise.resolve(handler(req, res)).catch(() => res.destroy());
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}/webhook`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      }),
+  };
+}
+
+async function readRequestBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
+}
 
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
@@ -1007,55 +1034,210 @@ describe('createGate', () => {
   });
 
   it('creates WebhookGate for strategy="webhook" and returns the approver decision', async () => {
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = async () =>
-      new Response(JSON.stringify({ decision: 'approve' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
+    const approver = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ decision: 'approve' }));
+    });
     try {
-      const gate = createGate({
-        strategy: 'webhook',
-        params: { url: 'http://approver.test/decide', timeout_sec: 5 },
-      });
+      const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 5 } });
       expect(await gate.approve(signing())).toBe('approve');
     } finally {
-      globalThis.fetch = origFetch;
+      await approver.close();
     }
   });
 
   it('WebhookGate posts the signing spec as JSON with numeric sats', async () => {
-    const origFetch = globalThis.fetch;
-    let body: unknown;
-    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
-      body = JSON.parse(init?.body as string);
-      return new Response(JSON.stringify({ decision: 'reject' }), { status: 200 });
-    }) as typeof fetch;
+    let seen: { method?: string; contentType?: string; authorization?: string; body?: string } = {};
+    const approver = await serve(async (req, res) => {
+      seen = {
+        method: req.method,
+        contentType: req.headers['content-type'],
+        authorization: req.headers.authorization,
+        body: await readRequestBody(req),
+      };
+      res.writeHead(200);
+      res.end(JSON.stringify({ decision: 'reject' }));
+    });
     try {
-      const gate = createGate({
-        strategy: 'webhook',
-        params: { url: 'http://approver.test/decide', timeout_sec: 5 },
-      });
+      const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 5 } });
       const spec = signing({ external: 50_000, change: 20_000 });
       expect(await gate.approve(spec)).toBe('reject');
-      expect(body).toEqual(spec);
-      expect(typeof (body as SigningSpec).amount).toBe('number');
+      expect(seen.method).toBe('POST');
+      expect(seen.contentType).toBe('application/json');
+      expect(seen.authorization).toBeUndefined();
+      expect(JSON.parse(seen.body!)).toEqual(spec);
+      expect(typeof (JSON.parse(seen.body!) as SigningSpec).amount).toBe('number');
     } finally {
-      globalThis.fetch = origFetch;
+      await approver.close();
     }
   });
 
-  it('WebhookGate throws on non-200 response', async () => {
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = async () => new Response('server down', { status: 503 });
+  it('WebhookGate sends the Bearer token read from the env at request time', async () => {
+    let authorization: string | undefined;
+    const approver = await serve((req, res) => {
+      authorization = req.headers.authorization;
+      res.end(JSON.stringify({ decision: 'approve' }));
+    });
+    const envName = 'OTZI_TEST_WEBHOOK_TOKEN';
     try {
       const gate = createGate({
         strategy: 'webhook',
-        params: { url: 'http://approver.test/decide', timeout_sec: 5 },
+        params: { url: approver.url, timeout_sec: 5, bearer_token_env: envName },
       });
-      await expect(gate.approve(signing())).rejects.toThrow(/503/);
+      delete process.env[envName];
+      await expect(gate.approve(signing())).rejects.toThrow(/OTZI_TEST_WEBHOOK_TOKEN.*empty or unset/);
+      process.env[envName] = 's3cret';
+      expect(await gate.approve(signing())).toBe('approve');
+      expect(authorization).toBe('Bearer s3cret');
     } finally {
-      globalThis.fetch = origFetch;
+      delete process.env[envName];
+      await approver.close();
+    }
+  });
+
+  it('WebhookGate throws on non-200 response and names the status and body', async () => {
+    const approver = await serve((_req, res) => {
+      res.writeHead(503, 'Service Unavailable');
+      res.end('server down');
+    });
+    try {
+      const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 5 } });
+      await expect(gate.approve(signing())).rejects.toThrow(/503 Service Unavailable — server down/);
+    } finally {
+      await approver.close();
+    }
+  });
+
+  it('WebhookGate does not follow redirects', async () => {
+    const approver = await serve((_req, res) => {
+      res.writeHead(302, { location: '/elsewhere' });
+      res.end();
+    });
+    try {
+      const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 5 } });
+      await expect(gate.approve(signing())).rejects.toThrow(/302/);
+    } finally {
+      await approver.close();
+    }
+  });
+
+  it('WebhookGate rejects a body that is not JSON or carries no valid decision', async () => {
+    for (const [body, message] of [
+      ['not json', /response is not JSON/],
+      [JSON.stringify({ decision: 'maybe' }), /unexpected decision "maybe"/],
+      [JSON.stringify({}), /unexpected decision undefined/],
+      [JSON.stringify({ error: 'approver shutting down' }), /unexpected decision undefined/],
+    ] as const) {
+      const approver = await serve((_req, res) => {
+        res.end(body);
+      });
+      try {
+        const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 5 } });
+        await expect(gate.approve(signing())).rejects.toThrow(message);
+      } finally {
+        await approver.close();
+      }
+    }
+  });
+
+  it('WebhookGate reports a refused connection as a failed request', async () => {
+    const approver = await serve((_req, res) => {
+      res.end();
+    });
+    const { url } = approver;
+    await approver.close();
+    const gate = createGate({ strategy: 'webhook', params: { url, timeout_sec: 5 } });
+    await expect(gate.approve(signing())).rejects.toThrow(/WebhookGate: request failed/);
+  });
+
+  it('WebhookGate waits for an approver that holds the response, then returns its decision', async () => {
+    const approver = await serve((_req, res) => {
+      setTimeout(() => res.end(JSON.stringify({ decision: 'approve' })), 300);
+    });
+    try {
+      const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 5 } });
+      expect(await gate.approve(signing())).toBe('approve');
+    } finally {
+      await approver.close();
+    }
+  });
+
+  // timeout_sec is one deadline for the whole request: connect, headers and the body read.
+  // These pin the deadline against an approver that answers early but never finishes.
+  describe('WebhookGate deadline', () => {
+    async function expectsTimeout(handler: (req: IncomingMessage, res: ServerResponse) => void) {
+      const approver = await serve(handler);
+      try {
+        const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 0.4 } });
+        const started = Date.now();
+        await expect(gate.approve(signing())).rejects.toThrow(/WebhookGate: timed out after 0\.4s/);
+        const elapsed = Date.now() - started;
+        expect(elapsed).toBeGreaterThanOrEqual(350);
+        expect(elapsed).toBeLessThan(3_000);
+      } finally {
+        await approver.close();
+      }
+    }
+
+    it('fires when the approver never answers', async () => {
+      await expectsTimeout(() => {});
+    });
+
+    it('fires when the approver sends headers at once and never the body', async () => {
+      await expectsTimeout((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.flushHeaders();
+      });
+    });
+
+    it('fires when the approver sends headers at once and trickles whitespace', async () => {
+      await expectsTimeout((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.flushHeaders();
+        const timer = setInterval(() => res.write(' '), 50);
+        res.on('close', () => clearInterval(timer));
+      });
+    });
+
+    it('fires when the approver sends part of the body and stalls', async () => {
+      await expectsTimeout((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"decision":');
+      });
+    });
+  });
+
+  it('WebhookGate fails when the connection drops in the middle of the body', async () => {
+    const approver = await serve((_req, res) => {
+      res.writeHead(200, { 'content-length': '100' });
+      res.write('{"decision":');
+      setTimeout(() => res.destroy(), 50);
+    });
+    try {
+      const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 5 } });
+      await expect(gate.approve(signing())).rejects.toThrow(/WebhookGate: /);
+    } finally {
+      await approver.close();
+    }
+  });
+
+  it('WebhookGate caps the response body so a hostile approver cannot exhaust memory', async () => {
+    let sent = 0;
+    const approver = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      const chunk = ' '.repeat(16 * 1024);
+      const timer = setInterval(() => {
+        sent += chunk.length;
+        res.write(chunk);
+      }, 5);
+      res.on('close', () => clearInterval(timer));
+    });
+    try {
+      const gate = createGate({ strategy: 'webhook', params: { url: approver.url, timeout_sec: 10 } });
+      await expect(gate.approve(signing())).rejects.toThrow(/response body exceeds 65536 bytes/);
+      expect(sent).toBeLessThan(2 * 1024 * 1024);
+    } finally {
+      await approver.close();
     }
   });
 

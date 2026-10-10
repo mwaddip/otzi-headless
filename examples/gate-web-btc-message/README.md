@@ -17,7 +17,7 @@ The daemon has no knowledge of message signatures or of this auth scheme. That s
 ```
 
 1. A trigger reaches the daemon (the `sign` op on the leader, a ceremony announce on a participant). The daemon analyses the proposal against its own key and builds the spec.
-2. The webhook gate POSTs the spec JSON to `/webhook`. The approver mints a fresh 16-byte hex nonce, files the request under it and holds the connection open. It sends the `200` headers at once and a space every 30 s, because the daemon's HTTP client abandons a response that stays silent for 5 minutes, whatever `timeout_sec` says; JSON allows the leading whitespace.
+2. The webhook gate POSTs the spec JSON to `/webhook`. The approver mints a fresh 16-byte hex nonce, files the request under it and holds the connection open.
 3. The operator opens the page. It lists every pending spec: ceremony id, outputs with labels and change flags, fee, fee rate and txid for a signing spec; threshold, ring and leader for a DKG spec.
 4. The operator picks Approve or Reject. The page shows the exact message to sign:
 
@@ -61,7 +61,7 @@ signing_ms = 86400000                          # every signer's decision must ar
 dkg_ms     = 86400000
 ```
 
-Raise `[deadlines]` on every node to cover the slowest approver, and keep `timeout_sec` within it (see `docs/gates.md` § Operator-in-the-loop timeouts). If the daemon's request times out or the daemon restarts, the approver drops that pending entry.
+Raise `[deadlines]` on every node to cover the slowest approver, and keep `timeout_sec` within it (see `docs/gates.md` § Operator-in-the-loop timeouts). `timeout_sec` is one deadline for the daemon's whole request. When it passes, or the daemon restarts, the daemon disconnects and the approver drops that pending entry.
 
 A gate decides for its own node only, so run one approver per node (or point several nodes at one approver; each request is held under its own nonce). Configure a gate on every node that should refuse spends.
 
@@ -84,7 +84,7 @@ Paste the signature as base64, as wallets print it. Message signing in Bitcoin C
 - **Pinned address.** The approver trusts exactly one address. A signature from any other key does not verify.
 - **Nonce per request.** 16 random bytes per held webhook request, deleted when its decision lands, so a nonce works once. A wrong signature does not consume it.
 - **Decision and ceremony in the message.** An approve signature does not verify as a reject, and a signature for one ceremony does not verify for another.
-- **Fail closed.** A malformed spec, an unknown spec `kind`, a wrong bearer token or a full queue (100 pending) answer with an HTTP error, and a shutting-down approver ends each held response with an error body that has no `decision`. The daemon's gate counts each of these as a reject.
+- **Fail closed.** A malformed spec, an unknown spec `kind`, a wrong bearer token, a full queue (100 pending) or a shutting-down approver all answer with an HTTP error, which the daemon's gate counts as a reject.
 - **Exposure.** `/webhook` is only reachable with the bearer token when `APPROVER_TOKEN` is set. `GET /pending` shows the specs (addresses, amounts, labels) to anyone who can reach the listener, and a signature is all `/decide` needs. The default listener is loopback; for a remote operator, put the approver behind a TLS reverse proxy with the access control your site uses.
 - **Page rendering.** `index.html` writes every spec-derived string (labels come from address books) as text, never as markup, and the page is served with a restrictive `Content-Security-Policy`.
 

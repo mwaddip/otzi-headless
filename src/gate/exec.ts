@@ -13,9 +13,8 @@
  * decision file, poll an approval queue, etc.) until the operator responds.
  * Bound by `timeout_sec`.
  *
- * TOML shape (under `[gate]`):
+ * TOML shape (under `[gate]`, parameters sit directly next to `strategy`):
  *   strategy = "exec"
- *   [gate.params]
  *   command = ["/etc/otzi/approve.sh"]   # argv; command[0] is the executable
  *   timeout_sec = 86400                  # hard cap on child lifetime
  *   working_dir = "/var/otzi"            # optional cwd

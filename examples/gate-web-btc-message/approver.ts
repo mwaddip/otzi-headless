@@ -7,8 +7,7 @@
 //
 // The daemon knows nothing about message signatures: it sees only the decision.
 // The verification lives here, so the auth scheme can be swapped without touching
-// the daemon. A held request sends its 200 headers at once and a space every 30 s
-// (see KEEPALIVE_MS), then the JSON body when the operator decides.
+// the daemon.
 //
 //   daemon ──POST /webhook (spec)──▶ approver ── holds the response ──┐
 //                                       ▲                             │
@@ -42,13 +41,6 @@ import { decisionMessage, verifyDecision } from './decision.ts';
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SIGNATURE_CHARS = 4096;
 const MAX_PENDING = 100;
-/**
- * The daemon's HTTP client (Node's fetch) abandons a request that receives no response
- * headers, or no body bytes, for 5 minutes, whatever `timeout_sec` says. A held request
- * therefore sends its headers at once and a space every 30 s (JSON allows leading
- * whitespace) until the decision arrives.
- */
-const KEEPALIVE_MS = 30_000;
 /** Ceremony ids on the wire (`^[A-Za-z0-9._:-]{1,128}$`); also keeps the signed message free of odd characters. */
 const CEREMONY_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const NONCE_HEX = /^[0-9a-f]{32}$/;
@@ -69,9 +61,8 @@ interface Pending {
   ceremonyId: string;
   spec: Record<string, unknown>;
   receivedAt: string;
-  /** The daemon's held webhook response: 200 headers are out, the JSON body is not. */
+  /** The daemon's held webhook response. */
   res: ServerResponse;
-  keepAlive: NodeJS.Timeout;
 }
 
 /** nonce → held webhook request. A nonce is deleted when its decision lands, so it works once. */
@@ -142,17 +133,11 @@ async function onWebhook(req: IncomingMessage, res: ServerResponse): Promise<voi
 
   const ceremonyId = spec.ceremonyId;
   const nonce = randomBytes(16).toString('hex');
-  res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-  res.flushHeaders();
-  const keepAlive = setInterval(() => {
-    if (!res.destroyed) res.write(' ');
-  }, KEEPALIVE_MS);
-  pending.set(nonce, { ceremonyId, spec, receivedAt: new Date().toISOString(), res, keepAlive });
+  pending.set(nonce, { ceremonyId, spec, receivedAt: new Date().toISOString(), res });
   console.log(`approver: pending ${spec.kind} '${ceremonyId}' (nonce ${nonce})`);
 
   // The daemon gave up (its timeout_sec passed or it restarted): nothing left to answer.
   res.on('close', () => {
-    clearInterval(keepAlive);
     if (pending.delete(nonce)) console.log(`approver: daemon closed the request, dropped '${ceremonyId}' (nonce ${nonce})`);
   });
 }
@@ -184,16 +169,16 @@ async function onDecide(req: IncomingMessage, res: ServerResponse): Promise<void
   }
 
   pending.delete(nonce);
-  settle(entry, { decision });
+  sendJson(entry.res, 200, { decision });
   console.log(`approver: ${decision} '${entry.ceremonyId}' (nonce ${nonce})`);
   sendJson(res, 200, { ok: true, ceremonyId: entry.ceremonyId, decision });
 }
 
-// Answer held requests with an error body (no `decision`, so the daemon rejects), not a hang.
+// Answer held requests with 503 so the daemon sees an error (a reject), not a hang.
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
     console.log(`approver: ${sig}, shutting down`);
-    for (const p of pending.values()) settle(p, { error: 'approver shutting down' });
+    for (const p of pending.values()) sendJson(p.res, 503, { error: 'approver shutting down' });
     pending.clear();
     server.close(() => process.exit(0));
     server.closeIdleConnections();
@@ -232,12 +217,6 @@ function handle(res: ServerResponse, fn: () => Promise<void>): void {
       sendJson(res, 500, { error: 'internal error' });
     }
   });
-}
-
-/** Ends a held webhook response with its JSON body. */
-function settle(p: Pending, body: unknown): void {
-  clearInterval(p.keepAlive);
-  if (!p.res.destroyed && !p.res.writableEnded) p.res.end(JSON.stringify(body));
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

@@ -217,14 +217,14 @@
   - **Pre:** `spec` is fully populated.
   - **Post:** Returns `Promise<Decision>`.
   - **Process:**
-    1. Set up AbortController, timeout = `timeoutSec * 1000` ms.
-    2. Build headers: `{'content-type': 'application/json'}` + optional `Authorization: Bearer <token>` (from env).
-    3. POST `serializeSpec(spec)` to `url`.
-    4. Expect JSON response `{"decision": "approve" | "reject"}`.
-    5. Return decision.
+    1. Build headers: `{'content-type': 'application/json'}` + optional `Authorization: Bearer <token>` (from env; throws before any request when the variable is empty or unset).
+    2. POST `serializeSpec(spec)` to `url` with `node:http` / `node:https` `request` (a fresh connection per call; redirects are not followed). The deadline timer starts here.
+    3. Collect the response body, at most 64 KiB (65 536 bytes).
+    4. A status outside 2xx throws with the status line and the first 500 characters of the body.
+    5. Expect JSON `{"decision": "approve" | "reject"}`; return the decision.
   - **Returns:** `'approve'` or `'reject'` from response.decision.
-  - **Throws:** Error on HTTP failure, timeout, non-JSON response, missing/invalid decision field, or non-OK HTTP status.
-  - **Timeout:** AbortController signal aborted after `timeoutSec * 1000` ms; fetch rejects with AbortError.
+  - **Throws:** Error on HTTP failure, timeout, a connection closed before the body ended, a 2xx body over 64 KiB, non-JSON response, missing/invalid decision field, or non-2xx HTTP status.
+  - **Timeout:** `timeoutSec` is ONE deadline covering connect, response headers and the whole body read. On expiry the request is destroyed and the call throws `WebhookGate: timed out after <timeoutSec>s`. Early headers, trickled bytes or a stalled body do not extend it. Values above 2 147 483 647 ms (the longest timer Node can set) are capped to it.
 
 - `parseWebhookParams(params)` — function
   - **Pre:** The `params` of `GateConfig`: every key of the `[gate]` table except `strategy`.
@@ -236,16 +236,18 @@
 - Response is expected to be JSON with `{"decision": "approve" | "reject"}`.
 - Bearer token is read from env at request time (not at config time); throws if env var is missing/empty when set.
 - Non-OK HTTP status (not 2xx) throws before parsing response body.
+- The transport is `node:http` / `node:https`, not `fetch`: the global fetch client abandons a response that is silent for 5 minutes (headers and body timeouts), whatever `timeoutSec` says.
+- The response body is capped at 64 KiB, so a hostile approver cannot exhaust the daemon's memory.
 
 **Cross-component contracts:**
 - Created by `factory.createGate()` when `gate.strategy === 'webhook'`.
-- Daemon expects synchronous-looking approval via HTTP (long-polling supported; endpoint holds connection open).
+- Daemon expects synchronous-looking approval via HTTP (long-polling supported; endpoint holds connection open for up to `timeoutSec`, with or without sending headers early).
 - Spec includes all fields; delegate is responsible for validation if needed. `examples/gate-web-btc-message/` is a webhook approver whose operator signs each decision with a Bitcoin message signature.
 
 **Notes / gotchas:**
 - Bearer token is read from `process.env[bearerTokenEnv]` on each request (allows rotation without daemon restart).
 - If env var is set but empty, throws immediately.
-- Timeout applies to entire HTTP request lifecycle (connection + response read + body parse).
+- The timeout covers the connection, the response headers and the whole body read; the JSON parse that follows is synchronous.
 - Response body truncated to 500 chars in error message.
 - HTTP errors (connection refused, DNS failure, timeout) result in thrown Error (not Decision).
 - If response JSON is missing `decision` field, throws (no default).
@@ -305,7 +307,7 @@
 
 **Approver (`approver.ts`):**
 - Environment: `APPROVER_ADDRESS` (required; must satisfy `isValidSignInAddress`, otherwise the approver exits 1), `APPROVER_LISTEN` (`host:port`, default `127.0.0.1:8181`), `APPROVER_TOKEN` (optional; when set, `POST /webhook` requires `Authorization: Bearer <token>`).
-- `POST /webhook` is the daemon's webhook gate. The body is the spec JSON; `ceremonyId` must match `^[A-Za-z0-9._:-]{1,128}$` and `kind` must be `signing` or `dkg`, else `400`. The approver answers `200` at once with the headers only, then sends a space every 30 s (leading whitespace is valid JSON) so the daemon's HTTP client does not abandon a silent response after its 5-minute headers and body timeouts. The request is held under a fresh random 16-byte hex nonce until `/decide` ends the body with `{"decision": …}`, the daemon hangs up, or shutdown ends it with `{"error": …}` (no `decision`, so the gate rejects).
+- `POST /webhook` is the daemon's webhook gate. The body is the spec JSON; `ceremonyId` must match `^[A-Za-z0-9._:-]{1,128}$` and `kind` must be `signing` or `dkg`, else `400`. The request is held, with no response bytes sent, under a fresh random 16-byte hex nonce until `/decide` answers it with `200 {"decision": …}`, the daemon disconnects (its `timeout_sec` passed or it restarted; the entry is dropped), or shutdown answers `503`.
 - `GET /pending` returns `{ address, pending: [{ nonce, ceremonyId, receivedAt, spec, messages: { approve, reject } }] }`, where `messages` holds the `decisionMessage` text for each decision.
 - `POST /decide` takes `{ nonce, decision, signature }`. It resolves the held request only when `verifyDecision` holds for the pinned address, that request's ceremony id and the nonce. A signature that does not verify answers `403` and leaves the request pending; an unknown or used nonce answers `404`.
 

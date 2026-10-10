@@ -218,8 +218,12 @@ bearer_token_env = "APPROVER_TOKEN"    # optional: env var carrying bearer token
 
 The daemon POSTs the spec JSON to `url`. The approver endpoint must respond with
 `200 OK` and a JSON body `{"decision": "approve" | "reject"}`. The request holds
-the connection open for up to `timeout_sec`; long-polling is fine. Non-200
-responses or missing/unexpected decision fields are treated as errors (→ reject).
+the connection open for up to `timeout_sec`; long-polling is fine. `timeout_sec`
+is one deadline for the whole exchange (connect, headers and the full body), so
+an approver that sends headers early or trickles bytes does not extend it. The
+response body is capped at 64 KiB and redirects are not followed. Non-200
+responses, a timeout, or missing/unexpected decision fields are treated as errors
+(→ reject).
 
 ## Operator-in-the-loop timeouts
 
