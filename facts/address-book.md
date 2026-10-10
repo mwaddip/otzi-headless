@@ -14,7 +14,7 @@
 
 - `async readAddressBook(path: string, network: NetworkName): Promise<AddressBookEntry[]>`
   - **Pre:** `network` is the configured network.
-  - **Post:** Returns the validated entries (`parseAddressBookFile(JSON, network)`). Returns `[]` when `path` does not exist (ENOENT).
+  - **Post:** Returns the validated entries (`parseAddressBookFile(JSON, network)`). Returns `[]` when `path` does not exist (ENOENT); the CLI and spec labelling rely on this. The policy loader (`loadAddressBook`) does not: it treats a missing file as a failure (see below).
   - **Throws:** On unreadable file, invalid JSON, wrong `kind` / `version`, any invalid entry, or a file network ≠ `network` (messages from `parseAddressBookFile`).
 
 - `async writeAddressBook(path: string, network: NetworkName, entries: AddressBookEntry[]): Promise<void>`
@@ -36,11 +36,11 @@
 **Cross-component contracts:**
 - Depends on: `validateEntries`, `parseAddressBookFile`, `addressBookFile` (`src/otzi/lib/address-book.ts`), `isValidAddress` (`src/otzi/lib/bitcoin.ts`).
 - Used by:
-  - `Daemon`: `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)` for the orchestrator and leader (spec labels via `labelFor`), and `loadAddressBook` (the entries' addresses) for `PolicyGate`.
+  - `Daemon`: `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)` for the orchestrator and leader (spec labels via `labelFor`), and `loadAddressBook` for `PolicyGate`: the entries' addresses, throwing when the file does not exist (ENOENT) or is invalid, so `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
   - `src/cli/cmd/book.ts` (all verbs), `src/cli/cmd/btc.ts` (`resolveRecipient` for `btc send`, labels in `btc sign` summaries).
   - `src/cli/cmd/backup.ts` / `restore.ts` (tar path `etc/otzi/address-book.otzi.json`, restored at 0640).
 
 **Notes / gotchas:**
 - The daemon reads the book at each use (each spec build, each `"address-book"` policy evaluation); edits take effect without a restart.
-- In the daemon, a failed read means no labels for spec building, and a reject for the `"address-book"` policy rule (strict by default).
+- In the daemon, a missing or invalid book means no labels for spec building and a reject for the `"address-book"` policy rule (strict by default).
 - Labels are not required to be unique; `resolveRecipient` takes the first match, so keep labels unique for `btc send`.

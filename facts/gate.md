@@ -68,7 +68,7 @@
 
 - `interface PolicyGateOptions { now?: () => number; loadAddressBook?: () => Promise<string[]> }`
   - `now` defaults to `Date.now` (injectable for window tests).
-  - `loadAddressBook` returns the addresses in this node's address book; required for `allowedRecipients === 'address-book'`.
+  - `loadAddressBook` returns the addresses in this node's address book; required for `allowedRecipients === 'address-book'`. It rejects (throws) when the book cannot be loaded, including when the book file does not exist.
 
 - `class PolicyGate implements ApprovalGate`
   - **Constructor:** `new PolicyGate(config: PolicyConfig, opts?: PolicyGateOptions)`. Never throws.
@@ -82,13 +82,13 @@
     |---|---|---|
     | `max_sats_per_tx` | `maxSatsPerTx` | `spec.amount` ≤ cap. |
     | `max_sats_per_24h` | `maxSatsPer24h` | Sum of `amount` over this node's approvals in the last 24 h, plus `spec.amount`, ≤ cap. |
-    | `allowed_recipients` | `allowedRecipients` | Every output with `isChange === false` has its `address` in the set. With `"address-book"`, the set is `loadAddressBook()` read at each evaluation. |
+    | `allowed_recipients` | `allowedRecipients` | Every output with `isChange === false` has its `address` in the set. With `"address-book"`, the set is `loadAddressBook()` read at each evaluation; a missing or invalid book rejects. |
     | `max_fee_sats` | `maxFeeSats` | `spec.fee` ≤ cap. |
     | `max_fee_rate` | `maxFeeRate` | `spec.feeRate` ≤ cap (sat/vB). |
     | `max_ceremonies_per_hour` | `maxCeremoniesPerHour` | Signing approvals by this node in the last hour < cap. |
 
   - **DKG rule:** `dkg_leader_allowlist` (`dkgLeaderAllowlist`) — `spec.leader` must be in the list. Signing rules never apply to a `DkgSpec`; the DKG rule never applies to a `SigningSpec`.
-  - **Strict by default:** a configured rule whose input is missing rejects. With `"address-book"`, a failed load, an invalid book file, or no `loadAddressBook` dependency rejects (and a warning is logged).
+  - **Strict by default:** a configured rule whose input is missing rejects. With `"address-book"`, a missing book file, an invalid book file, any other failed load, or no `loadAddressBook` dependency rejects every signing spec — even one whose outputs are all change — and a warning is logged.
   - **Windows:** every rule is evaluated first; only when the final decision is approve is the approval recorded in the hourly window (timestamp) and the 24 h window (`{ at: now(), amount }`). Entries older than 3 600 000 ms / 86 400 000 ms are pruned. The checks and the records happen in one synchronous section (after any address-book load), so concurrent evaluations cannot both pass a cap.
 
 - `parsePolicyParams(params: Record<string, unknown>): PolicyConfig`
@@ -118,7 +118,7 @@
 
 **Cross-component contracts:**
 - Created by `factory.createGate()` when `gate.strategy === 'policy'`.
-- `loadAddressBook` is wired by the daemon from `readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)` (see [address-book.md](address-book.md)).
+- `loadAddressBook` is wired by the daemon: it reads `DEFAULT_ADDRESS_BOOK_PATH` like `readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)` but treats a missing file (ENOENT) as a failure, where `readAddressBook` itself returns `[]` (see [address-book.md](address-book.md)).
 - Expected by daemon to be deterministic and side-effect-free apart from the window memory.
 
 **Notes / gotchas:**
@@ -282,7 +282,7 @@
 - Each strategy's `parseFooParams()` is called here; errors abort daemon startup.
 
 **Cross-component contracts:**
-- Called by `Daemon` at construction, with `loadAddressBook` reading this node's address book.
+- Called by `Daemon` at construction, with `loadAddressBook` reading this node's address book (a missing file is a failure).
 - Gate instance persists for daemon lifetime (stateful for rate windows).
 
 **Notes / gotchas:**

@@ -12,9 +12,11 @@
   - **Post:** `share` is the decrypted v4 share, checked against `config.network.name`; `undefined` on a node without a vault (no file at `[share].path`). `password` is kept in memory so a DKG on this node can encrypt its new share with it.
   - **Invariant:** `share` presence gates signing; a node without a share can run the run-once DKG.
 
-- `async loadAndValidate(configPath: string, options?: { env?: Readonly<Record<string, string | undefined>> }): Promise<LoadedDaemonState>`
-  - **Pre:** `configPath` is a readable `daemon.toml`. The share password is in the env var named by `[share].password_env` (`options.env`, default `process.env`).
-  - **Post:** Config parsed (`parseDaemonConfigToml`); `share = await loadVaultShare(config.share.path, password, config.network.name)`; a `.pending` file next to the share path is reported through `warnOnPendingShare` and never loaded. Whenever a share is loaded, `vault-pubkey.json` is rewritten from it (`writeVaultPubkeyFile(vaultPubkeyFromPackage(share.publicKeyPackage, network))`), in addition to the write on DKG commit. The rewrite is best-effort: a write failure is logged and does not stop startup.
+- `async loadAndValidate(configPath: string, options?: { env?: Readonly<Record<string, string | undefined>>; vaultPubkeyPath?: string; logger?: Logger }): Promise<LoadedDaemonState>`
+  - **Options (defaults):** `env` — `process.env`; `vaultPubkeyPath` — `DEFAULT_VAULT_PUBKEY_PATH` (tests and alternate installs pass their own path so nothing is written to `/var/lib/otzi`); `logger` — `NOOP_LOGGER`.
+  - **Pre:** `configPath` is a readable `daemon.toml`. The share password is in the env var named by `[share].password_env` (in `options.env`).
+  - **Post:** Config parsed (`parseDaemonConfigToml`); `share = await loadVaultShare(config.share.path, password, config.network.name)`; `warnOnPendingShare(config.share.path, logger)` reports a `.pending` file next to the share path, which is never loaded. Whenever a share is loaded, `vault-pubkey.json` is rewritten from it (`writeVaultPubkeyFile(vaultPubkeyFromPackage(share.publicKeyPackage, network), vaultPubkeyPath)`), in addition to the write on DKG commit. The rewrite is best-effort: a write failure is logged at warn level through `logger` and does not stop startup.
+  - **Ownership:** the startup `vault-pubkey.json` rewrite and the `.pending` warning both happen here and nowhere else at startup; `runDaemonCommand` passes its logger and does not warn a second time.
   - **Throws:** `ConfigError` / TOML errors; `Error` naming the env var when the password is missing or empty; every `loadVaultShare` error (wrong password, network mismatch, corrupted file).
 
 **Invariants:**
@@ -105,12 +107,12 @@
 **Invariants:**
 - Every value is public; mode 0644 lets `otzi` group members and other users run read-only CLI commands.
 - Written:
-  - at daemon startup whenever a share is loaded (`loadAndValidate`; best-effort — a write failure is logged and does not stop startup);
+  - at daemon startup whenever a share is loaded (`loadAndValidate`, at its `vaultPubkeyPath` option; best-effort — a write failure is logged and does not stop startup);
   - by the share stager's `commit()` after a DKG completes.
 
 **Cross-component contracts:**
 - Depends on: `toVaultKey`, `vaultPayment` (`src/otzi/lib`).
-- Written by: `config-merge.ts` (startup), `vault-share.ts` (`createShareStager().commit()`).
+- Written by: `config-merge.ts` (`loadAndValidate` at startup, path from its `vaultPubkeyPath` option), `vault-share.ts` (`createShareStager().commit()`, path from `ShareStagerOptions.vaultPubkeyPath`).
 - Consumed by: `otzi vault`, `otzi btc balance|send|sign` (read-only).
 
 ---
@@ -210,7 +212,7 @@
 
 - `class Daemon`
   - **`constructor(deps: DaemonDeps)`**
-    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo`; the gate via `createGate(config.gate, { loadAddressBook })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists = () => vaultFileExists(config.share.path)`, `createStager = () => createShareStager({ path, password, network, partyId: selfPartyId, vaultPubkeyPath })`, `rng`, and `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)`; trigger sources from `config.triggers`. `loadAddressBook` returns the book's addresses.
+    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo`; the gate via `createGate(config.gate, { loadAddressBook })`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists = () => vaultFileExists(config.share.path)`, `createStager = () => createShareStager({ path, password, network, partyId: selfPartyId, vaultPubkeyPath })`, `rng`, and `addressBook = () => readAddressBook(DEFAULT_ADDRESS_BOOK_PATH, network)`; trigger sources from `config.triggers`. `loadAddressBook` reads the same file and returns its addresses, but throws when the file does not exist (ENOENT) as well as when it is invalid — unlike `readAddressBook`, which returns `[]` on ENOENT — so `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
     - **Invariant:** Does NOT start anything.
   - **`async start(): Promise<void>`** — starts the orchestrator and every trigger. Reentrant.
   - **`async stop(): Promise<void>`** — stops triggers, the orchestrator, and closes the blob server. Reentrant.
@@ -323,7 +325,7 @@
 - `BroadcastFailedError` → the signed transaction hex is printed to stderr (so the operator can broadcast it by other means) and the process exits 1. Any other error → message on stderr, exit 1.
 
 - **`runDaemonCommand`**
-  - **Post:** `loadAndValidate` → `buildTransportFromFiles` → `Daemon` → `start`; SIGINT/SIGTERM stop the daemon and the transport, then exit 0. The startup line names the mode: signing (vault loaded) or setup (no vault). In setup mode it states that signing is refused until `otzi generate` completes and the daemon restarts. A stale `.pending` share is reported at warn level.
+  - **Post:** `loadAndValidate(configPath, { logger })` → `buildTransportFromFiles` → `Daemon` → `start`; SIGINT/SIGTERM stop the daemon and the transport, then exit 0. The startup line names the mode: signing (vault loaded) or setup (no vault). In setup mode it states that signing is refused until `otzi generate` completes and the daemon restarts. The stale-`.pending` warning and the `vault-pubkey.json` rewrite come from `loadAndValidate` (through the logger passed in); `runDaemonCommand` does not warn a second time.
 
 **Invariants:**
 - The daemon is the only long-lived verb; every other verb talks to it over the daemon client (UDS by default) or works on local files.
