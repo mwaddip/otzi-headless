@@ -118,6 +118,35 @@ describe('frost-sign-session', () => {
       });
     });
 
+    it('rejects an r1 payload truncated inside the last point, naming the sender', () => {
+      const env = decodeEnvelope(round1(sessions[1]!))!;
+      const full = fromHex(env.data);
+      const truncated = encodeEnvelope('frost-sign-r1', 1, -1, sid, full.slice(0, full.length - 13));
+      expect(addBlob(sessions[0]!, truncated, 1, 1)).toEqual({
+        ok: false,
+        error: expect.stringMatching(/party 1 carries an invalid commitment point/),
+      });
+      expect(sessions[0]!.collectedR1.has(1)).toBe(false);
+    });
+
+    it.each(['hiding', 'binding'] as const)('rejects an r1 with a 33-byte off-curve %s point', field => {
+      const s1 = sessions[1]!;
+      round1(s1);
+      const offCurve = new Uint8Array(33); // x = 5 has no y on secp256k1
+      offCurve[0] = 0x02;
+      offCurve[32] = 5;
+      const forged = encodeFrostSignR1(
+        1,
+        s1.myCommitments!.map(c => ({ ...c, [field]: offCurve })),
+        sid,
+      );
+      expect(addBlob(sessions[0]!, forged, 1, 1)).toEqual({
+        ok: false,
+        error: expect.stringMatching(/party 1 carries an invalid commitment point/),
+      });
+      expect(sessions[0]!.collectedR1.has(1)).toBe(false);
+    });
+
     it('rejects the wrong entry count', () => {
       const s1 = sessions[1]!;
       round1(s1);

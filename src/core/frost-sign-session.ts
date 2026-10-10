@@ -15,6 +15,7 @@
  *     nonces are dropped as soon as it returns (or throws).
  */
 
+import { secp256k1 } from '@noble/curves/secp256k1.js';
 import {
   signRound1,
   signRound2,
@@ -207,6 +208,17 @@ export type FrostSignRound = 1 | 2;
 
 type AddBlobResult = { ok: true } | { ok: false; error: string };
 
+/** True for a 33-byte compressed secp256k1 point that lies on the curve. */
+function isCompressedPoint(bytes: Uint8Array): boolean {
+  if (bytes.length !== 33) return false;
+  try {
+    secp256k1.Point.fromBytes(bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** The sign decoders can throw on a truncated payload; a malformed blob is a rejection, never a throw. */
 function tryDecode<T>(decode: (blob: string) => T | null, blob: string): T | null {
   try {
@@ -259,6 +271,11 @@ export function addBlob(
     }
     if (session.collectedR1.has(from)) {
       return { ok: false, error: `already have r1 from party ${from}` };
+    }
+    // The decoder does not check lengths; a truncated or off-curve point would
+    // otherwise only fail later, anonymously, inside round 2.
+    if (!decoded.commitments.every(c => isCompressedPoint(c.hiding) && isCompressedPoint(c.binding))) {
+      return { ok: false, error: `r1 blob from party ${from} carries an invalid commitment point` };
     }
     session.collectedR1.set(from, decoded.commitments);
     return { ok: true };

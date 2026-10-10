@@ -470,6 +470,7 @@ export type CeremonyMessage = AnnounceDkg | AnnounceSign | SignoffDone | Signoff
     - the blob does not decode (`decodeFrostSignR1` / `decodeFrostSignR2` → null, or the decoder throws on a truncated payload);
     - **sender binding:** the partyId inside the blob ≠ `from`, or any entry's FROST identifier ≠ `from + 1`;
     - entry count ≠ `sighashes.length`;
+    - round 1: any `hiding` or `binding` that is not a 33-byte compressed secp256k1 point on the curve (a truncated or off-curve point is rejected naming `from`, not left to fail later inside `round2`);
     - a second set from the same `from` for the round;
     - round 1 after round 2 has started.
   - **Throws:** Never.
@@ -488,7 +489,7 @@ export type CeremonyMessage = AnnounceDkg | AnnounceSign | SignoffDone | Signoff
 - Used by: `sign-ceremony.ts` (proposal signing), `dkg-ceremony.ts` (verification signature).
 
 **Notes / gotchas:**
-- The Ötzi sign decoders do not check payload length, the inner partyId or the identifiers; `addBlob` is where those checks live.
+- The Ötzi sign decoders do not check payload length, the inner partyId, the identifiers or the points; `addBlob` is where those checks live: payload partyId, entry count, identifiers, and in round 1 point validity. A truncated round-2 payload makes the decoder throw, which `addBlob` turns into a rejection.
 - `sessionId` is not a secret; it only tags envelopes.
 
 ---

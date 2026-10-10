@@ -200,7 +200,7 @@ Pre/post conditions below are taken from Ötzi's `facts/INTERFACES.md` at the re
 
 **Notes / gotchas:**
 - The count is one byte: a ceremony signs at most 255 sighashes. Headless enforces this before any signing starts (`MAX_INPUTS`).
-- The sign decoders check the envelope and type only. They do not check the payload length, that the payload partyId equals the envelope `from`, or the entry identifiers. Headless sessions apply those checks: payload partyId = authenticated `from`, entry count = sighash count, every identifier = `from + 1` (see [core.md](core.md) `frost-sign-session.ts`).
+- The sign decoders check the envelope and type only. They do not check the payload length, that the payload partyId equals the envelope `from`, the entry identifiers or the points. Headless sessions apply those checks: payload partyId = authenticated `from`, entry count = sighash count, every identifier = `from + 1`, and in round 1 every `hiding` / `binding` a valid compressed secp256k1 point (see [core.md](core.md) `frost-sign-session.ts`). `decodeFrostSignR2` throws a `TypeError` on a truncated payload; the session catches it.
 - Ötzi's `ParticipantBinding`, `SighashInfo` and `FrostSignatureSet` belong to its relay flow; `SighashInfo` is the element type of `ProposalAnalysis.sighashes`.
 
 ---
