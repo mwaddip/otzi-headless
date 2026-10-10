@@ -249,6 +249,7 @@
 
 **Invariants:**
 - Per-key workers retry independently; the deadline and the signal stop all of them.
+- When a `pullAll` call settles (every key present, a key failed, the deadline, or the signal), its remaining workers stop retrying and put nothing further.
 - A worker short-circuits if its key lands in the store by another path (local production, parallel puller).
 - Blobs stored via `pullAll` go through `store.put` (idempotent on equal bytes; a conflict is a protocol violation that propagates).
 

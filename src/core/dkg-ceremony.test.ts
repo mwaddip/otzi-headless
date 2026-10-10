@@ -154,6 +154,8 @@ describe('runDkgCeremony', () => {
     for (const s of stagers) expect(s.calls.at(-1)).toBe('discard');
     expect(stagers[2]!.calls).toEqual(['stage', 'discard']);
     expect(reasonOf(out[2])).toMatch(/^DKG aborted: disk full x/);
+    // A node publishes its confirmation only after staging.
+    expect(ring[2]!.io.store.has({ ceremonyId, round: DKG_ROUNDS.verified, from: 2 })).toBe(false);
 
     // Node 2 announced the abort; the others stopped on it and stayed silent.
     expect(abortsFrom(heard)).toEqual(new Set([2]));
@@ -162,6 +164,28 @@ describe('runDkgCeremony', () => {
     expect(msg.reason).toMatch(/^disk full x/);
     expect(msg.reason!.length).toBeLessThanOrEqual(1024);
     for (const i of [0, 1]) expect(reasonOf(out[i])).toBe('DKG aborted: aborted');
+  });
+
+  it('nobody commits when a node fails to stage, even without hearing its abort', async () => {
+    // No signals wired: only the protocol ordering (stage before dkg-verified) protects the others.
+    ring = makeRing(3, { deadlineMs: 500 });
+    const slow = stagers[2]!;
+    slow.stage = async () => {
+      slow.calls.push('stage');
+      await sleep(50);
+      throw new Error('disk full');
+    };
+
+    const out = await Promise.allSettled(ring.map((n, i) => runDkgCeremony(n.io, spec, stagers[i]!)));
+
+    expect(out.every(o => o.status === 'rejected')).toBe(true);
+    for (const s of stagers) expect(s.calls).not.toContain('commit');
+    expect(reasonOf(out[2])).toBe('DKG aborted: disk full');
+    const verifiedFrom2 = blobKeyToString({ ceremonyId, round: DKG_ROUNDS.verified, from: 2 });
+    for (const i of [0, 1]) {
+      expect(stagers[i]!.calls).toEqual(['stage', 'discard']);
+      expect(reasonOf(out[i])).toContain(verifiedFrom2);
+    }
   });
 
   it('an inconsistent round-2 share aborts and nobody commits', async () => {

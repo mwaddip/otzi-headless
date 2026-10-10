@@ -215,6 +215,26 @@ describe('BlobPuller abort signal', () => {
     ).rejects.toThrow(/Deadline exceeded/);
   });
 
+  it('once the call settles on a failed key, the other workers stop and put nothing', async () => {
+    const store = new BlobStore();
+    const failing: BlobKey = { ceremonyId: 'c', round: 'r1', from: 1 };
+    const late: BlobKey = { ceremonyId: 'c', round: 'r1', from: 2 };
+    const start = Date.now();
+    const { transport, calls } = stubTransport(async key => {
+      if (key.from === 1) throw new Error('peer 1 refused');
+      return Date.now() - start > 30 ? new Uint8Array([2]) : null; // late arrives after the failure
+    });
+
+    await expect(
+      new BlobPuller(transport, store).pullAll([failing, late], slowOpts),
+    ).rejects.toThrow(/peer 1 refused/);
+
+    const after = calls.length;
+    await new Promise(resolve => setTimeout(resolve, 60));
+    expect(calls.length).toBe(after);
+    expect(store.has(late)).toBe(false);
+  });
+
   it('resolves normally when the signal never fires', async () => {
     const store = new BlobStore();
     const blob = new Uint8Array([9]);

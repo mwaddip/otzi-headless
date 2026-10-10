@@ -57,8 +57,10 @@ export class BlobPuller {
 
     for (let attempt = 0; attempt < opts.maxAttempts; attempt++) {
       if (this.store.has(key)) return;
+      if (stop.aborted) await onStop; // no retry once stopped
 
       const blob = await Promise.race([this.transport.pull(key), onStop]);
+      if (stop.aborted) await onStop; // a blob that lands after the stop is not stored
       if (blob) {
         if (!this.store.has(key)) this.store.put(key, blob);
         return;
