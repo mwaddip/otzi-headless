@@ -184,6 +184,14 @@ async function leadDkg(ring: RingNode[], p: PartyId, ceremonyId: string, signal?
 /** Wait until `fn` stops throwing. */
 const eventually = (fn: () => void) => vi.waitFor(fn, { timeout: 3_000, interval: 5 });
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>(r => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 // ─── DKG ───────────────────────────────────────────────────────────────────
 
 describe('Orchestrator: DKG participation', () => {
@@ -347,9 +355,9 @@ describe('Orchestrator: DKG participation', () => {
   });
 });
 
-// ─── One live DKG per node ─────────────────────────────────────────────────
+// ─── Local slots ───────────────────────────────────────────────────────────
 
-describe('Orchestrator: beginLocalDkg', () => {
+describe('Orchestrator: local ceremony slots', () => {
   let ring: RingNode[];
 
   beforeEach(() => {
@@ -374,7 +382,7 @@ describe('Orchestrator: beginLocalDkg', () => {
     expect(orch.beginLocalDkg('local-e')).not.toBeNull();
   });
 
-  it('refuses while a participant DKG is live and frees the slot when it settles', async () => {
+  it('refuses while a participant DKG is live, and refuses its id after it ended', async () => {
     const id = 'dkg-joined';
     const p1 = participant(ring[1]!, { ceremonyDeadlines: { signingMs: 5_000, dkgMs: 150 } });
 
@@ -382,7 +390,48 @@ describe('Orchestrator: beginLocalDkg', () => {
     expect(p1.orch.beginLocalDkg('local-a')).toBeNull();
 
     expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'timeout' });
-    expect(p1.orch.beginLocalDkg('local-a')).not.toBeNull();
+    let slot: ReturnType<Orchestrator['beginLocalDkg']> = null;
+    await eventually(() => {
+      slot = p1.orch.beginLocalDkg('local-a');
+      expect(slot).not.toBeNull();
+    });
+    slot!.end();
+    // The ended ceremony's id stays taken for its retention period.
+    expect(p1.orch.beginLocalDkg(id)).toBeNull();
+    expect(p1.orch.beginLocalSigning(id)).toBeNull();
+  });
+
+  it('holds the DKG slot until a joined DKG finishes unwinding', async () => {
+    const id = 'dkg-unwinding';
+    const release = deferred();
+    const stager = recordingStager();
+    stager.discard = async () => {
+      stager.calls.push('discard');
+      await release.promise;
+    };
+    const p1 = participant(ring[1]!, { createStager: () => stager });
+
+    // Node 0 announces but never takes part; node 2 then aborts the ceremony.
+    await broadcastFrom(ring, 0, announceDkg(id, new Uint8Array(32).fill(6)));
+    await eventually(() => expect(p1.createStager).toHaveBeenCalledTimes(1));
+    await broadcastFrom(ring, 2, { v: 2, kind: 'signoff-aborted', ceremonyId: id, reason: 'operator abort' });
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'aborted', reason: 'operator abort' });
+    await eventually(() => expect(stager.calls).toEqual(['discard']));
+
+    // The tracker is gone, but the ceremony is still inside discard(): no second DKG.
+    expect(p1.orch.beginLocalDkg('local-a')).toBeNull();
+    await broadcastFrom(ring, 0, announceDkg('dkg-next', new Uint8Array(32).fill(7)));
+    expect(p1.log.about('dkg-next')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about('dkg-next')[0]!.msg).toMatch(/a DKG is already running/);
+    expect(p1.createStager).toHaveBeenCalledTimes(1);
+
+    release.resolve();
+    let slot: ReturnType<Orchestrator['beginLocalDkg']> = null;
+    await eventually(() => {
+      slot = p1.orch.beginLocalDkg('local-a');
+      expect(slot).not.toBeNull();
+    });
+    slot!.end();
   });
 
   it('drops announce-dkg while a local DKG is live', async () => {
@@ -417,6 +466,64 @@ describe('Orchestrator: beginLocalDkg', () => {
       expect(slot.signal.aborted).toBe(true);
     } finally {
       slot.end();
+    }
+  });
+
+  it('reserves signing ids this node leads', () => {
+    const { orch } = participant(ring[1]!);
+
+    const a = orch.beginLocalSigning('sign-a');
+    expect(a).not.toBeNull();
+    expect(orch.beginLocalSigning('sign-a')).toBeNull();
+    expect(orch.beginLocalDkg('sign-a')).toBeNull();
+    const b = orch.beginLocalSigning('sign-b'); // distinct ids run side by side
+    expect(b).not.toBeNull();
+
+    a!.end();
+    a!.end(); // idempotent
+    const again = orch.beginLocalSigning('sign-a');
+    expect(again).not.toBeNull();
+    a!.end(); // a stale end() never releases a later reservation
+    expect(orch.beginLocalSigning('sign-a')).toBeNull();
+    again!.end();
+    b!.end();
+
+    const dkg = orch.beginLocalDkg('dkg-a')!;
+    expect(orch.beginLocalSigning('dkg-a')).toBeNull();
+    dkg.end();
+    expect(orch.beginLocalSigning('dkg-a')).not.toBeNull();
+  });
+
+  it.each([
+    ['a DKG that completes (promise path)', false],
+    ['a DKG deadline (timer path)', true],
+  ])('isolates a throwing onCompleted handler: %s', async (_name, timesOut) => {
+    const id = 'dkg-handler';
+    const escaped: unknown[] = [];
+    const onEscape = (err: unknown) => escaped.push(err);
+    process.on('unhandledRejection', onEscape);
+    process.on('uncaughtException', onEscape);
+    try {
+      const p1 = participant(ring[1]!, timesOut ? { ceremonyDeadlines: { signingMs: 5_000, dkgMs: 150 } } : {});
+      if (!timesOut) participant(ring[2]!);
+      const seen: CeremonyOutcome[] = [];
+      p1.orch.onCompleted(() => {
+        throw new Error('handler boom');
+      });
+      p1.orch.onCompleted(o => seen.push(o));
+      const waiting = p1.orch.waitFor(id, WAIT_MS);
+
+      if (timesOut) await broadcastFrom(ring, 0, announceDkg(id, new Uint8Array(32).fill(8)));
+      else await leadDkg(ring, 0, id);
+
+      expect(await waiting).toMatchObject({ ceremonyId: id, status: timesOut ? 'timeout' : 'done' });
+      expect(seen).toHaveLength(1);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(escaped).toEqual([]);
+      expect(p1.log.lines.filter(l => l.level === 'error' && l.msg.includes('handler boom'))).toHaveLength(1);
+    } finally {
+      process.off('unhandledRejection', onEscape);
+      process.off('uncaughtException', onEscape);
     }
   });
 });
@@ -557,6 +664,69 @@ describe('Orchestrator: proposal signing', () => {
     expect(sent).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['this node is not in signers', { signers: [0, 2] }, 'info', /party 1 is not in signers/],
+    ['the leader is not in signers', { signers: [1, 2] }, 'warn', /leader party 0 is not in signers/],
+    ['signers has duplicates', { signers: [0, 1, 1, 2] }, 'warn', /signers has duplicates/],
+    ['a signer is outside the ring', { signers: [0, 1, 2, 7] }, 'warn', /signer 7 is not in the ring/],
+    ['signers is below the threshold', { signers: [0, 1] }, 'warn', /signers has 2 entries, the vault needs 3/],
+    ['no vault is loaded', { signers: [0, 1, 2], noVault: true }, 'warn', /no vault loaded/],
+  ] as const)('drops announce-sign when %s', async (_name, c, level, reason) => {
+    const id = 'sign-structural';
+    const p1 = participant(ring[1]!, 'noVault' in c ? {} : { vault: shareOf(tv, 1) });
+    const sent = vi.spyOn(ring[1]!.io.transport, 'broadcast');
+
+    await broadcastFrom(ring, 0, {
+      v: 2,
+      kind: 'announce-sign',
+      ceremonyId: id,
+      signers: [...c.signers],
+      proposal: makeProposal(tv.vaultKey, NET),
+    });
+
+    const lines = p1.log.about(id);
+    expect(lines).toEqual([expect.objectContaining({ level })]);
+    expect(lines[0]!.msg).toMatch(reason);
+    expect(p1.gate.specs).toEqual([]);
+    expect(ring[1]!.io.store.list(id)).toEqual([]);
+    expect(sent).not.toHaveBeenCalled();
+    await expect(p1.orch.waitFor(id, 50)).rejects.toThrow(/timed out/);
+  });
+
+  it('refuses to lead a ceremony whose id is live or ended here', async () => {
+    const id = 'sign-taken';
+    const [p1] = participants();
+
+    const signaturesHex = await lead(id, makeProposal(tv.vaultKey, NET));
+    // Live tracker (awaiting the signoff).
+    expect(p1.orch.beginLocalSigning(id)).toBeNull();
+    expect(p1.orch.beginLocalDkg(id)).toBeNull();
+    const free = p1.orch.beginLocalDkg('dkg-free'); // the refusal above is about the id
+    expect(free).not.toBeNull();
+    free!.end();
+
+    await broadcastFrom(ring, 0, signoffDone(id, signaturesHex));
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'done' });
+    // Ended record, within retention.
+    expect(p1.orch.beginLocalSigning(id)).toBeNull();
+    expect(p1.orch.beginLocalDkg(id)).toBeNull();
+  });
+
+  it('drops an announce-sign whose id this node leads', async () => {
+    const id = 'sign-local';
+    const [p1] = participants();
+    const slot = p1.orch.beginLocalSigning(id)!;
+
+    await broadcastFrom(ring, 0, announceSign(id, makeProposal(tv.vaultKey, NET)));
+
+    expect(p1.log.about(id)).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about(id)[0]!.msg).toMatch(/this node leads a ceremony with this id/);
+    expect(p1.gate.specs).toEqual([]);
+    expect(ring[1]!.io.store.list(id)).toEqual([]);
+    await expect(p1.orch.waitFor(id, 50)).rejects.toThrow(/timed out/);
+    slot.end();
+  });
+
   it('drops announce-sign from a non-leader for a pinned ceremony', async () => {
     const id = 'sign-pinned';
     const [p1] = participants();
@@ -598,7 +768,7 @@ describe('Orchestrator: proposal signing', () => {
 
   it('settles timeout when no signoff arrives', async () => {
     const id = 'sign-timeout';
-    const [p1] = participants([{ ceremonyDeadlines: { signingMs: 300, dkgMs: 8_000 } }]);
+    const [p1] = participants([{ ceremonyDeadlines: { signingMs: 1_500, dkgMs: 8_000 } }]);
 
     await lead(id, makeProposal(tv.vaultKey, NET));
 

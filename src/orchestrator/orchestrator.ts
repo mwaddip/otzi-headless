@@ -13,9 +13,11 @@
  * settles the ceremony locally as `rejected`; every earlier check is a
  * structural drop that is only logged.
  *
- * The orchestrator also holds this node's single DKG slot: a DKG this node
- * leads registers through `beginLocalDkg`, and no second DKG — led or joined —
- * starts while one is live (two DKGs would share one `.pending` path).
+ * The orchestrator also holds this node's single DKG slot and reserves the ids
+ * of ceremonies this node leads (`beginLocalDkg`, `beginLocalSigning`): no
+ * second DKG — led or joined — starts while one is live, because two DKGs
+ * would share one `.pending` path, and a joined ceremony never shares an id
+ * with one this node leads.
  */
 
 import { EventEmitter } from 'node:events';
@@ -95,6 +97,10 @@ export class Orchestrator {
   /** Outcomes of ceremonies that settled within their retention period. */
   private readonly ended = new Map<string, { outcome: CeremonyOutcome; timer: ReturnType<typeof setTimeout> }>();
   private localDkg: LocalDkgSlot | null = null;
+  /** A joined DKG's ceremony, held until it settles: stage, commit and discard can outlast its tracker. */
+  private joinedDkg: Promise<void> | null = null;
+  /** Signing ceremonies this node leads, by id; the value identifies the reservation. */
+  private readonly localSigning = new Map<string, object>();
   private off: Unsubscribe | null = null;
   private started = false;
 
@@ -127,15 +133,26 @@ export class Orchestrator {
     this.ended.clear();
     this.localDkg?.controller.abort();
     this.localDkg = null;
+    this.localSigning.clear();
+    // `joinedDkg` stays held until that ceremony has unwound.
     this.events.emit('stopped');
     this.log.info('orchestrator: stopped');
   }
 
-  /** Fires on every ceremony outcome. Handler exceptions are not caught. */
+  /** Fires on every ceremony outcome. A throwing handler is logged and never disturbs the others. */
   onCompleted(handler: (o: CeremonyOutcome) => void): Unsubscribe {
-    this.events.on('completed', handler);
+    const isolated = (o: CeremonyOutcome) => {
+      try {
+        handler(o);
+      } catch (err) {
+        this.log.error(`orchestrator: onCompleted handler threw for ${o.ceremonyId}: ${errorMessage(err)}`, {
+          ceremonyId: o.ceremonyId,
+        });
+      }
+    };
+    this.events.on('completed', isolated);
     return () => {
-      this.events.off('completed', handler);
+      this.events.off('completed', isolated);
     };
   }
 
@@ -172,17 +189,33 @@ export class Orchestrator {
 
   /**
    * Register a DKG this node leads. `null` while any DKG — led or joined — is
-   * live. The slot's `signal` aborts on a ring member's `signoff-aborted` for
-   * `ceremonyId` or on `stop()`; `end()` releases the slot (idempotent).
+   * live, or when `ceremonyId` is taken. The slot's `signal` aborts on a ring
+   * member's `signoff-aborted` for `ceremonyId` or on `stop()`; `end()`
+   * releases the slot (idempotent).
    */
   beginLocalDkg(ceremonyId: string): { signal: AbortSignal; end(): void } | null {
-    if (this.dkgLive()) return null;
+    if (this.dkgLive() || this.idTaken(ceremonyId)) return null;
     const slot: LocalDkgSlot = { ceremonyId, controller: new AbortController() };
     this.localDkg = slot;
     return {
       signal: slot.controller.signal,
       end: () => {
         if (this.localDkg === slot) this.localDkg = null;
+      },
+    };
+  }
+
+  /**
+   * Reserve the id of a signing ceremony this node leads. `null` when
+   * `ceremonyId` is taken; `end()` releases the reservation (idempotent).
+   */
+  beginLocalSigning(ceremonyId: string): { end(): void } | null {
+    if (this.idTaken(ceremonyId)) return null;
+    const token = {};
+    this.localSigning.set(ceremonyId, token);
+    return {
+      end: () => {
+        if (this.localSigning.get(ceremonyId) === token) this.localSigning.delete(ceremonyId);
       },
     };
   }
@@ -212,7 +245,14 @@ export class Orchestrator {
   }
 
   private run(task: Promise<void>): void {
-    task.catch(err => this.log.error(`orchestrator: unexpected error: ${errorMessage(err)}`));
+    task.catch(err => this.unexpected(err));
+  }
+
+  private unexpected(err: unknown, t?: Tracker): void {
+    this.log.error(`orchestrator: unexpected error${t ? ` in ${t.kind} ${t.ceremonyId}` : ''}: ${errorMessage(err)}`, {
+      ceremonyId: t?.ceremonyId,
+    });
+    if (t) this.settle(t, { status: 'aborted', reason: `internal error: ${errorMessage(err)}` });
   }
 
   // ─── announce-dkg ────────────────────────────────────────────────────────
@@ -254,20 +294,27 @@ export class Orchestrator {
       return this.settle(t, { status: 'aborted', reason: `cannot create the share stager: ${errorMessage(err)}` });
     }
     const dkgSpec = { ceremonyId, sessionId: fromHex(msg.sessionIdHex), threshold, parties, network, rng: this.deps.rng };
-    runDkgCeremony(this.ceremonyIo('dkg'), dkgSpec, stager, t.controller.signal).then(
-      ({ publicKeyPackage }) => {
-        const address = vaultPayment(toVaultKey(publicKeyPackage), network).address;
-        if (t.settled) {
-          this.log.warn(
-            `orchestrator: dkg ${ceremonyId} committed a share for ${address} after the ceremony ended here; the share is on disk`,
-            { ceremonyId, address },
-          );
-          return;
-        }
-        this.settle(t, { status: 'done', address });
-      },
-      err => this.settle(t, { status: 'aborted', reason: errorMessage(err) }),
-    );
+    const ceremony = runDkgCeremony(this.ceremonyIo('dkg'), dkgSpec, stager, t.controller.signal)
+      .then(
+        ({ publicKeyPackage }) => {
+          const address = vaultPayment(toVaultKey(publicKeyPackage), network).address;
+          if (t.settled) {
+            this.log.warn(
+              `orchestrator: dkg ${ceremonyId} committed a share for ${address} after the ceremony ended here; the share is on disk`,
+              { ceremonyId, address },
+            );
+            return;
+          }
+          this.settle(t, { status: 'done', address });
+        },
+        err => this.settle(t, { status: 'aborted', reason: errorMessage(err) }),
+      )
+      .catch(err => this.unexpected(err, t));
+    // The DKG slot stays held until the ceremony has unwound, discard or commit included.
+    this.joinedDkg = ceremony;
+    void ceremony.finally(() => {
+      if (this.joinedDkg === ceremony) this.joinedDkg = null;
+    });
   }
 
   // ─── announce-sign ───────────────────────────────────────────────────────
@@ -311,10 +358,12 @@ export class Orchestrator {
       rng: this.deps.rng,
     };
     // Success leaves the tracker live until a signoff or the deadline.
-    participateInSigning(this.ceremonyIo('signing'), signSpec, t.controller.signal).then(
-      () => {},
-      err => this.settle(t, { status: 'aborted', reason: errorMessage(err) }),
-    );
+    participateInSigning(this.ceremonyIo('signing'), signSpec, t.controller.signal)
+      .then(
+        () => {},
+        err => this.settle(t, { status: 'aborted', reason: errorMessage(err) }),
+      )
+      .catch(err => this.unexpected(err, t));
   }
 
   private signerProblem(from: PartyId, signers: readonly PartyId[], threshold: number): string | null {
@@ -422,8 +471,8 @@ export class Orchestrator {
       else drop('info', 'duplicate announce for a live ceremony');
       return true;
     }
-    if (this.localDkg?.ceremonyId === ceremonyId) {
-      drop('warn', 'this node leads a DKG with this id');
+    if (this.localDkg?.ceremonyId === ceremonyId || this.localSigning.has(ceremonyId)) {
+      drop('warn', 'this node leads a ceremony with this id');
       return true;
     }
     if (this.ended.has(ceremonyId)) {
@@ -433,10 +482,21 @@ export class Orchestrator {
     return false;
   }
 
+  /** A local DKG slot, a DKG tracker, or a joined DKG still unwinding. */
   private dkgLive(): boolean {
-    if (this.localDkg) return true;
+    if (this.localDkg || this.joinedDkg) return true;
     for (const t of this.trackers.values()) if (t.kind === 'dkg') return true;
     return false;
+  }
+
+  /** A live tracker, an outcome within retention, or a local slot holds `ceremonyId`. */
+  private idTaken(ceremonyId: string): boolean {
+    return (
+      this.trackers.has(ceremonyId) ||
+      this.ended.has(ceremonyId) ||
+      this.localDkg?.ceremonyId === ceremonyId ||
+      this.localSigning.has(ceremonyId)
+    );
   }
 
   /** Create the tracker (leader pinned) and start the ceremony deadline. */
