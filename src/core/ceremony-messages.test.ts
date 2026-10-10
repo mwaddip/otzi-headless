@@ -9,7 +9,6 @@ import { describe, it, expect } from 'vitest';
 import {
   announceFrostMessage,
   encodeCeremonyMessage,
-  manifestPushMessage,
   parseCeremonyMessage,
   type AnnounceOpnetParams,
 } from './ceremony-messages';
@@ -217,52 +216,11 @@ describe('announce-frost: opnet-params variant', () => {
   });
 });
 
-describe('manifest-push wire opcode', () => {
-  const manifestText = '{"version":1,"name":"X","contracts":[]}';
-
-  it('round-trips a valid payload', () => {
-    const msg = manifestPushMessage({ manifest: manifestText, hmac: 'AA'.repeat(32) });
-    const encoded = encodeCeremonyMessage(msg);
-    const decoded = parseCeremonyMessage(encoded);
-    if (!decoded) throw new Error('parse returned null');
-    if (decoded.kind !== 'manifest-push') throw new Error(`wrong kind: ${decoded.kind}`);
-    expect(decoded.manifest).toBe(manifestText);
-    expect(decoded.hmac).toBe('aa'.repeat(32));
-  });
-
-  it('rejects missing manifest', () => {
-    const garbage = new TextEncoder().encode(
-      JSON.stringify({ v: 1, kind: 'manifest-push', hmac: 'aa' }),
+describe('unrecognized message kinds', () => {
+  it('parse to null, so a peer sending a kind this build dropped is ignored', () => {
+    const bytes = new TextEncoder().encode(
+      JSON.stringify({ v: 1, kind: 'no-such-kind', payload: 'x' }),
     );
-    expect(parseCeremonyMessage(garbage)).toBeNull();
-  });
-
-  it('rejects missing hmac', () => {
-    const garbage = new TextEncoder().encode(
-      JSON.stringify({ v: 1, kind: 'manifest-push', manifest: '{}' }),
-    );
-    expect(parseCeremonyMessage(garbage)).toBeNull();
-  });
-
-  it('rejects empty hmac', () => {
-    const garbage = new TextEncoder().encode(
-      JSON.stringify({ v: 1, kind: 'manifest-push', manifest: '{}', hmac: '' }),
-    );
-    expect(parseCeremonyMessage(garbage)).toBeNull();
-  });
-
-  it('rejects non-hex hmac', () => {
-    const garbage = new TextEncoder().encode(
-      JSON.stringify({ v: 1, kind: 'manifest-push', manifest: '{}', hmac: 'not-hex!' }),
-    );
-    expect(parseCeremonyMessage(garbage)).toBeNull();
-  });
-
-  it('preserves verbatim manifest bytes (no canonicalization)', () => {
-    const weird = '{"version":1,  "contracts": [],"name":"X"}';
-    const msg = manifestPushMessage({ manifest: weird, hmac: 'aa'.repeat(32) });
-    const decoded = parseCeremonyMessage(encodeCeremonyMessage(msg));
-    if (!decoded || decoded.kind !== 'manifest-push') throw new Error('parse failed');
-    expect(decoded.manifest).toBe(weird);
+    expect(parseCeremonyMessage(bytes)).toBeNull();
   });
 });

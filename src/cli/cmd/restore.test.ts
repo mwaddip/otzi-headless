@@ -16,23 +16,29 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
-import { runBackup, BACKUP_HEADER_LEN, BACKUP_MAGIC_LEN } from './backup';
+import { createCipheriv, pbkdf2Sync, randomBytes } from 'node:crypto';
+import { create as tarCreate } from 'tar';
+import {
+  runBackup,
+  BACKUP_HEADER_LEN,
+  BACKUP_IV_LEN,
+  BACKUP_MAGIC,
+  BACKUP_MAGIC_LEN,
+  BACKUP_PBKDF2_ITERATIONS,
+  BACKUP_SALT_LEN,
+} from './backup';
 import { runRestore } from './restore';
 
 interface Fixture {
   configPath: string;
-  manifestPath: string;
   sharePath: string;
   identityPath: string;
   pubkeyBookPath: string;
   vaultPubkeyPath: string;
-  bootstrapSecretPath: string;
 }
 
 interface FixtureOpts {
-  skipManifest?: boolean;
   skipVaultPubkey?: boolean;
-  skipBootstrapSecret?: boolean;
   /**
    * If set, encode the share/identity/pubkeys at relative paths under this
    * tar-encoded prefix. The fixture writes the actual files under the root
@@ -54,8 +60,6 @@ async function buildBackupFixture(
   const identityPath = join(varDir, 'identity.json');
   const pubkeyBookPath = join(varDir, 'pubkeys.json');
   const vaultPubkeyPath = join(varDir, 'vault-pubkey.json');
-  const bootstrapSecretPath = join(varDir, 'bootstrap-secret');
-  const manifestPath = join(etcDir, 'manifest.otzi.json');
 
   const tomlText = `
 [share]
@@ -84,13 +88,6 @@ strategy = "auto"
   const configPath = join(etcDir, 'daemon.toml');
   await writeFile(configPath, tomlText, { mode: 0o640 });
 
-  if (!opts.skipManifest) {
-    await writeFile(
-      manifestPath,
-      JSON.stringify({ version: 1, name: 'fixture', contracts: [] }),
-      { mode: 0o660 },
-    );
-  }
   await writeFile(sharePath, JSON.stringify({ version: 3, partyId: 7 }), {
     mode: 0o600,
   });
@@ -103,18 +100,13 @@ strategy = "auto"
       mode: 0o644,
     });
   }
-  if (!opts.skipBootstrapSecret) {
-    await writeFile(bootstrapSecretPath, 'bootstrap-token\n', { mode: 0o660 });
-  }
 
   return {
     configPath,
-    manifestPath,
     sharePath,
     identityPath,
     pubkeyBookPath,
     vaultPubkeyPath,
-    bootstrapSecretPath,
   };
 }
 
@@ -132,6 +124,42 @@ async function pathExists(p: string): Promise<boolean> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw err;
   }
+}
+
+/**
+ * Build a valid encrypted archive from an explicit entry table, bypassing
+ * `runBackup`. Lets a test hand `runRestore` an archive whose entries differ
+ * from what the current `runBackup` writes (e.g. one from an older daemon).
+ * Same wire format as backup.ts: magic | salt | iv | tag | AES-256-GCM(tgz).
+ */
+async function craftArchive(
+  dir: string,
+  entries: Record<string, string>,
+): Promise<{ path: string; password: string }> {
+  const staging = await mkdtemp(join(dir, 'craft-stage-'));
+  const names = Object.keys(entries);
+  for (const name of names) {
+    const dest = join(staging, name);
+    await mkdir(join(dest, '..'), { recursive: true });
+    await writeFile(dest, entries[name]!);
+  }
+  const chunks: Buffer[] = [];
+  const tarStream = tarCreate({ cwd: staging, gzip: true, portable: true }, names);
+  for await (const chunk of tarStream as AsyncIterable<Buffer>) chunks.push(chunk);
+
+  const password = 'crafted-archive-password';
+  const salt = randomBytes(BACKUP_SALT_LEN);
+  const iv = randomBytes(BACKUP_IV_LEN);
+  const key = pbkdf2Sync(password, salt, BACKUP_PBKDF2_ITERATIONS, 32, 'sha256');
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(Buffer.concat(chunks)), cipher.final()]);
+  const magic = Buffer.alloc(BACKUP_MAGIC_LEN, 0);
+  magic.write(BACKUP_MAGIC, 0, 'ascii');
+
+  const path = join(dir, 'crafted.otzi-backup');
+  await writeFile(path, Buffer.concat([magic, salt, iv, cipher.getAuthTag(), ciphertext]));
+  await rm(staging, { recursive: true, force: true });
+  return { path, password };
 }
 
 /**
@@ -160,11 +188,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: outDir,
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     // Restore into a fresh root.
@@ -184,7 +208,6 @@ describe('runRestore', () => {
     // the runRestore output paths.
     const restored = (rel: string): string => resolve(restoreRoot, rel);
     expect(restoredPaths.has(restored('etc/otzi/daemon.toml'))).toBe(true);
-    expect(restoredPaths.has(restored('etc/otzi/manifest.otzi.json'))).toBe(true);
     // Share file lives at the same relative path the backup recorded.
     const shareRel = f.sharePath.startsWith('/') ? f.sharePath.slice(1) : f.sharePath;
     expect(restoredPaths.has(restored(shareRel))).toBe(true);
@@ -197,7 +220,9 @@ describe('runRestore', () => {
       : f.pubkeyBookPath;
     expect(restoredPaths.has(restored(pubkeysRel))).toBe(true);
     expect(restoredPaths.has(restored('var/lib/otzi/vault-pubkey.json'))).toBe(true);
-    expect(restoredPaths.has(restored('var/lib/otzi/bootstrap-secret'))).toBe(true);
+
+    // Exactly the vault's file set, nothing else.
+    expect(restoredPaths.size).toBe(5);
 
     // meta.json is NOT restored to disk.
     expect(restoredPaths.has(restored('meta.json'))).toBe(false);
@@ -227,11 +252,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: outDir,
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     const restoreRoot = join(tmp, 'dst');
@@ -251,7 +272,6 @@ describe('runRestore', () => {
     // so we catch bugs where we report one mode but write another).
     const restored = (rel: string): string => resolve(restoreRoot, rel);
     expect(await modeOf(restored('etc/otzi/daemon.toml'))).toBe(0o640);
-    expect(await modeOf(restored('etc/otzi/manifest.otzi.json'))).toBe(0o660);
 
     const shareRel = f.sharePath.startsWith('/') ? f.sharePath.slice(1) : f.sharePath;
     expect(await modeOf(restored(shareRel))).toBe(0o600); // share — by elimination
@@ -264,7 +284,6 @@ describe('runRestore', () => {
       : f.pubkeyBookPath;
     expect(await modeOf(restored(pubkeysRel))).toBe(0o644);
     expect(await modeOf(restored('var/lib/otzi/vault-pubkey.json'))).toBe(0o644);
-    expect(await modeOf(restored('var/lib/otzi/bootstrap-secret'))).toBe(0o660);
 
     // Result-reported modes match on-disk modes.
     expect(got.get(restored('etc/otzi/daemon.toml'))).toBe(0o640);
@@ -277,11 +296,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     await expect(
@@ -301,11 +316,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     // Flip 1 byte mid-ciphertext (well after the magic + header).
@@ -365,11 +376,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     const dstRoot = join(tmp, 'dst');
@@ -416,11 +423,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     await expect(
@@ -442,11 +445,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     const result = await runRestore({
@@ -460,17 +459,13 @@ describe('runRestore', () => {
     expect(result.restoredFiles.length).toBeGreaterThan(0);
   });
 
-  it('skips optional bootstrap-secret cleanly when archive omits it', async () => {
+  it('restores an archive built without the optional vault-pubkey file', async () => {
     const backupRoot = join(tmp, 'src');
-    const f = await buildBackupFixture(backupRoot, { skipBootstrapSecret: true });
+    const f = await buildBackupFixture(backupRoot, { skipVaultPubkey: true });
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     const restoreRoot = join(tmp, 'dst');
@@ -482,40 +477,39 @@ describe('runRestore', () => {
       daemonStatusCheck: NEVER_RUNNING,
     });
 
-    // bootstrap-secret should NOT be in the restored set (wasn't in the archive).
+    // vault-pubkey.json was not in the archive, so it is not in the restored set.
     const restoredPaths = new Set(result.restoredFiles.map((r) => r.path));
     expect(
-      restoredPaths.has(resolve(restoreRoot, 'var/lib/otzi/bootstrap-secret')),
+      restoredPaths.has(resolve(restoreRoot, 'var/lib/otzi/vault-pubkey.json')),
     ).toBe(false);
     // But required files are still there.
     expect(restoredPaths.has(resolve(restoreRoot, 'etc/otzi/daemon.toml'))).toBe(true);
+    expect(restoredPaths.size).toBe(4);
   });
 
-  it('skips optional manifest cleanly when archive omits it', async () => {
-    const backupRoot = join(tmp, 'src');
-    const f = await buildBackupFixture(backupRoot, { skipManifest: true });
-    const backup = await runBackup({
-      configPath: f.configPath,
-      outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+  it('places an entry outside the file set at the most restrictive mode (0600)', async () => {
+    // Archives written by older daemons can carry entries the current file
+    // set no longer has. Restore does not special-case them: any entry that is
+    // neither a daemon.toml-derived path nor in the fixed-mode table is placed
+    // with the most-restrictive default.
+    const archive = await craftArchive(tmp, {
+      'etc/otzi/daemon.toml': '[share]\npath = "/var/lib/otzi/share.json"\n',
+      'var/lib/otzi/share.json': '{}',
+      'var/lib/otzi/extra-entry': 'leftover\n',
     });
 
     const restoreRoot = join(tmp, 'dst');
     const result = await runRestore({
-      archivePath: backup.path,
-      password: backup.password,
+      archivePath: archive.path,
+      password: archive.password,
       rootOverride: restoreRoot,
       configExistsCheck: NEVER_EXISTS,
       daemonStatusCheck: NEVER_RUNNING,
     });
 
-    const restoredPaths = new Set(result.restoredFiles.map((r) => r.path));
-    expect(restoredPaths.has(resolve(restoreRoot, 'etc/otzi/manifest.otzi.json'))).toBe(false);
-    expect(restoredPaths.has(resolve(restoreRoot, 'etc/otzi/daemon.toml'))).toBe(true);
+    const extra = resolve(restoreRoot, 'var/lib/otzi/extra-entry');
+    expect(result.restoredFiles.find((r) => r.path === extra)?.mode).toBe(0o600);
+    expect(await modeOf(extra)).toBe(0o600);
   });
 
   it('extraction never escapes rootOverride even if a tar entry has a leading slash (paranoid check)', async () => {
@@ -529,11 +523,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     const restoreRoot = join(tmp, 'dst');
@@ -557,11 +547,7 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     const result = await runRestore({
@@ -583,26 +569,23 @@ describe('runRestore', () => {
     // the placement loop and triggers the rollback path.
     //
     // The first file the loop tries to place is `etc/otzi/daemon.toml`
-    // (by tar entry order — see backup.ts fileSet). The second is
-    // `etc/otzi/manifest.otzi.json`. Sabotage the second to fail; assert
-    // that the first was rolled back (no file at `<restoreRoot>/etc/otzi/
-    // daemon.toml`) and that NO files anywhere under restoreRoot survive.
+    // (by tar entry order — see backup.ts fileSet); the last one before the
+    // generated meta.json is `var/lib/otzi/vault-pubkey.json`. Sabotage that
+    // last one to fail; assert that everything placed before it was rolled
+    // back (no file at `<restoreRoot>/etc/otzi/daemon.toml`, share, identity
+    // or pubkeys) so NO files anywhere under restoreRoot survive.
     const backupRoot = join(tmp, 'src');
     const f = await buildBackupFixture(backupRoot);
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     const restoreRoot = join(tmp, 'dst-rollback');
-    // Pre-create the manifest *path* as a directory so writeFile() will
+    // Pre-create the vault-pubkey *path* as a directory so writeFile() will
     // throw EISDIR when the loop reaches it.
-    const sabotagePath = join(restoreRoot, 'etc/otzi/manifest.otzi.json');
+    const sabotagePath = join(restoreRoot, 'var/lib/otzi/vault-pubkey.json');
     await mkdir(sabotagePath, { recursive: true });
 
     const daemonTomlDest = join(restoreRoot, 'etc/otzi/daemon.toml');
@@ -638,12 +621,6 @@ describe('runRestore', () => {
     expect(await pathExists(resolve(restoreRoot, shareRel))).toBe(false);
     expect(await pathExists(resolve(restoreRoot, identityRel))).toBe(false);
     expect(await pathExists(resolve(restoreRoot, pubkeysRel))).toBe(false);
-    expect(
-      await pathExists(resolve(restoreRoot, 'var/lib/otzi/vault-pubkey.json')),
-    ).toBe(false);
-    expect(
-      await pathExists(resolve(restoreRoot, 'var/lib/otzi/bootstrap-secret')),
-    ).toBe(false);
   });
 
   it('magic mismatch error fires before pre-flight checks against existing config (cheap precheck order)', async () => {
@@ -766,11 +743,7 @@ describe('passwordStdin', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     // Use the stdinStream seam so we don't have to monkey-patch
@@ -799,11 +772,7 @@ describe('passwordStdin', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     const fakeStdin = Readable.from([
@@ -826,11 +795,7 @@ describe('passwordStdin', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: { vaultPubkey: f.vaultPubkeyPath },
     });
 
     const half = Math.floor(backup.password.length / 2);

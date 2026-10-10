@@ -21,23 +21,20 @@ import {
   BACKUP_HEADER_LEN,
   BACKUP_PBKDF2_ITERATIONS,
 } from './backup';
+import * as backupModule from './backup';
 
 interface Fixture {
   configPath: string;
-  manifestPath: string;
   sharePath: string;
   identityPath: string;
   pubkeyBookPath: string;
   vaultPubkeyPath: string;
-  bootstrapSecretPath: string;
   expectedShareTar: string;
   expectedIdTar: string;
   expectedPubTar: string;
 }
 
 interface FixtureOpts {
-  /** Skip writing the manifest file (test optional skip). */
-  skipManifest?: boolean;
   /** Skip writing the share file (test required-file failure). */
   skipShare?: boolean;
   /** Skip writing the identity file (test required-file failure). */
@@ -46,16 +43,14 @@ interface FixtureOpts {
   skipPubkeys?: boolean;
   /** Skip writing the vault-pubkey cache (test optional skip). */
   skipVaultPubkey?: boolean;
-  /** Skip writing the bootstrap-secret (test optional skip). */
-  skipBootstrapSecret?: boolean;
 }
 
 /**
  * Materialize a fake daemon install layout under `root`. The share / identity
  * / pubkey-book paths are encoded into the daemon.toml so backup discovers
- * them via the real config-parsing path. The "fixed" paths (manifest,
- * vault-pubkey, bootstrap-secret) are tmpdir-rooted and have to be passed via
- * `pathOverrides` to runBackup — those paths aren't in the config.
+ * them via the real config-parsing path. The "fixed" path (vault-pubkey) is
+ * tmpdir-rooted and has to be passed via `pathOverrides` to runBackup — that
+ * path isn't in the config.
  */
 async function buildFixture(root: string, opts: FixtureOpts = {}): Promise<Fixture> {
   const etcDir = join(root, 'etc', 'otzi');
@@ -67,8 +62,6 @@ async function buildFixture(root: string, opts: FixtureOpts = {}): Promise<Fixtu
   const identityPath = join(varDir, 'identity.json');
   const pubkeyBookPath = join(varDir, 'pubkeys.json');
   const vaultPubkeyPath = join(varDir, 'vault-pubkey.json');
-  const bootstrapSecretPath = join(varDir, 'bootstrap-secret');
-  const manifestPath = join(etcDir, 'manifest.otzi.json');
 
   const tomlText = `
 [share]
@@ -97,12 +90,6 @@ strategy = "auto"
   const configPath = join(etcDir, 'daemon.toml');
   await writeFile(configPath, tomlText);
 
-  if (!opts.skipManifest) {
-    await writeFile(
-      manifestPath,
-      JSON.stringify({ version: 1, name: 'fixture', contracts: [] }),
-    );
-  }
   if (!opts.skipShare) {
     await writeFile(sharePath, JSON.stringify({ version: 3, partyId: 7 }), {
       mode: 0o600,
@@ -117,20 +104,13 @@ strategy = "auto"
   if (!opts.skipVaultPubkey) {
     await writeFile(vaultPubkeyPath, JSON.stringify({ p2tr: 'bc1p...' }));
   }
-  if (!opts.skipBootstrapSecret) {
-    await writeFile(bootstrapSecretPath, 'super-secret-bootstrap-token\n', {
-      mode: 0o660,
-    });
-  }
 
   return {
     configPath,
-    manifestPath,
     sharePath,
     identityPath,
     pubkeyBookPath,
     vaultPubkeyPath,
-    bootstrapSecretPath,
     expectedShareTar: stripLead(sharePath),
     expectedIdTar: stripLead(identityPath),
     expectedPubTar: stripLead(pubkeyBookPath),
@@ -176,11 +156,7 @@ function decryptBackup(buf: Buffer, password: string): Buffer {
 
 /** Build the `pathOverrides` block from a fixture. */
 function overridesFrom(f: Fixture) {
-  return {
-    manifest: f.manifestPath,
-    vaultPubkey: f.vaultPubkeyPath,
-    bootstrapSecret: f.bootstrapSecretPath,
-  };
+  return { vaultPubkey: f.vaultPubkeyPath };
 }
 
 describe('runBackup', () => {
@@ -217,12 +193,10 @@ describe('runBackup', () => {
     expect(new Set(result.filesIncluded)).toEqual(
       new Set([
         'etc/otzi/daemon.toml',
-        'etc/otzi/manifest.otzi.json',
         f.expectedShareTar,
         f.expectedPubTar,
         f.expectedIdTar,
         'var/lib/otzi/vault-pubkey.json',
-        'var/lib/otzi/bootstrap-secret',
         'meta.json',
       ]),
     );
@@ -233,11 +207,7 @@ describe('runBackup', () => {
   });
 
   it('skips missing optional files silently', async () => {
-    const f = await buildFixture(tmp, {
-      skipManifest: true,
-      skipVaultPubkey: true,
-      skipBootstrapSecret: true,
-    });
+    const f = await buildFixture(tmp, { skipVaultPubkey: true });
     const out = join(tmp, 'out');
     const result = await runBackup({
       configPath: f.configPath,
@@ -251,9 +221,24 @@ describe('runBackup', () => {
     expect(result.filesIncluded).toContain(f.expectedPubTar);
     expect(result.filesIncluded).toContain('meta.json');
 
-    expect(result.filesIncluded).not.toContain('etc/otzi/manifest.otzi.json');
     expect(result.filesIncluded).not.toContain('var/lib/otzi/vault-pubkey.json');
-    expect(result.filesIncluded).not.toContain('var/lib/otzi/bootstrap-secret');
+  });
+
+  it('exports default paths only for the files the vault actually has', () => {
+    // facts/daemon.md "Backup file set": the OPNet contract file and the
+    // bootstrap-window token are gone from the file set, so no default path
+    // constant for them is left for `runBackup` or `runRestore` to reference.
+    const pathConstants = Object.keys(backupModule).filter((k) =>
+      k.startsWith('DEFAULT_'),
+    );
+    expect(pathConstants.filter((k) => /MANIFEST|BOOTSTRAP/.test(k))).toEqual([]);
+    expect(pathConstants.sort()).toEqual([
+      'DEFAULT_DAEMON_CONFIG_PATH',
+      'DEFAULT_IDENTITY_PATH',
+      'DEFAULT_PUBKEY_BOOK_PATH',
+      'DEFAULT_SHARE_PATH',
+      'DEFAULT_VAULT_PUBKEY_PATH',
+    ]);
   });
 
   it('fails clearly when a required file (share) is missing', async () => {

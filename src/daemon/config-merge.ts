@@ -44,25 +44,6 @@ export interface LoadedDaemonState {
   frostLegacySig?: Uint8Array;
   /** Pre-bound persistence sink. Present after `validateLoaded`; absent for `buildStateFromShare` / `buildStateNoShare`. */
   persistDkgShare?: DkgPersistenceSink;
-  /**
-   * Optional shared secret read from `/var/lib/otzi/bootstrap-secret` at
-   * daemon startup. Used by phase 9c's control-plane wire opcode to verify
-   * operator-typed HMAC. Wiped on first successful DKG completion.
-   */
-  bootstrapSecret?: string;
-}
-
-const BOOTSTRAP_SECRET_PATH = '/var/lib/otzi/bootstrap-secret';
-
-async function loadBootstrapSecret(): Promise<string | undefined> {
-  try {
-    const raw = await readFile(BOOTSTRAP_SECRET_PATH, 'utf8');
-    const trimmed = raw.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
-  } catch (err) {
-    if (isFileNotFound(err)) return undefined;
-    throw err;
-  }
 }
 
 export interface LoadOptions {
@@ -92,8 +73,6 @@ export async function validateLoaded(
       `daemon: env var '${config.share.passwordEnv}' not set — must be set for both share decryption (when share file exists) and DKG-output encryption (when in DKG-only mode)`,
     );
 
-  const bootstrapSecret = await loadBootstrapSecret();
-
   let shareText: string | undefined;
   try {
     shareText = await readFile(config.share.path, 'utf8');
@@ -103,11 +82,7 @@ export async function validateLoaded(
       // with a persist sink ready for the post-DKG write.
       const base = buildStateNoShare(config);
       const persistDkgShare = makePersistSink(config, password);
-      return {
-        ...base,
-        persistDkgShare,
-        ...(bootstrapSecret ? { bootstrapSecret } : {}),
-      };
+      return { ...base, persistDkgShare };
     }
     throw err;
   }
@@ -151,7 +126,6 @@ export async function validateLoaded(
     ...base,
     ...(frostLegacySig ? { frostLegacySig } : {}),
     persistDkgShare,
-    ...(bootstrapSecret ? { bootstrapSecret } : {}),
   };
 }
 

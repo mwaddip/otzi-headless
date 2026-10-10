@@ -35,14 +35,6 @@ Description: Operator usernames (space-separated)
  add operators manually later via `sudo usermod -aG otzi <user>` or
  `sudo dpkg-reconfigure otzi-headless`.
 
-Template: otzi-headless/bootstrap-secret
-Type: password
-Description: Bootstrap secret (shared passphrase)
- Operators agree on this string out-of-band BEFORE install. It
- authenticates control-plane CLI operations (e.g. `otzi sync`) during
- the bootstrap window. Wiped from disk after DKG completes; cannot be
- recovered. After DKG, manifest changes are operator-local per node.
-
 Template: otzi-headless/network
 Type: select
 Choices: mainnet, testnet, regtest

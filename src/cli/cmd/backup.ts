@@ -1,8 +1,8 @@
 /**
  * `otzi backup` — produce a single password-protected archive of full daemon
- * state (config + manifest + share + identity + pubkey-book + bootstrap-secret
- * + meta) so an operator who loses their host can recover into a fresh `.deb`
- * install via `otzi restore`.
+ * state (config + share + identity + pubkey-book + vault-pubkey + meta) so an
+ * operator who loses their host can recover into a fresh `.deb` install via
+ * `otzi restore`.
  *
  * The archive layout is a versioned, magic-prefixed binary file:
  *
@@ -39,12 +39,10 @@ import { create as tarCreate } from 'tar';
 import { parse as parseToml } from 'smol-toml';
 
 export const DEFAULT_DAEMON_CONFIG_PATH = '/etc/otzi/daemon.toml';
-export const DEFAULT_MANIFEST_PATH = '/etc/otzi/manifest.otzi.json';
 export const DEFAULT_SHARE_PATH = '/var/lib/otzi/share.json';
 export const DEFAULT_IDENTITY_PATH = '/var/lib/otzi/identity.json';
 export const DEFAULT_PUBKEY_BOOK_PATH = '/var/lib/otzi/pubkeys.json';
 export const DEFAULT_VAULT_PUBKEY_PATH = '/var/lib/otzi/vault-pubkey.json';
-export const DEFAULT_BOOTSTRAP_SECRET_PATH = '/var/lib/otzi/bootstrap-secret';
 
 export const BACKUP_MAGIC = 'OTZI-BACKUP-V1';
 export const BACKUP_MAGIC_LEN = 32;
@@ -113,9 +111,7 @@ export interface BackupOptions {
    * tmpdir-rooted layout so we don't read /etc/otzi/* during a unit test.
    */
   pathOverrides?: {
-    manifest?: string;
     vaultPubkey?: string;
-    bootstrapSecret?: string;
   };
 }
 
@@ -164,22 +160,14 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
       ? nodeTable.pubkey_book_file
       : DEFAULT_PUBKEY_BOOK_PATH;
 
-  const manifestSource = opts.pathOverrides?.manifest ?? DEFAULT_MANIFEST_PATH;
   const vaultPubkeySource =
     opts.pathOverrides?.vaultPubkey ?? DEFAULT_VAULT_PUBKEY_PATH;
-  const bootstrapSecretSource =
-    opts.pathOverrides?.bootstrapSecret ?? DEFAULT_BOOTSTRAP_SECRET_PATH;
 
   // --- Step 2: assemble the file table. Tar paths are RELATIVE (no leading
   // slash) so restore can `chroot`-style place them back at the corresponding
   // absolute paths.
   const fileSet: FileEntry[] = [
     { tarPath: 'etc/otzi/daemon.toml', sourcePath: configPath, required: true },
-    {
-      tarPath: 'etc/otzi/manifest.otzi.json',
-      sourcePath: manifestSource,
-      required: false,
-    },
     { tarPath: stripLeadingSlash(sharePath), sourcePath: sharePath, required: true },
     {
       tarPath: stripLeadingSlash(pubkeyBookPath),
@@ -194,11 +182,6 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
     {
       tarPath: 'var/lib/otzi/vault-pubkey.json',
       sourcePath: vaultPubkeySource,
-      required: false,
-    },
-    {
-      tarPath: 'var/lib/otzi/bootstrap-secret',
-      sourcePath: bootstrapSecretSource,
       required: false,
     },
   ];

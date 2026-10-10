@@ -4,15 +4,9 @@
  *   otzi daemon <config.toml>                   — run the daemon
  *   otzi setup <config.toml>                    — run bootstrap (reads [bootstrap].role from config)
  *   otzi generate <config.toml> [flags]         — trigger DKG against local daemon
- *   otzi install <path>                         — install a manifest
- *   otzi sync <path>                            — distribute a manifest to all peers (bootstrap-window-only)
- *   otzi list                                   — show the installed manifest
- *   otzi uninstall                              — remove the installed manifest
- *   otzi sign <contract> <method> <args...>     — sign + broadcast OPNet contract call
  *   otzi vault [--json]                         — print vault metadata
  *   otzi btc send <addr> <amount>[unit]         — send BTC from the vault
  *   otzi btc balance [--unit ...]               — read vault BTC balance
- *   otzi op20 balance <ticker|ID>               — read vault OP20 balance
  *   otzi backup                                 — write password-protected archive of daemon state
  *   otzi restore <path> [--password-stdin]      — recover daemon state from an archive
  *
@@ -22,7 +16,7 @@
  * mode (signing rejected; DKG works) — operator runs `otzi generate` against
  * it from another shell, then restarts to load the persisted share.
  *
- * Operator-facing commands (install/list/sign/...) talk to the local daemon
+ * Operator-facing commands (vault/btc/...) talk to the local daemon
  * over a Unix domain socket (typically /var/run/otzi/otzi.sock). The default
  * config path /etc/otzi/daemon.toml matches the .deb install layout.
  *
@@ -52,29 +46,11 @@ export async function main(argv: readonly string[]): Promise<void> {
     case 'generate':
       await runGenerateCommand(rest);
       return;
-    case 'install':
-      await runInstallCommand(rest);
-      return;
-    case 'sync':
-      await runSyncCommand(rest);
-      return;
-    case 'list':
-      await runListCommand(rest);
-      return;
-    case 'uninstall':
-      await runUninstallCommand(rest);
-      return;
-    case 'sign':
-      await runSignCommand(rest);
-      return;
     case 'vault':
       await runVaultCommand(rest);
       return;
     case 'btc':
       await runBtcCommand(rest);
-      return;
-    case 'op20':
-      await runOp20Command(rest);
       return;
     case 'backup':
       await runBackupCommand(rest);
@@ -93,15 +69,9 @@ function usage(): string {
     '  otzi daemon <path/to/daemon.toml>',
     '  otzi setup <path/to/daemon.toml>',
     '  otzi generate <path/to/daemon.toml> [--ceremony-id <id>]',
-    '  otzi install <path>',
-    '  otzi sync <path>',
-    '  otzi list',
-    '  otzi uninstall',
-    '  otzi sign <contract> <method> [args...] [--config <path>] [--fee-rate <sat/vB>]',
     '  otzi vault [--json]',
     '  otzi btc send <address> <amount>[unit] [--config <path>] [--fee-rate <sat/vB>]',
     '  otzi btc balance [--unit sats|btc|mbtc|ubtc]',
-    '  otzi op20 balance <ticker|ID>',
     '  otzi backup',
     '  otzi restore <archive-path> [--password-stdin]',
   ].join('\n');
@@ -120,7 +90,7 @@ async function runDaemonCommand(args: string[]): Promise<void> {
   // logger to both the transport (for peer-mesh allowlist warns picked up by
   // fail2ban via journald) and to the Daemon (for orchestrator/leader/triggers
   // info+error context). stderr only — stdout is reserved for CLI machine output.
-  // CLI subcommands (sign/vault/btc/op20/...) deliberately keep `NOOP_LOGGER`
+  // CLI subcommands (vault/btc/...) deliberately keep `NOOP_LOGGER`
   // and MUST stay that way: their stdout is consumed by shell scripts piping tx
   // IDs, vault metadata, balances into `xargs`/`opnet broadcast`/etc., so any
   // log line on stdout would corrupt the downstream parser. Wire log output to
@@ -325,75 +295,6 @@ function parsePositionalAndFlags(args: string[]): {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// `otzi install <path>`
-// ─────────────────────────────────────────────────────────────────────────
-
-async function runInstallCommand(args: string[]): Promise<void> {
-  const source = args[0];
-  if (!source || source.startsWith('--')) throw new Error('usage: otzi install <path>');
-  const { install } = await import('../cli/cmd/install');
-  await install({ source });
-  console.error(`otzi: installed manifest from ${source}`);
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// `otzi sync <path>` — distribute a manifest to all peers
-// ─────────────────────────────────────────────────────────────────────────
-
-async function runSyncCommand(args: string[]): Promise<void> {
-  const { positional, flags } = parsePositionalAndFlags(args);
-  const source = positional[0];
-  if (!source) throw new Error('usage: otzi sync <path>');
-  const configPath = flags.get('config') || DEFAULT_DAEMON_CONFIG_PATH;
-  const { sync } = await import('../cli/cmd/sync');
-  const result = await sync({ configPath, source });
-  console.error(
-    `otzi sync: manifest installed locally + broadcast to ${result.peersNotified} peer(s) (ceremonyId=${result.ceremonyId})`,
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// `otzi list`
-// ─────────────────────────────────────────────────────────────────────────
-
-async function runListCommand(_args: string[]): Promise<void> {
-  const { list } = await import('../cli/cmd/list');
-  const out = await list();
-  console.log(out);
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// `otzi uninstall`
-// ─────────────────────────────────────────────────────────────────────────
-
-async function runUninstallCommand(_args: string[]): Promise<void> {
-  const { uninstall } = await import('../cli/cmd/uninstall');
-  const result = await uninstall();
-  console.error(result.removed ? 'otzi: manifest removed' : 'otzi: no manifest installed');
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// `otzi sign <contract> <method> <args...>`
-// ─────────────────────────────────────────────────────────────────────────
-
-async function runSignCommand(args: string[]): Promise<void> {
-  const { positional, flags } = parsePositionalAndFlags(args);
-  if (positional.length < 2)
-    throw new Error('usage: otzi sign <contract> <method> [args...]');
-  const [contractIdent, methodIdent, ...rest] = positional;
-  const { sign } = await import('../cli/cmd/sign');
-  const configPath = flags.get('config') || DEFAULT_DAEMON_CONFIG_PATH;
-  const result = await sign({
-    configPath,
-    contractIdent: contractIdent!,
-    methodIdent: methodIdent!,
-    args: rest,
-    ...(flags.has('fee-rate') ? { feeRate: Number(flags.get('fee-rate')) } : {}),
-  });
-  console.log(result.transactionId);
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 // `otzi vault [--json]`
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -437,24 +338,6 @@ async function runBtcCommand(args: string[]): Promise<void> {
     return;
   }
   throw new Error('usage: otzi btc {send <address> <amount>[unit] | balance [--unit ...]}');
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// `otzi op20 balance <ticker|ID>`
-// ─────────────────────────────────────────────────────────────────────────
-
-async function runOp20Command(args: string[]): Promise<void> {
-  const sub = args[0];
-  if (sub === 'balance') {
-    const identifier = args[1];
-    if (!identifier || identifier.startsWith('--'))
-      throw new Error('usage: otzi op20 balance <ticker|ID>');
-    const { op20Balance } = await import('../cli/cmd/op20');
-    const out = await op20Balance({ identifier });
-    console.log(out);
-    return;
-  }
-  throw new Error('usage: otzi op20 balance <ticker|ID>');
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -34,7 +34,6 @@ db_get otzi-headless/node-id || true
 # Ask high-priority prompts in order.
 db_input high otzi-headless/role || true
 db_input high otzi-headless/operators || true
-db_input high otzi-headless/bootstrap-secret || true
 db_input high otzi-headless/network || true
 db_input high otzi-headless/transport || true
 

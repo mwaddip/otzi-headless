@@ -15,8 +15,8 @@ case "$1" in
               --home /var/lib/otzi --shell /usr/sbin/nologin otzi
     fi
 
-    # /etc/otzi: 2770 root:otzi (setgid) so group-otzi members can edit/install
-    # manifests; new files inherit group otzi via setgid.
+    # /etc/otzi: 2770 root:otzi (setgid) so group-otzi members can edit the
+    # config; new files inherit group otzi via setgid.
     [ -d /etc/otzi ] || mkdir -p /etc/otzi
     chown root:otzi /etc/otzi
     chmod 2770 /etc/otzi
@@ -46,9 +46,9 @@ case "$1" in
       fi
     done
 
-    # Restore-from-backup branch (run BEFORE bootstrap-secret + daemon.toml
-    # render). If the operator picked "yes" at the debconf prompt, pipe the
-    # password to `otzi restore --password-stdin <path>` and short-circuit the
+    # Restore-from-backup branch (run BEFORE the daemon.toml render). If the
+    # operator picked "yes" at the debconf prompt, pipe the password to
+    # `otzi restore --password-stdin <path>` and short-circuit the
     # fresh-install path. NEVER pass the password as an argv flag — it would
     # leak via /proc/<pid>/cmdline + ps. db_reset wipes the password from
     # /var/cache/debconf/passwords.dat on EVERY exit path.
@@ -99,17 +99,6 @@ BANNER
         echo "otzi-headless: (or remove the package + reinstall with a valid backup)" >&2
         exit 1
       fi
-    fi
-
-    # Persist the bootstrap secret. It will be wiped by the daemon after
-    # the first successful DKG.
-    db_get otzi-headless/bootstrap-secret || true
-    BOOTSTRAP_SECRET="$RET"
-    if [ -n "$BOOTSTRAP_SECRET" ]; then
-      umask 027
-      printf '%s\n' "$BOOTSTRAP_SECRET" >/var/lib/otzi/bootstrap-secret
-      chown root:otzi /var/lib/otzi/bootstrap-secret
-      chmod 660 /var/lib/otzi/bootstrap-secret
     fi
 
     # Render daemon.toml only if missing — preserve operator edits across upgrades.
