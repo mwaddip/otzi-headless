@@ -1,7 +1,7 @@
 # otzi-headless: FROST-only Bitcoin vault — design
 
 Date: 2026-10-10
-Status: approved in brainstorming; pending written-spec review
+Status: approved
 Reference: otzi `master` at `71eb9bd` (`facts/INTERFACES.md` §1, §3–§8, §11, §15)
 
 ## 1. Goal
@@ -176,6 +176,11 @@ type CeremonyMessage =
 
 Symmetric. The node whose trigger fires generates the 32-byte session ID and
 announces; it has no other special role.
+
+The DKG is a run-once setup step for unconfigured nodes. Setup runs under a trust
+assumption: one administrator sets up the federation, or a trusted group does it live.
+The checks below make a faulty or inconsistent setup fail loudly; once a vault exists,
+no DKG can touch it.
 
 1. **Announce.** `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`.
    A node drops it unless it holds no vault (no share loaded, no file at the share
