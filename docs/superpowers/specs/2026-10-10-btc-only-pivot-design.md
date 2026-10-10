@@ -31,7 +31,7 @@ backup/restore and `.deb` packaging.
 | # | Decision | Choice |
 |---|---|---|
 | D1 | Existing v3 vaults | Clean break. No v3 support and no migration path. |
-| D2 | Code shared with otzi | Verbatim copy of otzi modules into `src/wire/` and `src/node/`, source commit recorded, drift script. |
+| D2 | Code shared with otzi | Verbatim copy of otzi modules into `src/otzi/lib/` and `src/otzi/backend/`, source commit recorded, drift script. |
 | D3 | Signing request | Caller sends otzi's `SendProposal`; daemon returns the signed transaction; caller broadcasts. The daemon has no chain access. |
 | D4 | Manifest replacement | Per-node address book in otzi's address-book file format. Control plane, `manifest-push`, `otzi sync` and the bootstrap secret are removed. |
 | D5 | OP_WALLET approver example | Ported to Bitcoin message signatures (`examples/gate-web-btc-message`). |
@@ -67,78 +67,86 @@ browser parties in one session) are out of scope.
 
 | Destination | otzi source |
 |---|---|
-| `src/wire/` | `src/lib/dkg.ts`, `dkg.fixture.ts`, `dkg.test.ts`, `frost-sign.ts`, `frost-sign.test.ts`, `share-file.ts`, `share-file.test.ts`, `bitcoin.ts`, `bitcoin.test.ts`, `crypto.ts`, `hex.ts`, `vault-types.ts`, `address-book.ts`, `address-book.test.ts` |
-| `src/node/` | `backend/src/lib/bitcoin.ts`, `bitcoin.test.ts`, `test-vault.fixture.ts`, `esplora.ts`, `btc-message.ts`, `btc-message.test.ts`, `types.ts` |
+| `src/otzi/lib/` | `src/lib/dkg.ts`, `dkg.fixture.ts`, `dkg.test.ts`, `frost-sign.ts`, `frost-sign.test.ts`, `share-file.ts`, `share-file.test.ts`, `bitcoin.ts`, `bitcoin.test.ts`, `crypto.ts`, `hex.ts`, `vault-types.ts`, `address-book.ts`, `address-book.test.ts` |
+| `src/otzi/backend/` | `backend/src/lib/bitcoin.ts`, `bitcoin.test.ts`, `test-vault.fixture.ts`, `esplora.ts`, `btc-message.ts`, `btc-message.test.ts`, `types.ts` |
 
 Rules:
 - Files are byte-identical to the recorded otzi commit. Headless code that needs more
-  goes in sibling files.
-- `facts/wire.md` and `facts/node.md` record the source commit.
+  goes in its own modules outside `src/otzi/`.
+- `src/otzi/OTZI_COMMIT` holds the full source commit hash; `facts/otzi.md` documents
+  the lifted surface.
 - `scripts/check-otzi-drift.sh <otzi-checkout>` diffs every lifted file against the
   checkout and exits non-zero on any difference.
 - Browser-only helpers (`downloadShareFile`, `downloadAddressBook`) are present but
   never called; `tsconfig` keeps the `DOM` lib so they typecheck.
+- The directory mirrors otzi's layout, so lifted files never collide with headless
+  modules and the old `src/wire/` and `src/node/` can be removed once nothing imports
+  them.
 
 ### 4.2 Deleted
 
 - `vendor/post-quantum/`
-- `src/wire/`: `threshold.ts`, `serialize.ts`, `share-crypto.ts`, `share-write.ts`,
-  `frost-reconstruct.ts`, `manifest.ts`, `manifest-types.ts`, `op20-methods.ts`,
-  `relay-crypto.ts`, and the current `dkg.ts`, `frost-sign.ts`, `crypto.ts`, `hex.ts`,
-  `vault-types.ts` (replaced by §4.1)
-- `src/node/`: `encryption.ts`, `frost-link.ts`, `frost-psbt-signer.ts`,
-  `opnet-client.ts`, `threshold-signer.ts`, current `types.ts` (replaced by §4.1)
+- `src/wire/` and `src/node/` (all files)
 - `src/broadcast/` (all files)
-- `src/core/dkg-session.ts`
-- `src/daemon/control-plane.ts`
+- `src/core/ceremony-runner.ts`, `src/core/ceremony-messages.ts`, `src/core/dkg-session.ts`
+- `src/daemon/control-plane.ts`, `src/daemon/share-persistence.ts`
 - `src/cli/`: `builtin-abis.ts`, `manifest-resolver.ts`, `manifest-types.ts`,
   `manifest-validate.ts`, `validation.ts`, `cmd/sign.ts`, `cmd/op20.ts`,
   `cmd/install.ts`, `cmd/uninstall.ts`, `cmd/list.ts`, `cmd/sync.ts` (with tests)
-- `examples/manifest-builder/`, `docs/headless-manifest-schema.json`,
-  `docs/manifest-builder-spec.md`, `scripts/testnet-e2e.ts`, `PLAN.md`
+- `examples/manifest-builder/`, `examples/gate-web-opwallet/`,
+  `docs/headless-manifest-schema.json`, `docs/manifest-builder-spec.md`,
+  `scripts/testnet-e2e.ts`, `PLAN.md`, `facts/wire.md`, `facts/node.md`,
+  `facts/broadcast.md`
 - Dependencies: `@btc-vision/bip32`, `@btc-vision/bitcoin`, `@btc-vision/post-quantum`,
   `@btc-vision/transaction`, `opnet`, `ajv`; dev dependencies `@preact/signals`,
   `htm`, `preact`
 
 ### 4.3 Added dependencies
 
-`@scure/btc-signer`, `@scure/base` (versions matching otzi `71eb9bd`). `@mwaddip/frots`,
-`@noble/curves`, `@noble/hashes` stay.
+`@scure/btc-signer@2.4.1`, `@scure/base@2.4.0` (exact pins, the versions in otzi's
+lockfile at `71eb9bd`). `@mwaddip/frots`, `@noble/curves`, `@noble/hashes` stay.
 
 ### 4.4 Kept unchanged
 
-`src/core/{blob-store,blob-puller,transport,in-memory-transport,types}.ts`,
-`src/transport/**`, `src/triggers/**`, `src/util/**`, gate mechanics in
-`src/gate/{exec,webhook,factory}.ts`, backup/restore archive mechanics, `.deb` build
-mechanics, `examples/fail2ban/`.
+`src/core/{blob-store,transport,in-memory-transport,types}.ts`, `src/transport/**`,
+`src/triggers/**`, `src/util/**`, gate mechanics in `src/gate/{exec,webhook,factory}.ts`,
+backup/restore archive mechanics, `.deb` build mechanics, `examples/fail2ban/`.
 
 ### 4.5 Reworked
 
 | Area | Change |
 |---|---|
-| `core/ceremony-messages.ts` | Four `v: 2` messages (§5.1). |
-| `core/blob-server.ts` | Targeted-blob access control (§5.2). |
-| `core/frost-dkg-session.ts`, `core/frost-sign-session.ts` | Sender binding, commitment count, nonce wipe (§5.2–§5.4). |
-| `core/ceremony-runner.ts` | FROST DKG with verification and confirmation; proposal signing. |
+| `core/blob-server.ts` | Addressed-blob access control (§5.2). |
+| `core/blob-puller.ts` | `pullAll` takes an optional `AbortSignal` so an abort stops pulling. |
+| `core/frost-dkg-session.ts`, `core/frost-sign-session.ts` | otzi codecs, sender binding, commitment count, explicit session ID, nonce drop (§5.2–§5.4). |
 | `orchestrator/*` | Participant analysis against its own key; DKG abort from any ring member; signoff verification; blob cleanup after settle. |
-| `gate/types.ts`, `gate/policy.ts` | Bitcoin signing spec and rules (§6.2, §6.3). |
-| `daemon/{leader,daemon,config-merge,share-persistence,vault-pubkey,entrypoint,setup}.ts` | v4 shares, new API ops, pending-share handling. |
+| `gate/types.ts`, `gate/policy.ts`, `orchestrator/spec-builder.ts` | Bitcoin signing spec and rules (§6.2, §6.3). |
+| `daemon/{leader,daemon,config-merge,vault-pubkey,transport-factory,entrypoint,setup}.ts` | v4 shares, new API ops, pending-share handling. |
 | `config/*` | `[network]` section (§6.6). |
 | `bootstrap/pubkey-book.ts` | 96-bit fingerprint (§6.7). |
-| `cli/cmd/{btc,vault,backup,restore}.ts`, `cli/daemon-client.ts`, entrypoint verbs | §6.5. |
+| `cli/cmd/{btc,vault,backup,restore}.ts`, entrypoint verbs | §6.5. `otzi generate` talks to the daemon through the same client as every other verb (UDS by default). |
 | `examples/gate-file-approver.sh` | New spec shape. |
-| `examples/gate-web-opwallet/` | Becomes `examples/gate-web-btc-message/` (§6.8). |
 | `packaging/deb/**` | debconf prompts (§6.7). |
 | Docs | `CLAUDE.md`, `INTERFACES.md`, every `facts/*.md`, `README.md`, `docs/*`. Contract and doc text states current facts and their purpose. |
 
 ### 4.6 New
 
+- `src/core/messages.ts`: ceremony messages (§5.1).
+- `src/core/ceremony-io.ts`: the `{transport, store, puller, pullOpts}` bundle the
+  ceremonies run on.
+- `src/core/dkg-ceremony.ts`, `src/core/sign-ceremony.ts`: the two protocols (§5.3,
+  §5.4).
+- `src/core/blob-retention.ts`: delayed blob cleanup (§5.2).
+- `src/daemon/vault-share.ts`: load, stage, commit and discard v4 share files.
+- `src/daemon/api.ts`: daemon API request parsing (§6.1).
 - `src/address-book/store.ts`: read/write the per-node address book (§6.4).
-- `src/cli/cmd/book.ts`: `otzi book …` verbs.
-- `src/testing/mock-esplora.ts`: test-only mock Esplora server (§10).
+- `src/cli/cmd/book.ts`, `src/cli/cmd/generate.ts`: CLI verbs.
+- `src/testing/ring.ts`, `src/testing/proposal.ts`, `src/testing/mock-esplora.ts`:
+  test-only helpers (§10).
+- `examples/gate-web-btc-message/` (§6.8).
 - `.github/workflows/ci.yml`: typecheck, both test suites and the drift check on push
   and pull request.
-- `facts/address-book.md`.
+- `facts/otzi.md`, `facts/address-book.md`.
 
 ## 5. Ceremony protocols
 
@@ -270,7 +278,7 @@ Unknown top-level fields are rejected with 400.
 
 | Op | Request | Response |
 |---|---|---|
-| `vault-info` | — | `{ partyIds, threshold, parties, network, address, internalKey, outputKey }`; 409 before the first DKG. |
+| `vault-info` | — | `{ partyIds, threshold, parties, network, address, internalKey, outputKey }`; 409 when no vault is loaded. |
 | `dkg` | `{ ceremonyId? }` | `{ ceremonyId, status: 'done', address, internalKey, network }`. `parties` = ring size, `threshold` = `parties`. 409 when this node already holds a vault. |
 | `sign` | `{ ceremonyId?, signers?, proposal }` | `{ ceremonyId, status: 'done', txid, signedTxHex, signaturesHex }`. |
 
@@ -279,7 +287,8 @@ Input rules:
 - `signers`: defaults to all n; otherwise unique ring members, includes this node, at
   least `minSigners`.
 - `proposal`: `{ network, tx, prevouts }` with string `tx`, array `prevouts`, at most
-  255 inputs; everything else is checked by `analyzeProposal`.
+  255 inputs; hex fields are normalized to lowercase; everything else is checked by
+  `analyzeProposal`.
 
 Status codes: 400 bad input or proposal rejected by analysis (message from
 `analyzeProposal`); 403 gate reject (`{ error, decision, ceremonyId }`); 409 no vault;
@@ -381,7 +390,8 @@ password_env = "OTZI_SHARE_PASSWORD"
 - Startup: read the share JSON, `decryptShareFile`, `assertShareMatchesVault` against
   the configured network, check `partyId` against the pubkey book and `parties`
   against the ring size. Any mismatch refuses to start.
-- `vault-pubkey.json` (0644): `{ network, address, internalKey, outputKey, threshold, parties }`.
+- `vault-pubkey.json` (0644): `{ network, address, internalKey, outputKey, threshold, parties, vaultKey }`,
+  where `vaultKey` is otzi's public `VaultKey` (needed by `buildSend` in the CLI).
 - Backup archive: `daemon.toml`, share, identity key, pubkey book, address book (if
   present), `vault-pubkey.json`, `meta.json`. Archive format and encryption unchanged.
 
@@ -398,7 +408,7 @@ password_env = "OTZI_SHARE_PASSWORD"
 ### 6.8 Examples
 
 - `examples/gate-web-btc-message/`: webhook approver run with `tsx`, importing the
-  lifted `src/node/btc-message.ts`. Config pins one operator Bitcoin address. Each
+  lifted `src/otzi/backend/btc-message.ts`. Config pins one operator Bitcoin address. Each
   decision is the message `otzi-gate:<approve|reject>:<ceremonyId>:<nonce>` signed in
   any wallet that signs messages (BIP-322 simple for P2WPKH/P2TR; legacy/BIP-137 for
   older types). The page lists pending ceremonies with outputs, labels, change, fee
@@ -447,7 +457,7 @@ support or migration; message signing by the vault.
 ## 10. Testing
 
 - **Harness:** vitest for headless code. Lifted otzi tests run unchanged with
-  `node --import tsx --test src/wire/*.test.ts src/node/*.test.ts`; vitest excludes
+  `node --import tsx --test src/otzi/lib/*.test.ts src/otzi/backend/*.test.ts`; vitest excludes
   them. `npm test` runs both.
 - **Unit:** frost sessions (sender binding, commitment count, round 2 once, nonce
   drop); `BlobServer` access control; blob cleanup; message parser (strict fields,
