@@ -2,19 +2,28 @@
  * Master-side bootstrap.
  *
  * Stands up a short-lived HTTP server on `bind`. Each leaf POSTs its
- * `{ public_key_hex, advertised_endpoint }` to `/register`. Master
- * canonicalizes the incoming `advertised_endpoint` and validates it against
- * an operator-supplied allowlist. Once all expected peers + self have
- * registered, master sorts the collected entries by raw pubkey bytes
- * ascending, assigns `partyId = index`, builds the book, and fans it out
- * as the response to every waiting registration handler.
+ * `public_key_hex` to `/register`, and admission decides who gets in:
+ *
+ *   - `endpoints` (peer-mesh): the leaf also sends `advertised_endpoint`,
+ *     which master canonicalizes and checks against the operator-supplied
+ *     allowlist (`[[peers]]`). Every book entry carries its endpoint.
+ *   - `count` (relay): the leaf sends no endpoint; master admits the first
+ *     `parties − 1` distinct pubkeys. No book entry carries an endpoint.
+ *
+ * Once the expected total (self included) has registered, master sorts the
+ * collected entries by raw pubkey bytes ascending, assigns
+ * `partyId = index`, builds the book, and fans it out as the response to
+ * every waiting registration handler.
  *
  * Error responses:
- *   400 — bad body / pubkey format / non-canonical or wildcard endpoint /
- *         legacy `node_id` field present
- *   404 — advertised_endpoint not on the operator's allowlist
- *   409 — endpoint already registered OR pubkey already registered
- *   408 — server-side bootstrap timeout
+ *   400 — bad body / pubkey format / legacy `node_id` field present;
+ *         endpoints: missing, non-canonical or wildcard endpoint;
+ *         count: any `advertised_endpoint` key
+ *   404 — endpoints: advertised_endpoint not on the operator's allowlist
+ *   409 — endpoints: endpoint OR pubkey already registered;
+ *         count: pubkey already registered (the leader's own included),
+ *         or `bootstrap is full`
+ *   408 — server-side bootstrap timeout (names received vs expected)
  */
 
 import * as http from 'node:http';
@@ -25,23 +34,35 @@ import { canonicalizeEndpoint, EndpointParseError } from '../util/endpoint';
 import {
   buildBook,
   computeFingerprint,
+  keyId,
   type PubkeyBook,
   type PubkeyBookEntry,
 } from './pubkey-book';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 
+/** Who the leader admits. */
+export type MasterAdmission =
+  | {
+      /** Peer-mesh: an allowlist of advertised endpoints. */
+      kind: 'endpoints';
+      /** This node's endpoint, canonical `host:port` (post-`canonicalizeEndpoint`). */
+      selfEndpoint: string;
+      /**
+       * Every other node's endpoint (from `[[peers]]`). Caller MUST pass
+       * canonical-form strings. Does NOT include self.
+       */
+      expectedPeers: ReadonlyArray<{ advertisedEndpoint: string }>;
+    }
+  | {
+      /** Relay: the first `parties − 1` distinct pubkeys, registering with no endpoint. */
+      kind: 'count';
+      /** Ring size, self included. An integer ≥ 2. */
+      parties: number;
+    };
+
 export interface MasterBootstrapInputs {
-  self: {
-    identity: IdentityKeyPair;
-    /** Canonical `host:port` form (post-`canonicalizeEndpoint`). */
-    advertisedEndpoint: string;
-  };
-  /**
-   * Allowlist of advertised endpoints master expects to register. Caller
-   * MUST pass canonical-form strings (apply `canonicalizeEndpoint` upstream).
-   * Does NOT include self.
-   */
-  expectedPeers: ReadonlyArray<{ advertisedEndpoint: string }>;
+  self: { identity: IdentityKeyPair };
+  admission: MasterAdmission;
   bind: string;
   /** Defaults to 30 min. */
   timeoutMs?: number;
@@ -55,8 +76,8 @@ export interface MasterBootstrapResult {
 
 interface RegisteredEntry {
   publicKey: Uint8Array;
-  /** Canonical form. */
-  advertisedEndpoint: string;
+  /** Canonical form. Endpoints admission only; absent under count admission. */
+  advertisedEndpoint?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -100,17 +121,31 @@ export async function runMasterBootstrap(
   const log = input.logger ?? NOOP_LOGGER;
   const { host, port } = parseBind(input.bind);
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const { admission } = input;
+  const selfPublicKey = input.self.identity.publicKeyRaw;
 
-  // Allowlist of canonical advertised endpoints (excludes self).
-  const expectedAllowlist = new Set<string>(input.expectedPeers.map((p) => p.advertisedEndpoint));
-  const expectedTotal = expectedAllowlist.size + 1; // +1 for self
-
-  // registered keyed by canonical advertisedEndpoint
+  // Endpoints: the allowlist of canonical advertised endpoints (excludes self).
+  // Count: no allowlist; `parties` registrations in total.
+  let expectedAllowlist: Set<string> | null = null;
+  let expectedTotal: number; // self included
+  // Registrations, self pre-registered: keyed by canonical endpoint
+  // (endpoints admission) or by lowercase pubkey hex (count admission).
   const registered = new Map<string, RegisteredEntry>();
-  registered.set(input.self.advertisedEndpoint, {
-    publicKey: input.self.identity.publicKeyRaw,
-    advertisedEndpoint: input.self.advertisedEndpoint,
-  });
+  if (admission.kind === 'endpoints') {
+    expectedAllowlist = new Set<string>(admission.expectedPeers.map((p) => p.advertisedEndpoint));
+    expectedTotal = expectedAllowlist.size + 1;
+    registered.set(admission.selfEndpoint, {
+      publicKey: selfPublicKey,
+      advertisedEndpoint: admission.selfEndpoint,
+    });
+  } else {
+    if (!Number.isInteger(admission.parties) || admission.parties < 2)
+      throw new Error(
+        `runMasterBootstrap: count admission needs parties to be an integer >= 2 (got ${admission.parties})`,
+      );
+    expectedTotal = admission.parties;
+    registered.set(toHex(selfPublicKey), { publicKey: selfPublicKey });
+  }
 
   const gate = new CompletionGate();
 
@@ -126,17 +161,20 @@ export async function runMasterBootstrap(
     const entries: PubkeyBookEntry[] = sorted.map((r, idx) => ({
       partyId: idx as PartyId,
       publicKeyHex: toHex(r.publicKey),
-      advertisedEndpoint: r.advertisedEndpoint,
+      ...(r.advertisedEndpoint !== undefined ? { advertisedEndpoint: r.advertisedEndpoint } : {}),
     }));
     gate.resolve(buildBook(entries));
   };
 
-  // Single-peer ring: master alone satisfies expectedTotal=1.
+  // Single-peer ring (endpoints admission, no expected peers): master alone
+  // satisfies expectedTotal=1.
   completeIfReady();
 
   const server = http.createServer((req, res) => {
     void handleRequest(req, res, {
       expectedAllowlist,
+      expectedTotal,
+      selfPublicKeyHex: toHex(selfPublicKey),
       registered,
       gate,
       completeIfReady,
@@ -145,7 +183,12 @@ export async function runMasterBootstrap(
   });
 
   const timer = setTimeout(() => {
-    gate.reject(new Error(`master bootstrap timed out after ${timeoutMs}ms`));
+    // Counts exclude self, so a leader whose `parties` is too high sees the shortfall.
+    gate.reject(
+      new Error(
+        `master bootstrap timed out after ${timeoutMs}ms: received ${registered.size - 1} of ${expectedTotal - 1} registrations`,
+      ),
+    );
   }, timeoutMs);
 
   await new Promise<void>((resolve, reject) => {
@@ -165,6 +208,7 @@ export async function runMasterBootstrap(
   log.info('master bootstrap: listening', {
     host,
     port,
+    admission: admission.kind,
     expectedTotal,
     alreadyRegistered: registered.size,
   });
@@ -186,7 +230,12 @@ export async function runMasterBootstrap(
 // ─────────────────────────────────────────────────────────────────────────
 
 interface HandlerContext {
-  expectedAllowlist: Set<string>;
+  /** Endpoints admission: the allowlist. `null` under count admission. */
+  expectedAllowlist: Set<string> | null;
+  /** Registrations needed in total, self included. */
+  expectedTotal: number;
+  /** Lowercase. */
+  selfPublicKeyHex: string;
   registered: Map<string, RegisteredEntry>;
   gate: CompletionGate;
   completeIfReady: () => void;
@@ -220,7 +269,6 @@ async function handleRequest(
   }
 
   const publicKeyHex = body.public_key_hex ?? body.publicKeyHex;
-  const rawEndpoint = body.advertised_endpoint ?? body.advertisedEndpoint;
 
   if (typeof publicKeyHex !== 'string' || publicKeyHex.length !== 65 * 2) {
     respondJson(res, 400, { error: "'public_key_hex' must be 130 hex chars (65 bytes)" });
@@ -230,48 +278,13 @@ async function handleRequest(
     respondJson(res, 400, { error: "'public_key_hex' must start with 04 (uncompressed P-256)" });
     return;
   }
-  if (typeof rawEndpoint !== 'string' || rawEndpoint.length === 0) {
-    respondJson(res, 400, { error: "'advertised_endpoint' missing or empty" });
-    return;
-  }
 
-  let advertisedEndpoint: string;
-  try {
-    advertisedEndpoint = canonicalizeEndpoint(rawEndpoint);
-  } catch (err) {
-    if (err instanceof EndpointParseError) {
-      respondJson(res, 400, { error: `invalid advertised_endpoint: ${err.message}` });
-      return;
-    }
-    throw err;
-  }
-
-  if (!ctx.expectedAllowlist.has(advertisedEndpoint)) {
-    respondJson(res, 404, {
-      error: `advertised_endpoint '${advertisedEndpoint}' not on expected-peer allowlist`,
-    });
-    return;
-  }
-  if (ctx.registered.has(advertisedEndpoint)) {
-    respondJson(res, 409, { error: `endpoint '${advertisedEndpoint}' already registered` });
-    return;
-  }
-
-  // Pubkey-collision check across already-registered entries (incl. self).
   const lowerHex = publicKeyHex.toLowerCase();
-  for (const r of ctx.registered.values()) {
-    if (toHex(r.publicKey).toLowerCase() === lowerHex) {
-      respondJson(res, 409, { error: `publicKey already registered for a different endpoint` });
-      return;
-    }
-  }
-
-  ctx.registered.set(advertisedEndpoint, {
-    publicKey: new Uint8Array(Buffer.from(lowerHex, 'hex')),
-    advertisedEndpoint,
-  });
-  ctx.log.info('master bootstrap: registered', { advertisedEndpoint });
-  ctx.completeIfReady();
+  const admitted =
+    ctx.expectedAllowlist === null
+      ? admitByCount(res, body, lowerHex, ctx)
+      : admitByEndpoint(res, body, lowerHex, ctx.expectedAllowlist, ctx);
+  if (!admitted) return;
 
   // Long-poll: await the single-shot completion gate, respond when it fires.
   try {
@@ -281,6 +294,102 @@ async function handleRequest(
   } catch (err) {
     respondJson(res, 408, { error: err instanceof Error ? err.message : String(err) });
   }
+}
+
+/**
+ * Count admission (relay): no endpoint, a pubkey not yet registered, and a
+ * free slot. Registers and returns `true`, or responds with the refusal and
+ * returns `false`.
+ */
+function admitByCount(
+  res: http.ServerResponse,
+  body: Record<string, unknown>,
+  lowerHex: string,
+  ctx: HandlerContext,
+): boolean {
+  if ('advertised_endpoint' in body || 'advertisedEndpoint' in body) {
+    respondJson(res, 400, { error: "'advertised_endpoint' not used in relay mode" });
+    return false;
+  }
+  // Before the count: a node that registers twice is told it is already in.
+  if (lowerHex === ctx.selfPublicKeyHex) {
+    respondJson(res, 409, { error: "publicKey already registered (it is the leader's own key)" });
+    return false;
+  }
+  if (ctx.registered.has(lowerHex)) {
+    respondJson(res, 409, { error: 'publicKey already registered' });
+    return false;
+  }
+  if (ctx.registered.size >= ctx.expectedTotal) {
+    respondJson(res, 409, { error: 'bootstrap is full' });
+    return false;
+  }
+
+  ctx.registered.set(lowerHex, { publicKey: new Uint8Array(Buffer.from(lowerHex, 'hex')) });
+  ctx.log.info('master bootstrap: registered', {
+    keyId: keyId(lowerHex),
+    registered: ctx.registered.size,
+    expectedTotal: ctx.expectedTotal,
+  });
+  ctx.completeIfReady();
+  return true;
+}
+
+/**
+ * Endpoints admission (peer-mesh): a canonical endpoint on the allowlist, not
+ * yet registered, with a pubkey not yet registered. Registers and returns
+ * `true`, or responds with the refusal and returns `false`.
+ */
+function admitByEndpoint(
+  res: http.ServerResponse,
+  body: Record<string, unknown>,
+  lowerHex: string,
+  expectedAllowlist: Set<string>,
+  ctx: HandlerContext,
+): boolean {
+  const rawEndpoint = body.advertised_endpoint ?? body.advertisedEndpoint;
+  if (typeof rawEndpoint !== 'string' || rawEndpoint.length === 0) {
+    respondJson(res, 400, { error: "'advertised_endpoint' missing or empty" });
+    return false;
+  }
+
+  let advertisedEndpoint: string;
+  try {
+    advertisedEndpoint = canonicalizeEndpoint(rawEndpoint);
+  } catch (err) {
+    if (err instanceof EndpointParseError) {
+      respondJson(res, 400, { error: `invalid advertised_endpoint: ${err.message}` });
+      return false;
+    }
+    throw err;
+  }
+
+  if (!expectedAllowlist.has(advertisedEndpoint)) {
+    respondJson(res, 404, {
+      error: `advertised_endpoint '${advertisedEndpoint}' not on expected-peer allowlist`,
+    });
+    return false;
+  }
+  if (ctx.registered.has(advertisedEndpoint)) {
+    respondJson(res, 409, { error: `endpoint '${advertisedEndpoint}' already registered` });
+    return false;
+  }
+
+  // Pubkey-collision check across already-registered entries (incl. self).
+  for (const r of ctx.registered.values()) {
+    if (toHex(r.publicKey).toLowerCase() === lowerHex) {
+      respondJson(res, 409, { error: `publicKey already registered for a different endpoint` });
+      return false;
+    }
+  }
+
+  ctx.registered.set(advertisedEndpoint, {
+    publicKey: new Uint8Array(Buffer.from(lowerHex, 'hex')),
+    advertisedEndpoint,
+  });
+  ctx.log.info('master bootstrap: registered', { advertisedEndpoint });
+  ctx.completeIfReady();
+  return true;
 }
 
 function readBody(req: http.IncomingMessage): Promise<Buffer> {

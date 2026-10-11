@@ -60,7 +60,7 @@
 
 **Cross-component contracts:**
 - Depends on: Web Crypto API (crypto.subtle.digest for SHA-256, fingerprint), `node:crypto` `createHash` (key id), hex utilities (fromHex, toHex), `canonicalizeEndpoint` from `src/util/endpoint.ts`.
-- Used by: `runMasterBootstrap` and `runMemberRegister` to build and distribute the final book (both still require and write an endpoint for every entry); `transport-factory.resolveSelfFromBook` (pubkey-match) and, for peer-mesh only, `transport-factory.validatePeersAgainstBook` (canonical-endpoint match) at daemon startup; fingerprint shown to operators.
+- Used by: `runMasterBootstrap` and `runMemberRegister` to build and distribute the final book (endpoints admission writes an endpoint on every entry; count admission writes none); `transport-factory.resolveSelfFromBook` (pubkey-match) and, for peer-mesh only, `transport-factory.validatePeersAgainstBook` (canonical-endpoint match) at daemon startup; fingerprint shown to operators.
 - Wire/byte format: On-disk JSON (pretty-printed); in-memory entries array sorted by partyId.
 
 **Notes / gotchas:**
@@ -68,26 +68,31 @@
 - `computeFingerprint` hashes raw P-256 bytes (0x04 || X || Y), not compressed or any other format.
 - `keyId` hashes the same raw bytes, not the hex text; uppercase and lowercase hex of one key give one id.
 - Operators compare the 96-bit fingerprint out of band across all daemons before any DKG; mismatch = abort + redo bootstrap.
+- Key-id rule: every node's setup banner (`src/daemon/setup.ts`) prints this node's key id and the key id of every book entry. Operators confirm that each listed id belongs to one of their own nodes; an unknown id means someone else registered, so they delete the pubkey book on every node and redo setup. The fingerprint cannot show such an intruder, since every node receives the same book.
 - Legacy `nodeId` field: dropped in Phase F. `parseBook` strict-rejects entries containing it; cross-node identity is by raw pubkey, local labels live only in `config.node.id`.
 
 ---
 
 ### `master.ts`
-**Purpose:** One-shot HTTP server on the leader daemon; collects registrations from all peers, validates pubkeys against the operator-supplied advertised-endpoint allowlist, deterministically assigns partyIds by sorted-pubkey-bytes order, and fans out the complete pubkey book.
+**Purpose:** One-shot HTTP server on the leader daemon; collects registrations, admits them by one of two rules (an advertised-endpoint allowlist for peer-mesh, a count for relay), deterministically assigns partyIds by sorted-pubkey-bytes order, and fans out the complete pubkey book.
 
 **Public surface:**
+- `MasterAdmission`
+  - `{ kind: 'endpoints'; selfEndpoint: string; expectedPeers: ReadonlyArray<{ advertisedEndpoint: string }> }` — peer-mesh. `selfEndpoint` is this node's canonical endpoint; `expectedPeers` are the canonical endpoints of every other node (from `[[peers]]`), self excluded. Every book entry carries its endpoint.
+  - `{ kind: 'count'; parties: number }` — relay. `parties` is the ring size, the leader included (from `[bootstrap] parties`). The leader admits the first `parties − 1` distinct pubkeys that register without an endpoint. No book entry carries an endpoint.
+
 - `MasterBootstrapInputs`
   - **Pre:** none
-  - **Post:** Configuration object specifying self identity + advertisedEndpoint, expected non-self peers (`{ advertisedEndpoint }[]`, canonical form), bind address, optional timeout and logger.
+  - **Post:** `{ self: { identity }, admission: MasterAdmission, bind, timeoutMs?, logger? }`.
 
 - `MasterBootstrapResult`
   - **Pre:** none
   - **Post:** Contains final `book` and the 96-bit `fingerprint` (`computeFingerprint` format).
 
 - `runMasterBootstrap(input: MasterBootstrapInputs): Promise<MasterBootstrapResult>`
-  - **Pre:** `input.bind` is valid `"host:port"` string. `input.self.identity` has 65-byte `publicKeyRaw`. `input.self.advertisedEndpoint` is canonical (caller already applied `canonicalizeEndpoint`). `input.expectedPeers[*].advertisedEndpoint` are all canonical and do not include self.
-  - **Post:** HTTP server bound to `input.bind`, listening for POST /register requests. Returns only after all expected peers (plus self) have registered and all in-flight responses have been flushed to clients. Server is gracefully shut down on return (no forced close).
-  - **Throws:** `Error` if bind is invalid, server listen fails, or bootstrap times out after `input.timeoutMs` (default 30 min).
+  - **Pre:** `input.bind` is valid `"host:port"` string. `input.self.identity` has 65-byte `publicKeyRaw`. Endpoints admission: `selfEndpoint` and every `expectedPeers[*].advertisedEndpoint` are canonical (caller applied `canonicalizeEndpoint`), and `expectedPeers` excludes self. Count admission: `parties` is an integer ≥ 2 (the config parser further bounds it to 255).
+  - **Post:** HTTP server bound to `input.bind`, listening for POST /register requests. Returns only after the expected total has registered (endpoints: `expectedPeers.length + 1`; count: `parties`; self included) and all in-flight responses have been flushed to clients. Server is gracefully shut down on return (no forced close).
+  - **Throws:** `Error` if bind is invalid, count admission has `parties` that is not an integer ≥ 2, server listen fails, or bootstrap times out after `input.timeoutMs` (default 30 min). The timeout message names the shortfall: `master bootstrap timed out after <ms>ms: received <r> of <e> registrations` (`r` and `e` count the other nodes, self excluded), so an operator who set `parties` too high sees it.
   - **Concurrency:** Internally serialized by long-poll gate; multiple registrations may be in-flight, but all wait on the same `CompletionGate` promise.
 
 - `CompletionGate` (internal)
@@ -97,22 +102,29 @@
   - **Concurrency:** Safe; idempotent settle (first caller wins).
 
 **Invariants:**
-- Self is pre-registered at startup (under its canonical `advertisedEndpoint` key); registration map keyed by canonical endpoint string.
-- Book is not marked complete until *all* expected peers (plus self) are registered.
-- On completion: registered entries are sorted by raw pubkey bytes ascending (`Buffer.compare` semantics on 65-byte arrays); each is assigned `partyId = index`. Every peer in the ring reproduces this mapping deterministically from the same book.
-- HTTP status codes: 200 on success (all peers in), 400 on bad request (incl. legacy `node_id` field), 404 on advertised-endpoint not in allowlist, 409 on duplicate endpoint OR duplicate pubkey, 408 on timeout.
+- Self is pre-registered at startup. The registration map is keyed by canonical endpoint (endpoints admission) or by lowercase pubkey hex (count admission).
+- Book is not marked complete until the expected total (self included) has registered.
+- On completion: registered entries are sorted by raw pubkey bytes ascending (`Buffer.compare` semantics on 65-byte arrays); each is assigned `partyId = index`. Every peer in the ring reproduces this mapping deterministically from the same book. Endpoints admission writes each entry's canonical endpoint; count admission writes entries with no `advertisedEndpoint` key, the leader's own included.
+- HTTP status codes, both modes: 200 on success (all registrations in, body `{ book, fingerprint }`); 404 for anything but `POST /register`; 400 on invalid JSON, a legacy `node_id` / `nodeId` field, or a `public_key_hex` that is not 130 hex chars starting `04`; 408 on timeout (body error is the timeout message above).
+- HTTP status codes, endpoints admission (peer-mesh): 400 `'advertised_endpoint' missing or empty` or `invalid advertised_endpoint: …`; 404 advertised endpoint not on the allowlist; 409 duplicate endpoint OR duplicate pubkey.
+- HTTP status codes, count admission (relay), checked in this order after the shared checks:
+  1. 400 `'advertised_endpoint' not used in relay mode` when the body has an `advertised_endpoint` (or `advertisedEndpoint`) key at all, whatever its value.
+  2. 409 `publicKey already registered` for a pubkey already registered, and 409 `publicKey already registered (it is the leader's own key)` for the leader's pubkey. Checked before the count, so a member that registers twice is told it is already in, not that the bootstrap is full.
+  3. 409 `bootstrap is full` once `parties` registrations (self included) are in.
 - Every registration response includes the complete book and fingerprint (computed at the moment gate resolves).
 - Response header `connection: close` forces each client to disconnect, preventing idle keep-alive sockets from blocking server shutdown.
 - Server uses graceful shutdown (`server.close()`) to allow in-flight response writers to flush before closure; `closeAllConnections()` is NOT used.
 - Timeout fires only once, canceling all pending registrations with 408 error.
 
 **Cross-component contracts:**
-- Depends on: Node.js http module, `buildBook` and `computeFingerprint` from pubkey-book.ts, `canonicalizeEndpoint` from `src/util/endpoint.ts`.
-- Used by: Leader daemon during bootstrap phase (called once at startup via `otzi setup`).
-- Wire/byte format: HTTP POST /register with JSON body `{ public_key_hex, advertised_endpoint }`. Response body is JSON `{ book, fingerprint }` or `{ error }`.
+- Depends on: Node.js http module, `buildBook`, `computeFingerprint` and `keyId` (log field) from pubkey-book.ts, `canonicalizeEndpoint` from `src/util/endpoint.ts`.
+- Used by: Leader daemon during bootstrap phase (called once via `otzi setup`; `setupMaster` picks the admission from `[transport] kind`).
+- Wire/byte format: HTTP POST /register with JSON body `{ public_key_hex, advertised_endpoint }` (endpoints admission) or `{ public_key_hex }` (count admission). Response body is JSON `{ book, fingerprint }` or `{ error }`.
 
 **Notes / gotchas:**
-- Single-peer ring: if leader is the only member, `completeIfReady()` resolves before the server even starts listening — idempotent.
+- Single-peer ring (endpoints admission with no expected peers): `completeIfReady()` resolves before the server even starts listening — idempotent. Count admission needs at least one other node.
+- Count admission trusts whoever reaches the port first: anyone who can reach the bootstrap port during setup can take a slot. The defences are network exposure (the port reachable only by the members), the 409 `bootstrap is full` that a displaced member then gets, and the key ids in every node's setup banner.
+- `bootstrap is full` reaches only a registration whose connection the server accepted before it closed. Once the book is complete the server stops accepting connections, so a member that arrives later gets connection refused instead; the leader's banner, listing a key id the operator does not recognise, is what shows the intruder then.
 - Request body size limited to 16 KB to prevent DoS.
 - Fingerprint is computed once when the gate resolves, then included in all pending responses.
 - `connection: close` header is mandatory to avoid hang on server shutdown (idle keep-alive would block).
@@ -122,36 +134,44 @@
 ---
 
 ### `register.ts`
-**Purpose:** Member-side bootstrap; POSTs identity pubkey + advertisedEndpoint to leader, awaits the complete book, validates self-entry by pubkey match.
+**Purpose:** Member-side bootstrap; POSTs the identity pubkey (plus the advertised endpoint under peer-mesh) to the leader, awaits the complete book, validates the self entry by pubkey match.
 
 **Public surface:**
 - `MemberRegisterInputs`
-  - **Post:** Configuration specifying self identity + advertisedEndpoint, leader URL, optional timeout and logger.
+  - **Post:** `{ self: { identity, advertisedEndpoint? }, masterUrl, timeoutMs?, logger? }`. A present `advertisedEndpoint` (canonical) means peer-mesh; an absent one means relay.
 
 - `MemberRegisterResult`
   - **Post:** Contains final `book` and the 96-bit `fingerprint` (`computeFingerprint` format).
 
 - `runMemberRegister(input: MemberRegisterInputs): Promise<MemberRegisterResult>`
-  - **Pre:** `input.masterUrl` is valid URL. `input.self.identity.publicKeyRaw` is 65-byte P-256 public key. `input.self.advertisedEndpoint` is canonical (caller applied `canonicalizeEndpoint`).
-  - **Post:** Returns the pubkey book (parsed and validated) and the fingerprint. Validates that returned book contains an entry whose `publicKeyHex` matches self (case-insensitive), and that entry's `advertisedEndpoint` round-trips unchanged. Validates that locally-computed fingerprint matches the master-advertised one.
-  - **Throws:** `Error` if leader responds with non-200 status, returned book is malformed, self-entry missing by pubkey, entry's `advertisedEndpoint` differs from input, or fingerprints disagree. Timeout (after `input.timeoutMs`, default 30 min) also throws.
+  - **Pre:** `input.masterUrl` is valid URL. `input.self.identity.publicKeyRaw` is 65-byte P-256 public key. `input.self.advertisedEndpoint`, when present, is canonical (caller applied `canonicalizeEndpoint`).
+  - **Post:** Returns the pubkey book (parsed and validated) and the fingerprint. Validates that the returned book contains an entry whose `publicKeyHex` matches self (case-insensitive), checks that entry's endpoint by mode (below), and validates that the locally-computed fingerprint matches the master-advertised one.
+  - **Self-entry endpoint check:**
+    - peer-mesh (endpoint sent): the entry's `advertisedEndpoint` must equal the one sent. Missing → `register: the leader's book has no advertisedEndpoint for this node; it registered '<sent>'`. Different → `register: master returned advertisedEndpoint='<got>' != ours='<sent>'`.
+    - relay (no endpoint sent): the entry must have no `advertisedEndpoint` → otherwise `register: the leader's book gives this node advertisedEndpoint='<got>'; a relay node registers none`.
+  - **Leader errors mapped to operator messages:**
+    - relay member, 400 whose error starts `'advertised_endpoint' missing` (an endpoints-mode leader) → `setup: the leader expects peer-mesh registrations (an advertised endpoint); this node is configured for relay — use the same transport on every node`.
+    - peer-mesh member, 400 `'advertised_endpoint' not used in relay mode` (a count-mode leader) → `setup: the leader expects relay registrations (no advertised endpoint); this node is configured for peer-mesh — use the same transport on every node`.
+    - 409 `bootstrap is full` → `setup: bootstrap is full — another party registered in this node's place; abort, delete pubkeys.json on every node and redo setup with the bootstrap port reachable only by the members`.
+    - Any other non-200 → `register: master responded <status>[: <error>]`.
+  - **Throws:** `Error` as above, or if the returned book is malformed, the self entry is missing by pubkey, or fingerprints disagree. Timeout (after `input.timeoutMs`, default 30 min) also throws.
   - **Concurrency:** None (member registers once at startup).
 
 **Invariants:**
-- POST body uses snake_case keys: `public_key_hex`, `advertised_endpoint`. No `node_id` (rejected by leader post-Phase-F).
+- POST body uses snake_case keys: `public_key_hex`, plus `advertised_endpoint` under peer-mesh only (a relay member sends no such key). No `node_id` (rejected by leader post-Phase-F).
 - Response must include both `book` and `fingerprint` fields; absence of either throws.
-- Self-entry check uses pubkey match (not nodeId; that concept is gone). The matched entry's `advertisedEndpoint` must equal what we sent — defends against leader-side canonicalization mismatching the leaf's input.
+- Self-entry check uses pubkey match (not nodeId; that concept is gone). The matched entry's endpoint must be what this node registered — the same string under peer-mesh (defends against leader-side canonicalization mismatching the leaf's input), none under relay.
 - Fingerprint check: locally computed SHA-256 must match leader's advertised value (defends against both book tamper and fingerprint mismatch).
 - AbortController timeout ensures cleanup even on network hang.
 
 **Cross-component contracts:**
-- Depends on: Fetch API, `parseBook` and `computeFingerprint` from pubkey-book.ts.
-- Used by: Member daemon during bootstrap phase (called once at startup via `otzi setup`).
+- Depends on: Fetch API, `parseBook` and `computeFingerprint` from pubkey-book.ts; the error strings `master.ts` sends (`'advertised_endpoint' missing or empty`, `'advertised_endpoint' not used in relay mode`, `bootstrap is full`).
+- Used by: Member daemon during bootstrap phase (called once via `otzi setup`; `setupMember` sends the endpoint only under peer-mesh).
 - Wire/byte format: HTTP POST with JSON body (snake_case). Response is JSON `{ book, fingerprint }` or `{ error }`.
 
 **Notes / gotchas:**
 - Member self-check by pubkey catches a compromised leader substituting the member's pubkey for a different one.
-- Fingerprint check across all nodes is the last-line defense; operators compare the `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` string out of band.
+- Fingerprint check across all nodes is the last-line defense; operators compare the `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` string out of band, then confirm every key id in the banner is one of theirs.
 - Timeout applies to the entire POST + wait loop, not individual network operations.
 - `connection: close` header is set by leader, so member's cleanup is automatic.
 

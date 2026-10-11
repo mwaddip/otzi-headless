@@ -8,7 +8,7 @@
 - systemd (the .deb installs a unit file at `/lib/systemd/system/otzi.service`).
 - One open port per node for peer-mesh (default `8800`); leader nodes also
   open the bootstrap-server port temporarily (default `7090`) during initial
-  pubkey exchange. The operator API is local-only over a UDS at
+  pubkey exchange, reachable only by the members (see step 3 of the walkthrough). The operator API is local-only over a UDS at
   `/var/run/otzi/otzi.sock` — no operator-facing port is exposed.
 - Outbound HTTPS from the host where you run `otzi btc *` to the Esplora API
   (mempool.space for the configured network, or your `esplora_url`). The daemon
@@ -59,14 +59,59 @@ follow up with `sudo apt -f install` to resolve.)
    sudo -u otzi otzi setup /etc/otzi/daemon.toml
    ```
    (Or, as a member of the `otzi` group, just `otzi setup
-   /etc/otzi/daemon.toml`.) Records identity pubkeys + each peer's
-   reachable address in `/var/lib/otzi/pubkeys.json` and prints the
-   96-bit SHA-256 fingerprint of the pubkey book, formatted
-   `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx`. **Compare the fingerprint on every node
-   out of band before going further.** A mismatch means someone tampered with the
-   exchange: delete `/var/lib/otzi/pubkeys.json` on every node and redo setup.
+   /etc/otzi/daemon.toml`.) Records identity pubkeys (and, under peer-mesh, each
+   peer's reachable address) in `/var/lib/otzi/pubkeys.json` and prints a banner
+   like this one:
+   ```
+     otzi: setup complete — node-a
+     fingerprint: 3f2a-9c41-07be-d5e0-6a18-b2c7
+     this node: 1c9e04ab
+     party 0: 1c9e04ab  node-a.example:8800
+     party 1: 7d20f3c5  node-b.example:8800
+     party 2: e4b1a960  node-c.example:8800
+   ```
+   A key id is the first 8 hex characters of SHA-256 over a node's identity
+   pubkey. A relay book has no endpoints, so its `party` lines end after the key id.
+   Before going further:
+   - **Compare the fingerprint on every node out of band.** A mismatch means
+     someone tampered with the exchange: delete `/var/lib/otzi/pubkeys.json` on
+     every node and redo setup.
+   - **Confirm every key id belongs to one of your nodes.** Note each node's
+     `this node:` id; every `party` line must show one of them. An unknown id means
+     someone else registered: delete `/var/lib/otzi/pubkeys.json` on every node and
+     redo setup. The fingerprint cannot catch this, because the extra key is in
+     every node's book.
+
    partyIds are assigned deterministically by sorted-pubkey-bytes order — every
    node observes the same mapping.
+
+   **Admission depends on the transport.** Every node must use the same one.
+   - **Peer-mesh:** the leader admits only the endpoints in its `[[peers]]`.
+   - **Relay:** nodes have no endpoints, so the leader admits the first
+     `parties − 1` registrations, where `[bootstrap] parties` on the leader is the
+     ring size including itself (see [config.md](config.md#bootstrap)).
+   - A member whose transport differs from the leader's fails with
+     `setup: the leader expects … registrations …; this node is configured for … — use the same transport on every node`.
+   - A member that fails with `setup: bootstrap is full` was beaten to its slot by
+     someone else. Likewise, if the leader finishes before all your members have
+     registered, someone else filled a slot; a member that arrives after that
+     cannot connect. Either way: abort, delete `/var/lib/otzi/pubkeys.json` on
+     every node and redo setup.
+   - If the leader times out with `received 1 of 2 registrations` (or similar),
+     fewer members registered than it expected: check that every member ran
+     setup and, under relay, the leader's `parties`.
+
+   **Bootstrap port exposure.** While setup runs, the leader's bootstrap port
+   (default `7090`) must be reachable only by the members. This matters most
+   under relay, where admission is by count. Use one of:
+   - a VPN;
+   - a firewall rule that admits only the members' addresses;
+   - a loopback bind reached through SSH tunnels: `bind = "127.0.0.1:7090"` on the
+     leader, and on each member `ssh -N -L 7090:127.0.0.1:7090 <leader-host>` with
+     `leader_url = "http://127.0.0.1:7090"`.
+
+   The leader stops listening once every member has registered. Remove any
+   firewall opening you made for setup.
 
 4. **Enable + start the daemon** on every node:
    ```

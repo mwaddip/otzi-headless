@@ -207,6 +207,12 @@ three nodes out of band** (voice call, signed message). If any node shows a
 different value, someone tampered with the exchange — delete
 `/var/lib/otzi/pubkeys.json` everywhere and start over.
 
+The banner also lists key ids: this node's (`this node: <id>`) and one
+`party <partyId>: <id>` line per ring member. **Confirm every listed key id is
+one of your three nodes'.** An unknown id means someone else registered —
+delete `/var/lib/otzi/pubkeys.json` everywhere and start over. Keep the
+bootstrap port reachable only by the three nodes while setup runs.
+
 The pubkey book records each peer's partyId (assigned deterministically by
 sorted-pubkey-bytes order, identical on every node) and reachable address.
 No manual editing of `daemon.toml` is required — `[[peers]]` was populated

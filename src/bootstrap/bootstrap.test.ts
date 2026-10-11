@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import * as http from 'node:http';
 import * as net from 'node:net';
 import { createHash } from 'node:crypto';
 import { generateIdentity, type IdentityKeyPair } from '../transport/identity';
@@ -231,6 +232,13 @@ describe('pubkey-book — key ids', () => {
     );
   });
 
+  it('keyId known answer: 04 || 64 x 0x11 gives f0b9315a', () => {
+    // Pinned literal (sha256 = f0b9315a0459dab7…, computed once with sha256sum
+    // and Python's hashlib). Operators compare key ids by eye across nodes, so
+    // the printed format must never drift.
+    expect(keyId('04' + '11'.repeat(64))).toBe('f0b9315a');
+  });
+
   it('keyId is lowercase whatever the case of the input hex', () => {
     const lower = '04' + 'ab'.repeat(64);
     expect(keyId(lower.toUpperCase())).toBe(keyId(lower));
@@ -288,7 +296,7 @@ describe('pubkey-book — pubkey uniqueness', () => {
 // 3-peer bootstrap end-to-end
 // ─────────────────────────────────────────────────────────────────────────
 
-describe('bootstrap — 3-peer end-to-end', () => {
+describe('bootstrap — 3-peer end-to-end (endpoints admission unchanged)', () => {
   it('master + 2 members: all derive matching books + fingerprints', async () => {
     const master = await makePeer('node-a', 18800);
     const memberB = await makePeer('node-b', 18801);
@@ -296,11 +304,15 @@ describe('bootstrap — 3-peer end-to-end', () => {
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
-      self: master,
-      expectedPeers: [
-        { advertisedEndpoint: memberB.advertisedEndpoint },
-        { advertisedEndpoint: memberC.advertisedEndpoint },
-      ],
+      self: { identity: master.identity },
+      admission: {
+        kind: 'endpoints',
+        selfEndpoint: master.advertisedEndpoint,
+        expectedPeers: [
+          { advertisedEndpoint: memberB.advertisedEndpoint },
+          { advertisedEndpoint: memberC.advertisedEndpoint },
+        ],
+      },
       bind: `127.0.0.1:${port}`,
       timeoutMs: 10_000,
     });
@@ -344,8 +356,12 @@ describe('bootstrap — 3-peer end-to-end', () => {
     const master = await makePeer('solo', 18800);
     const port = await freePort();
     const { book, fingerprint } = await runMasterBootstrap({
-      self: master,
-      expectedPeers: [],
+      self: { identity: master.identity },
+      admission: {
+        kind: 'endpoints',
+        selfEndpoint: master.advertisedEndpoint,
+        expectedPeers: [],
+      },
       bind: `127.0.0.1:${port}`,
       timeoutMs: 5_000,
     });
@@ -365,11 +381,15 @@ describe('bootstrap — 3-peer end-to-end', () => {
       const port = await freePort();
 
       const masterDone = runMasterBootstrap({
-        self: master,
-        expectedPeers: [
-          { advertisedEndpoint: memberB.advertisedEndpoint },
-          { advertisedEndpoint: memberC.advertisedEndpoint },
-        ],
+        self: { identity: master.identity },
+        admission: {
+          kind: 'endpoints',
+          selfEndpoint: master.advertisedEndpoint,
+          expectedPeers: [
+            { advertisedEndpoint: memberB.advertisedEndpoint },
+            { advertisedEndpoint: memberC.advertisedEndpoint },
+          ],
+        },
         bind: `127.0.0.1:${port}`,
         timeoutMs: 10_000,
       });
@@ -406,15 +426,19 @@ describe('bootstrap — 3-peer end-to-end', () => {
 // Error paths
 // ─────────────────────────────────────────────────────────────────────────
 
-describe('bootstrap — error paths', () => {
+describe('bootstrap — error paths (endpoints admission unchanged)', () => {
   it('endpoint NOT on allowlist → master rejects with 404', async () => {
     const master = await makePeer('node-a', 18800);
     const stranger = await makePeer('uninvited', 19999);
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
-      self: master,
-      expectedPeers: [{ advertisedEndpoint: '127.0.0.1:18801' }],
+      self: { identity: master.identity },
+      admission: {
+        kind: 'endpoints',
+        selfEndpoint: master.advertisedEndpoint,
+        expectedPeers: [{ advertisedEndpoint: '127.0.0.1:18801' }],
+      },
       bind: `127.0.0.1:${port}`,
       timeoutMs: 2_000,
     }).catch((err) => ({ err }));
@@ -440,8 +464,12 @@ describe('bootstrap — error paths', () => {
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
-      self: master,
-      expectedPeers: [{ advertisedEndpoint: 'node-b.example.com:8800' }],
+      self: { identity: master.identity },
+      admission: {
+        kind: 'endpoints',
+        selfEndpoint: master.advertisedEndpoint,
+        expectedPeers: [{ advertisedEndpoint: 'node-b.example.com:8800' }],
+      },
       bind: `127.0.0.1:${port}`,
       timeoutMs: 2_000,
     });
@@ -468,11 +496,15 @@ describe('bootstrap — error paths', () => {
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
-      self: master,
-      expectedPeers: [
-        { advertisedEndpoint: memberB.advertisedEndpoint },
-        { advertisedEndpoint: memberC.advertisedEndpoint },
-      ],
+      self: { identity: master.identity },
+      admission: {
+        kind: 'endpoints',
+        selfEndpoint: master.advertisedEndpoint,
+        expectedPeers: [
+          { advertisedEndpoint: memberB.advertisedEndpoint },
+          { advertisedEndpoint: memberC.advertisedEndpoint },
+        ],
+      },
       bind: `127.0.0.1:${port}`,
       timeoutMs: 3_000,
     });
@@ -507,11 +539,15 @@ describe('bootstrap — error paths', () => {
     const port = await freePort();
 
     const masterDone = runMasterBootstrap({
-      self: master,
-      expectedPeers: [
-        { advertisedEndpoint: memberB.advertisedEndpoint },
-        { advertisedEndpoint: '127.0.0.1:19999' }, // ghost peer
-      ],
+      self: { identity: master.identity },
+      admission: {
+        kind: 'endpoints',
+        selfEndpoint: master.advertisedEndpoint,
+        expectedPeers: [
+          { advertisedEndpoint: memberB.advertisedEndpoint },
+          { advertisedEndpoint: '127.0.0.1:19999' }, // ghost peer
+        ],
+      },
       bind: `127.0.0.1:${port}`,
       timeoutMs: 500,
     });
@@ -525,4 +561,391 @@ describe('bootstrap — error paths', () => {
     await expect(masterDone).rejects.toThrow(/timed out/);
     await expect(bRegister).rejects.toThrow();
   }, 10_000);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Count admission (relay) and transport-aware member errors
+// ─────────────────────────────────────────────────────────────────────────
+
+type RegisterReply = { status: number; json: { error?: string; book?: unknown; fingerprint?: string } };
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const pubHex = (id: IdentityKeyPair) => toHex(id.publicKeyRaw);
+const byRawPubkey = (a: string, b: string) =>
+  Buffer.compare(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
+
+async function postRegister(port: number, body: unknown): Promise<RegisterReply> {
+  const res = await fetch(`http://127.0.0.1:${port}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, json: (await res.json()) as RegisterReply['json'] };
+}
+
+/**
+ * Opens a POST /register whose headers reach the leader (it answers
+ * `100 Continue`, so its handler is running) but whose body is held back until
+ * `send`. Lets a test deliver a registration after the count is reached on a
+ * connection the leader accepted before it closed.
+ */
+function openHeldRegistration(port: number): Promise<{ send: (body: unknown) => Promise<RegisterReply> }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      method: 'POST',
+      path: '/register',
+      headers: { 'content-type': 'application/json', expect: '100-continue' },
+    });
+    const reply = new Promise<RegisterReply>((res, rej) => {
+      req.on('response', (r) => {
+        const chunks: Buffer[] = [];
+        r.on('data', (c: Buffer) => chunks.push(c));
+        r.on('end', () =>
+          res({ status: r.statusCode!, json: JSON.parse(Buffer.concat(chunks).toString('utf8')) }),
+        );
+        r.on('error', rej);
+      });
+      req.on('error', rej);
+    });
+    reply.catch(() => {});
+    req.on('continue', () =>
+      resolve({
+        send: (body) => {
+          req.end(JSON.stringify(body));
+          return reply;
+        },
+      }),
+    );
+    req.on('error', reject);
+    req.flushHeaders();
+  });
+}
+
+/** A fake leader that answers every POST /register with `reply` and records the bodies. */
+async function stubMaster(
+  reply: () => Promise<{ status: number; json: unknown }>,
+): Promise<{ url: string; bodies: unknown[]; close: () => Promise<void> }> {
+  const bodies: unknown[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      bodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      void reply().then(({ status, json }) => {
+        res.statusCode = status;
+        res.setHeader('content-type', 'application/json');
+        res.setHeader('connection', 'close');
+        res.end(JSON.stringify(json));
+      });
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const addr = server.address() as net.AddressInfo;
+  return {
+    url: `http://127.0.0.1:${addr.port}`,
+    bodies,
+    close: () => new Promise<void>((r) => server.close(() => r())),
+  };
+}
+
+/** A 200 `{ book, fingerprint }` reply over `keys` (partyIds by sorted pubkey), with an endpoint on each key named in `endpoints`. */
+async function bookReply(
+  keys: string[],
+  endpoints: Record<string, string>,
+): Promise<{ status: number; json: unknown }> {
+  const book = buildBook(
+    [...keys].sort(byRawPubkey).map((publicKeyHex, partyId) => ({
+      partyId,
+      publicKeyHex,
+      ...(endpoints[publicKeyHex] !== undefined ? { advertisedEndpoint: endpoints[publicKeyHex] } : {}),
+    })),
+  );
+  return { status: 200, json: { book, fingerprint: await computeFingerprint(book) } };
+}
+
+describe('bootstrap — count admission (relay)', () => {
+  it('count admission: completes after parties − 1 registrations without endpoints', async () => {
+    const [master, b, c] = await Promise.all([generateIdentity(), generateIdentity(), generateIdentity()]);
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}`;
+
+    const masterDone = runMasterBootstrap({
+      self: { identity: master },
+      admission: { kind: 'count', parties: 3 },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 10_000,
+    });
+    await sleep(50);
+
+    const [m, rb, rc] = await Promise.all([
+      masterDone,
+      runMemberRegister({ self: { identity: b }, masterUrl: url, timeoutMs: 10_000 }),
+      runMemberRegister({ self: { identity: c }, masterUrl: url, timeoutMs: 10_000 }),
+    ]);
+
+    // A book of 3, the same on every node.
+    expect(m.book.entries).toHaveLength(3);
+    expect(serializeBook(rb.book)).toBe(serializeBook(m.book));
+    expect(serializeBook(rc.book)).toBe(serializeBook(m.book));
+    expect(rb.fingerprint).toBe(m.fingerprint);
+    expect(rc.fingerprint).toBe(m.fingerprint);
+
+    // partyIds follow the sorted raw pubkey bytes.
+    const sorted = [master, b, c].map(pubHex).sort(byRawPubkey);
+    expect(m.book.entries.map((e) => e.publicKeyHex)).toEqual(sorted);
+    expect(m.book.entries.map((e) => e.partyId)).toEqual([0, 1, 2]);
+
+    // No entry carries an endpoint, the leader's own included.
+    for (const e of m.book.entries) expect('advertisedEndpoint' in e).toBe(false);
+    expect(serializeBook(m.book)).not.toContain('advertisedEndpoint');
+  }, 15_000);
+
+  it('count admission: a registration with an endpoint gets 400', async () => {
+    const [master, b] = await Promise.all([generateIdentity(), generateIdentity()]);
+    const port = await freePort();
+    const masterDone = runMasterBootstrap({
+      self: { identity: master },
+      admission: { kind: 'count', parties: 2 },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    await sleep(50);
+
+    const withEndpoint = await postRegister(port, {
+      public_key_hex: pubHex(b),
+      advertised_endpoint: '127.0.0.1:18801',
+    });
+    expect(withEndpoint.status).toBe(400);
+    expect(withEndpoint.json.error).toBe("'advertised_endpoint' not used in relay mode");
+
+    // The key alone is refused, whatever its spelling or value.
+    const camelEmpty = await postRegister(port, { public_key_hex: pubHex(b), advertisedEndpoint: '' });
+    expect(camelEmpty.status).toBe(400);
+    expect(camelEmpty.json.error).toBe("'advertised_endpoint' not used in relay mode");
+
+    // The refused registrations took no slot: b still completes the book.
+    const rb = await runMemberRegister({
+      self: { identity: b },
+      masterUrl: `http://127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    expect(rb.book.entries).toHaveLength(2);
+    await masterDone;
+  }, 10_000);
+
+  it("count admission: a duplicate pubkey or the master's own pubkey gets 409", async () => {
+    const [master, b, c] = await Promise.all([generateIdentity(), generateIdentity(), generateIdentity()]);
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}`;
+    const masterDone = runMasterBootstrap({
+      self: { identity: master },
+      admission: { kind: 'count', parties: 3 },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    await sleep(50);
+
+    const own = await postRegister(port, { public_key_hex: pubHex(master) });
+    expect(own.status).toBe(409);
+    expect(own.json.error).toBe("publicKey already registered (it is the leader's own key)");
+
+    const bDone = runMemberRegister({ self: { identity: b }, masterUrl: url, timeoutMs: 5_000 });
+    await sleep(100);
+    // Same key again, in upper case: still the same key.
+    const dup = await postRegister(port, { public_key_hex: pubHex(b).toUpperCase() });
+    expect(dup.status).toBe(409);
+    expect(dup.json.error).toBe('publicKey already registered');
+
+    // Neither refusal took a slot: c completes the book of 3.
+    const cDone = runMemberRegister({ self: { identity: c }, masterUrl: url, timeoutMs: 5_000 });
+    const [m] = await Promise.all([masterDone, bDone, cDone]);
+    expect(m.book.entries.map((e) => e.publicKeyHex).sort(byRawPubkey)).toEqual(
+      [master, b, c].map(pubHex).sort(byRawPubkey),
+    );
+  }, 10_000);
+
+  it('count admission: a registration after the count is reached gets 409 bootstrap is full', async () => {
+    const [master, b, late] = await Promise.all([generateIdentity(), generateIdentity(), generateIdentity()]);
+    const port = await freePort();
+    const masterDone = runMasterBootstrap({
+      self: { identity: master },
+      admission: { kind: 'count', parties: 2 },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    await sleep(50);
+
+    // The late party's connection is in before the book completes; its body is not.
+    const held = await openHeldRegistration(port);
+
+    const rb = await runMemberRegister({
+      self: { identity: b },
+      masterUrl: `http://127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    expect(rb.book.entries).toHaveLength(2);
+
+    const reply = await held.send({ public_key_hex: pubHex(late) });
+    expect(reply.status).toBe(409);
+    expect(reply.json.error).toBe('bootstrap is full');
+
+    const m = await masterDone;
+    expect(m.book.entries.map((e) => e.publicKeyHex)).not.toContain(pubHex(late));
+  }, 10_000);
+
+  it('leader timeout names received vs expected registrations', async () => {
+    const [master, b] = await Promise.all([generateIdentity(), generateIdentity()]);
+    const port = await freePort();
+    const masterDone = runMasterBootstrap({
+      self: { identity: master },
+      admission: { kind: 'count', parties: 3 },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 500,
+    });
+    await sleep(50);
+    const bDone = runMemberRegister({
+      self: { identity: b },
+      masterUrl: `http://127.0.0.1:${port}`,
+      timeoutMs: 3_000,
+    });
+
+    await expect(masterDone).rejects.toThrow(/timed out after 500ms: received 1 of 2 registrations/);
+    // The waiting member hears the same shortfall in its 408.
+    await expect(bDone).rejects.toThrow(/408: .*received 1 of 2 registrations/);
+  }, 10_000);
+
+  it('endpoints admission timeout names received vs expected registrations too', async () => {
+    const master = await makePeer('node-a', 18800);
+    const port = await freePort();
+    const masterDone = runMasterBootstrap({
+      self: { identity: master.identity },
+      admission: {
+        kind: 'endpoints',
+        selfEndpoint: master.advertisedEndpoint,
+        expectedPeers: [{ advertisedEndpoint: '127.0.0.1:18801' }, { advertisedEndpoint: '127.0.0.1:18802' }],
+      },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 300,
+    });
+    await expect(masterDone).rejects.toThrow(/received 0 of 2 registrations/);
+  }, 10_000);
+
+  it('count admission refuses parties below 2', async () => {
+    const master = await generateIdentity();
+    for (const parties of [1, 0, 2.5, Number.NaN]) {
+      await expect(
+        runMasterBootstrap({
+          self: { identity: master },
+          admission: { kind: 'count', parties },
+          bind: '127.0.0.1:0',
+          timeoutMs: 1_000,
+        }),
+      ).rejects.toThrow(/parties/);
+    }
+  });
+});
+
+describe('bootstrap — member checks by transport', () => {
+  it('member in relay mode refuses a book whose own entry has an endpoint', async () => {
+    const [m, b] = await Promise.all([generateIdentity(), generateIdentity()]);
+    const stub = await stubMaster(() => bookReply([pubHex(m), pubHex(b)], { [pubHex(b)]: '127.0.0.1:18801' }));
+    try {
+      await expect(
+        runMemberRegister({ self: { identity: b }, masterUrl: stub.url, timeoutMs: 5_000 }),
+      ).rejects.toThrow(
+        "register: the leader's book gives this node advertisedEndpoint='127.0.0.1:18801'; a relay node registers none",
+      );
+      // A relay member sends no advertised_endpoint key at all.
+      expect(stub.bodies).toEqual([{ public_key_hex: pubHex(b) }]);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('peer-mesh member refuses a book whose own entry has no endpoint', async () => {
+    const [m, b] = await Promise.all([generateIdentity(), generateIdentity()]);
+    const stub = await stubMaster(() => bookReply([pubHex(m), pubHex(b)], {}));
+    try {
+      await expect(
+        runMemberRegister({
+          self: { identity: b, advertisedEndpoint: '127.0.0.1:18801' },
+          masterUrl: stub.url,
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toThrow(
+        "register: the leader's book has no advertisedEndpoint for this node; it registered '127.0.0.1:18801'",
+      );
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('a relay-mode member registering with an endpoints-mode master gets an error naming the transport mismatch', async () => {
+    const master = await makePeer('node-a', 18800);
+    const b = await generateIdentity();
+    const port = await freePort();
+    const masterDone = runMasterBootstrap({
+      self: { identity: master.identity },
+      admission: {
+        kind: 'endpoints',
+        selfEndpoint: master.advertisedEndpoint,
+        expectedPeers: [{ advertisedEndpoint: '127.0.0.1:18801' }],
+      },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 500,
+    }).catch((err: unknown) => err);
+    await sleep(50);
+
+    const err = await runMemberRegister({
+      self: { identity: b },
+      masterUrl: `http://127.0.0.1:${port}`,
+      timeoutMs: 2_000,
+    }).catch((e: unknown) => e as Error);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/transport/);
+    expect((err as Error).message).toMatch(/relay/);
+    expect((err as Error).message).toBe(
+      'setup: the leader expects peer-mesh registrations (an advertised endpoint); this node is configured for relay — use the same transport on every node',
+    );
+    await masterDone;
+  }, 10_000);
+
+  it('a peer-mesh member registering with a count-mode master gets an error naming the transport mismatch', async () => {
+    const [master, b] = await Promise.all([generateIdentity(), generateIdentity()]);
+    const port = await freePort();
+    const masterDone = runMasterBootstrap({
+      self: { identity: master },
+      admission: { kind: 'count', parties: 2 },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 500,
+    }).catch((err: unknown) => err);
+    await sleep(50);
+
+    await expect(
+      runMemberRegister({
+        self: { identity: b, advertisedEndpoint: '127.0.0.1:18801' },
+        masterUrl: `http://127.0.0.1:${port}`,
+        timeoutMs: 2_000,
+      }),
+    ).rejects.toThrow(
+      'setup: the leader expects relay registrations (no advertised endpoint); this node is configured for peer-mesh — use the same transport on every node',
+    );
+    await masterDone;
+  }, 10_000);
+
+  it('member maps 409 bootstrap is full to the abort-and-redo error', async () => {
+    const b = await generateIdentity();
+    const stub = await stubMaster(async () => ({ status: 409, json: { error: 'bootstrap is full' } }));
+    try {
+      await expect(
+        runMemberRegister({ self: { identity: b }, masterUrl: stub.url, timeoutMs: 5_000 }),
+      ).rejects.toThrow(
+        "setup: bootstrap is full — another party registered in this node's place; abort, delete pubkeys.json on every node and redo setup with the bootstrap port reachable only by the members",
+      );
+    } finally {
+      await stub.close();
+    }
+  });
 });

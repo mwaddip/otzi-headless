@@ -394,7 +394,7 @@
 | Verb | Behaviour |
 |---|---|
 | `otzi daemon <config>` | Run the daemon (`runDaemonCommand`). |
-| `otzi setup <config>` | Bootstrap pubkey exchange; prints the 96-bit fingerprint. |
+| `otzi setup <config>` | Bootstrap pubkey exchange (endpoint allowlist under peer-mesh, count under relay); prints the 96-bit fingerprint and the key ids of this node and every ring entry. |
 | `otzi generate [--config <path>] [--ceremony-id <id>]` | Daemon `dkg` op (`generate`); banner prints the vault address and the restart instruction. |
 | `otzi vault [--json] [--config <path>]` | Address, network, threshold/parties, checked against the daemon's loaded share (`vault`); the full file (keys included) with `--json`. |
 | `otzi btc balance [--unit sats\|btc\|mbtc\|ubtc] [--config <path>]` | Esplora balance: confirmed and unconfirmed. |
@@ -439,16 +439,21 @@
 **Public surface:**
 - **`setupMaster(configPath, bind): Promise<void>`**
   - **Pre:** Config path + bind address (host:port) provided.
-  - **Post:** Loads config; loads/generates identity key; runs bootstrap master; writes pubkey book; prints the fingerprint banner.
-  - **Idempotent:** If the pubkey book already exists, re-prints the fingerprint without re-bootstrapping.
+  - **Post:** Loads config; picks the admission from `[transport] kind` (peer-mesh → `{ kind: 'endpoints', selfEndpoint: transport.advertised_endpoint, expectedPeers: [[peers]] }`; relay → `{ kind: 'count', parties: bootstrap.parties }`); loads/generates identity key; runs bootstrap master; writes pubkey book; prints the setup banner.
+  - **Throws:** peer-mesh without `transport.advertised_endpoint`; relay without `[bootstrap] parties` (`setup: relay mode needs [bootstrap] parties on the leader …` — the config parser already requires it on a relay leader, so only a config with no `[bootstrap]` reaches this).
+  - **Idempotent:** If the pubkey book already exists, re-prints the banner without re-bootstrapping.
   - **Identity:** Reused if file exists; generated if missing (mode 0660).
 
 - **`setupMember(configPath, masterUrl): Promise<void>`**
   - **Pre:** Config path + master URL provided.
-  - **Post:** Loads config; loads/generates identity key; registers with master; writes pubkey book; prints the fingerprint banner.
-  - **Idempotent:** If the pubkey book already exists, re-prints the fingerprint.
+  - **Post:** Loads config; loads/generates identity key; registers with master (peer-mesh: with `transport.advertised_endpoint`, which must be set; relay: with no endpoint); writes pubkey book; prints the setup banner.
+  - **Idempotent:** If the pubkey book already exists, re-prints the banner.
 
-- **Fingerprint banner:** the 96-bit fingerprint `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` from `computeFingerprint`, with the instruction to compare it out of band with every other operator before any DKG.
+- **Setup banner** (`announceComplete`, both roles, both transports, and on the idempotent re-print):
+  - `fingerprint: xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` from `computeFingerprint`;
+  - `this node: <keyId>` — this node's identity pubkey (`keyId` from `pubkey-book.ts`); on a re-print with no identity file, `this node: no identity key at <file>`;
+  - one line per book entry in partyId order: `party <partyId>: <keyId>`, followed by two spaces and the entry's endpoint when it has one (peer-mesh);
+  - the instruction to compare the fingerprint out of band with every other operator before any DKG, and `Confirm every key id above belongs to one of your nodes; an unknown id means someone else registered — delete pubkeys.json on every node and redo setup.`
 
 - **Validation:** `identity_key_file` and `pubkey_book_file` must be set in config; missing paths fail immediately.
 
@@ -460,6 +465,7 @@
 **Invariants:**
 - Setup is idempotent; re-running after abort is safe.
 - The fingerprint must match across all nodes (operators compare it); a mismatch means tampering — delete the books and redo setup.
+- Every key id in the banner must belong to one of the operators' own nodes; an unknown one means someone else registered (in relay mode anyone who reaches the bootstrap port can) — delete the books and redo setup.
 
 **Cross-component contracts:**
 - Depends on: Config loader, bootstrap runners (`runMasterBootstrap`, `runMemberRegister`), identity crypto, pubkey book serialization.
