@@ -500,6 +500,35 @@ describe('Daemon address book', () => {
     }
   });
 
+  it('an exec gate command inherits neither the share password nor the HTTP trigger token', async () => {
+    const tokenVar = 'OTZI_TEST_HTTP_TRIGGER_TOKEN';
+    const passwordVar = 'OTZI_SHARE_PASSWORD';
+    const saved = { token: process.env[tokenVar], password: process.env[passwordVar] };
+    process.env[tokenVar] = 'trigger-token-must-not-leak';
+    process.env[passwordVar] = PASSWORD;
+    try {
+      const probe = `if [ -n "\${${tokenVar}+x}" ] || [ -n "\${${passwordVar}+x}" ]; then echo reject; else echo approve; fi`;
+      const c = await cluster({
+        gates: { 0: `[gate]\nstrategy = "exec"\ncommand = ["sh", "-c", ${JSON.stringify(probe)}]\ntimeout_sec = 10` },
+        triggers: `${HTTP_TRIGGER}\nauth_token_env = "${tokenVar}"`,
+      });
+      const tv = await writeShares(c);
+      const { urls } = await c.boot();
+
+      const res = await fetch(urls[0]!, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env[tokenVar]}` },
+        body: JSON.stringify({ op: 'sign', ceremonyId: 'pay-env', proposal: pay(tv, TREASURY) }),
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      for (const [name, value] of [[tokenVar, saved.token], [passwordVar, saved.password]] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   it('a missing or invalid book only means unlabelled specs for a gate that does not use it', async () => {
     const c = await cluster({ gates: { 0: '[gate]\nstrategy = "policy"\nmax_sats_per_tx = 100000' } });
     const tv = await writeShares(c);

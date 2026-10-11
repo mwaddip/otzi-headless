@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { dkgRound1 } from '@mwaddip/frots';
-import { decodeEnvelope, encodeFrostRound1 } from '../otzi/lib/dkg';
+import { decodeEnvelope, decodeFrostRound2, encodeFrostRound1, encodeFrostRound2 } from '../otzi/lib/dkg';
 import { rng } from '../otzi/lib/dkg.fixture';
 import { toHex } from '../otzi/lib/hex';
 import {
@@ -62,6 +62,22 @@ describe('frost-dkg-session', () => {
     const results = dkgSessions.map(finalize);
     const key = toHex(results[0]!.publicKeyPackage.verifyingKey);
     for (const r of results) expect(toHex(r.publicKeyPackage.verifyingKey)).toBe(key);
+  });
+
+  it('names the cheating sender by party id, not by FROST identifier', () => {
+    exchangeR1();
+    for (const s of dkgSessions) round2(s);
+    const victim = dkgSessions[0]!;
+    for (const from of [1, 2]) {
+      let blob = round2ForTarget(dkgSessions[from]!, victim.partyId)!;
+      if (from === 2) {
+        // Party 2 (FROST identifier 3) sends a share that does not match its commitments.
+        const pkg = decodeFrostRound2(blob)!;
+        blob = encodeFrostRound2({ ...pkg, signingShare: pkg.signingShare + 1n }, sessionId);
+      }
+      expect(addBlob(victim, blob, 'r2', from)).toEqual({ ok: true });
+    }
+    expect(() => finalize(victim)).toThrow(/VSS verification failed for share from party 2$/);
   });
 
   describe('round 1', () => {

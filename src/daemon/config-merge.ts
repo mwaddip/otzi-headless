@@ -24,7 +24,7 @@ import {
   vaultPubkeyFromPackage,
   writeVaultPubkeyFile,
 } from './vault-pubkey';
-import { loadVaultShare, warnOnPendingShare } from './vault-share';
+import { loadVaultShare, removeCommittedStaging, warnOnPendingShare } from './vault-share';
 
 export interface LoadedDaemonState {
   config: DaemonConfig;
@@ -39,7 +39,7 @@ export interface LoadOptions {
   env?: Readonly<Record<string, string | undefined>>;
   /** Where `vault-pubkey.json` is rewritten. Defaults to `DEFAULT_VAULT_PUBKEY_PATH`. */
   vaultPubkeyPath?: string;
-  /** Receives the stale-`.pending` warning and a failed `vault-pubkey.json` write. Defaults to `NOOP_LOGGER`. */
+  /** Receives the stale-`.pending` warning (or the note that a leftover staging link was removed) and a failed `vault-pubkey.json` write. Defaults to `NOOP_LOGGER`. */
   logger?: Logger;
 }
 
@@ -77,7 +77,10 @@ export async function loadAndValidate(
     }
   }
 
-  await warnOnPendingShare(config.share.path, logger);
+  // A `.pending` that is the loaded share's own file is a failed unlink after the commit: nothing to warn about.
+  if (!(share && (await removeCommittedStaging(config.share.path, logger)))) {
+    await warnOnPendingShare(config.share.path, logger);
+  }
 
   return { config, ...(share ? { share } : {}), password };
 }

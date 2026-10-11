@@ -417,7 +417,7 @@ describe('HttpTrigger — Host header on a loopback bind', () => {
       expect(await requestWithHost(port, ok), ok).toBe(200);
     }
     expect(calls).toBe(4);
-    for (const bad of ['evil.example', `evil.example:${port}`, `127.0.0.1:${port + 1}`, '127.0.0.1', `rebind.attacker.example:${port}`]) {
+    for (const bad of ['evil.example', `localhost.:${port}`, `evil.example:${port}`, `127.0.0.1:${port + 1}`, '127.0.0.1', `rebind.attacker.example:${port}`]) {
       expect(await requestWithHost(port, bad), bad).toBe(403);
     }
     expect(calls).toBe(4);

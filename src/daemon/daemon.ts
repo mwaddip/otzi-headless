@@ -92,8 +92,8 @@ export class Daemon {
       loadAddressBook: async () =>
         (await readAddressBook(bookPath, network, { missing: 'error' })).map(e => e.address),
       logger: this.log,
-      // An exec gate's command never sees the share password.
-      secretEnv: [config.share.passwordEnv],
+      // An exec gate's command never sees the share password or an HTTP trigger's token.
+      secretEnv: [config.share.passwordEnv, ...triggerTokenEnvNames(config.triggers)],
     });
     this.log.info(`daemon: gate strategy ${config.gate.strategy}`, { strategy: config.gate.strategy });
     const node = { id: config.node.id, partyId: selfPartyId };
@@ -199,6 +199,17 @@ function requireStringParam(params: Record<string, unknown> | undefined, key: st
   const v = params?.[key];
   if (typeof v !== 'string') throw new Error(`daemon: ${path}.${key} missing or not a string`);
   return v;
+}
+
+/** The `auth_token_env` variable names of the HTTP triggers: secrets an exec gate's command must not inherit. */
+export function triggerTokenEnvNames(entries: readonly TriggerEntry[]): string[] {
+  const names: string[] = [];
+  entries.forEach((entry, i) => {
+    if (entry.kind !== 'http') return;
+    const name = optionalStringParam(entry.params, 'auth_token_env', `triggers[${i}]`);
+    if (name) names.push(name);
+  });
+  return names;
 }
 
 function optionalStringParam(params: Record<string, unknown> | undefined, key: string, path: string): string | undefined {

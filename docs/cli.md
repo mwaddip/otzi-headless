@@ -84,12 +84,12 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
   sudo otzi backup
   ```
 
-  It needs root: the share file is readable only by its owner. Under plain `sudo` the archive lands in `/root`.
+  It needs root: the share file is readable only by its owner. Under plain `sudo` the archive lands in root's home directory (`/root`, as in the banner below); copy it off the host.
 
   Output:
   ```
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    Backup written: /home/operator/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
+    Backup written: /root/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
     Password:       a8K2zP4mQ9xR7sN3vL5jB6tH1wF0gY9c
 
     WRITE THIS DOWN. There is no recovery path if you lose this password.
@@ -99,7 +99,7 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
 
 - `otzi restore <archive-path> [--password-stdin]` — decrypt an `otzi-backup` archive and restore files to their canonical paths with canonical modes. Without `--password-stdin`, the CLI prompts for the password on the terminal; what you type is shown (the prompt does not mask it), so prefer `--password-stdin` where others can see the screen. With `--password-stdin`, it reads the password from stdin until newline — used by debconf during fresh installs and by scripted runs.
 
-  Restore only creates files. It writes the vault's own files — `daemon.toml`, the address book, `vault-pubkey.json`, and the share, identity and pubkey book at the paths the archived `daemon.toml` names — and only under `/etc/otzi` and `/var/lib/otzi`. Any other entry in the archive is skipped with a warning. If it fails part-way, it removes the files it created; nothing that existed before is touched.
+  Restore only creates files. It writes the vault's own files — `daemon.toml`, the address book, `vault-pubkey.json`, and the share, identity and pubkey book at the paths the archived `daemon.toml` names — and only directly inside `/etc/otzi` and `/var/lib/otzi` (not in a subdirectory of them). Any other entry in the archive is skipped with a warning. If it fails part-way, it removes the files it created; nothing that existed before is touched.
 
   Refuses (exit 1) if:
   - `/etc/otzi/daemon.toml` already exists. Move it aside first (`sudo mv /etc/otzi/daemon.toml /root/`).
@@ -107,7 +107,7 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
   - The archive magic isn't `OTZI-BACKUP-V1`.
   - Decryption fails — wrong password or tampered archive (same error; it doesn't say which).
   - Any file it would write already exists. The error lists them; move them aside (don't delete a share — it is key material) and run restore again.
-  - The archive's `daemon.toml` puts the share, identity or pubkey book outside `/etc/otzi` and `/var/lib/otzi`, or the archive holds a symlink, hardlink, device, FIFO, `..` or absolute entry, a directory where a file belongs, or a file twice.
+  - The archive's `daemon.toml` puts the share, identity or pubkey book anywhere but directly inside `/etc/otzi` or `/var/lib/otzi` (a subdirectory such as `/var/lib/otzi/keys/` is refused too), or the archive holds a symlink, hardlink, device, FIFO, `..` or absolute entry, a directory where a file belongs, or a file twice.
 
   ```bash
   sudo systemctl stop otzi

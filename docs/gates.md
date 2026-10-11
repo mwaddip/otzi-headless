@@ -187,7 +187,7 @@ strategy    = "exec"
 command     = ["/etc/otzi/gate-file-approver.sh"]   # argv; command[0] is executable
 timeout_sec = 86400                                  # hard cap on child lifetime (24h)
 working_dir = "/var/otzi"                            # optional cwd
-env         = { FOO = "bar" }                        # optional env, added to the daemon's
+env         = { FOO = "bar" }                        # optional env, added to the daemon's environment
 ```
 
 The daemon writes the spec JSON as one line on the command's stdin. The command
@@ -195,7 +195,9 @@ must exit 0 with the first line of stdout being either `approve` or `reject`.
 Any other output, non-zero exit or timeout rejects the ceremony (a participant
 drops it silently; the leader returns `403`). The command need not read the
 spec; stdout and stderr are read up to 64 KiB each. Its environment is the
-daemon's plus `env`, without the share password variable (`[share].password_env`).
+daemon's plus `env`, without the share password variable (`[share].password_env`) and
+without the token variable of any HTTP trigger (`auth_token_env`); to hand it one of
+those anyway, set it in `env`.
 
 `timeout_sec` is at most 2147483.647 (about 24.8 days), the longest timer Node.js can
 hold; a larger value is refused at startup (`gate.timeout_sec`). At the timeout the

@@ -197,7 +197,9 @@ at warn level on startup and never loaded. It may be this node's share of a
 vault the other nodes committed: if `otzi vault` on another node shows the
 address the warning names, `sudo mv /var/lib/otzi/share.json.pending
 /var/lib/otzi/share.json` and restart the daemon. Otherwise the next DKG
-overwrites it.
+overwrites it. If the file is the loaded share itself (a second name left by a
+failed removal after the commit), the daemon removes it at startup and logs at
+info level.
 
 ### Address book
 
@@ -256,7 +258,7 @@ entropy) and printed once to stdout:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Backup written: /home/operator/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
+  Backup written: /root/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
   Password:       a8K2zP4mQ9xR7sN3vL5jB6tH1wF0gY9c
 
   WRITE THIS DOWN. There is no recovery path if you lose this password.
@@ -310,9 +312,11 @@ sudo mv /etc/otzi/daemon.toml /root/otzi-aside/
 sudo otzi restore ~/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
 ```
 
-Restore writes only the vault's own files under `/etc/otzi` and
+Restore writes only the vault's own files, directly inside `/etc/otzi` and
 `/var/lib/otzi`. It refuses an archive whose daemon.toml points the
-share, identity or pubkey book anywhere else, and an archive with a
+share, identity or pubkey book anywhere else (a subdirectory such as
+`/var/lib/otzi/keys/` included, so keep those three files directly in
+those two directories), and an archive with a
 symlink, hardlink, device, `..` or absolute entry; any other unknown
 entry is skipped with a warning. If it fails part-way, it removes the
 files it created and leaves everything else as it was.
@@ -352,7 +356,7 @@ sudo systemctl start otzi
 - Any file it would write already exists (all of them are listed) —
   move them aside and run restore again.
 - The archive's `daemon.toml` puts the share, identity or pubkey book
-  outside `/etc/otzi` and `/var/lib/otzi`, or the archive holds a
+  anywhere but directly inside `/etc/otzi` or `/var/lib/otzi`, or the archive holds a
   symlink, hardlink, device, FIFO, `..` or absolute entry.
 
 #### What the archive does NOT contain

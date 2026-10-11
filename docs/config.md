@@ -74,7 +74,9 @@ and checks its `partyId` and `parties` against the pubkey book. Any mismatch
 refuses to start; a share that fails a check is never treated as "no vault". A
 leftover `<path>.pending` file is logged at warn level and never loaded: it may
 be this node's share of a vault the other nodes committed (see
-[`cli.md`](./cli.md) § `otzi generate`), otherwise the next DKG overwrites it.
+[`cli.md`](./cli.md) § `otzi generate`), otherwise the next DKG overwrites it. A `.pending` that is the loaded share's own
+file (a failed removal after the commit left a second name for it) is removed at
+startup, with an info line.
 
 ## `[node]` (required)
 
@@ -212,7 +214,7 @@ Details:
 | `command` | string[] | argv. `command[0]` is the executable. |
 | `timeout_sec` | number, 0 < n <= 2147483.647 | Hard cap on child lifetime (seconds): at the cap the ceremony is rejected and the child gets `SIGTERM`, then `SIGKILL` 5 s later if it is still running. The upper bound is the longest timer Node.js can hold (2147483647 ms, about 24.8 days); a larger value is refused at startup. |
 | `working_dir` | string, optional | cwd for the child. |
-| `env` | table, optional | Extra environment, added to the daemon's environment. The child never inherits the share password variable (`[share].password_env`). |
+| `env` | table, optional | Extra environment, added to the daemon's environment. The child never inherits the share password variable (`[share].password_env`) or an HTTP trigger's token variable (`auth_token_env`). |
 
 The daemon writes the ceremony spec as one JSON line on the child's stdin and
 reads the first line of stdout as the decision (`approve`/`reject`). Anything

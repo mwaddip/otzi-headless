@@ -213,7 +213,7 @@ no DKG can touch it.
    `verifyingKey`.
 7. **Complete.** Once all N−1 confirmations verify, commit whatever the abort signal
    says: `link` `.pending` to the share path (refused if an entry exists there, so a
-   vault is never replaced), `unlink` `.pending`, fsync the directory, write
+   vault is never replaced), fsync the directory, `unlink` `.pending`, fsync the directory again, write
    `vault-pubkey.json` (atomically; a failed write is a warning, startup rewrites it),
    settle as done.
 
@@ -235,7 +235,9 @@ this node has published its `dkg-verified`:
   restart the daemon; otherwise remove it.
 
 A `.pending` file found at startup is logged at warn level with the same recovery and
-not loaded; the next DKG overwrites it.
+not loaded; the next DKG overwrites it. The exception is a `.pending` that is the loaded
+share's own file (same device and inode: the `unlink` after the commit's `link` failed):
+startup removes it and logs at info level.
 
 Guarantee: a node completes only when every node has produced a signature under the
 same vault key over the same transcript and has staged its share durably to disk; once
@@ -417,6 +419,11 @@ password_env = "OTZI_SHARE_PASSWORD"
   where `vaultKey` is otzi's public `VaultKey` (needed by `buildSend` in the CLI).
 - Backup archive: `daemon.toml`, share, identity key, pubkey book, address book (if
   present), `vault-pubkey.json`, `meta.json`. Archive format and encryption unchanged.
+  Restore writes only these files, each a direct child of `/etc/otzi` or `/var/lib/otzi`
+  (so the share, identity and pubkey-book paths in `daemon.toml` must sit directly in
+  those directories; nested paths are refused, which leaves no directory between them
+  and a target for a symlink to replace), creates files only, and never replaces or
+  follows anything that exists.
 
 ### 6.7 Packaging and bootstrap
 

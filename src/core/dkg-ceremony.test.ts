@@ -233,8 +233,8 @@ describe('runDkgCeremony', () => {
     expect(out.every(o => o.status === 'rejected')).toBe(true);
     for (const s of stagers) expect(s.calls).not.toContain('commit');
     expect(stagers[1]!.calls).toEqual(['discard']);
-    // frots names the FROST identifier: 3 is party 2.
-    expect(reasonOf(out[1])).toMatch(/^DKG aborted: .*VSS verification failed for share from sender 3/);
+    // frots names FROST identifier 3; the message names party 2.
+    expect(reasonOf(out[1])).toMatch(/^DKG aborted: .*VSS verification failed for share from party 2$/);
     expect(abortsFrom(heard)).toEqual(new Set([1]));
   });
 

@@ -1334,6 +1334,7 @@ describe('parseWebhookParams — url scheme', () => {
     'http://192.168.1.10/',
     'http://[fe80::1]/',
     'http://localhost.evil.example/',
+    'http://localhost./otzi',
     'http://127.0.0.1.nip.io/',
   ])('refuses plain http to a non-loopback host: %s', (url) => {
     let err: unknown;

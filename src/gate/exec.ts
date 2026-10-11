@@ -17,7 +17,8 @@
  * The command never takes the daemon down: a command that exits without
  * reading its stdin (a large spec fills the pipe) only causes a stdin error
  * that is ignored, and its stdout / stderr are read up to 64 KiB each. It does
- * not inherit the share password variable (`omitEnv`).
+ * not inherit the secrets the daemon names in `omitEnv`: the share password
+ * variable and the HTTP triggers' token variables.
  *
  * TOML shape (under `[gate]`, parameters sit directly next to `strategy`):
  *   strategy = "exec"
@@ -39,7 +40,7 @@ export interface ExecGateConfig {
   timeoutSec: number;
   workingDir?: string;
   env?: Record<string, string>;
-  /** Variables removed from the inherited environment (the share password's); `env` applies after. */
+  /** Variables removed from the inherited environment (the share password's, the HTTP trigger tokens'); `env` applies after. */
   omitEnv?: readonly string[];
   /** Time between the timeout's SIGTERM and SIGKILL, in ms. Default 5000. */
   killGraceMs?: number;

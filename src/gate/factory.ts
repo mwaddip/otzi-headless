@@ -16,7 +16,8 @@ export class AutoGate implements ApprovalGate {
  * `deps.loadAddressBook` returns this node's address book addresses for
  * `allowed_recipients = "address-book"` (rejecting when there is no usable
  * book); `deps.logger` receives the policy gate's warnings; `deps.secretEnv`
- * names variables an `exec` command must not inherit (the share password's).
+ * names variables an `exec` command must not inherit (the share password's and
+ * the HTTP trigger tokens').
  */
 export function createGate(
   config: GateConfig,

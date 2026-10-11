@@ -128,7 +128,8 @@ inconsistent setup fail loudly. Once a vault exists, no DKG can touch it.
    pulls the other N−1, and checks each against `M` and its own vault key.
 7. **Complete.** Once all N−1 confirmations verify, the node commits even if the
    ceremony is aborted meanwhile: it links `.pending` to the share path (refused
-   if anything exists there, so a vault is never replaced), removes `.pending`,
+   if anything exists there, so a vault is never replaced), syncs the directory,
+   removes `.pending`, syncs the directory again,
    writes `vault-pubkey.json` (a failed write is only a warning; startup rewrites
    it), and settles as done.
 
@@ -145,7 +146,8 @@ naming the file, the vault address and the recovery: run `otzi vault` on the
 other nodes; if any shows that address, rename `.pending` to the share path and
 restart the daemon, otherwise remove it. A `.pending` file found at startup is
 logged at warn level with the same recovery and never loaded; the next DKG
-overwrites it.
+overwrites it. If it is the loaded share's own file (a second name left by a
+failed removal after the commit), startup removes it and logs at info level.
 
 **After the DKG.** The new share is on disk but not loaded. Restart every daemon
 so each loads its share; until then `sign` returns `409`. Replacing an existing

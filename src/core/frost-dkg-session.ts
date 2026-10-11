@@ -171,8 +171,23 @@ export function finalize(session: FrostDkgSession): {
     receivedR2.set(partyIdToFrostId(senderPartyId), pkg);
   }
 
-  session.result = libDkgFinalize(session.r2Secret, receivedR1, receivedR2);
+  try {
+    session.result = libDkgFinalize(session.r2Secret, receivedR1, receivedR2);
+  } catch (err) {
+    throw err instanceof Error ? namePartiesInFrostError(err) : err;
+  }
   return session.result;
+}
+
+/**
+ * frots names the sender of a bad share by FROST identifier (`party + 1`);
+ * every other message names parties. `from sender 3` becomes `from party 2`.
+ */
+function namePartiesInFrostError(err: Error): Error {
+  const renamed = err.message.replace(/\bfrom sender (\d+)\b/g, (_m, id: string) =>
+    `from party ${frostIdToPartyId(BigInt(id))}`,
+  );
+  return renamed === err.message ? err : new Error(renamed, { cause: err });
 }
 
 export type FrostDkgRound = 'r1' | 'r2';

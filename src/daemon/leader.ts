@@ -160,8 +160,11 @@ export class LeaderDispatcher {
         let failure = err;
         if (deadline.signal.aborted && !slot.signal.aborted) {
           // The ceremony stops silently on its signal; nobody else has announced this abort.
-          const reason = deadlineReason(deadline);
-          await this.broadcastBestEffort({ v: 2, kind: 'signoff-aborted', ceremonyId, reason });
+          // The ceremony's own error is the abort the deadline causes (`aborted`) or a real failure
+          // that struck as the deadline passed (a refused commit, a full disk): the message keeps it.
+          const underlying = err instanceof DkgShareKeptError ? err.reason : errorMessage(err).replace(/^DKG aborted: /, '');
+          const reason = deadlineReasonWith(deadline, underlying);
+          await this.broadcastBestEffort({ v: 2, kind: 'signoff-aborted', ceremonyId, reason: reason.slice(0, MAX_REASON_LENGTH) });
           failure =
             err instanceof DkgShareKeptError
               ? new DkgShareKeptError(reason, err.keptNote, err.stagedPath, { cause: err })
@@ -323,6 +326,18 @@ function idInUse(ceremonyId: string): string {
 
 function deadlineReason(deadline: CeremonyDeadline): string {
   return `ceremony deadline of ${deadline.ms} ms passed`;
+}
+
+/**
+ * The deadline's reason plus the failure underneath it. A ceremony stopped by
+ * its deadline fails with a bare `aborted`, which adds nothing; any other
+ * failure (`aborted (discard failed: …)` keeps its note) is appended in parentheses.
+ */
+function deadlineReasonWith(deadline: CeremonyDeadline, underlying: string): string {
+  const base = deadlineReason(deadline);
+  if (underlying === 'aborted') return base;
+  const note = /^aborted (\(.*\))$/s.exec(underlying);
+  return `${base} ${note ? note[1] : `(${underlying})`}`;
 }
 
 function errorMessage(err: unknown): string {

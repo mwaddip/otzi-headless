@@ -12,7 +12,7 @@
  * The share password is never logged and never put in an error message.
  */
 
-import { link, mkdir, open, readFile, rm, stat, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readFile, rm, stat, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { NetworkName } from '../config/types';
 import { NETWORK_NAMES } from '../config/types';
@@ -98,6 +98,40 @@ export async function loadVaultShare(
 }
 
 /**
+ * Remove a `.pending` that is the share itself: the same file (device and
+ * inode) as the loaded share at `path`. `commit` links the staged file into
+ * place and then unlinks the staging name; when that unlink failed, the
+ * leftover is a second name for the committed share, with nothing to recover.
+ * Logs at info and returns true when it was one (a failed removal is a
+ * warning, still true); false for any other `.pending`, or none.
+ */
+export async function removeCommittedStaging(path: string, log: Logger): Promise<boolean> {
+  const pending = pendingPath(path);
+  let same: boolean;
+  try {
+    const [share, staged] = await Promise.all([lstat(path), lstat(pending)]);
+    same = share.isFile() && staged.isFile() && share.dev === staged.dev && share.ino === staged.ino;
+  } catch {
+    return false;
+  }
+  if (!same) return false;
+  try {
+    await unlink(pending);
+  } catch (err) {
+    log.warn(
+      `leftover staging file ${pending} is the same file as the committed share ${path} but could not be removed ` +
+        `(${errorText(err)}); remove it by hand, it holds nothing the share does not`,
+      { path: pending },
+    );
+    return true;
+  }
+  log.info(`removed ${pending}: the same file as the committed share ${path}, left by a failed unlink after the commit`, {
+    path: pending,
+  });
+  return true;
+}
+
+/**
  * Warn about a `.pending` file left by an unfinished DKG. It is never loaded:
  * it may be this node's share of a vault the other nodes committed (a node
  * that published its confirmation keeps it), or a stale one the next DKG
@@ -156,12 +190,14 @@ export function createShareStager(opts: ShareStagerOptions): ShareStager {
    */
   let wrote = false;
 
-  /** Once the share is in place, a failed step is a warning: the vault exists. */
-  const afterCommit = async (what: string, step: () => Promise<void>) => {
+  /** Once the share is in place, a failed step is a warning: the vault exists. True when the step succeeded. */
+  const afterCommit = async (what: string, step: () => Promise<void>): Promise<boolean> => {
     try {
       await step();
+      return true;
     } catch (err) {
       log.warn(`share committed to ${path}, but ${what}: ${errorText(err)}`, { path });
+      return false;
     }
   };
 
@@ -204,8 +240,19 @@ export function createShareStager(opts: ShareStagerOptions): ShareStager {
       // just a second name for it, no longer a file to discard.
       wrote = false;
       const meta = vaultPubkeyFromPackage(staged.publicKeyPackage, network);
-      await afterCommit(`its staging file ${pending} (the same file) was not removed`, () => unlink(pending));
-      await afterCommit(`its directory ${dir} was not synced`, () => syncDir(dir));
+      // The new name is made durable before the old one is removed: a crash between the two must
+      // leave the share under at least one name. If that sync fails the staging name stays (it is
+      // the same file as the share, and the next start removes it).
+      const linked = await afterCommit(
+        `its directory ${dir} was not synced after the link, so its staging file ${pending} (the same file) was kept`,
+        () => syncDir(dir),
+      );
+      if (linked) {
+        const unlinked = await afterCommit(`its staging file ${pending} (the same file) was not removed`, () =>
+          unlink(pending),
+        );
+        if (unlinked) await afterCommit(`its directory ${dir} was not synced after the unlink`, () => syncDir(dir));
+      }
       await afterCommit(
         `vault-pubkey.json was not written to ${vaultPubkeyPath}; the daemon rewrites it on its next start`,
         () => writeVaultPubkeyFile(meta, vaultPubkeyPath),

@@ -112,11 +112,11 @@ describe('EndpointParseError', () => {
 });
 
 describe('isLoopbackHost', () => {
-  it.each(['localhost', 'LOCALHOST', 'localhost.', '127.0.0.1', '127.255.3.4', '::1', '[::1]', '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1', '::1%lo'])(
+  it.each(['localhost', 'LOCALHOST', '127.0.0.1', '127.255.3.4', '::1', '[::1]', '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1', '::1%lo'])(
     'is true for %s',
     (host) => expect(isLoopbackHost(host)).toBe(true),
   );
-  it.each(['localhost.evil.example', '127.0.0.1.nip.io', '128.0.0.1', '10.0.0.1', '::2', 'fe80::1', '0.0.0.0', '::', '', 'example.com'])(
+  it.each(['localhost.', 'LOCALHOST.', 'localhost.evil.example', '127.0.0.1.nip.io', '128.0.0.1', '10.0.0.1', '::2', 'fe80::1', '0.0.0.0', '::', '', 'example.com'])(
     'is false for %s',
     (host) => expect(isLoopbackHost(host)).toBe(false),
   );

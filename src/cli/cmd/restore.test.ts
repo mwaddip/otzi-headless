@@ -4,7 +4,7 @@
  * coverage to make sure the friendly messages survive refactors.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   chmod,
   lstat,
@@ -33,6 +33,21 @@ import {
   BACKUP_SALT_LEN,
 } from './backup';
 import { runRestore } from './restore';
+
+// A test can make `open` fail for one file name, to break a restore part-way.
+const failOpen = vi.hoisted(() => ({ suffix: undefined as string | undefined }));
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    open: async (...args: Parameters<typeof actual.open>) => {
+      if (failOpen.suffix !== undefined && String(args[0]).endsWith(failOpen.suffix)) {
+        throw Object.assign(new Error('EIO: simulated write failure'), { code: 'EIO' });
+      }
+      return actual.open(...args);
+    },
+  };
+});
 
 interface Fixture {
   /** The install root the fixture lives under (backup's `rootOverride`). */
@@ -474,7 +489,7 @@ describe('runRestore', () => {
         daemonStatusCheck: NEVER_RUNNING,
       }),
     ).rejects.toThrow(
-      `config already present at ${expectedConfigPath}; remove it first`,
+      `config already present at ${expectedConfigPath}; move it aside first`,
     );
   });
 
@@ -497,7 +512,7 @@ describe('runRestore', () => {
         daemonStatusCheck: NEVER_RUNNING,
       }),
     ).rejects.toThrow(
-      'config already present at /etc/otzi/daemon.toml; remove it first',
+      'config already present at /etc/otzi/daemon.toml; move it aside first',
     );
   });
 
@@ -1037,7 +1052,9 @@ describe('runRestore — entry and path safety', () => {
     ['[node].pubkey_book_file', '[node]\npubkey_book_file = "/var/lib/otzi/../../../etc/passwd"\n', 'etc/passwd'],
     ['[share].path (the data dir itself)', '[share]\npath = "/var/lib/otzi"\n', 'var/lib/otzi'],
     ['[share].path (relative)', '[share]\npath = "var/lib/otzi/share.json"\n', 'var/lib/otzi/share.json'],
-  ])('refuses a daemon.toml whose %s is outside /etc/otzi and /var/lib/otzi', async (key, toml, tarPath) => {
+    ['[share].path (nested)', '[share]\npath = "/var/lib/otzi/keys/share.json"\n', 'var/lib/otzi/keys/share.json'],
+    ['[node].identity_key_file (nested)', '[node]\nidentity_key_file = "/etc/otzi/keys/identity.json"\n', 'etc/otzi/keys/identity.json'],
+  ])('refuses a daemon.toml whose %s is not a direct child of /etc/otzi or /var/lib/otzi', async (key, toml, tarPath) => {
     const archive = await rawArchive(tmp, [
       { name: 'etc/otzi/daemon.toml', type: '0', data: toml },
       { name: tarPath, type: '0', data: 'payload' },
@@ -1052,7 +1069,7 @@ describe('runRestore — entry and path safety', () => {
     expect(await filesUnder(root)).toEqual([]);
   });
 
-  it('refuses to write through a symlinked directory inside the data dir', async () => {
+  it('refuses a target below a subdirectory of the data dir, so no symlinked directory can redirect a write', async () => {
     const outside = join(tmp, 'outside');
     await mkdir(outside, { recursive: true });
     await mkdir(join(root, 'var/lib/otzi'), { recursive: true });
@@ -1061,9 +1078,60 @@ describe('runRestore — entry and path safety', () => {
       { name: 'etc/otzi/daemon.toml', type: '0', data: '[share]\npath = "/var/lib/otzi/sub/share.json"\n' },
       { name: 'var/lib/otzi/sub/share.json', type: '0', data: 'payload' },
     ]);
-    await expect(restore(archive)).rejects.toThrow(/symlink/);
+    await expect(restore(archive)).rejects.toThrow(
+      /\[share\]\.path = \/var\/lib\/otzi\/sub\/share\.json is not a direct child of \/etc\/otzi or \/var\/lib\/otzi; refused/,
+    );
     expect(await filesUnder(outside)).toEqual([]);
     expect(await pathExists(join(root, 'etc/otzi/daemon.toml'))).toBe(false);
+  });
+
+  it('places the share, identity and pubkey book as direct children of either allowed directory', async () => {
+    const toml =
+      '[share]\npath = "/var/lib/otzi/share.json"\n[node]\nidentity_key_file = "/etc/otzi/identity.json"\npubkey_book_file = "/var/lib/otzi/./pubkeys.json"\n';
+    const archive = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: toml },
+      { name: 'var/lib/otzi/share.json', type: '0', data: 'share' },
+      { name: 'etc/otzi/identity.json', type: '0', data: 'identity' },
+      { name: 'var/lib/otzi/pubkeys.json', type: '0', data: 'book' },
+    ]);
+    const result = await restore(archive);
+    expect(result.restoredFiles.map(f => f.path).sort()).toEqual(
+      ['etc/otzi/daemon.toml', 'etc/otzi/identity.json', 'var/lib/otzi/pubkeys.json', 'var/lib/otzi/share.json'].map(p =>
+        join(root, p),
+      ),
+    );
+    expect(await filesUnder(root)).toEqual([
+      'etc/otzi/daemon.toml',
+      'etc/otzi/identity.json',
+      'var/lib/otzi/pubkeys.json',
+      'var/lib/otzi/share.json',
+    ]);
+  });
+
+  it('shows archive-derived names without control characters in its refusals', async () => {
+    const hostile = 'var/lib/otzi/evil\u001b[2J\nfake line';
+    const entry = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: TOML },
+      { name: hostile, type: '2', linkname: '/etc/shadow' },
+    ]);
+    const err1 = await restore(entry).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err1!.message).toBe('archive entry var/lib/otzi/evil[2J fake line: symlink refused');
+
+    // The same for a path the archived daemon.toml names (TOML escapes carry the control characters).
+    const path = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: '[share]\npath = "/etc/evil\\u001b[2J\\nfake line"\n' },
+    ]);
+    const err2 = await restore(path).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err2!.message).toBe(
+      'daemon.toml in the archive: [share].path = /etc/evil[2J fake line is outside /etc/otzi and /var/lib/otzi; refused',
+    );
+    expect(await filesUnder(root)).toEqual([]);
   });
 
   it('refuses an archive that names the same file twice', async () => {
@@ -1105,20 +1173,23 @@ describe('runRestore — entry and path safety', () => {
     await mkdir(join(root, 'etc/otzi'), { recursive: true });
     await writeFile(join(root, 'var/lib/otzi/keep.txt'), 'keep me');
     await writeFile(join(root, 'etc/otzi/otzi.env'), 'OTZI_SHARE_PASSWORD=x');
-    // The pubkey book lives "inside" the identity file: placing it after the
-    // identity file fails (its parent is a regular file).
     const toml =
-      '[share]\npath = "/var/lib/otzi/share.json"\n[node]\nidentity_key_file = "/var/lib/otzi/id"\npubkey_book_file = "/var/lib/otzi/id/book.json"\n';
+      '[share]\npath = "/var/lib/otzi/share.json"\n[node]\nidentity_key_file = "/var/lib/otzi/id"\npubkey_book_file = "/var/lib/otzi/book.json"\n';
     const archive = await rawArchive(tmp, [
       { name: 'etc/otzi/daemon.toml', type: '0', data: toml },
       { name: 'var/lib/otzi/share.json', type: '0', data: 'share' },
       { name: 'var/lib/otzi/id', type: '0', data: 'identity' },
-      { name: 'var/lib/otzi/id/book.json', type: '0', data: 'book' },
+      { name: 'var/lib/otzi/book.json', type: '0', data: 'book' },
     ]);
 
-    await expect(restore(archive)).rejects.toThrow();
+    // The last file cannot be written: the three before it must go, the two that were there stay.
+    failOpen.suffix = 'var/lib/otzi/book.json';
+    try {
+      await expect(restore(archive)).rejects.toThrow(/EIO: simulated write failure/);
+    } finally {
+      failOpen.suffix = undefined;
+    }
     expect(await filesUnder(root)).toEqual(['etc/otzi/otzi.env', 'var/lib/otzi/keep.txt']);
     expect(await readFile(join(root, 'var/lib/otzi/keep.txt'), 'utf8')).toBe('keep me');
   });
 });
-

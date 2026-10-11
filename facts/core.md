@@ -394,7 +394,7 @@ export type CeremonyMessage = AnnounceDkg | AnnounceSign | SignoffDone | Signoff
 - `function finalize(session) → { keyPackage, publicKeyPackage }`
   - **Pre:** Round 2 run; all N−1 round-2 packages addressed to self collected.
   - **Post:** Calls frots `dkgFinalize` (verifies every received share), caches and returns the key material with the BIP341 key-path tweak applied.
-  - **Throws:** On missing packages or a frots verification failure.
+  - **Throws:** On missing packages or a frots verification failure. frots names the sender of a bad share by FROST identifier (`from sender 3`); the error rewrites it to the party id (`from party 2`, cause kept), like every other message.
   - **Idempotency:** Returns the cached result on repeated calls.
 
 - `function addBlob(session, blob: string, round: 'r1' | 'r2', from: PartyId) → { ok: true } | { ok: false; error: string }`

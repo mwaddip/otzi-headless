@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -193,6 +193,24 @@ strategy = "auto"
     expect(state.share!.partyId).toBe(2);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]!.msg).toContain(pendingPath(sharePath));
+  });
+
+  it('removes a leftover .pending that is the loaded share itself, logging at info and not warning', async () => {
+    await writeShare();
+    await link(sharePath, pendingPath(sharePath)); // a failed unlink after the commit's link
+    const { logger, warnings } = capturingLogger();
+    const infos: string[] = [];
+    const state = await loadAndValidate(configPath, {
+      env,
+      vaultPubkeyPath,
+      logger: { ...logger, info: msg => infos.push(msg) },
+    });
+    expect(state.share!.partyId).toBe(2);
+    expect(existsSync(pendingPath(sharePath))).toBe(false);
+    expect(existsSync(sharePath)).toBe(true);
+    expect(warnings).toEqual([]);
+    expect(infos).toHaveLength(1);
+    expect(infos[0]).toContain(pendingPath(sharePath));
   });
 
   it('warns about a leftover .pending file on a node without a share', async () => {

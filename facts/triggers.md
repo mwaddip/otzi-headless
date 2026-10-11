@@ -90,7 +90,7 @@
 - **Request handling**
   - **Pre:** HTTP request arrives.
   - **Post:** Body read up to MAX_BODY_BYTES (1MB), parsed as JSON if Content-Type is application/json.
-  - **Host header (loopback bind):** when the bind host is loopback (`isLoopbackHost`; always, as the parser allows nothing else), a request whose `Host` header does not name a loopback host (`localhost`, `127.0.0.0/8`, `::1`) with the port the server listens on is answered `403 {"error":"forbidden host"}` before auth or body: a web page in the operator's browser cannot reach the API through DNS rebinding.
+  - **Host header (loopback bind):** when the bind host is loopback (`isLoopbackHost`; always, as the parser allows nothing else), a request whose `Host` header does not name a loopback host (`localhost`, `127.0.0.0/8`, `::1`; not `localhost.`) with the port the server listens on is answered `403 {"error":"forbidden host"}` before auth or body: a web page in the operator's browser cannot reach the API through DNS rebinding.
   - **Auth:** If `authTokenEnv` was configured, request MUST have `Authorization: Bearer <token>` header; 401 if missing/wrong. The comparison is constant-time (`timingSafeEqual` over the SHA-256 digests of the header and of `Bearer <token>`).
   - **Body parsing:** 400 if JSON parse fails.
   - **Handler:** Invoked with `HttpRequest`; exceptions caught, logged, and returned as 500.

@@ -15,7 +15,7 @@
 - `async loadAndValidate(configPath: string, options?: { env?: Readonly<Record<string, string | undefined>>; vaultPubkeyPath?: string; logger?: Logger }): Promise<LoadedDaemonState>`
   - **Options (defaults):** `env` — `process.env`; `vaultPubkeyPath` — `DEFAULT_VAULT_PUBKEY_PATH` (tests and alternate installs pass their own path so nothing is written to `/var/lib/otzi`); `logger` — `NOOP_LOGGER`.
   - **Pre:** `configPath` is a readable `daemon.toml`. The share password is in the env var named by `[share].password_env` (in `options.env`).
-  - **Post:** Config parsed (`parseDaemonConfigToml`); `share = await loadVaultShare(config.share.path, password, config.network.name)`; `warnOnPendingShare(config.share.path, logger)` reports a `.pending` file next to the share path, which is never loaded. Whenever a share is loaded, `vault-pubkey.json` is rewritten from it (`writeVaultPubkeyFile(vaultPubkeyFromPackage(share.publicKeyPackage, network), vaultPubkeyPath)`), in addition to the write on DKG commit. The rewrite is best-effort: a write failure is logged at warn level through `logger` and does not stop startup.
+  - **Post:** Config parsed (`parseDaemonConfigToml`); `share = await loadVaultShare(config.share.path, password, config.network.name)`; when a share was loaded, `removeCommittedStaging(config.share.path, logger)` first removes a `.pending` that is the share's own file (info line, no warning); otherwise `warnOnPendingShare(config.share.path, logger)` reports a `.pending` file next to the share path, which is never loaded. Whenever a share is loaded, `vault-pubkey.json` is rewritten from it (`writeVaultPubkeyFile(vaultPubkeyFromPackage(share.publicKeyPackage, network), vaultPubkeyPath)`), in addition to the write on DKG commit. The rewrite is best-effort: a write failure is logged at warn level through `logger` and does not stop startup.
   - **Ownership:** the startup `vault-pubkey.json` rewrite and the `.pending` warning both happen here and nowhere else at startup; `runDaemonCommand` passes its logger and does not warn a second time.
   - **Throws:** `ConfigError` / TOML errors; `Error` naming the env var when the password is missing or empty; every `loadVaultShare` error (wrong password, network mismatch, corrupted file).
 
@@ -50,6 +50,9 @@
     - other read errors (anything but ENOENT).
   - **Invariant:** the password is never logged and never part of an error message.
 
+- `async removeCommittedStaging(path: string, log: Logger): Promise<boolean>`
+  - **Post:** When `pendingPath(path)` and `path` are both regular files (`lstat`, no symlinks) with the same device and inode — the second name `commit` leaves when its `unlink` after the `link` failed — unlinks `pendingPath(path)`, logs one info line naming both, and returns `true`; a failed unlink is a warn line (remove it by hand) and also returns `true`. In every other case (no share, no `.pending`, a different file, a symlink, any `lstat` error) it touches nothing, logs nothing and returns `false`. The file is the committed share itself, so there is nothing to recover and no rename or overwrite advice.
+
 - `async warnOnPendingShare(path: string, log: Logger): Promise<void>`
   - **Post:** When `pendingPath(path)` exists, logs one warn line naming it: it is left over from an unfinished DKG and is not loaded; it may be this node's share of a vault the other nodes committed — when `otzi vault` on another node shows that vault, rename it to `path` and restart; otherwise the next DKG overwrites it. When the file's plaintext header (`network`, `internalKey`) reads, the line names the vault address (`vaultPaymentFromInternalKey`); the file is never decrypted. Otherwise does nothing.
 
@@ -61,7 +64,7 @@
   - **`stage(r)`:** writes `JSON.stringify(await encryptShareFile(r.keyPackage, r.publicKeyPackage, network, partyId, password))` to `pendingPath(path)` with mode 0600, creating the parent directory and overwriting any earlier `.pending`; then fsyncs the file and its directory. It resolves only once the staged share is durable, because the DKG publishes this node's confirmation right after it.
   - **`commit()`:**
     - **Pre:** `stage` resolved.
-    - **Post:** `link(pendingPath(path), path)` — no-clobber: a link never replaces an existing entry — then `unlink(pendingPath(path))`, fsync of the directory, and `writeVaultPubkeyFile(vaultPubkeyFromPackage(r.publicKeyPackage, network), vaultPubkeyPath)`. Once the link succeeded the share is in place and `commit` resolves: a failure to unlink the staging file, to fsync the directory or to write `vault-pubkey.json` is logged at warn level naming the path (the daemon rewrites `vault-pubkey.json` on its next start; a leftover `.pending` is the same file as the share).
+    - **Post:** `link(pendingPath(path), path)` — no-clobber: a link never replaces an existing entry — fsync of the directory (the new name is durable before the old one goes), `unlink(pendingPath(path))`, fsync of the directory again, and `writeVaultPubkeyFile(vaultPubkeyFromPackage(r.publicKeyPackage, network), vaultPubkeyPath)`. Once the link succeeded the share is in place and `commit` resolves: a failure to fsync the directory after the link (the staging file is then kept and not unlinked), to unlink the staging file, to fsync the directory after the unlink or to write `vault-pubkey.json` is logged at warn level naming the path (the daemon rewrites `vault-pubkey.json` on its next start; a leftover `.pending` is the same file as the share, and the next start removes it with `removeCommittedStaging`).
     - **Throws:** (nothing placed at `path` in each case)
       - `Error('share path already exists: <path>')` when an entry exists at `path` (EEXIST from the link, a dangling symlink included);
       - `Error('commit called before stage')` when `stage` has not resolved;
@@ -71,12 +74,12 @@
 **Invariants:**
 - A share reaches `path` only through `commit`, i.e. only after the DKG's all-N confirmation, and `commit` never replaces an entry at `path`.
 - Share files are mode 0600 from the first byte written (`.pending` and after the commit).
-- The staged share is synced to disk before the node's confirmation is published, and the directory is synced after the commit.
+- The staged share is synced to disk before the node's confirmation is published, and the directory is synced between the commit's link and unlink and after the unlink.
 - Share files are byte-compatible with web Ötzi in both directions.
 
 **Cross-component contracts:**
 - Depends on: `encryptShareFile`, `decryptShareFile`, `assertShareMatchesVault` (`src/otzi/lib/share-file.ts`), `vaultPaymentFromInternalKey` (`src/otzi/lib/bitcoin.ts`), `vault-pubkey.ts`.
-- Used by: `config-merge.ts` (`loadVaultShare`, `warnOnPendingShare`), `Daemon` (`vaultFileExists`, `createShareStager` for orchestrator and leader).
+- Used by: `config-merge.ts` (`loadVaultShare`, `removeCommittedStaging`, `warnOnPendingShare`), `Daemon` (`vaultFileExists`, `createShareStager` for orchestrator and leader).
 
 ---
 
@@ -209,7 +212,7 @@
 
 - **Ceremony deadline:** each ceremony the leader runs is bounded as a whole. From the ceremony start (just before the announce) an `AbortController` is aborted after `ceremonyDeadlines.signingMs` / `dkgMs`; its timer is cleared in a `finally`.
   - Signing: the controller's signal is `leadSigning`'s `signal`. A deadline abort fails the request with `Error('ceremony deadline of <ms> ms passed')` (500), and `signoff-aborted` carries that reason.
-  - DKG: the controller's signal is combined with the slot signal (`AbortSignal.any`) for `runDkgCeremony`, which takes its abort path (stager `discard` before this node's confirmation, the staged share kept after it; no broadcast of its own). When the deadline, not the slot, aborted it, the leader broadcasts `signoff-aborted {ceremonyId, reason: 'ceremony deadline of <ms> ms passed'}` and the request fails with `DKG aborted: ceremony deadline of <ms> ms passed` (500) — or, when this node had published its confirmation, with `DkgShareKeptError('ceremony deadline of <ms> ms passed', keptNote)`, so the message still says where the staged share was kept and to check the other nodes.
+  - DKG: the controller's signal is combined with the slot signal (`AbortSignal.any`) for `runDkgCeremony`, which takes its abort path (stager `discard` before this node's confirmation, the staged share kept after it; no broadcast of its own). When the deadline, not the slot, aborted it, the leader broadcasts `signoff-aborted {ceremonyId, reason: 'ceremony deadline of <ms> ms passed'}` and the request fails with `DKG aborted: ceremony deadline of <ms> ms passed` (500) — or, when this node had published its confirmation, with `DkgShareKeptError('ceremony deadline of <ms> ms passed', keptNote)`, so the message still says where the staged share was kept and to check the other nodes. A ceremony the deadline merely stopped fails with a bare `aborted`; when it failed with something else as the deadline passed (a refused commit, a full disk), that failure is appended to the reason in parentheses — `ceremony deadline of <ms> ms passed (share path already exists: <path>)` — in the error, the log line and the broadcast reason (cut to 1024 characters), and an `aborted (discard failed: …)` note survives the same way.
 - **Leader pulls:** each ceremony the leader runs uses `{ ...io, pullOpts: { ...io.pullOpts, deadlineMs, maxAttempts: Number.MAX_SAFE_INTEGER } }` with `deadlineMs` = `ceremonyDeadlines.signingMs` or `ceremonyDeadlines.dkgMs` — pulls retry with backoff until the ceremony deadline, as on participants; `io.pullOpts` supplies only the backoff (`initialDelayMs`, `maxDelayMs`).
 
 - `class LeaderDispatcher`
@@ -266,8 +269,8 @@
 
 - `class Daemon`
   - **`constructor(deps: DaemonDeps)`**
-    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook, logger, secretEnv: [config.share.passwordEnv] })`, and one info line `daemon: gate strategy <strategy>`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath, logger })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(addressBookPath, network)` (`addressBookPath` = `deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH`); the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file with `readAddressBook(addressBookPath, network, { missing: 'error' })` and returns its addresses, so it throws when the file does not exist (ENOENT) as well as when it is invalid — where the `addressBook` labelling read returns `[]` on ENOENT — and `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
-    - **Invariant:** Does NOT start anything. The share password reaches only the share stager; it is never logged or returned, and an `exec` gate's command does not inherit its environment variable.
+    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook, logger, secretEnv: [config.share.passwordEnv, ...triggerTokenEnvNames(config.triggers)] })` (`triggerTokenEnvNames` = the `auth_token_env` of every `http` trigger), and one info line `daemon: gate strategy <strategy>`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath, logger })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(addressBookPath, network)` (`addressBookPath` = `deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH`); the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file with `readAddressBook(addressBookPath, network, { missing: 'error' })` and returns its addresses, so it throws when the file does not exist (ENOENT) as well as when it is invalid — where the `addressBook` labelling read returns `[]` on ENOENT — and `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
+    - **Invariant:** Does NOT start anything. The share password reaches only the share stager; it is never logged or returned, and an `exec` gate's command inherits neither its environment variable nor an HTTP trigger's token variable.
   - **`async start(): Promise<void>`** — starts the orchestrator and every trigger. Reentrant.
   - **`async stop(): Promise<void>`** — stops triggers, the orchestrator, and closes the blob server. Reentrant.
   - **`onCompleted(handler): Unsubscribe`** — forwards orchestrator outcomes.
@@ -601,7 +604,7 @@
 - Exports the wire-format constants `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_SALT_LEN`, `BACKUP_IV_LEN`, `BACKUP_TAG_LEN`, `BACKUP_HEADER_LEN`, `BACKUP_PBKDF2_ITERATIONS`, the default file paths and `stripLeadingSlash` — `restore.ts` consumes all of these.
 
 ### `restore.ts`
-**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, read its tar members in memory, validate every member and every target path, then create each file at its canonical absolute path with the mode the daemon expects. Usable as a CLI verb and as the engine the debconf postinst pipes the password into via stdin. Restore runs as root, so it writes only the vault's own files, only under `/etc/otzi` and `/var/lib/otzi`, and never replaces or follows anything already there.
+**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, read its tar members in memory, validate every member and every target path, then create each file at its canonical absolute path with the mode the daemon expects. Usable as a CLI verb and as the engine the debconf postinst pipes the password into via stdin. Restore runs as root, so it writes only the vault's own files, only directly inside `/etc/otzi` and `/var/lib/otzi`, and never replaces or follows anything already there.
 
 **Public surface:**
 - `runRestore(opts: RestoreOptions): Promise<RestoreResult>`
@@ -612,19 +615,19 @@
   - **Validation (after decryption, before anything is written; each failure throws and writes nothing):**
     1. Every tar member name is relative and has no `..` segment (`archive entry <name>: absolute path refused` / `… '..' refused`).
     2. Every member is a regular file, or a directory that is not a target path (skipped). A symlink, hardlink, character or block device or FIFO anywhere, and a directory at a target path, is refused (`archive entry <name>: <symlink|hardlink|character device|block device|FIFO|directory where a regular file is expected> refused`). A file named twice is refused.
-    3. The targets are the fixed tar paths `etc/otzi/daemon.toml` (required), `etc/otzi/address-book.otzi.json`, `var/lib/otzi/vault-pubkey.json`, plus the three paths the archived daemon.toml names (`[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file`, loose-parsed; the backup defaults when absent). Each of those three must be absolute and resolve (`path.posix.resolve`) strictly inside `/etc/otzi/` or `/var/lib/otzi/`, else `daemon.toml in the archive: <key> = <path> is outside /etc/otzi and /var/lib/otzi; refused`; no two targets may be the same path.
+    3. The targets are the fixed tar paths `etc/otzi/daemon.toml` (required), `etc/otzi/address-book.otzi.json`, `var/lib/otzi/vault-pubkey.json`, plus the three paths the archived daemon.toml names (`[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file`, loose-parsed; the backup defaults when absent). Each of those three must be absolute and resolve (`path.posix.resolve`) to a direct child of `/etc/otzi` or `/var/lib/otzi`: a path elsewhere is refused with `daemon.toml in the archive: <key> = <path> is outside /etc/otzi and /var/lib/otzi; refused`, a path below a subdirectory of them (`/var/lib/otzi/keys/share.json`) with `… <key> = <path> is not a direct child of /etc/otzi or /var/lib/otzi; refused`; no two targets may be the same path. With every target directly inside an allowed directory there is no directory in between that a symlink could replace between the checks and the write.
     4. Every other member (and `meta.json`, read for the result) is not written: it is skipped and listed in `skippedEntries`.
-    5. No existing directory between `<root>/etc/otzi` or `<root>/var/lib/otzi` and a target is a symlink or a non-directory (`refusing to restore through a symlink at <path>` / `… <path> is not a directory`).
-    6. **No target exists** (`lstat`; a symlink, dangling or not, counts): otherwise `restore would replace existing files: <path>, …; move them aside and run restore again`, listing every one.
-  - **Placement:** in archive order, each target is created with `open(path, 'wx', mode)` (fails if anything appeared there meanwhile; never follows a symlink at the final component), written, `chmod`'d to its mode and synced; parent directories are created as needed.
+    5. **No target exists** (`lstat`; a symlink, dangling or not, counts): otherwise `restore would replace existing files: <path>, …; move them aside and run restore again`, listing every one.
+    - **Display:** every piece of archive-derived text in these refusals (entry names, the paths and parse errors of the archived daemon.toml, the target paths) is shown through `displayText` (`src/util/text.ts`): control characters are removed, so an archive cannot inject terminal escape sequences into the error.
+  - **Placement:** in archive order, each target is created with `open(path, 'wx', mode)` (fails if anything appeared there meanwhile; never follows a symlink at the final component), written, `chmod`'d to its mode and synced; the allowed directory is created when missing.
   - **Post:** Every target in the archive exists at its canonical (or `rootOverride`-prefixed) absolute path with its mode (see "Restored file modes"). `meta.json` is read into the result but NEVER written to disk. Returns `{ restoredFiles: { path, mode }[], skippedEntries: string[], metaPartyId?, metaCreatedAt?, metaHostname? }`.
   - **Throws:**
     - Bad magic → `Error('not an otzi backup archive (magic mismatch)')`.
-    - Existing daemon.toml → `Error('config already present at <path>; remove it first')`.
+    - Existing daemon.toml → `Error('config already present at <path>; move it aside first')`.
     - Daemon running → `Error('daemon is running; stop it with \`systemctl stop otzi\` first')`.
     - Wrong password OR tampered ciphertext → BOTH surface as `Error('wrong password or corrupted archive')`. Distinguishing the two would give an attacker an oracle.
     - The validation errors above.
-    - A failure during placement → every file this call created is removed (LIFO); the original error is rethrown. Files that existed before the call are never touched (none is a target, by step 6), and parent directories are NOT rolled back.
+    - A failure during placement → every file this call created is removed (LIFO); the original error is rethrown. Files that existed before the call are never touched (none is a target, by step 5), and parent directories are NOT rolled back.
 
 - `RestoreOptions`
   - `archivePath: string` — required positional CLI arg.
@@ -711,6 +714,6 @@ Constants exported by `backup.ts`: `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_S
 | pubkey-book file | 0644 |
 | `/var/lib/otzi/vault-pubkey.json` | 0644 |
 
-Operator-configurable paths (share / identity / pubkeys per `[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file` in daemon.toml) are resolved at restore time by loose-parsing the archived daemon.toml, and must lie inside `/etc/otzi` or `/var/lib/otzi`. Unrecognized tar entries are not written; `otzi restore` prints `warning: skipped archive entry <name>: not part of an otzi backup` to stderr for each.
+Operator-configurable paths (share / identity / pubkeys per `[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file` in daemon.toml) are resolved at restore time by loose-parsing the archived daemon.toml, and must be direct children of `/etc/otzi` or `/var/lib/otzi` (no nested layouts). Unrecognized tar entries are not written; `otzi restore` prints `warning: skipped archive entry <name>: not part of an otzi backup` to stderr for each.
 
 ---

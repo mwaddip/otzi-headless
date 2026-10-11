@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -14,6 +14,7 @@ import {
   createShareStager,
   loadVaultShare,
   pendingPath,
+  removeCommittedStaging,
   vaultFileExists,
   warnOnPendingShare,
 } from './vault-share';
@@ -363,6 +364,42 @@ describe('vault-share', () => {
     it('rethrows read errors other than ENOENT instead of treating them as no vault', async () => {
       await mkdir(path, { recursive: true }); // a directory where the file should be
       await expect(loadVaultShare(path, PASSWORD, 'testnet4')).rejects.toMatchObject({ code: 'EISDIR' });
+    });
+  });
+
+  describe('removeCommittedStaging', () => {
+    it('removes a .pending that is the same file as the share and logs at info', async () => {
+      await writeShare();
+      await link(path, pendingPath(path)); // what a failed unlink after the commit's link leaves
+      const { logger, lines } = capturingLogger();
+      expect(await removeCommittedStaging(path, logger)).toBe(true);
+      expect(existsSync(pendingPath(path))).toBe(false);
+      expect(statSync(path).nlink).toBe(1);
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(goodShare);
+      expect(lines.map(l => l.level)).toEqual(['info']);
+      expect(lines[0]!.msg).toContain(pendingPath(path));
+      expect(lines[0]!.msg).toContain('same file as the committed share');
+      expect(lines[0]!.msg).not.toMatch(/rename|overwrite/);
+    });
+
+    it('leaves a .pending that is a different file, and reports false', async () => {
+      await writeShare();
+      await writeFile(pendingPath(path), JSON.stringify(goodShare), { mode: 0o600 }); // equal content, own inode
+      const { logger, lines } = capturingLogger();
+      expect(await removeCommittedStaging(path, logger)).toBe(false);
+      expect(existsSync(pendingPath(path))).toBe(true);
+      expect(lines).toEqual([]);
+    });
+
+    it('does nothing without a share, without a .pending, or when .pending is a symlink to the share', async () => {
+      const { logger, lines } = capturingLogger();
+      expect(await removeCommittedStaging(path, logger)).toBe(false);
+      await writeShare();
+      expect(await removeCommittedStaging(path, logger)).toBe(false);
+      await symlink(path, pendingPath(path));
+      expect(await removeCommittedStaging(path, logger)).toBe(false);
+      expect(lstatSync(pendingPath(path)).isSymbolicLink()).toBe(true);
+      expect(lines).toEqual([]);
     });
   });
 

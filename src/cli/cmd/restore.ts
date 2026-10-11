@@ -25,11 +25,13 @@
  * Restore runs as root, and an archive can come from a compromised host. So
  * after decryption the tar members are read in memory and validated before
  * anything is written: only the fixed paths and the three paths the archived
- * daemon.toml names are written, each strictly inside /etc/otzi or
- * /var/lib/otzi; `..`, absolute names, links, devices and FIFOs are refused;
- * other members are skipped with a warning. Restore only creates files: it
- * refuses when any target exists, never writes through a symlink, and on a
- * failure removes only the files it created.
+ * daemon.toml names are written, each a direct child of /etc/otzi or
+ * /var/lib/otzi (so no directory between those and a target can be swapped for
+ * a symlink while restore runs); `..`, absolute names, links, devices and
+ * FIFOs are refused; other members are skipped with a warning. Restore only
+ * creates files: it refuses when any target exists, never writes through a
+ * symlink, and on a failure removes only the files it created. Names taken
+ * from the archive are shown through `displayText` in every refusal.
  *
  * Wrong password and tampered ciphertext both surface as the same friendly
  * message — leaking which one happened gives an attacker an oracle.
@@ -38,11 +40,12 @@
 import { execFile as execFileCb } from 'node:child_process';
 import { createDecipheriv, pbkdf2Sync } from 'node:crypto';
 import { lstat, mkdir, open, readFile, rm, stat } from 'node:fs/promises';
-import { dirname, join, posix, relative, resolve, sep } from 'node:path';
+import { dirname, join, posix, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 import { Parser as TarParser } from 'tar';
 import { parse as parseToml } from 'smol-toml';
+import { displayText } from '../../util/text';
 import {
   BACKUP_HEADER_LEN,
   BACKUP_IV_LEN,
@@ -232,7 +235,7 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
       root === '/'
         ? '/etc/otzi/daemon.toml'
         : join(root, 'etc/otzi/daemon.toml');
-    throw new Error(`config already present at ${configPath}; remove it first`);
+    throw new Error(`config already present at ${configPath}; move it aside first`);
   }
 
   // --- Pre-flight check 3: refuse if daemon is running.
@@ -286,13 +289,13 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
   for (const m of members) {
     checkMemberName(m.rawName);
     const refused = REFUSED_TYPES[m.type];
-    if (refused) throw new Error(`archive entry ${m.rawName}: ${refused} refused`);
+    if (refused) throw new Error(`archive entry ${displayText(m.rawName)}: ${refused} refused`);
     if (m.type === 'Directory') {
       directories.push(m);
       continue;
     }
-    if (!REGULAR_TYPES.has(m.type)) throw new Error(`archive entry ${m.rawName}: tar type ${m.type} refused`);
-    if (files.has(m.name)) throw new Error(`archive entry ${m.rawName}: the archive holds this file more than once`);
+    if (!REGULAR_TYPES.has(m.type)) throw new Error(`archive entry ${displayText(m.rawName)}: tar type ${displayText(m.type)} refused`);
+    if (files.has(m.name)) throw new Error(`archive entry ${displayText(m.rawName)}: the archive holds this file more than once`);
     files.set(m.name, m);
   }
 
@@ -313,11 +316,11 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
   }
 
   // --- The targets: the fixed paths, plus the three paths the archived
-  // daemon.toml names, each strictly inside /etc/otzi or /var/lib/otzi.
+  // daemon.toml names, each a direct child of /etc/otzi or /var/lib/otzi.
   const targets = targetModes(files.get('etc/otzi/daemon.toml'));
   for (const d of directories) {
     if (targets.has(d.name)) {
-      throw new Error(`archive entry ${d.rawName}: directory where a regular file is expected refused`);
+      throw new Error(`archive entry ${displayText(d.rawName)}: directory where a regular file is expected refused`);
     }
   }
 
@@ -334,10 +337,11 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
     placements.push({ member: m, dest: resolve(root, m.name), mode });
   }
 
-  // --- The host side: no symlink on the way to a target, and no target exists.
-  for (const p of placements) await checkNoSymlinkOnTheWay(root, p.dest);
+  // --- The host side: no target exists. Every target is a direct child of an
+  // allowed directory, so there is no directory in between that could be swapped
+  // for a symlink between this check and the write below.
   const existing: string[] = [];
-  for (const p of placements) if (await entryExists(p.dest)) existing.push(p.dest);
+  for (const p of placements) if (await entryExists(p.dest)) existing.push(displayText(p.dest));
   if (existing.length > 0) {
     throw new Error(
       `restore would replace existing files: ${existing.join(', ')}; move them aside and run restore again`,
@@ -412,7 +416,7 @@ async function readArchiveMembers(tgz: Buffer): Promise<ArchiveMember[]> {
         });
       });
     });
-    parser.on('error', (err: Error) => rejectParse(new Error(`archive is not a valid tar: ${err.message}`)));
+    parser.on('error', (err: Error) => rejectParse(new Error(`archive is not a valid tar: ${displayText(err.message)}`)));
     parser.on('end', () => resolveParse());
     parser.end(tgz);
   });
@@ -422,16 +426,17 @@ async function readArchiveMembers(tgz: Buffer): Promise<ArchiveMember[]> {
 /** A member name must be relative and must not climb out with `..`. */
 function checkMemberName(rawName: string): void {
   if (rawName.startsWith('/') || /^[A-Za-z]:/.test(rawName)) {
-    throw new Error(`archive entry ${rawName}: absolute path refused`);
+    throw new Error(`archive entry ${displayText(rawName)}: absolute path refused`);
   }
-  if (rawName.split(/[\\/]/).includes('..')) throw new Error(`archive entry ${rawName}: '..' refused`);
-  if (rawName === '' || posix.normalize(rawName) === '.') throw new Error(`archive entry '${rawName}': empty name refused`);
+  if (rawName.split(/[\\/]/).includes('..')) throw new Error(`archive entry ${displayText(rawName)}: '..' refused`);
+  if (rawName === '' || posix.normalize(rawName) === '.') throw new Error(`archive entry '${displayText(rawName)}': empty name refused`);
 }
 
 /**
  * The tar paths restore writes, with their modes: the fixed ones and the
  * three the archived daemon.toml names. Throws when daemon.toml is missing or
- * unreadable, or names a path outside /etc/otzi and /var/lib/otzi.
+ * unreadable, or names a path that is not a direct child of /etc/otzi or
+ * /var/lib/otzi.
  */
 function targetModes(daemonToml: ArchiveMember | undefined): Map<string, number> {
   let rawConfig: Record<string, unknown>;
@@ -441,7 +446,7 @@ function targetModes(daemonToml: ArchiveMember | undefined): Map<string, number>
     // wouldn't pass full validation (e.g. mid-bootstrap, missing peers).
     rawConfig = parseToml(daemonToml.data.toString('utf8')) as Record<string, unknown>;
   } catch (err) {
-    throw new Error(`archive missing or malformed daemon.toml: ${(err as Error).message}`);
+    throw new Error(`archive missing or malformed daemon.toml: ${displayText((err as Error).message)}`);
   }
   const shareTable = (rawConfig.share ?? {}) as Record<string, unknown>;
   const nodeTable = (rawConfig.node ?? {}) as Record<string, unknown>;
@@ -456,44 +461,24 @@ function targetModes(daemonToml: ArchiveMember | undefined): Map<string, number>
   for (const [key, path, mode] of dynamic) {
     const tarPath = allowedTarPath(key, path);
     if (targets.has(tarPath)) {
-      throw new Error(`daemon.toml in the archive: ${key} = ${path} names a file another key also names; refused`);
+      throw new Error(`daemon.toml in the archive: ${key} = ${displayText(path)} names a file another key also names; refused`);
     }
     targets.set(tarPath, mode);
   }
   return targets;
 }
 
-/** The tar path of an absolute path that lies strictly inside an allowed directory. */
+/** The tar path of an absolute path that is a direct child of an allowed directory. */
 function allowedTarPath(key: string, path: string): string {
-  const outside = () =>
-    new Error(`daemon.toml in the archive: ${key} = ${path} is outside /etc/otzi and /var/lib/otzi; refused`);
-  if (!path.startsWith('/')) throw outside();
+  const refuse = (why: string) =>
+    new Error(`daemon.toml in the archive: ${key} = ${displayText(path)} ${why}; refused`);
+  if (!path.startsWith('/')) throw refuse('is outside /etc/otzi and /var/lib/otzi');
   const tarPath = stripLeadingSlash(posix.resolve(path));
-  if (!ALLOWED_DIRS.some(dir => tarPath.startsWith(`${dir}/`))) throw outside();
-  return tarPath;
-}
-
-/**
- * Every existing directory between the allowed directory and `dest` must be a
- * real directory: a symlink there (the data dir is group-writable) would send
- * the write elsewhere.
- */
-async function checkNoSymlinkOnTheWay(root: string, dest: string): Promise<void> {
-  const base = ALLOWED_DIRS.map(dir => resolve(root, dir)).find(b => dest.startsWith(`${b}${sep}`));
-  if (!base) throw new Error(`internal: restore target ${dest} is outside the allowed directories`);
-  let current = base;
-  for (const part of relative(base, dirname(dest)).split(sep).filter(Boolean)) {
-    current = join(current, part);
-    let st;
-    try {
-      st = await lstat(current);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; // created below, by restore
-      throw err;
-    }
-    if (st.isSymbolicLink()) throw new Error(`refusing to restore through a symlink at ${current}`);
-    if (!st.isDirectory()) throw new Error(`refusing to restore: ${current} is not a directory`);
+  if ((ALLOWED_DIRS as readonly string[]).includes(posix.dirname(tarPath))) return tarPath;
+  if (ALLOWED_DIRS.some(dir => tarPath.startsWith(`${dir}/`))) {
+    throw refuse('is not a direct child of /etc/otzi or /var/lib/otzi');
   }
+  throw refuse('is outside /etc/otzi and /var/lib/otzi');
 }
 
 /** True iff any file system entry (a dangling symlink included) exists at `p`. */

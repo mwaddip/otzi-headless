@@ -517,6 +517,52 @@ describe('LeaderDispatcher: a DKG that fails after its confirmation', () => {
   });
 });
 
+describe('LeaderDispatcher: the deadline does not hide the failure that was thrown', () => {
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+  it('a DKG whose staging fails as the deadline passes names both', async () => {
+    const ring = makeRing(3);
+    cosigner(ring[1]!);
+    cosigner(ring[2]!);
+    const stager = recordingStager();
+    stager.stage = async () => {
+      stager.calls.push('stage');
+      await sleep(DEADLINE_MS + 200);
+      throw new Error('disk full');
+    };
+    const leader = leaderOn(ring[0]!, { vault: undefined, slots: fakeSlots().slots, createStager: () => stager });
+
+    const err = await rejection(leader.runDkg({ ceremonyId: 'gen-disk' }));
+
+    expect((err as Error).message).toBe(`DKG aborted: ceremony deadline of ${DEADLINE_MS} ms passed (disk full)`);
+    expect(((err as Error).cause as Error).message).toBe('DKG aborted: disk full');
+  });
+
+  it('a kept share is reported with the failure that was thrown and the recovery', async () => {
+    const ring = makeRing(3);
+    cosigner(ring[1]!);
+    cosigner(ring[2]!);
+    const stager = recordingStager();
+    stager.commit = async () => {
+      stager.calls.push('commit');
+      await sleep(DEADLINE_MS + 200);
+      throw new Error('share path already exists: /test/share.json');
+    };
+    const leader = leaderOn(ring[0]!, { vault: undefined, slots: fakeSlots().slots, createStager: () => stager });
+
+    const err = await rejection(leader.runDkg({ ceremonyId: 'gen-exists' }));
+
+    expect(err).toBeInstanceOf(DkgShareKeptError);
+    expect((err as Error).message).toMatch(
+      new RegExp(
+        `^DKG aborted: ceremony deadline of ${DEADLINE_MS} ms passed \\(share path already exists: /test/share\\.json\\); ` +
+          `this node published its confirmation of vault tb1p[0-9a-z]+, so its staged share was kept at /test/share\\.json\\.pending: `,
+      ),
+    );
+    expect(stager.calls).toEqual(['stage', 'commit']);
+  });
+});
+
 describe('LeaderDispatcher with this node\'s orchestrator as its slots', () => {
   it('a reused ceremony id never reaches the gate: no rate-window approval is consumed', async () => {
     const ring = makeRing(3);
