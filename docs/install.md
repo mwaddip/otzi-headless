@@ -158,7 +158,7 @@ sudo dpkg-reconfigure otzi-headless
 | `/var/lib/otzi/share.json` | encrypted Ötzi v4 share | otzi:otzi 600 |
 | `/var/lib/otzi/share.json.pending` | DKG staging file; exists while a DKG runs, or after a DKG that failed once this node had confirmed | otzi:otzi 600 |
 | `/var/lib/otzi/vault-pubkey.json` | public vault metadata | otzi:otzi 644 |
-| `/var/run/otzi/` | runtime dir for the socket (setgid and sticky: a group member cannot unlink or rename the daemon's socket and bind a look-alike; the unit's `RuntimeDirectory=` creates it with the same mode) | root:otzi 3770 |
+| `/var/run/otzi/` | runtime dir for the socket (setgid and sticky: a group member cannot unlink or rename the daemon's socket and bind a look-alike; the unit's `RuntimeDirectory=` creates it with the same mode) | root:otzi 3770 (postinst, tmpfiles) before the service starts; otzi:otzi 3770 while it runs (the unit's `RuntimeDirectory=` hands it to `User=otzi`) |
 | `/var/run/otzi/otzi.sock` | UDS socket for operator CLI | otzi:otzi 660 |
 
 ## Operations

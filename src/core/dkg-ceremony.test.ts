@@ -499,23 +499,38 @@ describe('runDkgCeremony with real share stagers: no lost share', () => {
 
   it('a node whose commit fails after its confirmation keeps its staged share', async () => {
     const stagers = [0, 1, 2].map(i => stagerFor(i));
+    // Node 2's commit is refused only after nodes 0 and 1 have finished their ceremonies. Its failure
+    // broadcasts signoff-aborted, and a peer still short of one confirmation stops on it; which node
+    // stages last (PBKDF2, so it depends on load) would otherwise decide whether any peer completes.
+    // Waiting on the ceremonies themselves, not a sleep, fixes the order under any load, and they are
+    // bounded by the ring's pull deadline. Node 2's confirmation is already served by then.
+    let othersFinished: Promise<unknown> = Promise.resolve();
     // Something appears at node 2's share path after it staged: its commit is refused.
     const commit2 = stagers[2]!.commit.bind(stagers[2]);
     stagers[2]!.commit = async () => {
+      await othersFinished;
       await writeFile(sharePath(2), 'not a share');
       return commit2();
     };
     const sigs = signals();
 
-    const out = await Promise.allSettled(ring.map((n, i) => runDkgCeremony(n.io, spec, stagers[i]!, sigs[i])));
+    const runs = ring.map((n, i) => runDkgCeremony(n.io, spec, stagers[i]!, sigs[i]));
+    othersFinished = Promise.allSettled([runs[0]!, runs[1]!]);
+    const out = await Promise.allSettled(runs);
 
+    // Nodes 0 and 1 verified every confirmation before node 2 failed: they committed the vault.
+    for (const i of [0, 1]) {
+      expect(out[i]!.status, `node ${i}`).toBe('fulfilled');
+      expect(existsSync(sharePath(i)), `node ${i} did not commit`).toBe(true);
+      expect(existsSync(pendingPath(sharePath(i))), `node ${i} left its staged share`).toBe(false);
+    }
     expect(existsSync(pendingPath(sharePath(2))), 'node 2 deleted its staged share').toBe(true);
     const err = keptError(out[2]);
     expect(err.reason).toBe(`share path already exists: ${sharePath(2)}`);
     expect(err.stagedPath).toBe(pendingPath(sharePath(2)));
     expect(err.keptNote).toContain(`rename ${pendingPath(sharePath(2))} to ${sharePath(2)}`);
     expect(readFileSync(sharePath(2), 'utf8')).toBe('not a share');
-    const done = out.find(o => o.status === 'fulfilled') as PromiseFulfilledResult<DkgCeremonyResult>;
+    const done = out[0] as PromiseFulfilledResult<DkgCeremonyResult>;
     const internalKey = toVaultKey(done.value.publicKeyPackage).untweakedVerifyingKey;
     await rm(sharePath(2)); // the operator moves the stray file away ...
     await expectNoLostShare(internalKey);

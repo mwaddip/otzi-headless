@@ -82,7 +82,8 @@ grep -qx "EnvironmentFile=-/etc/otzi/otzi.env" /lib/systemd/system/otzi.service 
 for LINE in ProtectSystem=strict ProtectHome=true PrivateTmp=true PrivateDevices=true NoNewPrivileges=true \
             ReadWritePaths=/var/lib/otzi ProtectKernelTunables=true ProtectKernelModules=true \
             ProtectKernelLogs=true ProtectControlGroups=true ProtectClock=true ProtectHostname=true \
-            RestrictSUIDSGID=true "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK"; do
+            RestrictSUIDSGID=true "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK" \
+            RuntimeDirectoryMode=3770; do
   grep -qx "$LINE" /lib/systemd/system/otzi.service || { echo "unit lacks $LINE"; exit 1; }
 done
 test -f /etc/otzi/daemon.toml      || { echo "missing daemon.toml"; exit 1; }

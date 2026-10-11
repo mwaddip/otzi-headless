@@ -84,6 +84,7 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 - Control messages are UTF-8 JSON with `v: 2`, exactly four kinds: `announce-dkg`, `announce-sign`, `signoff-done`, `signoff-aborted`. The parser rejects unknown keys and wrong types and returns `null` on anything else; it never throws.
 - Every `ceremonyId` matches `^[A-Za-z0-9._:-]{1,128}$`, checked at the API and in the parser.
 - A proposal has at most 255 inputs (the signing codec's count is one byte): rejected by the API, by participants, and by the CLI before any daemon call.
+- A node holds at most `MAX_LIVE_SIGNINGS_PER_LEADER = 32` live signing trackers per remote leader (live from the announce until signoff, abort, `timeout`, `rejected` or `stop()`); the 33rd concurrent `announce-sign` from the same leader is dropped with a warn line, and other leaders and ceremonies this node leads are not counted (see [facts/orchestrator.md](facts/orchestrator.md), `orchestrator.ts`).
 
 ### Round keys
 | Ceremony | Round key | Codec | Addressing |

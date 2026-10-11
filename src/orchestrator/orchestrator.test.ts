@@ -1050,6 +1050,43 @@ describe('Orchestrator: proposal signing', () => {
       await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT + 1));
     });
 
+    it('frees the slot when the gate rejects a ceremony', async () => {
+      // Every ceremony waits on the gate; the test decides the first one.
+      let decideFirst!: (d: Decision) => void;
+      const gate: ApprovalGate = {
+        approve: spec =>
+          spec.ceremonyId === capId(0)
+            ? new Promise<Decision>(resolve => { decideFirst = resolve; })
+            : new Promise<Decision>(() => {}),
+      };
+      const [p1] = participants([{ gate }]);
+
+      await announceMany(0, LIMIT);
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT));
+      await announceMany(LIMIT, 1);
+      expect(p1.log.about(capId(LIMIT))).toEqual([expect.objectContaining({ level: 'warn' })]);
+      expect(p1.gate.specs).toHaveLength(LIMIT);
+
+      // The gate returns reject: the tracker settles `rejected` and its slot frees.
+      decideFirst('reject');
+      expect(await p1.orch.waitFor(capId(0), WAIT_MS)).toEqual({
+        ceremonyId: capId(0),
+        kind: 'signing',
+        status: 'rejected',
+        reason: 'gate decision: reject',
+      });
+
+      // The id dropped earlier left no trace, so it is accepted now ...
+      await announceMany(LIMIT, 1);
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT + 1));
+      expect(p1.gate.specs[LIMIT]).toMatchObject({ ceremonyId: capId(LIMIT) });
+
+      // ... and the leader is back at the limit.
+      await announceMany(LIMIT + 1, 1);
+      expect(p1.log.about(capId(LIMIT + 1))).toEqual([expect.objectContaining({ level: 'warn' })]);
+      expect(p1.gate.specs).toHaveLength(LIMIT + 1);
+    });
+
     it('does not count ceremonies this node leads against a remote leader', async () => {
       const [p1] = participants([{ gate: undecided }]);
       const slots = Array.from({ length: LIMIT + 8 }, (_, i) => p1.orch.beginLocalSigning(`sign-led-${i}`));
