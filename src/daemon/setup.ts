@@ -225,6 +225,9 @@ function announceComplete(args: {
   note?: string;
 }): void {
   const { fingerprint, book, selfPublicKeyHex, config, note } = args;
+  const selfInBook =
+    selfPublicKeyHex !== null &&
+    book.entries.some((e) => e.publicKeyHex.toLowerCase() === selfPublicKeyHex.toLowerCase());
   console.error('');
   console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.error(`  otzi: setup complete — ${config.node.id}`);
@@ -234,6 +237,15 @@ function announceComplete(args: {
       ? `  this node: ${keyId(selfPublicKeyHex)}`
       : `  this node: no identity key at ${config.node.identityKeyFile}`,
   );
+  // Only a re-print can reach these: a fresh setup checks this node's key is in the book.
+  if (selfPublicKeyHex === null)
+    console.error(
+      '  ⚠ no identity key — the daemon cannot start; restore it from a backup, or delete pubkeys.json on every node and redo setup',
+    );
+  else if (!selfInBook)
+    console.error(
+      "  ⚠ this node's key is not in this book — the daemon will not start; delete pubkeys.json on every node and redo setup",
+    );
   for (const e of book.entries) {
     const endpoint = e.advertisedEndpoint !== undefined ? `  ${e.advertisedEndpoint}` : '';
     console.error(`  party ${e.partyId}: ${keyId(e.publicKeyHex)}${endpoint}`);

@@ -77,6 +77,9 @@
 **Purpose:** One-shot HTTP server on the leader daemon; collects registrations, admits them by one of two rules (an advertised-endpoint allowlist for peer-mesh, a count for relay), deterministically assigns partyIds by sorted-pubkey-bytes order, and fans out the complete pubkey book.
 
 **Public surface:**
+- `ENDPOINT_MISSING_ERROR` = `'advertised_endpoint' missing or empty`, `ENDPOINT_IN_RELAY_ERROR` = `'advertised_endpoint' not used in relay mode`, `BOOTSTRAP_FULL_ERROR` = `bootstrap is full`
+  - **Post:** The exact `error` strings of the refusals that `register.ts` maps to operator messages. Exported so the member matches the constants, not copies of the wording; a change to one changes both ends.
+
 - `MasterAdmission`
   - `{ kind: 'endpoints'; selfEndpoint: string; expectedPeers: ReadonlyArray<{ advertisedEndpoint: string }> }` — peer-mesh. `selfEndpoint` is this node's canonical endpoint; `expectedPeers` are the canonical endpoints of every other node (from `[[peers]]`), self excluded. Every book entry carries its endpoint.
   - `{ kind: 'count'; parties: number }` — relay. `parties` is the ring size, the leader included (from `[bootstrap] parties`). The leader admits the first `parties − 1` distinct pubkeys that register without an endpoint. No book entry carries an endpoint.
@@ -124,7 +127,7 @@
 **Notes / gotchas:**
 - Single-peer ring (endpoints admission with no expected peers): `completeIfReady()` resolves before the server even starts listening — idempotent. Count admission needs at least one other node.
 - Count admission trusts whoever reaches the port first: anyone who can reach the bootstrap port during setup can take a slot. The defences are network exposure (the port reachable only by the members), the 409 `bootstrap is full` that a displaced member then gets, and the key ids in every node's setup banner.
-- `bootstrap is full` reaches only a registration whose connection the server accepted before it closed. Once the book is complete the server stops accepting connections, so a member that arrives later gets connection refused instead; the leader's banner, listing a key id the operator does not recognise, is what shows the intruder then.
+- `bootstrap is full` reaches only a registration whose connection the server accepted before it closed. Once the book is complete the server stops accepting connections, so a member that arrives later gets connection refused instead; `register.ts` turns that into a hint to compare key ids, and the leader's banner, listing a key id the operator does not recognise, is what shows the intruder.
 - Request body size limited to 16 KB to prevent DoS.
 - Fingerprint is computed once when the gate resolves, then included in all pending responses.
 - `connection: close` header is mandatory to avoid hang on server shutdown (idle keep-alive would block).
@@ -154,6 +157,8 @@
     - peer-mesh member, 400 `'advertised_endpoint' not used in relay mode` (a count-mode leader) → `setup: the leader expects relay registrations (no advertised endpoint); this node is configured for peer-mesh — use the same transport on every node`.
     - 409 `bootstrap is full` → `setup: bootstrap is full — another party registered in this node's place; abort, delete pubkeys.json on every node and redo setup with the bootstrap port reachable only by the members`.
     - Any other non-200 → `register: master responded <status>[: <error>]`.
+    - Matching is by equality with the constants exported from `master.ts` (`ENDPOINT_MISSING_ERROR`, `ENDPOINT_IN_RELAY_ERROR`, `BOOTSTRAP_FULL_ERROR`).
+  - **Connection errors:** when the POST fails and the error's `cause.code` is `ECONNREFUSED`, `ECONNRESET` or `UND_ERR_SOCKET` (fetch hides the code in `cause`), the message names the code and adds a hint: `register: POST failed: <message> (<code>); the leader is not accepting registrations — it may not be started yet, or setup already completed without this node; if the leader has finished, compare key ids with the other operators, and if one is unknown delete pubkeys.json on every node and redo setup`. Any other failure stays `register: POST failed: <message>`.
   - **Throws:** `Error` as above, or if the returned book is malformed, the self entry is missing by pubkey, or fingerprints disagree. Timeout (after `input.timeoutMs`, default 30 min) also throws.
   - **Concurrency:** None (member registers once at startup).
 
@@ -165,7 +170,7 @@
 - AbortController timeout ensures cleanup even on network hang.
 
 **Cross-component contracts:**
-- Depends on: Fetch API, `parseBook` and `computeFingerprint` from pubkey-book.ts; the error strings `master.ts` sends (`'advertised_endpoint' missing or empty`, `'advertised_endpoint' not used in relay mode`, `bootstrap is full`).
+- Depends on: Fetch API, `parseBook` and `computeFingerprint` from pubkey-book.ts; the refusal constants exported by `master.ts` (`ENDPOINT_MISSING_ERROR`, `ENDPOINT_IN_RELAY_ERROR`, `BOOTSTRAP_FULL_ERROR`).
 - Used by: Member daemon during bootstrap phase (called once via `otzi setup`; `setupMember` sends the endpoint only under peer-mesh).
 - Wire/byte format: HTTP POST with JSON body (snake_case). Response is JSON `{ book, fingerprint }` or `{ error }`.
 

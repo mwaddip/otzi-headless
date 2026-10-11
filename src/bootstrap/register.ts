@@ -11,6 +11,11 @@
  */
 
 import type { IdentityKeyPair } from '../transport/identity';
+import {
+  BOOTSTRAP_FULL_ERROR,
+  ENDPOINT_IN_RELAY_ERROR,
+  ENDPOINT_MISSING_ERROR,
+} from './master';
 import { toHex } from '../otzi/lib/hex';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 import {
@@ -48,6 +53,10 @@ const PEER_MESH_MEMBER_RELAY_LEADER =
   'setup: the leader expects relay registrations (no advertised endpoint); this node is configured for peer-mesh — use the same transport on every node';
 const BOOTSTRAP_FULL =
   "setup: bootstrap is full — another party registered in this node's place; abort, delete pubkeys.json on every node and redo setup with the bootstrap port reachable only by the members";
+/** Connection-level failures that mean nothing is accepting registrations at the leader URL. */
+const NOT_LISTENING_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET']);
+const NOT_LISTENING_HINT =
+  'the leader is not accepting registrations — it may not be started yet, or setup already completed without this node; if the leader has finished, compare key ids with the other operators, and if one is unknown delete pubkeys.json on every node and redo setup';
 
 export async function runMemberRegister(
   input: MemberRegisterInputs,
@@ -79,7 +88,12 @@ export async function runMemberRegister(
     clearTimeout(timer);
     if ((err as { name?: string }).name === 'AbortError')
       throw new Error(`register: timed out after ${timeoutMs}ms waiting for master response`);
-    throw new Error(`register: POST failed: ${err instanceof Error ? err.message : String(err)}`);
+    const message = err instanceof Error ? err.message : String(err);
+    // fetch reports `fetch failed` and hides the socket error's code in `cause`.
+    const code = (err as { cause?: { code?: unknown } }).cause?.code;
+    if (typeof code === 'string' && NOT_LISTENING_CODES.has(code))
+      throw new Error(`register: POST failed: ${message} (${code}); ${NOT_LISTENING_HINT}`);
+    throw new Error(`register: POST failed: ${message}`);
   } finally {
     clearTimeout(timer);
   }
@@ -93,21 +107,12 @@ export async function runMemberRegister(
     } catch {
       /* fall through */
     }
-    // Error strings sent by master.ts.
     const relayMember = sentEndpoint === undefined;
-    if (
-      res.status === 400 &&
-      relayMember &&
-      leaderError?.startsWith("'advertised_endpoint' missing")
-    )
+    if (res.status === 400 && relayMember && leaderError === ENDPOINT_MISSING_ERROR)
       throw new Error(RELAY_MEMBER_PEER_MESH_LEADER);
-    if (
-      res.status === 400 &&
-      !relayMember &&
-      leaderError === "'advertised_endpoint' not used in relay mode"
-    )
+    if (res.status === 400 && !relayMember && leaderError === ENDPOINT_IN_RELAY_ERROR)
       throw new Error(PEER_MESH_MEMBER_RELAY_LEADER);
-    if (res.status === 409 && leaderError === 'bootstrap is full') throw new Error(BOOTSTRAP_FULL);
+    if (res.status === 409 && leaderError === BOOTSTRAP_FULL_ERROR) throw new Error(BOOTSTRAP_FULL);
     throw new Error(
       `register: master responded ${res.status}${leaderError !== undefined ? `: ${leaderError}` : ''}`,
     );

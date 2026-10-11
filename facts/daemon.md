@@ -452,6 +452,7 @@
 - **Setup banner** (`announceComplete`, both roles, both transports, and on the idempotent re-print):
   - `fingerprint: xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` from `computeFingerprint`;
   - `this node: <keyId>` — this node's identity pubkey (`keyId` from `pubkey-book.ts`); on a re-print with no identity file, `this node: no identity key at <file>`;
+  - a warning right after that line when the daemon could not start with this book: `⚠ no identity key — the daemon cannot start; restore it from a backup, or delete pubkeys.json on every node and redo setup` (no identity file), or `⚠ this node's key is not in this book — the daemon will not start; delete pubkeys.json on every node and redo setup` (an identity whose pubkey matches no entry). A fresh setup never prints either, since the member and master checks guarantee the key is in the book; only a re-print can;
   - one line per book entry in partyId order: `party <partyId>: <keyId>`, followed by two spaces and the entry's endpoint when it has one (peer-mesh);
   - the instruction to compare the fingerprint out of band with every other operator before any DKG, and `Confirm every key id above belongs to one of your nodes; an unknown id means someone else registered — delete pubkeys.json on every node and redo setup.`
 

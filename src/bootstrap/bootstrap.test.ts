@@ -12,7 +12,7 @@ import {
   serializeBook,
   type PubkeyBookEntry,
 } from './pubkey-book';
-import { runMasterBootstrap } from './master';
+import { BOOTSTRAP_FULL_ERROR, runMasterBootstrap } from './master';
 import { runMemberRegister } from './register';
 import { canonicalizeEndpoint } from '../util/endpoint';
 
@@ -795,6 +795,69 @@ describe('bootstrap — count admission (relay)', () => {
     expect(m.book.entries.map((e) => e.publicKeyHex)).not.toContain(pubHex(late));
   }, 10_000);
 
+  it('count admission: four concurrent registrations for one free slot admit exactly one', async () => {
+    const master = await generateIdentity();
+    const racers = await Promise.all([0, 1, 2, 3].map(() => generateIdentity()));
+    const port = await freePort();
+    const masterDone = runMasterBootstrap({
+      self: { identity: master },
+      admission: { kind: 'count', parties: 2 },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    await sleep(50);
+
+    const results = await Promise.allSettled(
+      racers.map((id) => postRegister(port, { public_key_hex: pubHex(id) })),
+    );
+    const m = await masterDone;
+
+    // Exactly one 200; every other racer got 409 bootstrap is full or a
+    // connection error (it arrived after the leader stopped listening).
+    const winners = results.flatMap((r, i) =>
+      r.status === 'fulfilled' && r.value.status === 200 ? [i] : [],
+    );
+    expect(winners).toHaveLength(1);
+    for (const r of results) {
+      if (r.status === 'rejected' || r.value.status === 200) continue;
+      expect(r.value.status).toBe(409);
+      expect(r.value.json.error).toBe('bootstrap is full');
+    }
+
+    // The book holds the leader and the one winner, and the winner got that book.
+    expect(m.book.entries).toHaveLength(2);
+    const winner = racers[winners[0]!]!;
+    expect(m.book.entries.map((e) => e.publicKeyHex).sort(byRawPubkey)).toEqual(
+      [pubHex(master), pubHex(winner)].sort(byRawPubkey),
+    );
+    const won = results[winners[0]!] as PromiseFulfilledResult<RegisterReply>;
+    expect(won.value.json.fingerprint).toBe(m.fingerprint);
+  }, 10_000);
+
+  it('a member that arrives after the leader completed gets a hint to compare key ids', async () => {
+    const [master, b, late] = await Promise.all([generateIdentity(), generateIdentity(), generateIdentity()]);
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}`;
+    const masterDone = runMasterBootstrap({
+      self: { identity: master },
+      admission: { kind: 'count', parties: 2 },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    await sleep(50);
+    await runMemberRegister({ self: { identity: b }, masterUrl: url, timeoutMs: 5_000 });
+    await masterDone; // the leader has stopped listening
+
+    const err = await runMemberRegister({ self: { identity: late }, masterUrl: url, timeoutMs: 5_000 }).catch(
+      (e: unknown) => e as Error,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/^register: POST failed: .*\(ECONNREFUSED\); /);
+    expect((err as Error).message).toContain(
+      'the leader is not accepting registrations — it may not be started yet, or setup already completed without this node; if the leader has finished, compare key ids with the other operators, and if one is unknown delete pubkeys.json on every node and redo setup',
+    );
+  }, 10_000);
+
   it('leader timeout names received vs expected registrations', async () => {
     const [master, b] = await Promise.all([generateIdentity(), generateIdentity()]);
     const port = await freePort();
@@ -937,7 +1000,8 @@ describe('bootstrap — member checks by transport', () => {
 
   it('member maps 409 bootstrap is full to the abort-and-redo error', async () => {
     const b = await generateIdentity();
-    const stub = await stubMaster(async () => ({ status: 409, json: { error: 'bootstrap is full' } }));
+    // The member matches master.ts's constant, so a rewording cannot silently break the mapping.
+    const stub = await stubMaster(async () => ({ status: 409, json: { error: BOOTSTRAP_FULL_ERROR } }));
     try {
       await expect(
         runMemberRegister({ self: { identity: b }, masterUrl: stub.url, timeoutMs: 5_000 }),

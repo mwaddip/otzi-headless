@@ -40,6 +40,17 @@ import {
 } from './pubkey-book';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 
+/**
+ * Refusals `register.ts` maps to operator messages. The member matches these
+ * constants, so a rewording here cannot silently break the mapping.
+ */
+/** 400, endpoints admission: the registration carries no endpoint (a relay member at a peer-mesh leader). */
+export const ENDPOINT_MISSING_ERROR = "'advertised_endpoint' missing or empty";
+/** 400, count admission: the registration carries an endpoint (a peer-mesh member at a relay leader). */
+export const ENDPOINT_IN_RELAY_ERROR = "'advertised_endpoint' not used in relay mode";
+/** 409, count admission: `parties` registrations are already in. */
+export const BOOTSTRAP_FULL_ERROR = 'bootstrap is full';
+
 /** Who the leader admits. */
 export type MasterAdmission =
   | {
@@ -308,7 +319,7 @@ function admitByCount(
   ctx: HandlerContext,
 ): boolean {
   if ('advertised_endpoint' in body || 'advertisedEndpoint' in body) {
-    respondJson(res, 400, { error: "'advertised_endpoint' not used in relay mode" });
+    respondJson(res, 400, { error: ENDPOINT_IN_RELAY_ERROR });
     return false;
   }
   // Before the count: a node that registers twice is told it is already in.
@@ -321,7 +332,7 @@ function admitByCount(
     return false;
   }
   if (ctx.registered.size >= ctx.expectedTotal) {
-    respondJson(res, 409, { error: 'bootstrap is full' });
+    respondJson(res, 409, { error: BOOTSTRAP_FULL_ERROR });
     return false;
   }
 
@@ -349,7 +360,7 @@ function admitByEndpoint(
 ): boolean {
   const rawEndpoint = body.advertised_endpoint ?? body.advertisedEndpoint;
   if (typeof rawEndpoint !== 'string' || rawEndpoint.length === 0) {
-    respondJson(res, 400, { error: "'advertised_endpoint' missing or empty" });
+    respondJson(res, 400, { error: ENDPOINT_MISSING_ERROR });
     return false;
   }
 

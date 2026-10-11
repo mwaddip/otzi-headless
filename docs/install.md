@@ -95,8 +95,11 @@ follow up with `sudo apt -f install` to resolve.)
    - A member that fails with `setup: bootstrap is full` was beaten to its slot by
      someone else. Likewise, if the leader finishes before all your members have
      registered, someone else filled a slot; a member that arrives after that
-     cannot connect. Either way: abort, delete `/var/lib/otzi/pubkeys.json` on
-     every node and redo setup.
+     fails with `register: POST failed: … (ECONNREFUSED); the leader is not
+     accepting registrations — …`. That message also appears when the leader has
+     not started yet, so first check whether the leader has finished, then compare
+     key ids. Either way, an unknown key id means: abort, delete
+     `/var/lib/otzi/pubkeys.json` on every node and redo setup.
    - If the leader times out with `received 1 of 2 registrations` (or similar),
      fewer members registered than it expected: check that every member ran
      setup and, under relay, the leader's `parties`.

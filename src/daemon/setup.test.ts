@@ -10,6 +10,10 @@ import { setupMaster, setupMember } from './setup';
 
 const KEY_ID_INSTRUCTION =
   'Confirm every key id above belongs to one of your nodes; an unknown id means someone else registered — delete pubkeys.json on every node and redo setup.';
+const NO_IDENTITY_WARNING =
+  '⚠ no identity key — the daemon cannot start; restore it from a backup, or delete pubkeys.json on every node and redo setup';
+const NOT_IN_BOOK_WARNING =
+  "⚠ this node's key is not in this book — the daemon will not start; delete pubkeys.json on every node and redo setup";
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -169,6 +173,8 @@ describe('setup banner', () => {
         expect(banner).toContain(`this node: ${keyId(pubkeys.get(n)!)}`);
         expect(banner.filter((l) => l.startsWith('party '))).toEqual(expectedPartyLines);
         expect(banner).toContain(KEY_ID_INSTRUCTION);
+        expect(banner).not.toContain(NO_IDENTITY_WARNING);
+        expect(banner).not.toContain(NOT_IN_BOOK_WARNING);
         // Key ids follow the fingerprint.
         const fp = banner.findIndex((l) => l.startsWith('fingerprint: '));
         const self = banner.findIndex((l) => l.startsWith('this node: '));
@@ -204,6 +210,8 @@ describe('setup banner', () => {
     );
     expect(banner).toContain(KEY_ID_INSTRUCTION);
     expect(banner.some((l) => l.startsWith('note: book already present'))).toBe(true);
+    expect(banner).not.toContain(NO_IDENTITY_WARNING);
+    expect(banner).not.toContain(NOT_IN_BOOK_WARNING);
 
     // With the identity file gone the banner still lists the ring and says so.
     await rm(a.identityFile);
@@ -211,7 +219,34 @@ describe('setup banner', () => {
     await setupMember(a.configPath, 'http://127.0.0.1:1');
     banner = bannerOf(lines, a.id);
     expect(banner).toContain(`this node: no identity key at ${a.identityFile}`);
+    expect(banner).toContain(NO_IDENTITY_WARNING);
+    expect(banner).not.toContain(NOT_IN_BOOK_WARNING);
     expect(banner.filter((l) => l.startsWith('party '))).toHaveLength(2);
+  });
+
+  it("a re-run warns when this node's key is not in the book", async () => {
+    const [a] = makeNodes(dir) as [TestNode];
+    const self = await generateIdentity(true);
+    const [x, y] = [toHex((await generateIdentity()).publicKeyRaw), toHex((await generateIdentity()).publicKeyRaw)];
+    await mkdir(path.dirname(a.identityFile), { recursive: true });
+    await writeFile(
+      a.identityFile,
+      JSON.stringify({ pkcs8Hex: toHex(await exportPrivateKeyPkcs8(self)), publicKeyHex: toHex(self.publicKeyRaw) }),
+    );
+    const sorted = [x, y].sort((p, q) => Buffer.compare(Buffer.from(p, 'hex'), Buffer.from(q, 'hex')));
+    await writeFile(
+      a.bookFile,
+      serializeBook(buildBook(sorted.map((publicKeyHex, partyId) => ({ partyId, publicKeyHex })))),
+    );
+    await writeFile(a.configPath, nodeToml(dir, a, [], 'relay', ''));
+
+    await setupMember(a.configPath, 'http://127.0.0.1:1');
+    const banner = bannerOf(lines, a.id);
+    expect(banner).toContain(`this node: ${keyId(toHex(self.publicKeyRaw))}`);
+    expect(banner).toContain(NOT_IN_BOOK_WARNING);
+    expect(banner).not.toContain(NO_IDENTITY_WARNING);
+    // The warning sits right under the line it is about.
+    expect(banner.indexOf(NOT_IN_BOOK_WARNING)).toBe(banner.findIndex((l) => l.startsWith('this node: ')) + 1);
   });
 
   it('relay setup on a leader without [bootstrap] parties fails naming it', async () => {
