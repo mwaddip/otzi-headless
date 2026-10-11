@@ -6,7 +6,7 @@
 #   - install completes cleanly
 #   - /usr/bin/otzi runs and prints usage
 #   - /etc/otzi/daemon.toml is rendered with the expected fields
-#   - /lib/systemd/system/otzi.service is registered
+#   - /lib/systemd/system/otzi.service is registered and carries the sandbox directives
 #   - otzi user/group exist
 #   - `otzi daemon` against the rendered config gets past parse + transport
 #     init and errors on the missing OTZI_SHARE_PASSWORD env var (proves the
@@ -76,6 +76,13 @@ test -f /usr/lib/otzi/entrypoint.mjs || { echo "missing entrypoint bundle"; exit
 test -f /lib/systemd/system/otzi.service || { echo "missing systemd unit"; exit 1; }
 grep -qx "EnvironmentFile=-/etc/otzi/otzi.env" /lib/systemd/system/otzi.service \
                                        || { echo "unit does not load /etc/otzi/otzi.env"; exit 1; }
+# The sandbox directives (docs/install.md, Service sandbox): a unit that lost one would still install.
+for LINE in ProtectSystem=strict ProtectHome=true PrivateTmp=true PrivateDevices=true NoNewPrivileges=true \
+            ReadWritePaths=/var/lib/otzi ProtectKernelTunables=true ProtectKernelModules=true \
+            ProtectKernelLogs=true ProtectControlGroups=true ProtectClock=true ProtectHostname=true \
+            RestrictSUIDSGID=true "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK"; do
+  grep -qx "$LINE" /lib/systemd/system/otzi.service || { echo "unit lacks $LINE"; exit 1; }
+done
 test -f /etc/otzi/daemon.toml      || { echo "missing daemon.toml"; exit 1; }
 getent passwd otzi >/dev/null      || { echo "missing otzi user"; exit 1; }
 getent group otzi >/dev/null       || { echo "missing otzi group"; exit 1; }

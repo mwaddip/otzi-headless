@@ -251,6 +251,23 @@ The script creates the directories on its first run, owned by `otzi` with group
 `otzi` and mode 0770, so operators in the `otzi` group can write decision files
 there.
 
+**Sandbox.** On a packaged install the command runs inside the daemon's systemd
+sandbox (see [`install.md`](./install.md) § Service sandbox), as the `otzi` user:
+
+- the file system is read-only except `/var/lib/otzi` (and a private `/tmp`);
+- `/dev` is a private one with only `null`, `zero`, `full`, `random`, `urandom`,
+  `tty` and the pty devices: no block devices, USB or serial ports;
+- `NoNewPrivileges=true`: `sudo`, `su` and other setuid helpers cannot raise
+  privilege, and the command cannot create setuid or setgid files;
+- it cannot change the clock, the hostname or kernel settings, and it can open
+  IPv4, IPv6, Unix and netlink sockets only.
+
+An approver that needs more (a hardware token on a USB or serial device, a
+directory outside `/var/lib/otzi`) needs a drop-in (`sudo systemctl edit otzi`,
+for example `PrivateDevices=false` or `ReadWritePaths=/srv/approvals`). That
+loosens the whole daemon, not only the command; an approver that runs elsewhere
+and is reached through the `webhook` strategy avoids it.
+
 ### `webhook` — POST spec to an HTTP endpoint
 
 ```toml

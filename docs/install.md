@@ -206,6 +206,38 @@ overwrites it. If the file is the loaded share itself (a second name left by a
 failed removal after the commit), the daemon removes it at startup and logs at
 info level.
 
+### Service sandbox
+
+The unit (`/lib/systemd/system/otzi.service`) runs the daemon as the `otzi` user
+with these restrictions, which also bind everything the daemon starts, such as an
+`exec` gate command:
+
+| Setting | Effect |
+|---|---|
+| `ProtectSystem=strict`, `ReadWritePaths=/var/lib/otzi` | The file system is read-only except `/var/lib/otzi` (and the unit's `/run/otzi`). |
+| `ProtectHome=true`, `PrivateTmp=true` | No `/home`, `/root` or `/run/user`; a private `/tmp`. |
+| `PrivateDevices=true` | A private `/dev` with only `null`, `zero`, `full`, `random`, `urandom`, `tty` and the pty devices: no block devices, USB or serial ports. |
+| `NoNewPrivileges=true`, `RestrictSUIDSGID=true` | No gaining privilege through setuid or setgid programs (`sudo`, `su`), and no creating setuid or setgid files. |
+| `ProtectKernelTunables=true`, `ProtectKernelModules=true`, `ProtectKernelLogs=true`, `ProtectControlGroups=true` | `/proc/sys`, `/sys` and the cgroup file system are read-only; no loading kernel modules; no kernel log. |
+| `ProtectClock=true`, `ProtectHostname=true` | The system clock, the hardware clock and the hostname cannot be changed. |
+| `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` | TCP/UDP, the operator socket and nothing else. Netlink is what glibc's name resolution (`getaddrinfo` with `AI_ADDRCONFIG`) uses to learn the host's address families. |
+| `RestrictNamespaces=true`, `RestrictRealtime=true`, `LockPersonality=true`, `SystemCallArchitectures=native` | No new namespaces, no realtime scheduling, no personality change, no non-native system calls. |
+
+Deliberately not set:
+
+- `MemoryDenyWriteExecute`: Node's V8 JIT needs writable and executable memory.
+- `SystemCallFilter`: an `exec` gate command runs inside this sandbox, and so does
+  whatever it starts. Its system calls are the operator's to choose.
+- An empty `CapabilityBoundingSet`: the daemon runs with no capabilities already;
+  the setting would only stop a drop-in from granting one, such as
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE` to listen on a port below 1024.
+
+`exec` gate commands therefore see no `/dev` beyond the basics and have no setuid
+helper to call; see [`gates.md`](./gates.md) § `exec`. To loosen any of this for
+one host, add a drop-in with `sudo systemctl edit otzi` rather than editing the
+packaged unit, which an upgrade replaces. `systemd-analyze security otzi.service`
+shows the unit's exposure.
+
 ### Address book
 
 Each node keeps its own address book at `/etc/otzi/address-book.otzi.json`. It

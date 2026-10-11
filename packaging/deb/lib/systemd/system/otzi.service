@@ -27,18 +27,48 @@ RestartSec=5
 RuntimeDirectory=otzi
 RuntimeDirectoryMode=2770
 
-# Hardening — Node's V8 needs writable+executable memory, so don't set
-# MemoryDenyWriteExecute. Everything else below is safe for a Node service.
+# Hardening. The daemon is an unprivileged Node process (User=otzi) that reads
+# /etc/otzi, writes /var/lib/otzi, talks to its peers over TCP and to the CLI
+# over a Unix socket, and runs the operator's exec-gate command. Everything it
+# does not need is closed off.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# A private /dev with only null, zero, full, random, urandom, tty and the pty
+# devices. An exec-gate command sees the same /dev.
+PrivateDevices=true
 NoNewPrivileges=true
 ReadWritePaths=/var/lib/otzi
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# The daemon creates no setuid or setgid files. (The setgid bit on /var/lib/otzi
+# and /run/otzi is set by the postinst and by RuntimeDirectoryMode=, not by the
+# daemon.)
+RestrictSUIDSGID=true
+# AF_NETLINK: glibc's getaddrinfo (AI_ADDRCONFIG) asks the kernel over netlink
+# which address families the host has configured. Without it, resolving a peer
+# or a webhook host name can fail.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
+#
+# Left out on purpose:
+# - MemoryDenyWriteExecute: Node's V8 JIT needs writable+executable memory.
+# - SystemCallFilter: a [gate] strategy = "exec" command runs inside this
+#   sandbox, and so does whatever it starts (a script, python, curl, a
+#   hardware-token helper). Its syscalls are the operator's to choose, and a
+#   filter that is safe for the daemon alone would break them.
+# - CapabilityBoundingSet= (empty): the daemon runs as the otzi user with no
+#   ambient capabilities, so it holds none already. Emptying the set would only
+#   stop an operator from granting one in a drop-in (AmbientCapabilities=
+#   CAP_NET_BIND_SERVICE to listen on a port below 1024, or whatever an
+#   exec-gate command needs).
 
 [Install]
 WantedBy=multi-user.target
