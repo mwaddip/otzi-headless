@@ -114,6 +114,9 @@ follow up with `sudo apt -f install` to resolve.)
    otzi vault
    ```
    The address and `<threshold>-of-<parties>` must be identical on all nodes.
+   `otzi vault` asks the running daemon for the vault it loaded and compares
+   `vault-pubkey.json` with the answer; a file that differs is refused (see
+   [`cli.md`](./cli.md)).
    Fund the address, then `otzi btc balance` and `otzi btc send` (see
    [`cli.md`](./cli.md)).
 
@@ -195,7 +198,8 @@ or ship logs to an external collector (rsyslog, Loki, Vector, etc.).
 
 A leftover `/var/lib/otzi/share.json.pending` from an interrupted DKG is logged
 at warn level on startup and never loaded. It may be this node's share of a
-vault the other nodes committed: if `otzi vault` on another node shows the
+vault the other nodes committed: if `otzi vault` on another node (restart its
+daemon first if it has not loaded the share) shows the
 address the warning names, `sudo mv /var/lib/otzi/share.json.pending
 /var/lib/otzi/share.json` and restart the daemon. Otherwise the next DKG
 overwrites it. If the file is the loaded share itself (a second name left by a

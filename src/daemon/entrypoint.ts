@@ -4,7 +4,7 @@
  *   otzi daemon <config.toml>                   — run the daemon
  *   otzi setup <config.toml>                    — run bootstrap (reads [bootstrap].role from config)
  *   otzi generate [--config <path>] [...]       — run the DKG through the local daemon
- *   otzi vault [--json]                         — print vault metadata
+ *   otzi vault [--json] [--config <path>]       — print vault metadata, checked against the daemon
  *   otzi btc balance [--unit ...]               — vault balance from Esplora
  *   otzi btc send <addr|label> <amount>[unit]|max — build, sign and broadcast a vault transfer
  *   otzi btc sign <proposal.json> [--broadcast] — sign a caller-built proposal
@@ -75,7 +75,7 @@ function usage(): string {
     '  otzi daemon <path/to/daemon.toml>',
     '  otzi setup <path/to/daemon.toml>',
     '  otzi generate [--config <path>] [--ceremony-id <id>]',
-    '  otzi vault [--json]',
+    '  otzi vault [--json] [--config <path>]',
     '  otzi btc balance [--unit sats|btc|mbtc|ubtc] [--config <path>]',
     '  otzi btc send <address|label> <amount>[unit]|max [--fee-rate <sat/vB>] [--config <path>]',
     '  otzi btc sign <proposal.json> [--broadcast] [--config <path>]',
@@ -268,14 +268,14 @@ async function runGenerateCommand(args: string[]): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// `otzi vault [--json]`
+// `otzi vault [--json] [--config <path>]`
 // ─────────────────────────────────────────────────────────────────────────
 
 async function runVaultCommand(args: string[]): Promise<void> {
-  const { positional, flags } = parseVerbArgs(args, { booleans: ['json'] });
+  const { positional, flags } = parseVerbArgs(args, { values: ['config'], booleans: ['json'] });
   noPositional(positional);
   const { vault } = await import('../cli/cmd/vault');
-  console.log(await vault({ json: flags.has('json') }));
+  console.log(await vault({ configPath: flags.get('config') ?? DEFAULT_DAEMON_CONFIG_PATH, json: flags.has('json') }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────

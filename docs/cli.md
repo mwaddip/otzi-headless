@@ -15,8 +15,8 @@ through Esplora.
 - Verbs that read the daemon configuration accept `--config <path>` (default
   `/etc/otzi/daemon.toml`). The CLI takes the UDS path, the network and the
   Esplora URL from it. `otzi daemon` and `otzi setup` take the config path as
-  their positional argument instead. `otzi vault` reads only
-  `/var/lib/otzi/vault-pubkey.json`.
+  their positional argument instead. `otzi vault` takes it too, to find the
+  daemon it checks `/var/lib/otzi/vault-pubkey.json` against.
 - Machine output (addresses, txids, signed hex, JSON) goes to stdout. Banners and
   errors go to stderr. Errors exit with status 1.
 - The CLI broadcasts only the daemon's own signed version of the transaction it asked about; a reply for a different transaction, or one missing a signature, is refused and nothing is posted.
@@ -37,11 +37,15 @@ through Esplora.
 
   Fails with `409` when this node already holds a vault, `403` when this node's gate rejects, `500` when the ceremony fails or times out. A DKG that fails before any node commits leaves no share at the share path on any node and can be re-run; a staged `<share path>.pending` left behind is overwritten by the next DKG.
 
-  A DKG can also fail on one node after another node has committed the vault (for example when a node loses its connection during the last exchange). A node that had already published its confirmation therefore never deletes its staged share: it keeps `<share path>.pending`, and the error (in the `500` reply when it is this node, in the daemon log otherwise) names the file and the vault address. Run `otzi vault` on the other nodes. If any of them shows that address, rename the `.pending` file to the share path on this node (`sudo mv <share path>.pending <share path>`) and restart its daemon. If none does, the vault was never created: remove the `.pending` files and run `otzi generate` again.
+  A DKG can also fail on one node after another node has committed the vault (for example when a node loses its connection during the last exchange). A node that had already published its confirmation therefore never deletes its staged share: it keeps `<share path>.pending`, and the error (in the `500` reply when it is this node, in the daemon log otherwise) names the file and the vault address. Run `otzi vault` on the other nodes (a node that committed the vault shows it once its daemon has been restarted; before that `otzi vault` says to restart). If any of them shows that address, rename the `.pending` file to the share path on this node (`sudo mv <share path>.pending <share path>`) and restart its daemon. If none does, the vault was never created: remove the `.pending` files and run `otzi generate` again.
 
 ### Vault
 
-- `otzi vault [--json]` — print the vault address, the network and `<threshold>-of-<parties>`, read from `/var/lib/otzi/vault-pubkey.json`. `--json` prints the whole file: `network`, `address`, `internalKey`, `outputKey`, `threshold`, `parties` and the public `vaultKey`. Works without the daemon. Fails with a pointer to `otzi generate` when the file does not exist.
+- `otzi vault [--json] [--config <path>]` — print the vault address, the network and `<threshold>-of-<parties>`. `--json` prints `network`, `address`, `internalKey`, `outputKey`, `threshold`, `parties` and the public `vaultKey`. Any member of the `otzi` group can rewrite `/var/lib/otzi/vault-pubkey.json`, so `otzi vault` asks the daemon (the `vault-info` op) for the vault it has loaded and compares the file with the answer:
+  - **File and daemon agree** (or there is no file): the daemon's values are printed. Without a file, `--json` has no `vaultKey` and says so on stderr.
+  - **They differ** (`address`, `internalKey`, `outputKey`, `threshold`, `parties`, `network`, or the file's `vaultKey` does not fit them): exit 1, nothing on stdout. The error on stderr lists each differing field as `<field>: file <x>, daemon <y>` and says the file does not match the daemon's loaded share. Do not use its address; restarting the daemon rewrites the file from its share. Find out who changed it before you do.
+  - **The daemon holds no vault** (`409`): exit 1. With no file, the error points at `otzi generate`. With a file (a DKG just ran and the daemon has not restarted since), it says the file does not match a loaded vault: restart the daemon, then run `otzi vault` again.
+  - **The daemon cannot be reached** (no socket, connection refused, socket not readable, or `--config` cannot be read): the file's values are printed as before, and stderr gets `not verified against the daemon (<reason>)`. Fails with a pointer to `otzi generate` when the file does not exist either.
 - `otzi btc balance [--unit sats|btc|mbtc|ubtc] [--config <path>]` — confirmed and unconfirmed vault balance from Esplora, in the chosen unit (default `sats`):
 
   ```

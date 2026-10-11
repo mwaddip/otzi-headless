@@ -124,7 +124,7 @@
 **Cross-component contracts:**
 - Depends on: `toVaultKey`, `vaultPayment` (`src/otzi/lib`).
 - Written by: `config-merge.ts` (`loadAndValidate` at startup, path from its `vaultPubkeyPath` option), `vault-share.ts` (`createShareStager().commit()`, path from `ShareStagerOptions.vaultPubkeyPath`).
-- Consumed by: `otzi vault`, `otzi btc balance|send|sign` (read-only).
+- Consumed by: `otzi vault` (read-only; checked against the daemon's `vault-info`, since any member of the `otzi` group can rewrite the file), `otzi btc balance|send|sign` (read-only).
 
 ---
 
@@ -391,7 +391,7 @@
 | `otzi daemon <config>` | Run the daemon (`runDaemonCommand`). |
 | `otzi setup <config>` | Bootstrap pubkey exchange; prints the 96-bit fingerprint. |
 | `otzi generate [--config <path>] [--ceremony-id <id>]` | Daemon `dkg` op (`generate`); banner prints the vault address and the restart instruction. |
-| `otzi vault [--json]` | Address, network, threshold/parties; the full file (keys included) with `--json`. |
+| `otzi vault [--json] [--config <path>]` | Address, network, threshold/parties, checked against the daemon's loaded share (`vault`); the full file (keys included) with `--json`. |
 | `otzi btc balance [--unit sats\|btc\|mbtc\|ubtc] [--config <path>]` | Esplora balance: confirmed and unconfirmed. |
 | `otzi btc send <label\|address> <amount[unit]\|max> [--fee-rate N] [--config <path>]` | `btcSend`: prints the txid and explorer URL. |
 | `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` | `btcSign`: prints the analysis summary, txid and signed hex; `--broadcast` posts it. |
@@ -402,7 +402,7 @@
 | `otzi book export [path]` | Write the book file (stdout without a path). |
 | `otzi backup` / `otzi restore <archive> [--password-stdin]` | Archive and restore node state. |
 
-- `--config` defaults to `/etc/otzi/daemon.toml`. Every `book` verb takes it too, to learn the network.
+- `--config` defaults to `/etc/otzi/daemon.toml`. Every `book` verb takes it too, to learn the network, and `vault` to find the daemon.
 - CLI verbs other than `daemon` keep `NOOP_LOGGER` and write machine output to stdout only; banners, summaries and errors go to stderr. Stdout per verb: `vault` the text or JSON; `btc balance` the two balance lines; `btc send` the txid, then the explorer URL; `btc sign` the txid, then the signed hex, then (with `--broadcast`) the explorer URL; `book list` one tab-separated line per entry; `book import` the line `added <a>, updated <u>, unchanged <n>, removed <r>`; `book export` the book file when no path is given. `generate`, `book add` and `book remove` print only to stderr, as does `book export <path>`.
 - `parseVerbArgs(args, { values?, booleans? }): { positional: string[]; flags: Map<string, string> }` — positionals and `--flags` in any order. A `values` flag takes the next argument (`flag '--x' needs a value` when it is missing or starts with `--`); a `booleans` flag takes none (so `btc sign --broadcast <file>` works); any other `--flag` is `unknown flag '--x'`, so a typo never falls back to a default.
 - `reportCliError(err, write?)` — the message on stderr. A `BroadcastFailedError` also prints a line naming the txid and saying the transaction is signed but not broadcast, then the signed transaction hex as the last line, so the operator can broadcast it by other means. The process exits 1 on any error.
@@ -486,7 +486,7 @@
   - `vaultInfo(): Promise<VaultInfo>` — `{ op: 'vault-info' }`.
   - **Throws:** `Error` when the config has neither trigger.
 
-**Cross-component contracts:** Used by every CLI verb that talks to the daemon (`generate`, `btc send`, `btc sign`). Commands take an injectable `{ request }` (`CliDeps.client`) for tests.
+**Cross-component contracts:** Used by every CLI verb that talks to the daemon (`generate`, `vault`, `btc send`, `btc sign`). Commands take an injectable `{ request }` (`CliDeps.client`) for tests; `vault` takes `{ vaultInfo }` (`VaultDeps.client`).
 
 ### `units.ts`
 **Purpose:** CLI amount parsing and formatting.
@@ -527,11 +527,17 @@
   - **Banner (entrypoint):** ceremony ID, network, vault address, share path, and the instruction to restart every daemon to load the new share.
 
 ### `vault.ts`
-**Purpose:** `otzi vault [--json]` — print the vault metadata from `vault-pubkey.json`.
+**Purpose:** `otzi vault [--json] [--config <path>]` — print the vault metadata, checked against the daemon. `vault-pubkey.json` is written by the daemon but can be rewritten by any member of the `otzi` group (it is mode 0644 in a group-writable directory), so a file the CLI shows without asking would be a way to put a wrong funding address in front of an operator.
 
-- `vault(opts?: { vaultPath?: string; json?: boolean }): Promise<string>`
-  - **Post:** Reads `readVaultPubkeyFile(opts.vaultPath)`. Default output, three lines: `network:   <network>`, `address:   <address>`, `threshold: <threshold>-of-<parties>`. With `json`: the whole file as pretty JSON (keys and `vaultKey` included).
-  - **Throws:** `readVaultPubkeyFile` errors (missing file points at `otzi generate`).
+- `interface VaultDeps { client?: Pick<DaemonClient, 'vaultInfo'>; warn?: (text: string) => void }` — `client` defaults to `DaemonClient.fromConfig(configPath)`, `warn` to stderr (`console.error`).
+- `vault(opts: { configPath: string; vaultPath?: string; json?: boolean }, deps?: VaultDeps): Promise<string>` — `vaultPath` defaults to `DEFAULT_VAULT_PUBKEY_PATH`.
+  - **Pre:** none; the daemon may be down.
+  - **Post:** asks the daemon (`vaultInfo()`, the `vault-info` op) and acts on the answer:
+    1. **Daemon holds a vault.** The reply is checked to carry `network`, `address`, `internalKey`, `outputKey`, `threshold` and `parties` (`Error("daemon reply to 'vault-info' has no vault (…)")` otherwise). When the file exists it is read and compared with the reply field by field: `network`, `address`, `internalKey`, `outputKey`, `threshold`, `parties`, and for the `vaultKey` that `--json` prints, `vaultKey.untweakedVerifyingKey` against `internalKey`, `vaultKey.minSigners` against `threshold` and the number of `vaultKey.verifyingShares` against `parties` (strict string/number equality). Any difference, or a file that cannot be read or validated, throws one `Error` that names the file path and each differing field as `<field>: file <x>, daemon <y>` (file text shown through `displayText`), says the file does not match the daemon's loaded share, and tells the operator that restarting the daemon rewrites it; nothing is returned, so nothing reaches stdout. On a match, or when the file does not exist, the daemon's values are returned: three lines `network:   <network>`, `address:   <address>`, `threshold: <threshold>-of-<parties>`, or with `json` pretty JSON in the file's key order (`network`, `address`, `internalKey`, `outputKey`, `threshold`, `parties`, then `vaultKey`). `vaultKey` comes from the file, which the daemon does not send: with a matching file the output is the file's bytes; with no file it is left out and `warn` gets a line saying so (`json` only).
+    2. **Daemon answers 409 (no vault loaded).** Throws: without a file, `the daemon has no vault loaded — run 'otzi generate' …`; with a file, an error saying the file does not match a loaded vault and to restart the daemon if a DKG has just completed (a vault created by a DKG is loaded only by a restart, and `vault-pubkey.json` exists from the DKG commit on). The file's values are not shown.
+    3. **Daemon unreachable.** A config the client cannot be built from (`DaemonClient.fromConfig` throws: file unreadable, invalid, no trigger), or a system error while asking (an error with a string `code`: `ENOENT` no socket, `ECONNREFUSED`, `EACCES`, …). `readVaultPubkeyFile(vaultPath)` is returned in the shape above, after `warn("not verified against the daemon (<reason>)")` (`<reason>` through `displayText`). A missing or invalid file throws as `readVaultPubkeyFile` does (a missing one points at `otzi generate`).
+  - **Throws:** a `DaemonClientError` for any status but 409 (401, 403, 500, …), and the `Error` of a reply that is not JSON: the daemon answered, so the file is not shown as if the daemon were down.
+  - **Invariants:** stdout carries only the returned text; a mismatch prints nothing there. The output shape is that of the file as before the cross-check; only `--json` without a file lacks `vaultKey`.
 
 ### `btc.ts`
 **Purpose:** `otzi btc balance|send|sign` — chain access through Esplora, signing through the daemon.

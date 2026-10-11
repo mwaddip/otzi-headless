@@ -322,7 +322,7 @@ daemon UDS are reserved for tests + debugging.
 | `otzi daemon <config>` | Run the daemon (long-lived; usually started by systemd). |
 | `otzi setup <config>` | Bootstrap pubkey exchange. Reads `[bootstrap].role`. Prints the 96-bit fingerprint. |
 | `otzi generate` | Run the run-once DKG through the local daemon; prints the vault address. |
-| `otzi vault [--json]` | Print the vault address, network and threshold/parties (keys with `--json`). |
+| `otzi vault [--json] [--config <path>]` | Print the vault address, network and threshold/parties (keys with `--json`), checked against the daemon's loaded share. |
 | `otzi btc balance [--unit ...]` | Confirmed and unconfirmed vault balance from Esplora (units: `sats` `btc` `mbtc` `ubtc`). |
 | `otzi btc send <label\|address> <amount[unit]\|max> [--fee-rate N]` | Build, sign and broadcast a send. |
 | `otzi btc sign <proposal.json> [--broadcast]` | Sign a caller-built `SendProposal`; prints the analysis, txid and signed hex. |
