@@ -50,8 +50,11 @@ follow up with `sudo apt -f install` to resolve.)
        the leader is auto-derived from the bootstrap leader URL, so
        you only list peers *other than* the leader).
      - For `relay`: **Relay URL** (`ws://` or `wss://`; the same on every node, see
-       [Relay coordinator](#relay-coordinator)). A relay config has no
-       `[[peers]]`, so no peer list is asked.
+       [Relay coordinator](#relay-coordinator)). Any other answer, or none, is left
+       out of `daemon.toml` with a warning on stderr, and the daemon and `otzi setup`
+       then refuse the config with `config transport.url: required when
+       transport.kind = "relay"` until you add `url` under `[transport]`. A relay
+       config has no `[[peers]]`, so no peer list is asked.
    - **Bootstrap bind** (leader) or **leader URL** (leaf).
    - **Number of nodes in the ring (including this one)** — asked only on a
      leader under `relay`. An integer from 2 to 255; it becomes `[bootstrap]
@@ -128,8 +131,8 @@ follow up with `sudo apt -f install` to resolve.)
    The leader stops listening once every member has registered. Remove any
    firewall opening you made for setup.
 
-4. **Enable + start the daemon** on every node (under `relay`, with the relay
-   server already running: see [Relay coordinator](#relay-coordinator)):
+4. **Enable + start the daemon** on every node (under `relay`, preferably with the
+   relay server already running: see [Relay coordinator](#relay-coordinator)):
    ```
    sudo systemctl enable --now otzi
    ```
@@ -260,8 +263,10 @@ transports. Two differences matter during setup:
   the relay, and under relay the leader admits members **by count**. Keep that
   port reachable only by the members until setup ends (see step 3 of the
   walkthrough).
-- The daemons connect to the relay when they start, so start the relay before
-  step 4 of the walkthrough.
+- The daemons connect to the relay when they start, so it is best to start the
+  relay before step 4 of the walkthrough. The order is advisory, not required: a
+  daemon that comes up first logs a warning and redials the relay with a backoff of
+  1 s up to 30 s, and connects as soon as the relay is there.
 
 ## Operator API
 
@@ -586,9 +591,11 @@ sudo apt remove otzi-headless    # keeps /etc/otzi/ and /var/lib/otzi/
 sudo apt purge otzi-headless     # ALSO removes the share + config + user
 ```
 
-The package does not stop or disable a unit you enabled yourself, so run `sudo systemctl
-disable --now otzi` (and, on the coordinator host, `otzi-relay`) first. `purge` also
-removes `/etc/otzi/relay.env` with the rest of `/etc/otzi`.
+`remove` and `purge` stop `otzi.service` and `otzi-relay.service` (an upgrade does not:
+a running daemon or relay keeps going until you restart it). They do not disable a unit
+you enabled yourself, so run `sudo systemctl disable otzi` (and, on the coordinator
+host, `otzi-relay`) first, or the enablement link stays behind. `purge` also removes
+`/etc/otzi/relay.env` with the rest of `/etc/otzi`.
 
 > **Warning:** `purge` deletes `/var/lib/otzi/share.json`. The vault is n-of-n:
 > losing any one share without a backup makes the funds unspendable. Run
@@ -600,8 +607,9 @@ removes `/etc/otzi/relay.env` with the rest of `/etc/otzi`.
 24.04 container with pre-seeded debconf answers, and verifies the rendered
 config + bundle invocation. Besides the peer-mesh install and the backup/restore
 round-trip it runs relay variants: a relay leader (`parties` 3) and a relay leaf,
-each of which must render a `daemon.toml` without `[[peers]]` that parses, and a
-leader with a bad ring size, which must be warned about and left out. It also
+each of which must render a `daemon.toml` without `[[peers]]` that parses, and leaders
+with a bad ring size or a relay URL that is not `ws://` or `wss://`, which must be
+warned about and left out. It also
 checks that `otzi-relay.service` is installed with its sandbox directives, not
 enabled, and that `/etc/otzi/relay.env` exists with the loopback default and
 survives a reconfigure. It needs docker. Useful before tagging a release.

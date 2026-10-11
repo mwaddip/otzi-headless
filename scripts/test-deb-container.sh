@@ -17,8 +17,9 @@
 #     directives and left disabled, and /etc/otzi/relay.env holds the loopback
 #     listen address and survives a reconfigure
 #   - relay-transport installs (leader with `parties` 3, leaf) render a
-#     daemon.toml with no [[peers]] that parses; a bad `parties` is left out
-#     with a warning; peer-mesh never gets `parties`
+#     daemon.toml with no [[peers]] that parses; a bad `parties` or a relay URL
+#     without ws:// or wss:// is left out with a warning; peer-mesh never gets
+#     `parties`
 #
 # Usage: bash scripts/test-deb-container.sh
 set -euo pipefail
@@ -134,7 +135,8 @@ for LINE in User=otzi Group=otzi EnvironmentFile=/etc/otzi/relay.env \
             ProtectSystem=strict ProtectHome=true PrivateTmp=true PrivateDevices=true NoNewPrivileges=true \
             ProtectKernelTunables=true ProtectKernelModules=true ProtectKernelLogs=true \
             ProtectControlGroups=true ProtectClock=true ProtectHostname=true RestrictSUIDSGID=true \
-            "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK"; do
+            "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK" \
+            RestrictNamespaces=true RestrictRealtime=true LockPersonality=true SystemCallArchitectures=native; do
   grep -qxF "$LINE" "$UNIT" || { echo "relay unit lacks $LINE"; exit 1; }
 done
 # The relay writes nothing and keeps no socket directory.
@@ -171,7 +173,7 @@ dpkg-reconfigure otzi-headless >/dev/null
 [ "$(sha256sum /etc/otzi/daemon.toml | cut -d" " -f1)" = "$CONFIG_SUM" ] || { echo "FAIL: reconfigure rewrote daemon.toml"; exit 1; }
 echo "OK: leftovers removed, daemon.toml kept"
 
-# relay.env is the operator's once it exists: a reconfigure must not put the default back.
+# relay.env belongs to the operator once it exists: a reconfigure must not put the default back.
 printf "%s\n" "OTZI_RELAY_LISTEN=127.0.0.1:7199" >/etc/otzi/relay.env
 dpkg-reconfigure otzi-headless >/dev/null
 grep -qxF "OTZI_RELAY_LISTEN=127.0.0.1:7199" /etc/otzi/relay.env || { echo "FAIL: reconfigure rewrote relay.env"; exit 1; }
@@ -358,7 +360,8 @@ echo "OK: backup password wiped from debconf cache"
 # debconf answers), preseeds relay answers and installs again. The rendered
 # daemon.toml must carry no [[peers]], must parse (`otzi daemon` gets as far as
 # the missing OTZI_SHARE_PASSWORD, as in the first pass), and the relay unit must
-# stay disabled. The relay leader also writes [bootstrap] parties.
+# stay disabled. The relay leader also writes [bootstrap] parties. A bad ring size
+# or a relay URL that is not ws:// or wss:// is left out with a warning.
 # ─────────────────────────────────────────────────────────────────────────
 
 # install_relay_variant <role> <parties-answer> <relay-url>: purge, preseed, install.
@@ -423,6 +426,7 @@ daemon_toml_parses "relay leader" "OTZI_SHARE_PASSWORD"
 # The closing message explains the relay coordinator.
 docker exec "$CONTAINER" grep -q "Relay coordinator" /tmp/relay-install.log || { echo "FAIL: no relay coordinator note in the install output"; exit 1; }
 docker exec "$CONTAINER" grep -q "systemctl enable --now otzi-relay" /tmp/relay-install.log || { echo "FAIL: install output does not say how to start the relay"; exit 1; }
+docker exec "$CONTAINER" grep -qF "(this node: wss://relay.example)" /tmp/relay-install.log || { echo "FAIL: install output does not name this node's relay URL"; exit 1; }
 echo "OK: relay leader renders parties = 3, no [[peers]], and parses"
 
 echo ">> relay variant: leaf (a stale parties answer must not be written)"
@@ -448,7 +452,30 @@ for BAD in 1 256 abc 3.5; do
     || { echo "FAIL: parties '$BAD' was written" >&2; exit 1; }
   daemon_toml_parses "relay leader, parties '$BAD'" "bootstrap.parties.*required"
 done
+# A blank answer gets its own wording.
+install_relay_variant leader "" ws://relay.example:9000
+docker exec "$CONTAINER" grep -q "WARNING.*no ring size given" /tmp/relay-install.log \
+  || { echo "FAIL: no warning for a blank ring size" >&2; exit 1; }
+docker exec "$CONTAINER" bash -euo pipefail -c '! grep -q "^parties" /etc/otzi/daemon.toml' \
+  || { echo "FAIL: a blank ring size was written" >&2; exit 1; }
+daemon_toml_parses "relay leader, blank parties" "bootstrap.parties.*required"
 echo "OK: a bad ring size is warned about and left out"
+
+echo ">> relay variant: leader with a relay URL the daemon cannot dial"
+# Only ws:// and wss:// are written. Anything else is warned about and left out, the parser
+# names transport.url, and the closing message does not print an empty "(this node: )".
+for BADURL in "" relay.example http://relay.example; do
+  install_relay_variant leader 3 "$BADURL"
+  docker exec "$CONTAINER" grep -Eq "WARNING.*(no relay URL given|ignoring relay URL '$BADURL')" /tmp/relay-install.log \
+    || { echo "FAIL: no warning for relay URL '$BADURL'" >&2; exit 1; }
+  docker exec "$CONTAINER" bash -euo pipefail -c '! grep -q "^url = " /etc/otzi/daemon.toml' \
+    || { echo "FAIL: relay URL '$BADURL' was written" >&2; exit 1; }
+  if docker exec "$CONTAINER" grep -qF "(this node: )" /tmp/relay-install.log; then
+    echo "FAIL: the closing message prints an empty relay URL for '$BADURL'" >&2; exit 1
+  fi
+  daemon_toml_parses "relay leader, url '$BADURL'" "transport.url.*required"
+done
+echo "OK: a relay URL without ws:// or wss:// is warned about and left out"
 
 echo ""
 echo "✓ all checks passed (fresh install + restore round-trip + relay variants)"

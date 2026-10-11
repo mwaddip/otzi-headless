@@ -213,8 +213,32 @@ BANNER
         case "$PARTIES_NUM" in
           [2-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) PARTIES_OK="$PARTIES_NUM" ;;
           *)
-            echo "otzi-headless: WARNING — ignoring ring size '$PARTIES': the number of nodes (this one included) must be an integer from 2 to 255." >&2
+            if [ -z "$PARTIES" ]; then
+              echo "otzi-headless: WARNING — no ring size given: the number of nodes (this one included) must be an integer from 2 to 255." >&2
+            else
+              echo "otzi-headless: WARNING — ignoring ring size '$PARTIES': the number of nodes (this one included) must be an integer from 2 to 255." >&2
+            fi
             echo "otzi-headless: set parties under [bootstrap] in /etc/otzi/daemon.toml before running 'otzi setup'." >&2
+            ;;
+        esac
+      fi
+
+      # [transport] url (relay): the daemon dials it as a WebSocket, so only a ws:// or
+      # wss:// URL is written. A blank or other answer is left out with a warning, and
+      # the parser then refuses the config naming transport.url, rather than the
+      # daemon failing later against an address it cannot dial.
+      RELAY_URL_OK=""
+      if [ "$TRANSPORT" = "relay" ]; then
+        RELAY_URL="$(printf '%s' "$RELAY_URL" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        case "$RELAY_URL" in
+          ws://?*|wss://?*) RELAY_URL_OK="$RELAY_URL" ;;
+          "")
+            echo "otzi-headless: WARNING — no relay URL given: it must be a ws:// or wss:// URL, for example wss://relay.example." >&2
+            echo "otzi-headless: set url under [transport] in /etc/otzi/daemon.toml before running 'otzi setup'." >&2
+            ;;
+          *)
+            echo "otzi-headless: WARNING — ignoring relay URL '$RELAY_URL': it must be a ws:// or wss:// URL, for example wss://relay.example." >&2
+            echo "otzi-headless: set url under [transport] in /etc/otzi/daemon.toml before running 'otzi setup'." >&2
             ;;
         esac
       fi
@@ -222,7 +246,7 @@ BANNER
       ENODE_ID="$(toml_escape "$NODE_ID")"
       EESPLORA_URL="$(toml_escape "$ESPLORA_URL")"
       EADVERTISED="$(toml_escape "$ADVERTISED")"
-      ERELAY_URL="$(toml_escape "$RELAY_URL")"
+      ERELAY_URL="$(toml_escape "$RELAY_URL_OK")"
       EBOOTSTRAP_BIND="$(toml_escape "$BOOTSTRAP_BIND")"
       EBOOTSTRAP_LEADER_URL="$(toml_escape "$BOOTSTRAP_LEADER_URL")"
 
@@ -256,9 +280,13 @@ EOF
         cat >>/etc/otzi/daemon.toml <<EOF
 [transport]
 kind = "relay"
-url = "$ERELAY_URL"
-
 EOF
+        if [ -n "$RELAY_URL_OK" ]; then
+          cat >>/etc/otzi/daemon.toml <<EOF
+url = "$ERELAY_URL"
+EOF
+        fi
+        printf '\n' >>/etc/otzi/daemon.toml
       else
         cat >>/etc/otzi/daemon.toml <<EOF
 [transport]
@@ -372,11 +400,17 @@ EOF
       # Relay transport: the steps above are the same, but a relay server has to
       # run somewhere. docs/install.md, Relay coordinator, has the details.
       if [ "$TRANSPORT" = "relay" ]; then
+        if [ -n "$RELAY_URL_OK" ]; then
+          RELAY_URL_NOTE="this node: $RELAY_URL_OK"
+        else
+          RELAY_URL_NOTE="this node has none yet: add it under [transport]"
+        fi
         cat <<EOF
 
 Relay coordinator (relay transport). One host runs the relay server for the
-whole ring: one of the ring nodes, or a separate host. Set it up before step 3,
-because every daemon connects to the relay when it starts:
+whole ring: one of the ring nodes, or a separate host. Start it before the
+daemons (step 3) if you can. A daemon that starts first just redials the relay,
+backing off from 1 s to 30 s, so the order is not strict:
   a. Install this package on the coordinator host. It ships otzi-relay.service,
      installed DISABLED: nothing starts the relay for you.
   b. The relay listens on the address in /etc/otzi/relay.env (root:root, mode
@@ -389,7 +423,7 @@ because every daemon connects to the relay when it starts:
   d. Start it on the coordinator host (logs: journalctl -u otzi-relay):
        sudo systemctl enable --now otzi-relay
   e. On every node, [transport] url in /etc/otzi/daemon.toml must be that
-     wss:// URL (this node: $RELAY_URL).
+     wss:// URL ($RELAY_URL_NOTE).
 Under relay the bootstrap leader admits members by count, so during step 1 keep
 the leader's bootstrap port reachable only by the ring members.
 EOF

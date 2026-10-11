@@ -287,11 +287,12 @@ function parseBind(bind: string): { host: string; port: number } {
   if (!m) throw new Error(`RelayServer: invalid listen '${bind}' — expected 'host:port'`);
   let host = m[1]!;
   // An IPv6 literal is written in brackets (`[::1]:7100`); `listen` and DNS take it without them.
-  // Only a matched pair is stripped; a lone bracket is a malformed address.
+  // One enclosing pair is stripped. A bracket left in the host (a lone one, or nested ones as in
+  // `[[::1]]`) is a malformed address, never a name to resolve.
   const bracketed = /^\[(.+)\]$/.exec(host);
   if (bracketed) host = bracketed[1]!;
-  else if (host.startsWith('[') || host.endsWith(']'))
-    throw new Error(`RelayServer: invalid listen '${bind}' — unbalanced brackets around the host`);
+  if (/[[\]]/.test(host))
+    throw new Error(`RelayServer: invalid listen '${bind}' — brackets must enclose the whole host, once ('[::1]:7100')`);
   const port = Number(m[2]);
   if (!Number.isInteger(port) || port < 0 || port > 65_535)
     throw new Error(`RelayServer: invalid port '${m[2]}'`);

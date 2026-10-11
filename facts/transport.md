@@ -482,7 +482,7 @@
 - `constructor(options: RelayServerOptions)`
   - **Pre:** `options.listen` is valid "host:port".
   - **Post:** Initializes relay state (rings map). Does not start listening yet. A bracketed IPv6 host is stored without its brackets (`[::1]:7100` binds host `::1`, and `address()` reports `::1`), as `src/config/parse.ts` reads a bracketed bind host; `listen` and DNS never see the brackets.
-  - **Throws:** `Error` if bind format is invalid (including an empty host, `[]`, or brackets that do not pair up: `[::1:7100`, `::1]:7100`), or `heartbeatMs` is not a finite number ≥ 1.
+  - **Throws:** `Error` if bind format is invalid (including an empty host, `[]`, or brackets that are not one pair around the whole host: `[::1:7100`, `::1]:7100`, `[[::1]]:7100`), or `heartbeatMs` is not a finite number ≥ 1.
 
 - `start(): Promise<void>`
   - **Pre:** Relay not already started.

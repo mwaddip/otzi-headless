@@ -131,8 +131,18 @@ describe('RelayServer — roster + routing', () => {
     expect(parsed('relay.example:7100')).toEqual({ host: 'relay.example', port: 7100 });
   });
 
-  it('rejects a bracketed host that is empty or unbalanced', () => {
-    for (const listen of ['[]:7100', '[::1:7100', '::1]:7100', '[::1]', '[::1]:99999']) {
+  it('rejects a bracketed host that is empty, unbalanced or nested', () => {
+    for (const listen of [
+      '[]:7100',
+      '[::1:7100',
+      '::1]:7100',
+      '[::1]',
+      '[::1]:99999',
+      '[[::1]]:7100',
+      '[::1]]:7100',
+      '[[::1]:7100',
+      '[a[b]c]:7100',
+    ]) {
       expect(() => new RelayServer({ listen }), listen).toThrow(/RelayServer: invalid|host required/);
     }
   });
