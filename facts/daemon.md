@@ -604,7 +604,7 @@
 - Exports the wire-format constants `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_SALT_LEN`, `BACKUP_IV_LEN`, `BACKUP_TAG_LEN`, `BACKUP_HEADER_LEN`, `BACKUP_PBKDF2_ITERATIONS`, the default file paths and `stripLeadingSlash` — `restore.ts` consumes all of these.
 
 ### `restore.ts`
-**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, read its tar members in memory, validate every member and every target path, then create each file at its canonical absolute path with the mode the daemon expects. Usable as a CLI verb and as the engine the debconf postinst pipes the password into via stdin. Restore runs as root, so it writes only the vault's own files, only directly inside `/etc/otzi` and `/var/lib/otzi`, and never replaces or follows anything already there.
+**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, read its tar members in memory, validate every member and every target path, then create each file at its canonical absolute path with the mode the daemon expects. Usable as a CLI verb and as the engine the debconf postinst pipes the password into via stdin. Restore runs as root, so it writes only the vault's own files, only directly inside `/etc/otzi` and `/var/lib/otzi`, and never replaces or follows anything already there. When it runs as root and a system user `otzi` exists, it also gives the files it places in `/var/lib/otzi` to that user, so the daemon (`User=otzi`) can read the share.
 
 **Public surface:**
 - `runRestore(opts: RestoreOptions): Promise<RestoreResult>`
@@ -619,8 +619,9 @@
     4. Every other member (and `meta.json`, read for the result) is not written: it is skipped and listed in `skippedEntries`.
     5. **No target exists** (`lstat`; a symlink, dangling or not, counts): otherwise `restore would replace existing files: <path>, …; move them aside and run restore again`, listing every one.
     - **Display:** every piece of archive-derived text in these refusals (entry names, the paths and parse errors of the archived daemon.toml, the target paths) is shown through `displayText` (`src/util/text.ts`): control characters are removed, so an archive cannot inject terminal escape sequences into the error.
-  - **Placement:** in archive order, each target is created with `open(path, 'wx', mode)` (fails if anything appeared there meanwhile; never follows a symlink at the final component), written, `chmod`'d to its mode and synced; the allowed directory is created when missing.
-  - **Post:** Every target in the archive exists at its canonical (or `rootOverride`-prefixed) absolute path with its mode (see "Restored file modes"). `meta.json` is read into the result but NEVER written to disk. Returns `{ restoredFiles: { path, mode }[], skippedEntries: string[], metaPartyId?, metaCreatedAt?, metaHostname? }`.
+  - **Placement:** in archive order, each target is created with `open(path, 'wx', mode)` (fails if anything appeared there meanwhile; never follows a symlink at the final component), given to the `otzi` user when ownership applies (below), written, `chmod`'d to its mode and synced; the allowed directory is created when missing.
+  - **Ownership:** applies only when the process runs as root (`process.getuid?.() === 0`) and the `otzi` lookup finds a user. The lookup reads `<root>/etc/passwd` (uid and primary gid of the user `otzi`) and `<root>/etc/group` (gid of the group `otzi`, which wins over the user's primary gid); a missing file, or no `otzi` entry, means no ownership change and no message (a dev machine). Then every file placed directly inside `/var/lib/otzi` (the share, identity and pubkey-book files when `daemon.toml` puts them there, and `vault-pubkey.json`) is `fchown`ed to that uid and gid on the handle `open` returned, before the handle is closed, so no file is ever left mis-owned by a crash after it was closed. Files placed in `/etc/otzi` (`daemon.toml`, the address book, and any of the three that `daemon.toml` puts there) keep the owner they were created with: root, group `otzi` through the setgid directory. A failing `fchown` is a placement failure (rollback below). Not root: nothing is chowned, the files belong to the invoking user. Directories restore creates are not chowned.
+  - **Post:** Every target in the archive exists at its canonical (or `rootOverride`-prefixed) absolute path with its mode and, where ownership applies, its owner (see "Restored file modes and owners"). `meta.json` is read into the result but NEVER written to disk. Returns `{ restoredFiles: { path, mode, owner? }[], skippedEntries: string[], metaPartyId?, metaCreatedAt?, metaHostname? }`.
   - **Throws:**
     - Bad magic → `Error('not an otzi backup archive (magic mismatch)')`.
     - Existing daemon.toml → `Error('config already present at <path>; move it aside first')`.
@@ -633,13 +634,19 @@
   - `archivePath: string` — required positional CLI arg.
   - `password?: string` — explicit password (test path or `--password` flag; the flag leaks via `/proc/<pid>/cmdline`, docs steer operators to stdin).
   - `passwordStdin?: boolean` — read password from stdin until newline (postinst path).
-  - `rootOverride?: string` — chroot-style prefix for all extraction targets (test seam; default `/`). The allowed directories become `<rootOverride>/etc/otzi` and `<rootOverride>/var/lib/otzi`; the paths daemon.toml names are still checked as production paths.
+  - `rootOverride?: string` — chroot-style prefix for all extraction targets (test seam; default `/`). The allowed directories become `<rootOverride>/etc/otzi` and `<rootOverride>/var/lib/otzi`; the paths daemon.toml names are still checked as production paths. The default `otzi` lookup reads `<rootOverride>/etc/passwd` and `<rootOverride>/etc/group`, so a test root without them never chowns.
   - `daemonStatusCheck?: () => Promise<boolean>` — override the `systemctl is-active otzi` probe (test seam).
   - `configExistsCheck?: () => Promise<boolean>` — override the daemon.toml-exists probe (test seam).
   - `stdinStream?: Readable` — alternate stream for the `passwordStdin` path (test seam).
+  - `isRoot?: boolean` — overrides `process.getuid?.() === 0` (test seam).
+  - `lookupOtziOwner?: () => Promise<OtziOwner | undefined>` — overrides the `<root>/etc/passwd` + `<root>/etc/group` lookup of the `otzi` user (test seam); `undefined` means there is no such user.
+  - `chownFile?: (handle: FileHandle, path: string, owner: OtziOwner) => Promise<void>` — overrides the `handle.chown(owner.uid, owner.gid)` call (test seam); called with the still-open handle.
+
+- `OtziOwner` — `{ uid: number; gid: number }`.
+- `findOtziOwner(passwd: string, group: string): OtziOwner | undefined` — pure parser of `passwd` / `group` file text: the uid of the user `otzi` and the gid of the group `otzi`, falling back to the user's primary gid; `undefined` when the user is missing or a field is not a non-negative integer.
 
 - `RestoreResult`
-  - `restoredFiles: { path: string; mode: number }[]`.
+  - `restoredFiles: { path: string; mode: number; owner?: OtziOwner }[]` — `owner` is present exactly for the files restore `fchown`ed.
   - `skippedEntries: string[]` — tar member names that are not part of a backup and were not written (the CLI prints one warning line per entry).
   - `metaPartyId?: number`, `metaCreatedAt?: string`, `metaHostname?: string` — from in-archive `meta.json`; missing/malformed meta is non-fatal.
 
@@ -648,6 +655,7 @@
 - Wrong-password and tampered-archive surface IDENTICALLY.
 - Members are parsed in memory (`tar` `Parser`); nothing from the archive is extracted to disk before validation, and nothing is ever written outside the target list.
 - Restore only creates files: it never replaces, truncates, deletes or writes through an existing file system entry. A throw mid-place removes only the files this call created.
+- Ownership never widens access: `fchown` happens on a file restore itself created with its final mode (the share is 0600), and only to the `otzi` user, whose daemon is the share's one legitimate reader. Restore never chowns a pre-existing entry, a directory, or anything in `/etc/otzi`.
 - `meta.json` and unknown members are never written to disk; unknown members are reported in `skippedEntries`.
 - Password resolution precedence: explicit `password` → `passwordStdin` → interactive readline prompt on stderr.
 - `runRestore` is pure-ish: filesystem I/O + crypto + `systemctl` exec only; a single `console.error` on rollback.
@@ -701,18 +709,20 @@ Constants exported by `backup.ts`: `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_S
 
 ---
 
-## Restored file modes (invariant)
+## Restored file modes and owners (invariant)
 
-`restore.ts` creates each file with these modes. They match what the `.deb` postinst sets up (chmod-only; ownership inherits from `/etc/otzi` and `/var/lib/otzi` setgid bits).
+`restore.ts` creates each file with these modes. They match what the `.deb` postinst sets up. The owner column is the result of a restore run as root on an install with a system user `otzi` (normal ownership: see `docs/install.md` § File layout); a file `restore` did not chown belongs to whoever created it, and gets group `otzi` from the setgid directory when root creates it.
 
-| Path | Mode |
-|---|---|
-| `/etc/otzi/daemon.toml` | 0640 |
-| `/etc/otzi/address-book.otzi.json` | 0640 |
-| share file (configurable path) | 0600 |
-| identity file | 0660 |
-| pubkey-book file | 0644 |
-| `/var/lib/otzi/vault-pubkey.json` | 0644 |
+| Path | Mode | Owner after restore as root |
+|---|---|---|
+| `/etc/otzi/daemon.toml` | 0640 | root:otzi (setgid dir) |
+| `/etc/otzi/address-book.otzi.json` | 0640 | root:otzi (setgid dir) |
+| share file (configurable path) | 0600 | otzi:otzi in `/var/lib/otzi` |
+| identity file | 0660 | otzi:otzi in `/var/lib/otzi` |
+| pubkey-book file | 0644 | otzi:otzi in `/var/lib/otzi` |
+| `/var/lib/otzi/vault-pubkey.json` | 0644 | otzi:otzi |
+
+A share, identity or pubkey-book file that `daemon.toml` puts directly in `/etc/otzi` stays root:otzi (mode as in the table). Without a user `otzi`, or when not root, no file is chowned.
 
 Operator-configurable paths (share / identity / pubkeys per `[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file` in daemon.toml) are resolved at restore time by loose-parsing the archived daemon.toml, and must be direct children of `/etc/otzi` or `/var/lib/otzi` (no nested layouts). Unrecognized tar entries are not written; `otzi restore` prints `warning: skipped archive entry <name>: not part of an otzi backup` to stderr for each.
 

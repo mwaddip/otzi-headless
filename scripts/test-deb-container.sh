@@ -164,7 +164,9 @@ docker exec "$CONTAINER" bash -euo pipefail -c '
 printf "%s\n" "{\"v\":1,\"data\":\"synthetic-share-payload\"}" >/var/lib/otzi/share.json
 printf "%s\n" "{\"pkcs8Hex\":\"deadbeef\",\"publicKeyHex\":\"cafe\"}" >/var/lib/otzi/identity.json
 printf "%s\n" "[]" >/var/lib/otzi/pubkeys.json
-chown otzi:otzi /var/lib/otzi/share.json /var/lib/otzi/identity.json /var/lib/otzi/pubkeys.json
+# No chown: written by root, the files are root:otzi (setgid dir) as a restore run as
+# root would leave them without ownership handling, so the restore assertions below
+# prove restore gives them to the otzi user (the archive itself carries no owner).
 chmod 600 /var/lib/otzi/share.json
 chmod 660 /var/lib/otzi/identity.json
 chmod 644 /var/lib/otzi/pubkeys.json
@@ -230,6 +232,16 @@ test -f /var/lib/otzi/share.json       || { echo "FAIL: share.json not restored"
 test -f /var/lib/otzi/identity.json    || { echo "FAIL: identity.json not restored";        exit 1; }
 test -f /var/lib/otzi/pubkeys.json     || { echo "FAIL: pubkeys.json not restored";         exit 1; }
 
+# Owners: restore ran as root; the daemon (User=otzi) must own what it reads in
+# /var/lib/otzi, and the config in /etc/otzi stays root:otzi.
+[ "$(stat -c %U /var/lib/otzi/share.json)" = "otzi" ]    || { echo "FAIL: share.json owner is $(stat -c %U /var/lib/otzi/share.json), want otzi"; exit 1; }
+[ "$(stat -c %G /var/lib/otzi/share.json)" = "otzi" ]    || { echo "FAIL: share.json group is $(stat -c %G /var/lib/otzi/share.json), want otzi"; exit 1; }
+[ "$(stat -c %U /var/lib/otzi/identity.json)" = "otzi" ] || { echo "FAIL: identity.json owner";    exit 1; }
+[ "$(stat -c %U /var/lib/otzi/pubkeys.json)" = "otzi" ]  || { echo "FAIL: pubkeys.json owner";     exit 1; }
+[ "$(stat -c %U:%G /etc/otzi/daemon.toml)" = "root:otzi" ] || { echo "FAIL: daemon.toml owner";    exit 1; }
+# ...and the proof that matters: the daemon user can read the restored share.
+runuser -u otzi -- head -c 1 /var/lib/otzi/share.json >/dev/null || { echo "FAIL: user otzi cannot read share.json"; exit 1; }
+
 # Per-file modes (mirrors restore.ts FIXED_FILE_MODES + dynamic table).
 stat -c "%a" /etc/otzi/daemon.toml         | grep -q "^640$" || { echo "FAIL: daemon.toml mode";       exit 1; }
 stat -c "%a" /var/lib/otzi/share.json      | grep -q "^600$" || { echo "FAIL: share.json mode";        exit 1; }
@@ -241,7 +253,7 @@ stat -c "%a" /var/lib/otzi/pubkeys.json    | grep -q "^644$" || { echo "FAIL: pu
 grep -q "id = \"testnode-a\"" /etc/otzi/daemon.toml || {
   echo "FAIL: restored daemon.toml does not match the original"; exit 1;
 }
-echo "OK: restored layout + modes match expected"
+echo "OK: restored layout + owners + modes match expected"
 '
 
 echo ">> verifying backup password wiped from debconf cache"

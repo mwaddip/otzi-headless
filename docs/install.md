@@ -147,7 +147,7 @@ sudo dpkg-reconfigure otzi-headless
 | `/etc/otzi/otzi.env` | share password for the unit (`OTZI_SHARE_PASSWORD=…`) | root:root 600 |
 | `/etc/otzi/address-book.otzi.json` | this node's address book (optional; owner and mode re-applied on every configure) | root:otzi 640 |
 | `/var/lib/otzi/` | data dir (setgid; group otzi can write) | root:otzi 2770 |
-| `/var/lib/otzi/identity.json` | ECDH identity | written 660 |
+| `/var/lib/otzi/identity.json` | ECDH identity | otzi:otzi 660 |
 | `/var/lib/otzi/pubkeys.json` | pubkey book from bootstrap | otzi:otzi 644 |
 | `/var/lib/otzi/share.json` | encrypted Ötzi v4 share | otzi:otzi 600 |
 | `/var/lib/otzi/share.json.pending` | DKG staging file; exists while a DKG runs, or after a DKG that failed once this node had confirmed | otzi:otzi 600 |
@@ -324,16 +324,24 @@ files it created and leaves everything else as it was.
 The CLI prompts for the password interactively. Use
 `--password-stdin` for scripted runs.
 
-Restore places each file at its canonical path with these modes:
+Restore places each file at its canonical path with these modes and owners:
 
-| Path | Mode |
-|---|---|
-| `/etc/otzi/daemon.toml` | 0640 |
-| `/etc/otzi/address-book.otzi.json` | 0640 |
-| share file (`[share].path`) | 0600 |
-| identity file | 0660 |
-| pubkey-book file | 0644 |
-| `/var/lib/otzi/vault-pubkey.json` | 0644 |
+| Path | Mode | Owner |
+|---|---|---|
+| `/etc/otzi/daemon.toml` | 0640 | root:otzi |
+| `/etc/otzi/address-book.otzi.json` | 0640 | root:otzi |
+| share file (`[share].path`) | 0600 | otzi:otzi |
+| identity file | 0660 | otzi:otzi |
+| pubkey-book file | 0644 | otzi:otzi |
+| `/var/lib/otzi/vault-pubkey.json` | 0644 | otzi:otzi |
+
+The owners are what restore sets when it runs as root (the debconf restore and
+`sudo otzi restore` both do) on a host with the `otzi` system user: it gives
+every file it places in `/var/lib/otzi` to `otzi:otzi`, because the daemon runs
+as `otzi` and could not read a root-owned `0600` share. Files in `/etc/otzi`
+keep the owner they are created with, `root:otzi` through the setgid
+directory. Run as another user, or on a host with no `otzi` user, restore
+changes no owner.
 
 The archive does not contain `/etc/otzi/otzi.env`. Recreate it with the share
 password, then start the daemon; it loads the restored share:

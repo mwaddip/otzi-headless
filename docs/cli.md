@@ -99,7 +99,7 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
 
 - `otzi restore <archive-path> [--password-stdin]` — decrypt an `otzi-backup` archive and restore files to their canonical paths with canonical modes. Without `--password-stdin`, the CLI prompts for the password on the terminal; what you type is shown (the prompt does not mask it), so prefer `--password-stdin` where others can see the screen. With `--password-stdin`, it reads the password from stdin until newline — used by debconf during fresh installs and by scripted runs.
 
-  Restore only creates files. It writes the vault's own files — `daemon.toml`, the address book, `vault-pubkey.json`, and the share, identity and pubkey book at the paths the archived `daemon.toml` names — and only directly inside `/etc/otzi` and `/var/lib/otzi` (not in a subdirectory of them). Any other entry in the archive is skipped with a warning. If it fails part-way, it removes the files it created; nothing that existed before is touched.
+  Restore only creates files, and run as root (`sudo otzi restore`, or the postinst) on a host with the `otzi` system user it gives every file it places in `/var/lib/otzi` to `otzi:otzi`, so the daemon can read the share; files in `/etc/otzi` stay `root:otzi`. Without root or without an `otzi` user it changes no owner. It writes the vault's own files — `daemon.toml`, the address book, `vault-pubkey.json`, and the share, identity and pubkey book at the paths the archived `daemon.toml` names — and only directly inside `/etc/otzi` and `/var/lib/otzi` (not in a subdirectory of them). Any other entry in the archive is skipped with a warning. If it fails part-way, it removes the files it created; nothing that existed before is touched.
 
   Refuses (exit 1) if:
   - `/etc/otzi/daemon.toml` already exists. Move it aside first (`sudo mv /etc/otzi/daemon.toml /root/`).
@@ -118,7 +118,7 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
   echo "$BACKUP_PWD" | sudo otzi restore --password-stdin ~/otzi-backup-...otzi-backup
   ```
 
-  On success, prints a per-file summary, a warning line for each skipped entry, and the next steps: create `/etc/otzi/otzi.env` with the share password (the archive does not contain it; `sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env`, then edit it), then `sudo systemctl start otzi`.
+  On success, prints a per-file summary (mode, and `owner otzi:otzi` for the files it gave to the `otzi` user), a warning line for each skipped entry, and the next steps: create `/etc/otzi/otzi.env` with the share password (the archive does not contain it; `sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env`, then edit it), then `sudo systemctl start otzi`.
 
   **Why stdin and not a `--password=<pwd>` flag?** A CLI flag would leak the password via `/proc/<pid>/cmdline` and `ps`. Stdin is the only safe non-interactive channel.
 

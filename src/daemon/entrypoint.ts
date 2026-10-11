@@ -461,7 +461,8 @@ async function runRestoreCommand(args: string[]): Promise<void> {
   }
   console.log('Restored files:');
   for (const f of result.restoredFiles) {
-    console.log(`  ${f.path} (mode 0${f.mode.toString(8).padStart(3, '0')})`);
+    const mode = `mode 0${f.mode.toString(8).padStart(3, '0')}`;
+    console.log(`  ${f.path} (${mode}${f.owner ? ', owner otzi:otzi' : ''})`);
   }
   console.log('Next steps:');
   console.log('  1. Create /etc/otzi/otzi.env with the share password (the archive does not contain it):');

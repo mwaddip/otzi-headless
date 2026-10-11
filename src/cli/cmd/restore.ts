@@ -7,11 +7,13 @@
  * install with throwaway prompts) and as the engine the debconf postinst
  * pipes the password into via stdin.
  *
- * Files are restored with `chmod` only; the daemon user/group is set by
- * postinst (Phase 9a) and inherited from the parent dir's setgid bit. If
- * extracting as root, files land as `root:otzi`; as a regular user, they
- * land as that user. Either way, ownership is determined by the runtime
- * uid + setgid parent dir, not by anything we set here.
+ * Ownership: files are created by the running user, in directories postinst
+ * made setgid root:otzi. When restore runs as root (postinst, or `sudo otzi
+ * restore`) and a system user `otzi` exists, each file placed in /var/lib/otzi
+ * is also `fchown`ed to that user and group on its open handle, because a
+ * root-owned 0600 share would leave the daemon (User=otzi) with EACCES. Files in
+ * /etc/otzi stay root:otzi (the setgid directory gives the group). Without root
+ * or without a user `otzi` (a dev machine) nothing is chowned.
  *
  * The per-file mode table is hard-coded and mirrors the postinst's chmod
  * choices. It is the security-relevant invariant: changing it widens or
@@ -40,6 +42,7 @@
 import { execFile as execFileCb } from 'node:child_process';
 import { createDecipheriv, pbkdf2Sync } from 'node:crypto';
 import { lstat, mkdir, open, readFile, rm, stat } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { dirname, join, posix, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
@@ -87,6 +90,12 @@ const META_TAR_PATH = 'meta.json';
 
 /** The only directories restore writes into (under `rootOverride` in tests). */
 const ALLOWED_DIRS = ['etc/otzi', 'var/lib/otzi'] as const;
+
+/** The directory whose files belong to the daemon's user (the share is read there). */
+const STATE_DIR = 'var/lib/otzi';
+
+/** The system user and group the daemon runs as (`User=otzi`). */
+const OTZI_NAME = 'otzi';
 
 /** Tar types that are regular files. */
 const REGULAR_TYPES: ReadonlySet<string> = new Set(['File', 'OldFile', 'ContiguousFile']);
@@ -139,6 +148,12 @@ function defaultConfigExistsCheck(rootOverride?: string): () => Promise<boolean>
   };
 }
 
+/** The uid and gid restore gives the files in /var/lib/otzi to. */
+export interface OtziOwner {
+  uid: number;
+  gid: number;
+}
+
 export interface RestoreOptions {
   /** Positional CLI arg — absolute path to the .otzi-backup file. */
   archivePath: string;
@@ -175,11 +190,31 @@ export interface RestoreOptions {
    * newline so the stdin path is exercised without monkey-patching globals.
    */
   stdinStream?: Readable;
+  /**
+   * Test seam: whether the process runs as root. Defaults to
+   * `process.getuid?.() === 0`. Files are only chowned when it is true.
+   */
+  isRoot?: boolean;
+  /**
+   * Test seam: look up the system user `otzi`. Defaults to reading
+   * `<rootOverride>/etc/passwd` and `<rootOverride>/etc/group`
+   * (`/etc/passwd` and `/etc/group` in production). `undefined` means there is
+   * no such user, and nothing is chowned.
+   */
+  lookupOtziOwner?: () => Promise<OtziOwner | undefined>;
+  /**
+   * Test seam: give the file open on `handle` (at `path`) to `owner`. Defaults
+   * to `handle.chown(owner.uid, owner.gid)`. Called before the handle is closed.
+   */
+  chownFile?: (handle: FileHandle, path: string, owner: OtziOwner) => Promise<void>;
 }
 
 export interface RestoreResult {
-  /** Absolute paths after extraction, with the mode each file was chmod'd to. */
-  restoredFiles: { path: string; mode: number }[];
+  /**
+   * Absolute paths after extraction, with the mode each file was chmod'd to
+   * and, for a file given to the `otzi` user, its owner.
+   */
+  restoredFiles: { path: string; mode: number; owner?: OtziOwner }[];
   /** Tar member names that are not part of a backup; skipped, never written. */
   skippedEntries: string[];
   /**
@@ -206,6 +241,10 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
   const configExists =
     opts.configExistsCheck ?? defaultConfigExistsCheck(opts.rootOverride);
   const daemonRunning = opts.daemonStatusCheck ?? defaultDaemonStatusCheck;
+  const isRoot = opts.isRoot ?? process.getuid?.() === 0;
+  const lookupOwner = opts.lookupOtziOwner ?? (() => readOtziOwner(root));
+  const chownFile =
+    opts.chownFile ?? ((handle: FileHandle, _path: string, owner: OtziOwner) => handle.chown(owner.uid, owner.gid));
 
   // --- Pre-flight check 1: magic byte (cheap precheck before decryption).
   const buf = await readFile(archivePath);
@@ -348,12 +387,17 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
     );
   }
 
+  // --- Who gets the files in /var/lib/otzi: the user `otzi`, when running as
+  // root and there is one. Looked up before anything is written, so a failing
+  // lookup leaves no partial restore behind.
+  const owner = isRoot ? await lookupOwner() : undefined;
+
   // --- Create each target. Only files this call created are tracked, so a
   // rollback never touches a file that existed before.
   // We deliberately do NOT track or remove parent directories: they may
   // have existed before restore (postinst sets them up), and mkdir with
   // recursive:true is idempotent — undoing it can't be done safely.
-  const restoredFiles: { path: string; mode: number }[] = [];
+  const restoredFiles: { path: string; mode: number; owner?: OtziOwner }[] = [];
   const created: string[] = [];
   try {
     for (const { member, dest, mode } of placements) {
@@ -362,7 +406,11 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
       // follows a symlink there.
       const handle = await open(dest, 'wx', mode);
       created.push(dest);
+      const fileOwner = owner !== undefined && posix.dirname(member.name) === STATE_DIR ? owner : undefined;
       try {
+        // Right after creation and on the handle: the owner is set before the
+        // file is closed, and it cannot have been swapped for another entry.
+        if (fileOwner) await chownFile(handle, dest, fileOwner);
         await handle.writeFile(member.data);
         // The umask may have narrowed the creation mode.
         await handle.chmod(mode);
@@ -370,7 +418,7 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
       } finally {
         await handle.close();
       }
-      restoredFiles.push({ path: dest, mode });
+      restoredFiles.push({ path: dest, mode, ...(fileOwner ? { owner: fileOwner } : {}) });
     }
   } catch (err) {
     // Best-effort rollback of what this call created. Individual rm failures
@@ -396,6 +444,42 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
     ...(metaCreatedAt !== undefined ? { metaCreatedAt } : {}),
     ...(metaHostname !== undefined ? { metaHostname } : {}),
   };
+}
+
+/**
+ * The uid and gid of the system user `otzi`, from the text of a passwd and a
+ * group file: the uid of the user, and the gid of the group `otzi` (the
+ * primary gid of the user when the group file has no such group). `undefined`
+ * when there is no user `otzi` or a field is not a non-negative integer.
+ */
+export function findOtziOwner(passwd: string, group: string): OtziOwner | undefined {
+  const fields = (text: string, name: string): string[] | undefined =>
+    text
+      .split('\n')
+      .map(line => line.split(':'))
+      .find(f => f[0] === name);
+  // A uid or gid chown accepts: 0 to 2^32 - 2 (2^32 - 1 means "leave unchanged").
+  const wholeNumber = (value: string | undefined): number | undefined =>
+    value !== undefined && /^\d{1,10}$/.test(value) && Number(value) <= 0xfffffffe ? Number(value) : undefined;
+
+  const user = fields(passwd, OTZI_NAME);
+  const uid = wholeNumber(user?.[2]);
+  const primaryGid = wholeNumber(user?.[3]);
+  if (uid === undefined || primaryGid === undefined) return undefined;
+  return { uid, gid: wholeNumber(fields(group, OTZI_NAME)?.[2]) ?? primaryGid };
+}
+
+/** `findOtziOwner` over `<root>/etc/passwd` and `<root>/etc/group`; a missing file counts as empty. */
+async function readOtziOwner(root: string): Promise<OtziOwner | undefined> {
+  const read = async (name: string): Promise<string> => {
+    try {
+      return await readFile(join(root, 'etc', name), 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
+      throw err;
+    }
+  };
+  return findOtziOwner(await read('passwd'), await read('group'));
 }
 
 /** Every tar member with its content, read from the gzipped tar in memory. */
