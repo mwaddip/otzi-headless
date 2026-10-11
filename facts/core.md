@@ -518,7 +518,7 @@ export class DkgShareKeptError extends Error { readonly reason: string; readonly
 export function keptShareNote(stager: Pick<ShareStager, 'sharePath' | 'stagedPath'>, address: string): string
 ```
 
-- `ShareStager` contract (what `runDkgCeremony` relies on): `stage` resolves only once the share is durable at `stagedPath`; `commit` resolves once the share is at `sharePath` and never replaces a file that exists there; `discard` removes the staged share.
+- `ShareStager` contract (what `runDkgCeremony` relies on): `stage` resolves only once the share is durable at `stagedPath`; `commit` resolves once the share is at `sharePath` and never replaces a file that exists there; `discard` removes the file this stager's own `stage` wrote in this ceremony, and nothing else: a `discard` before or without a `stage` is a no-op, because any `.pending` already at `stagedPath` may be the share a node kept after publishing its confirmation (ruling R41, no lost share).
 - `keptShareNote(stager, address)` → `this node published its confirmation of vault <address>, so its staged share was kept at <stagedPath>: run 'otzi vault' on the other nodes; if any of them shows <address>, rename <stagedPath> to <sharePath> and restart this daemon, otherwise remove <stagedPath>`.
 - `DkgShareKeptError(reason, keptNote, stagedPath, options?)` — `message` = `DKG aborted: <reason>; <keptNote>`; `name` = `'DkgShareKeptError'`. Thrown by a DKG that failed after this node published its `dkg-verified`; `LeaderDispatcher` rebuilds it with its deadline reason.
 
@@ -532,7 +532,7 @@ export function keptShareNote(stager: Pick<ShareStager, 'sharePath' | 'stagedPat
     5. **Confirm.** Put `dkg-verified` = the raw 64-byte aggregate signature (this node has now *published its confirmation*). Pull `dkg-verified` from all N−1 others; each must be 64 bytes and pass `verifySignature(theirs, M, publicKeyPackage.verifyingKey)`.
     6. **Complete.** `stager.commit()` — once all N−1 confirmations have verified, the node commits whatever `signal` says.
   - **Post (failure, any step):**
-    1. Before this node published its confirmation: `await stager.discard()`. No node can have committed, because every commit needs this node's confirmation.
+    1. Before this node published its confirmation: `await stager.discard()`, which removes only what this ceremony staged (nothing when it failed before `stage`: the committed nodes drop the announce of a later DKG, so a node that kept its share of a committed vault must find it intact after such a failure). No node can have committed, because every commit needs this node's confirmation.
     2. From the put of its own `dkg-verified` on — a confirmation pull that fails or times out, a confirmation that does not verify, an aborted `signal`, a failed `commit` — `discard` is never called: another node may already have committed this vault, so the staged share stays at `stagedPath`.
     3. Unless `signal?.aborted`, broadcast `signoff-aborted {ceremonyId, reason}` (in both cases: nodes that have not confirmed must stop).
     4. Throw `Error('DKG aborted: <reason>')` before the confirmation, and `DkgShareKeptError(reason, keptShareNote(stager, address))` after it, where `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address`. The callers log it at error level (see orchestrator.md, daemon.md `leader.ts`).
@@ -540,7 +540,7 @@ export function keptShareNote(stager: Pick<ShareStager, 'sharePath' | 'stagedPat
 
 **Invariants:**
 - **Guarantee:** a node completes only when every node has produced a signature under the same vault key over the same transcript and has staged its share durably to disk.
-- **No lost share:** a node that published its confirmation never deletes its staged share. Once any node commits, every other node holds the vault's share either at its share path or at its staged path, where the `DkgShareKeptError` (and the startup warning, `warnOnPendingShare`) tells the operator how to put it in place.
+- **No lost share:** a node that published its confirmation never deletes its staged share — not in that ceremony, and not in a later DKG it leads or joins that fails before staging (`discard` removes only a file its own ceremony staged). A later DKG that does reach `stage` needs all N nodes, so no node holds a vault, and it replaces a leftover `.pending`. Once any node commits, every other node holds the vault's share either at its share path or at its staged path, where the `DkgShareKeptError` (and the startup warning, `warnOnPendingShare`) tells the operator how to put it in place.
 - An equivocating node (different `dkg-r1` per puller) makes the verification signature or a confirmation fail; no node completes.
 - Sessions are destroyed on every exit path.
 
@@ -629,7 +629,7 @@ Test helpers; never imported by runtime code.
 - Transport null: retryable (BlobPuller backoff).
 - BlobStore conflict: protocol violation, ceremony-fatal.
 - `addBlob` → `{ ok: false }`: ceremony-fatal; the abort reason names the sender.
-- DKG failure: `signoff-aborted` from the failing node (unless aborted by signal); `.pending` discarded before this node published its `dkg-verified`, kept after it (`DkgShareKeptError`).
+- DKG failure: `signoff-aborted` from the failing node (unless aborted by signal); the `.pending` this ceremony staged is discarded before this node published its `dkg-verified`, kept after it (`DkgShareKeptError`); an earlier `.pending` a ceremony did not stage is never touched.
 - Signing failure after announce: the leader dispatcher broadcasts `signoff-aborted`.
 
 **Contracts (formal):**

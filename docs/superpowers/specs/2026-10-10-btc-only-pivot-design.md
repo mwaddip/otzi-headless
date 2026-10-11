@@ -222,7 +222,10 @@ aborted. Because the DKG is symmetric, a node accepts a DKG `signoff-aborted` fr
 ring member of that ceremony and stops. What happens to `.pending` depends on whether
 this node has published its `dkg-verified`:
 
-- Before: delete `.pending`. No node can have committed, because every commit needs
+- Before: delete the `.pending` this ceremony staged, and only that one: a ceremony that
+  failed before staging deletes nothing, because an earlier `.pending` may be the share
+  this node kept after publishing its confirmation (a later DKG that the committed nodes
+  drop fails before staging). No node can have committed, because every commit needs
   this node's confirmation.
 - After (a confirmation pull that fails, an abort, a failed commit): keep `.pending`.
   Another node may already have committed the vault, so deleting this node's share
@@ -442,7 +445,7 @@ password_env = "OTZI_SHARE_PASSWORD"
 | Leader, before announce | 400 / 403; peers see nothing. |
 | Leader, after announce | `signoff-aborted` with reason; 500. frots cheater identification names the signer when available. |
 | Participant | Silent; structured log with reason; local outcome `rejected`, `invalid-signoff`, `aborted` or `timeout`. |
-| DKG | `signoff-aborted` from the failing node; a node deletes `.pending` only if it had not yet published its `dkg-verified`, and otherwise keeps it and logs the recovery (§5.3). |
+| DKG | `signoff-aborted` from the failing node; a node deletes the `.pending` it staged only if it had not yet published its `dkg-verified`, and otherwise keeps it and logs the recovery; a `.pending` it did not stage is never deleted (§5.3). |
 | Deadlines | Config-driven as today (`auto`/`policy`: 5 min signing, 15 min DKG; `exec`/`webhook`: operator cap). |
 | Startup | Share, network, party and ring mismatches refuse to start with a specific error. |
 | CLI / Esplora | Non-2xx shows status and body (otzi `request`); failed broadcast prints the signed hex. |

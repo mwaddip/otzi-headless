@@ -581,6 +581,43 @@ describe('runDkgCeremony with real share stagers: no lost share', () => {
     expect((await loadVaultShare(sharePath(2), 'pw', 'testnet4'))!.partyId).toBe(2);
   }, REAL_STAGER_TEST_MS);
 
+  it('a later DKG that fails before staging leaves the share a node kept (ruling R41, no lost share)', async () => {
+    const stagers = [0, 1, 2].map(i => stagerFor(i));
+    const sigs = signals();
+    let othersSettled = false;
+    // Node 2 cannot get node 0's confirmation: nodes 0 and 1 commit the vault, node 2 keeps its .pending.
+    const pull = ring[2]!.io.transport.pull.bind(ring[2]!.io.transport);
+    ring[2]!.io.transport.pull = async key => {
+      if (key.round === DKG_ROUNDS.verified && key.from === 0) {
+        if (othersSettled) throw new Error('connection to party 0 lost');
+        return null;
+      }
+      return pull(key);
+    };
+    const others = Promise.allSettled([0, 1].map(i => runDkgCeremony(ring[i]!.io, spec, stagers[i]!, sigs[i])));
+    const third = runDkgCeremony(ring[2]!.io, spec, stagers[2]!, sigs[2]).then(
+      () => undefined,
+      (reason: unknown) => reason,
+    );
+    for (const o of await others) expect(o.status).toBe('fulfilled');
+    othersSettled = true;
+    expect(await third).toBeInstanceOf(DkgShareKeptError);
+    const keptBefore = readFileSync(pendingPath(sharePath(2)));
+
+    // Node 2 now runs (or joins) another DKG that the committed nodes do not take part in: they drop the
+    // announce, so its pulls of dkg-r1 fail before anything is staged. The kept share must survive.
+    ring[2]!.io.transport.pull = pull;
+    Object.assign(ring[2]!.io.pullOpts, { maxAttempts: 3, initialDelayMs: 1, maxDelayMs: 2, deadlineMs: 300 });
+    const later: DkgCeremonySpec = { ...spec, ceremonyId: 'dkg-test.2', sessionId: crypto.getRandomValues(new Uint8Array(32)) };
+    await expect(runDkgCeremony(ring[2]!.io, later, stagerFor(2))).rejects.toThrow(/^DKG aborted: .*dkg-r1/);
+
+    expect(existsSync(pendingPath(sharePath(2))), 'a failed later DKG deleted the share node 2 kept').toBe(true);
+    expect(readFileSync(pendingPath(sharePath(2))).equals(keptBefore)).toBe(true);
+    expect(existsSync(sharePath(2))).toBe(false);
+    const internalKey = await internalKeyAt(sharePath(0));
+    await expectNoLostShare(internalKey);
+  }, REAL_STAGER_TEST_MS);
+
   it('a node that hears signoff-aborted after its own confirmation keeps its staged share', async () => {
     const stagers = [0, 1, 2].map(i => stagerFor(i));
     // Node 0 sends the abort, as a failing node would; its own ceremony stops with it.

@@ -147,6 +147,14 @@ export function createShareStager(opts: ShareStagerOptions): ShareStager {
   const pending = pendingPath(path);
   const dir = dirname(path);
   let staged: DkgCeremonyResult | undefined;
+  /**
+   * True while `pending` is a file this stager created and not yet committed.
+   * `discard` removes only that file: any other `.pending` may be the share a
+   * node kept after publishing its confirmation (ruling R41), and a DKG that
+   * fails before it stages (the committed nodes drop its announce) must not
+   * delete it.
+   */
+  let wrote = false;
 
   /** Once the share is in place, a failed step is a warning: the vault exists. */
   const afterCommit = async (what: string, step: () => Promise<void>) => {
@@ -168,6 +176,7 @@ export function createShareStager(opts: ShareStagerOptions): ShareStager {
       // into a file that already exists with looser permissions.
       await rm(pending, { force: true });
       const handle = await open(pending, 'wx', 0o600);
+      wrote = true;
       try {
         await handle.writeFile(JSON.stringify(file));
         // Belt and braces against a restrictive umask having narrowed the mode.
@@ -191,7 +200,9 @@ export function createShareStager(opts: ShareStagerOptions): ShareStager {
         if (hasCode(err, 'EEXIST')) throw new Error(`share path already exists: ${path}`, { cause: err });
         throw err;
       }
-      // From here the share is in place and commit succeeds.
+      // From here the share is in place and commit succeeds; the staging name is
+      // just a second name for it, no longer a file to discard.
+      wrote = false;
       const meta = vaultPubkeyFromPackage(staged.publicKeyPackage, network);
       await afterCommit(`its staging file ${pending} (the same file) was not removed`, () => unlink(pending));
       await afterCommit(`its directory ${dir} was not synced`, () => syncDir(dir));
@@ -202,11 +213,14 @@ export function createShareStager(opts: ShareStagerOptions): ShareStager {
     },
 
     async discard(): Promise<void> {
+      // Nothing of this ceremony's on disk: whatever `.pending` exists is not ours to remove.
+      if (!wrote) return;
       try {
         await rm(pending);
       } catch (err) {
         if (!isNotFound(err)) throw err;
       }
+      wrote = false;
     },
   };
 }

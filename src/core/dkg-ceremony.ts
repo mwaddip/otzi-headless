@@ -55,6 +55,11 @@ export interface ShareStager {
   stage(r: DkgCeremonyResult): Promise<void>;
   /** Resolves once the share is at `sharePath`; never replaces an entry there. */
   commit(): Promise<void>;
+  /**
+   * Removes what this stager's own `stage` wrote, and nothing else: a call
+   * before or without a `stage` is a no-op, because a `.pending` already at
+   * `stagedPath` may be a share an earlier ceremony kept (ruling R41).
+   */
   discard(): Promise<void>;
 }
 

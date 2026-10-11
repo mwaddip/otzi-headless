@@ -66,7 +66,7 @@
       - `Error('share path already exists: <path>')` when an entry exists at `path` (EEXIST from the link, a dangling symlink included);
       - `Error('commit called before stage')` when `stage` has not resolved;
       - any other `link` error.
-  - **`discard()`:** removes `pendingPath(path)`; ENOENT is ignored. `runDkgCeremony` calls it only before this node published its `dkg-verified`.
+  - **`discard()`:** removes `pendingPath(path)` only when this stager instance wrote it (its `stage` created the file, and `commit` has not since linked it into place); ENOENT is ignored. A `discard` before or without a `stage` is a no-op and leaves any existing `.pending` alone: that file may be the share this node kept after publishing its `dkg-verified` in an earlier ceremony (ruling R41), and a later DKG that fails before staging (`otzi generate`, or an `announce-dkg` the committed nodes drop) must not delete it. `runDkgCeremony` calls it only before this node published its `dkg-verified`.
 
 **Invariants:**
 - A share reaches `path` only through `commit`, i.e. only after the DKG's all-N confirmation, and `commit` never replaces an entry at `path`.
@@ -463,7 +463,7 @@
 - **HTTP listener binding:** `HttpTrigger` binds loopback only (parser-enforced). Localhost binding is load-bearing: it is why the API needs no mTLS.
 - **Verify-before-gate:** leader (`LeaderDispatcher.sign`) and participants (`Orchestrator`) both run `analyzeProposal` against their own key before the gate; specs are built from that analysis.
 - **Leadership:** the leader is the node whose trigger fired. For signing it announces, aggregates, finalizes and sends the signoff; for DKG it only generates the session ID and announces.
-- **Share persistence:** leader and participants persist a DKG result through the same `ShareStager`: stage to `.pending` (synced), commit after all-N confirmation. A failure discards `.pending` on a node that had not yet published its `dkg-verified`; a node that had keeps it and logs an error naming it and the recovery (core.md, `runDkgCeremony`).
+- **Share persistence:** leader and participants persist a DKG result through the same `ShareStager`: stage to `.pending` (synced), commit after all-N confirmation. A failure discards the `.pending` this ceremony staged on a node that had not yet published its `dkg-verified` (a `.pending` from an earlier ceremony is never touched by a ceremony that did not stage); a node that had keeps it and logs an error naming it and the recovery (core.md, `runDkgCeremony`).
 - **No chain access:** the daemon returns signed transactions; the CLI broadcasts.
 
 ---

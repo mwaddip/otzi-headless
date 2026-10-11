@@ -229,16 +229,42 @@ describe('vault-share', () => {
       await expect(stager.discard()).resolves.toBeUndefined();
     });
 
+    it('discard without a stage leaves a .pending it did not write (ruling R41)', async () => {
+      await mkdir(join(dir, 'state'), { recursive: true });
+      await writeFile(pendingPath(path), JSON.stringify(goodShare), { mode: 0o600 });
+      const before = readFileSync(pendingPath(path));
+      const stager = createShareStager({ path, password: 'pw', network: 'testnet4', partyId: 0, vaultPubkeyPath });
+      await stager.discard();
+      expect(readFileSync(pendingPath(path)).equals(before)).toBe(true);
+      // A stage that failed before it wrote anything leaves the earlier file alone, too.
+      const wrongParty = createShareStager({ path, password: 'pw', network: 'testnet4', partyId: 1, vaultPubkeyPath });
+      await expect(
+        wrongParty.stage({ keyPackage: vault.keyPackages[0]!, publicKeyPackage: vault.publicKeyPackage }),
+      ).rejects.toThrow('Key package does not belong to this party');
+      await wrongParty.discard();
+      expect(readFileSync(pendingPath(path)).equals(before)).toBe(true);
+    });
+
+    it('discard removes only the file its own stage wrote, replacing an earlier .pending', async () => {
+      await mkdir(join(dir, 'state'), { recursive: true });
+      await writeFile(pendingPath(path), 'stale leftover', { mode: 0o600 });
+      const stager = createShareStager({ path, password: 'pw', network: 'testnet4', partyId: 0, vaultPubkeyPath });
+      await stager.stage({ keyPackage: vault.keyPackages[0]!, publicKeyPackage: vault.publicKeyPackage });
+      await stager.discard();
+      expect(existsSync(pendingPath(path))).toBe(false);
+      // A second stager (the next ceremony) that stages nothing leaves a file placed since alone.
+      await writeFile(pendingPath(path), 'kept by another ceremony', { mode: 0o600 });
+      await createShareStager({ path, password: 'pw', network: 'testnet4', partyId: 0, vaultPubkeyPath }).discard();
+      expect(readFileSync(pendingPath(path), 'utf8')).toBe('kept by another ceremony');
+    });
+
     it('discard rethrows errors other than ENOENT', async () => {
-      await writeFile(join(dir, 'blocker'), 'x');
-      const stager = createShareStager({
-        path: join(dir, 'blocker', 'share.json'),
-        password: 'pw',
-        network: 'testnet4',
-        partyId: 0,
-        vaultPubkeyPath,
-      });
-      await expect(stager.discard()).rejects.toMatchObject({ code: 'ENOTDIR' });
+      const stager = createShareStager({ path, password: 'pw', network: 'testnet4', partyId: 0, vaultPubkeyPath });
+      await stager.stage({ keyPackage: vault.keyPackages[0]!, publicKeyPackage: vault.publicKeyPackage });
+      // The staged file is replaced by a directory, which `rm` without `recursive` refuses.
+      await rm(pendingPath(path));
+      await mkdir(pendingPath(path));
+      await expect(stager.discard()).rejects.toMatchObject({ code: 'ERR_FS_EISDIR' });
     });
 
     it('does not leave the password in the files it writes', async () => {
