@@ -69,8 +69,21 @@ case "$1" in
     # fresh-install path. NEVER pass the password as an argv flag — it would
     # leak via /proc/<pid>/cmdline + ps. db_reset wipes the password from
     # /var/cache/debconf/passwords.dat on EVERY exit path.
+    #
+    # It runs only while there is no /etc/otzi/daemon.toml (a fresh install, or
+    # one where the operator moved the file aside): `otzi restore` refuses to run
+    # over an existing config, and the debconf answer outlives the install, so
+    # without this every later upgrade would try the restore again. A restore that
+    # succeeds sets the answer back to false.
     db_get otzi-headless/restore-from-backup || true
     RESTORE_REQUESTED="$RET"
+    if [ "$RESTORE_REQUESTED" = "true" ] && { [ -e /etc/otzi/daemon.toml ] || [ -L /etc/otzi/daemon.toml ]; }; then
+      echo "otzi-headless: /etc/otzi/daemon.toml exists; skipping the restore from backup (to restore, move it aside and run: dpkg-reconfigure otzi-headless)"
+      db_set otzi-headless/restore-from-backup false || true
+      db_reset otzi-headless/backup-password 2>/dev/null || true
+      db_reset otzi-headless/backup-path 2>/dev/null || true
+      RESTORE_REQUESTED="false"
+    fi
     if [ "$RESTORE_REQUESTED" = "true" ]; then
       db_get otzi-headless/backup-path || true
       BACKUP_PATH="$RET"
@@ -91,8 +104,11 @@ case "$1" in
 
       echo "otzi-headless: attempting restore from $BACKUP_PATH"
       if printf '%s\n' "$BACKUP_PASSWORD" | otzi restore --password-stdin "$BACKUP_PATH"; then
-        # Wipe password from debconf cache before continuing.
+        # Wipe password from debconf cache before continuing, and take the
+        # restore answer back so later upgrades do not repeat it.
         db_reset otzi-headless/backup-password 2>/dev/null || true
+        db_reset otzi-headless/backup-path 2>/dev/null || true
+        db_set otzi-headless/restore-from-backup false || true
         echo "otzi-headless: restored from backup; skipping fresh-install configuration"
         cat <<'BANNER'
 

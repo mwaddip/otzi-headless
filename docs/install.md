@@ -32,7 +32,8 @@ follow up with `sudo apt -f install` to resolve.)
    ```
    debconf will prompt for:
    - **Restore from a backup?** — `Yes` skips every other prompt and restores the
-     node from an archive (see § Backup + recovery).
+     node from an archive (see § Backup + recovery). Asked only while
+     `/etc/otzi/daemon.toml` does not exist, so not on an upgrade.
    - **Node role** (`leader` / `leaf`) — leader hosts bootstrap, leaves connect to it.
    - **Operator usernames** (space-separated) — each gets `usermod -aG otzi`.
    - **Bitcoin network** — `mainnet`, `testnet4` or `signet`. Every node in the
@@ -282,7 +283,18 @@ When installing the .deb on a new host, answer `Yes` to "Restore from a
 backup?". debconf prompts for the archive path and password; postinst
 pipes the password via stdin to `otzi restore --password-stdin`. If
 restore succeeds, the rest of the install prompts (network, role,
-peers, etc.) are skipped — config came from the backup.
+peers, etc.) are skipped — config came from the backup — and postinst sets
+the answer back to `No` and wipes the stored path and password, so later
+upgrades of the package leave the restored node alone.
+
+The question, and the restore, only happen while `/etc/otzi/daemon.toml` does
+not exist (a fresh install, or one where you moved it aside). On an installed
+node neither an upgrade nor `dpkg-reconfigure` asks it, and if the stored
+answer is still `Yes` (an earlier release left it so), postinst prints
+`skipping the restore from backup`, resets the answer and carries on with the
+normal upgrade. To restore onto an installed node, move `daemon.toml` and the
+other files restore lists aside first (see 2. below), then run
+`dpkg-reconfigure otzi-headless` or `otzi restore`.
 
 If restore fails (wrong password, corrupted archive, missing file),
 dpkg flags the package as half-installed. Retry via:
