@@ -543,6 +543,37 @@ describe('Daemon address book', () => {
   });
 });
 
+describe('Daemon allowed_recipients list', () => {
+  const TREASURY = 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx';
+  const OTHER = 'tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7';
+  const MAINNET = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4';
+  const gateWith = (...entries: string[]) =>
+    `[gate]\nstrategy = "policy"\nallowed_recipients = [${entries.map(e => JSON.stringify(e)).join(', ')}]`;
+
+  it('refuses to start when an entry is not an address of the configured network', async () => {
+    const mainnet = await cluster({ gates: { 1: gateWith(TREASURY, MAINNET) } });
+    await expect(mainnet.boot()).rejects.toThrow(/gate\.allowed_recipients\[1\].*'bc1q.*not a valid testnet4 address/);
+
+    const typo = await cluster({ gates: { 2: gateWith('tb1qa0000000000000000000000000000000000000') } });
+    await expect(typo.boot()).rejects.toThrow(/gate\.allowed_recipients\[0\].*not a valid testnet4 address/);
+  });
+
+  it('matches an all-uppercase entry against the lowercase output of the analysis', async () => {
+    const c = await cluster({ gates: { 0: gateWith(TREASURY.toUpperCase()) } });
+    const tv = await writeShares(c);
+    const { urls } = await c.boot();
+    const pay = (address: string) => makeProposal(tv.vaultKey, NET, { outputs: [{ address, amount: 50_000 }] });
+
+    const listed = await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-upper', proposal: pay(TREASURY) });
+    expect(listed.status).toBe(200);
+    expect(listed.json).toMatchObject({ ceremonyId: 'pay-upper', status: 'done' });
+    expect(await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-other', proposal: pay(OTHER) })).toEqual({
+      status: 403,
+      json: { error: 'gate rejected', decision: 'reject', ceremonyId: 'pay-other' },
+    });
+  });
+});
+
 describe('Daemon lifecycle', () => {
   it('double start and double stop are idempotent', async () => {
     const c = await cluster();

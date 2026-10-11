@@ -1,10 +1,13 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import * as btc from '@scure/btc-signer';
 import { describe, expect, it, vi } from 'vitest';
 import { ConfigError } from '../config/parse';
 import { buildDkgSpec, buildSigningSpec, resolveLeaderId } from '../orchestrator/spec-builder';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
-import type { ProposalAnalysis } from '../otzi/lib/bitcoin';
+import { isValidAddress, type ProposalAnalysis } from '../otzi/lib/bitcoin';
+import type { NetworkName } from '../otzi/lib/vault-types';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,10 +45,21 @@ async function readRequestBody(req: IncomingMessage): Promise<string> {
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
 
-const RECIPIENT_A = 'bc1qa0000000000000000000000000000000000000';
-const RECIPIENT_B = 'bc1qb0000000000000000000000000000000000000';
-const RECIPIENT_EVIL = 'bc1qe0000000000000000000000000000000000000';
-const VAULT = 'bc1pv0000000000000000000000000000000000000000000000000000000';
+/** The public key of the fixed secret key `n` (1..255): addresses below are real and reproducible. */
+function pubkeyOf(n: number): Uint8Array {
+  const secret = new Uint8Array(32);
+  secret[31] = n;
+  return secp256k1.getPublicKey(secret, true);
+}
+
+const p2wpkh = (n: number, net: typeof btc.NETWORK) => btc.p2wpkh(pubkeyOf(n), net).address!;
+const p2tr = (n: number, net: typeof btc.NETWORK) => btc.p2tr(pubkeyOf(n).slice(1), undefined, net).address!;
+
+// Mainnet, the network of the `signing()` specs below: every address passes `isValidAddress`.
+const RECIPIENT_A = p2wpkh(1, btc.NETWORK); // bc1q… (bech32)
+const RECIPIENT_B = p2tr(2, btc.NETWORK); // bc1p… (bech32m)
+const RECIPIENT_EVIL = p2wpkh(3, btc.NETWORK);
+const VAULT = p2tr(9, btc.NETWORK);
 
 interface SigningOpts {
   /** Value of one external output to `recipient`. Default 10 000. */
@@ -595,13 +609,16 @@ describe('PolicyGate — DKG', () => {
 // ---------------------------------------------------------------------------
 
 describe('parsePolicyParams', () => {
+  /** The `signing()` specs are mainnet. */
+  const parse = (params: Record<string, unknown>, network: NetworkName = 'mainnet') => parsePolicyParams(params, network);
+
   it('parses empty params', () => {
-    expect(parsePolicyParams({})).toEqual({});
+    expect(parse({})).toEqual({});
   });
 
   it('parses every key with the snake_case → camelCase mapping', () => {
     expect(
-      parsePolicyParams({
+      parse({
         max_sats_per_tx: 100_000,
         max_sats_per_24h: 1_000_000,
         allowed_recipients: [RECIPIENT_A, RECIPIENT_B],
@@ -622,12 +639,12 @@ describe('parsePolicyParams', () => {
   });
 
   it('rejects legacy keys with the replacement', () => {
-    expect(() => parsePolicyParams({ max_btc_per_tx: 1 })).toThrow(/use max_sats_per_tx/);
-    expect(() => parsePolicyParams({ max_amount: 1 })).toThrow(/use max_sats_per_tx/);
-    expect(() => parsePolicyParams({ allowed_btc_recipients: [] })).toThrow(/use allowed_recipients/);
-    expect(() => parsePolicyParams({ destination_allowlist: [] })).toThrow(/use allowed_recipients/);
-    expect(() => parsePolicyParams({ allowed_contracts: [] })).toThrow(/no longer supported/);
-    expect(() => parsePolicyParams({ method_allowlist: [] })).toThrow(/no longer supported/);
+    expect(() => parse({ max_btc_per_tx: 1 })).toThrow(/use max_sats_per_tx/);
+    expect(() => parse({ max_amount: 1 })).toThrow(/use max_sats_per_tx/);
+    expect(() => parse({ allowed_btc_recipients: [] })).toThrow(/use allowed_recipients/);
+    expect(() => parse({ destination_allowlist: [] })).toThrow(/use allowed_recipients/);
+    expect(() => parse({ allowed_contracts: [] })).toThrow(/no longer supported/);
+    expect(() => parse({ method_allowlist: [] })).toThrow(/no longer supported/);
   });
 
   it('reports each legacy key as a ConfigError at gate.<key>', () => {
@@ -641,7 +658,7 @@ describe('parsePolicyParams', () => {
     ];
     for (const [key, message] of legacy) {
       try {
-        parsePolicyParams({ [key]: 1 });
+        parse({ [key]: 1 });
         expect.fail(`${key} should have been rejected`);
       } catch (err) {
         expect(err).toBeInstanceOf(ConfigError);
@@ -652,11 +669,11 @@ describe('parsePolicyParams', () => {
   });
 
   it('rejects a legacy key even next to valid keys', () => {
-    expect(() => parsePolicyParams({ max_sats_per_tx: 1, max_amount: 1 })).toThrow(/gate\.max_amount/);
+    expect(() => parse({ max_sats_per_tx: 1, max_amount: 1 })).toThrow(/gate\.max_amount/);
   });
 
   it('rejects unknown keys', () => {
-    expect(() => parsePolicyParams({ ignore_amount: true })).toThrow(/gate\.ignore_amount.*unknown policy field/);
+    expect(() => parse({ ignore_amount: true })).toThrow(/gate\.ignore_amount.*unknown policy field/);
   });
 
   describe('sat caps', () => {
@@ -669,95 +686,95 @@ describe('parsePolicyParams', () => {
 
     for (const key of CAP_KEYS) {
       it(`${key} accepts integers and decimal strings`, () => {
-        expect(parsePolicyParams({ [key]: 0 })).toEqual({ [FIELD[key]]: 0 });
-        expect(parsePolicyParams({ [key]: 100_000 })).toEqual({ [FIELD[key]]: 100_000 });
-        expect(parsePolicyParams({ [key]: '2100000000000000' })).toEqual({ [FIELD[key]]: 2_100_000_000_000_000 });
-        expect(parsePolicyParams({ [key]: Number.MAX_SAFE_INTEGER })).toEqual({ [FIELD[key]]: Number.MAX_SAFE_INTEGER });
-        expect(parsePolicyParams({ [key]: String(Number.MAX_SAFE_INTEGER) })).toEqual({
+        expect(parse({ [key]: 0 })).toEqual({ [FIELD[key]]: 0 });
+        expect(parse({ [key]: 100_000 })).toEqual({ [FIELD[key]]: 100_000 });
+        expect(parse({ [key]: '2100000000000000' })).toEqual({ [FIELD[key]]: 2_100_000_000_000_000 });
+        expect(parse({ [key]: Number.MAX_SAFE_INTEGER })).toEqual({ [FIELD[key]]: Number.MAX_SAFE_INTEGER });
+        expect(parse({ [key]: String(Number.MAX_SAFE_INTEGER) })).toEqual({
           [FIELD[key]]: Number.MAX_SAFE_INTEGER,
         });
       });
 
       it(`${key} rejects negatives, fractions and unsafe integers`, () => {
         const path = new RegExp(`gate\\.${key}`);
-        expect(() => parsePolicyParams({ [key]: -1 })).toThrow(path);
-        expect(() => parsePolicyParams({ [key]: '-1' })).toThrow(path);
-        expect(() => parsePolicyParams({ [key]: 1.5 })).toThrow(path);
-        expect(() => parsePolicyParams({ [key]: '1.5' })).toThrow(path);
-        expect(() => parsePolicyParams({ [key]: Number.MAX_SAFE_INTEGER + 1 })).toThrow(path);
-        expect(() => parsePolicyParams({ [key]: String(Number.MAX_SAFE_INTEGER + 1) })).toThrow(path);
-        expect(() => parsePolicyParams({ [key]: '99999999999999999999999' })).toThrow(path);
-        expect(() => parsePolicyParams({ [key]: 10n ** 30n })).toThrow(path);
-        expect(() => parsePolicyParams({ [key]: Number.NaN })).toThrow(path);
-        expect(() => parsePolicyParams({ [key]: Number.POSITIVE_INFINITY })).toThrow(path);
+        expect(() => parse({ [key]: -1 })).toThrow(path);
+        expect(() => parse({ [key]: '-1' })).toThrow(path);
+        expect(() => parse({ [key]: 1.5 })).toThrow(path);
+        expect(() => parse({ [key]: '1.5' })).toThrow(path);
+        expect(() => parse({ [key]: Number.MAX_SAFE_INTEGER + 1 })).toThrow(path);
+        expect(() => parse({ [key]: String(Number.MAX_SAFE_INTEGER + 1) })).toThrow(path);
+        expect(() => parse({ [key]: '99999999999999999999999' })).toThrow(path);
+        expect(() => parse({ [key]: 10n ** 30n })).toThrow(path);
+        expect(() => parse({ [key]: Number.NaN })).toThrow(path);
+        expect(() => parse({ [key]: Number.POSITIVE_INFINITY })).toThrow(path);
       });
 
       it(`${key} rejects non-numeric values`, () => {
         const path = new RegExp(`gate\\.${key}`);
         for (const bad of ['', ' 5', '1e5', '0x10', 'oops', true, null, [], {}]) {
-          expect(() => parsePolicyParams({ [key]: bad }), JSON.stringify(bad)).toThrow(path);
+          expect(() => parse({ [key]: bad }), JSON.stringify(bad)).toThrow(path);
         }
       });
     }
 
     it('accepts a TOML bigint inside the safe range', () => {
-      expect(parsePolicyParams({ max_sats_per_tx: 5n })).toEqual({ maxSatsPerTx: 5 });
+      expect(parse({ max_sats_per_tx: 5n })).toEqual({ maxSatsPerTx: 5 });
     });
 
     it('names the offending cap in the error message', () => {
-      expect(() => parsePolicyParams({ max_sats_per_tx: -1 })).toThrow(/gate\.max_sats_per_tx.*must be >= 0/);
-      expect(() => parsePolicyParams({ max_sats_per_tx: 1.5 })).toThrow(/gate\.max_sats_per_tx.*must be an integer/);
-      expect(() => parsePolicyParams({ max_sats_per_tx: 2 ** 53 })).toThrow(/gate\.max_sats_per_tx.*must be <= 9007199254740991/);
-      expect(() => parsePolicyParams({ max_sats_per_tx: '1e5' })).toThrow(/gate\.max_sats_per_tx.*non-negative decimal string/);
+      expect(() => parse({ max_sats_per_tx: -1 })).toThrow(/gate\.max_sats_per_tx.*must be >= 0/);
+      expect(() => parse({ max_sats_per_tx: 1.5 })).toThrow(/gate\.max_sats_per_tx.*must be an integer/);
+      expect(() => parse({ max_sats_per_tx: 2 ** 53 })).toThrow(/gate\.max_sats_per_tx.*must be <= 9007199254740991/);
+      expect(() => parse({ max_sats_per_tx: '1e5' })).toThrow(/gate\.max_sats_per_tx.*non-negative decimal string/);
     });
   });
 
   describe('max_fee_rate', () => {
     it('accepts non-negative numbers, fractional included, and decimal strings', () => {
-      expect(parsePolicyParams({ max_fee_rate: 0 })).toEqual({ maxFeeRate: 0 });
-      expect(parsePolicyParams({ max_fee_rate: 2.5 })).toEqual({ maxFeeRate: 2.5 });
-      expect(parsePolicyParams({ max_fee_rate: 25 })).toEqual({ maxFeeRate: 25 });
-      expect(parsePolicyParams({ max_fee_rate: '2.5' })).toEqual({ maxFeeRate: 2.5 });
-      expect(parsePolicyParams({ max_fee_rate: '3' })).toEqual({ maxFeeRate: 3 });
+      expect(parse({ max_fee_rate: 0 })).toEqual({ maxFeeRate: 0 });
+      expect(parse({ max_fee_rate: 2.5 })).toEqual({ maxFeeRate: 2.5 });
+      expect(parse({ max_fee_rate: 25 })).toEqual({ maxFeeRate: 25 });
+      expect(parse({ max_fee_rate: '2.5' })).toEqual({ maxFeeRate: 2.5 });
+      expect(parse({ max_fee_rate: '3' })).toEqual({ maxFeeRate: 3 });
     });
 
     it('rejects negatives, non-finite numbers and malformed strings', () => {
       for (const bad of [-0.5, '-1', Number.NaN, Number.POSITIVE_INFINITY, '', '.5', '5.', '1e3', '2.5.1', ' 2', 'fast', true, null, []]) {
-        expect(() => parsePolicyParams({ max_fee_rate: bad }), String(bad)).toThrow(/gate\.max_fee_rate/);
+        expect(() => parse({ max_fee_rate: bad }), String(bad)).toThrow(/gate\.max_fee_rate/);
       }
-      expect(() => parsePolicyParams({ max_fee_rate: '9'.repeat(400) })).toThrow(/gate\.max_fee_rate/);
+      expect(() => parse({ max_fee_rate: '9'.repeat(400) })).toThrow(/gate\.max_fee_rate/);
     });
   });
 
   describe('allowed_recipients', () => {
     it('accepts an array of non-empty address strings, including an empty array', () => {
-      expect(parsePolicyParams({ allowed_recipients: [RECIPIENT_A] })).toEqual({ allowedRecipients: [RECIPIENT_A] });
-      expect(parsePolicyParams({ allowed_recipients: [] })).toEqual({ allowedRecipients: [] });
+      expect(parse({ allowed_recipients: [RECIPIENT_A] })).toEqual({ allowedRecipients: [RECIPIENT_A] });
+      expect(parse({ allowed_recipients: [] })).toEqual({ allowedRecipients: [] });
     });
 
     it('rejects a non-array', () => {
-      expect(() => parsePolicyParams({ allowed_recipients: RECIPIENT_A })).toThrow(
+      expect(() => parse({ allowed_recipients: RECIPIENT_A })).toThrow(
         /gate\.allowed_recipients.*must be an array/,
       );
     });
 
     it('rejects a non-string or empty element with an indexed path', () => {
-      expect(() => parsePolicyParams({ allowed_recipients: [RECIPIENT_A, RECIPIENT_B, 42] })).toThrow(
+      expect(() => parse({ allowed_recipients: [RECIPIENT_A, RECIPIENT_B, 42] })).toThrow(
         /gate\.allowed_recipients\[2\].*must be a string/,
       );
-      expect(() => parsePolicyParams({ allowed_recipients: [RECIPIENT_A, ''] })).toThrow(
+      expect(() => parse({ allowed_recipients: [RECIPIENT_A, ''] })).toThrow(
         /gate\.allowed_recipients\[1\].*must not be empty/,
       );
     });
 
     it('accepts the string "address-book"', () => {
-      expect(parsePolicyParams({ allowed_recipients: 'address-book' })).toEqual({ allowedRecipients: 'address-book' });
+      expect(parse({ allowed_recipients: 'address-book' })).toEqual({ allowedRecipients: 'address-book' });
     });
 
     it('rejects any other string, naming the key', () => {
       for (const bad of ['', 'address_book', 'Address-Book', ' address-book', 'any']) {
-        expect(() => parsePolicyParams({ allowed_recipients: bad }), JSON.stringify(bad)).toThrow(ConfigError);
-        expect(() => parsePolicyParams({ allowed_recipients: bad }), JSON.stringify(bad)).toThrow(
+        expect(() => parse({ allowed_recipients: bad }), JSON.stringify(bad)).toThrow(ConfigError);
+        expect(() => parse({ allowed_recipients: bad }), JSON.stringify(bad)).toThrow(
           /gate\.allowed_recipients.*"address-book"/,
         );
       }
@@ -765,25 +782,156 @@ describe('parsePolicyParams', () => {
 
     it('copies the array', () => {
       const input = [RECIPIENT_A];
-      const parsed = parsePolicyParams({ allowed_recipients: input });
+      const parsed = parse({ allowed_recipients: input });
       input.push(RECIPIENT_EVIL);
       expect(parsed.allowedRecipients).toEqual([RECIPIENT_A]);
+    });
+
+    describe('address validation (against the configured network)', () => {
+      const TESTNET_A = p2wpkh(1, btc.TEST_NETWORK); // tb1q…
+      const TESTNET_B = p2tr(2, btc.TEST_NETWORK); // tb1p…
+      const MAINNET_P2PKH = btc.p2pkh(pubkeyOf(4), btc.NETWORK).address!; // 1…
+      const MAINNET_P2SH = btc.p2sh(btc.p2wpkh(pubkeyOf(5), btc.NETWORK), btc.NETWORK).address!; // 3…
+      const TESTNET_P2PKH = btc.p2pkh(pubkeyOf(4), btc.TEST_NETWORK).address!; // m… or n…
+      const TESTNET_P2SH = btc.p2sh(btc.p2wpkh(pubkeyOf(5), btc.TEST_NETWORK), btc.TEST_NETWORK).address!; // 2…
+
+      /** The ConfigError `parse` throws, or a failed expectation. */
+      const rejected = (params: Record<string, unknown>, network?: NetworkName): ConfigError => {
+        try {
+          parse(params, network);
+        } catch (err) {
+          expect(err).toBeInstanceOf(ConfigError);
+          return err as ConfigError;
+        }
+        return expect.fail('should have thrown');
+      };
+
+      it('uses real addresses for the fixtures', () => {
+        for (const a of [RECIPIENT_A, RECIPIENT_B, RECIPIENT_EVIL, VAULT]) expect(isValidAddress(a, 'mainnet')).toBe(true);
+        for (const a of [TESTNET_A, TESTNET_B]) expect(isValidAddress(a, 'testnet4')).toBe(true);
+      });
+
+      it('rejects an entry that is not an address, naming the entry, its index and the network', () => {
+        const err = rejected({ allowed_recipients: [RECIPIENT_A, 'not-an-address'] });
+        expect(err.path).toBe('gate.allowed_recipients[1]');
+        expect(err.message).toContain("'not-an-address'");
+        expect(err.message).toContain('mainnet');
+      });
+
+      it.each([
+        ['a bech32 string with a bad checksum', 'bc1qa0000000000000000000000000000000000000'],
+        ['a bech32 address with one character changed', `${RECIPIENT_A.slice(0, -1)}${RECIPIENT_A.endsWith('q') ? 'p' : 'q'}`],
+        ['a base58 address with one character changed', `${MAINNET_P2PKH.slice(0, -1)}${MAINNET_P2PKH.endsWith('2') ? '3' : '2'}`],
+        ['a regtest address', 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080'],
+        ['whitespace around a valid address', ` ${RECIPIENT_A}`],
+        ['a hex script', '0014751e76e8199196d454941c45d1b3a323f1433bd6'],
+      ])('rejects %s', (_name, entry) => {
+        const err = rejected({ allowed_recipients: [RECIPIENT_B, entry] });
+        expect(err.path).toBe('gate.allowed_recipients[1]');
+        expect(err.message).toContain(`'${entry}'`);
+      });
+
+      it('rejects an address of another network, naming the network', () => {
+        const onMainnet = rejected({ allowed_recipients: [RECIPIENT_A, TESTNET_A] }, 'mainnet');
+        expect(onMainnet.path).toBe('gate.allowed_recipients[1]');
+        expect(onMainnet.message).toContain(TESTNET_A);
+        expect(onMainnet.message).toContain('mainnet');
+
+        for (const network of ['testnet4', 'signet'] as const) {
+          for (const entry of [RECIPIENT_A, RECIPIENT_B, MAINNET_P2PKH, MAINNET_P2SH]) {
+            const err = rejected({ allowed_recipients: [TESTNET_A, entry] }, network);
+            expect(err.message, `${entry} on ${network}`).toContain(entry);
+            expect(err.message).toContain(network);
+          }
+        }
+        for (const entry of [TESTNET_P2PKH, TESTNET_P2SH]) {
+          expect(rejected({ allowed_recipients: [entry] }, 'mainnet').message, entry).toContain(entry);
+        }
+      });
+
+      it('accepts the addresses of every type valid on the network, stored as given', () => {
+        expect(parse({ allowed_recipients: [RECIPIENT_A, RECIPIENT_B, MAINNET_P2PKH, MAINNET_P2SH] }, 'mainnet')).toEqual({
+          allowedRecipients: [RECIPIENT_A, RECIPIENT_B, MAINNET_P2PKH, MAINNET_P2SH],
+        });
+        for (const network of ['testnet4', 'signet'] as const) {
+          const entries = [TESTNET_A, TESTNET_B, TESTNET_P2PKH, TESTNET_P2SH];
+          expect(parse({ allowed_recipients: entries }, network)).toEqual({ allowedRecipients: entries });
+        }
+      });
+
+      it('keeps base58 addresses exactly as written (they are case-sensitive)', () => {
+        const parsed = parse({ allowed_recipients: [MAINNET_P2PKH, MAINNET_P2SH] });
+        expect(parsed.allowedRecipients).toEqual([MAINNET_P2PKH, MAINNET_P2SH]);
+        // Changing the case of a base58 address makes a different, invalid, string.
+        expect(() => parse({ allowed_recipients: [MAINNET_P2PKH.toUpperCase()] })).toThrow(ConfigError);
+        expect(() => parse({ allowed_recipients: [MAINNET_P2SH.toLowerCase()] })).toThrow(ConfigError);
+      });
+
+      it('lowercases an all-uppercase bech32 address, so it matches the analysis output', async () => {
+        const parsed = parse({ allowed_recipients: [RECIPIENT_A.toUpperCase(), RECIPIENT_B.toUpperCase(), RECIPIENT_EVIL] });
+        expect(parsed.allowedRecipients).toEqual([RECIPIENT_A, RECIPIENT_B, RECIPIENT_EVIL]);
+
+        const gate = new PolicyGate(parsed);
+        expect(await gate.approve(signing({ recipient: RECIPIENT_A }))).toBe('approve');
+        expect(await gate.approve(signing({ recipient: RECIPIENT_B }))).toBe('approve');
+        // The output is what the analysis produced (lowercase); an uppercase output never occurs.
+        expect(await gate.approve(signing({ recipient: p2wpkh(7, btc.NETWORK) }))).toBe('reject');
+      });
+
+      it('lowercases uppercase testnet bech32 and still checks the network', () => {
+        expect(parse({ allowed_recipients: [TESTNET_A.toUpperCase(), TESTNET_B.toUpperCase()] }, 'signet')).toEqual({
+          allowedRecipients: [TESTNET_A, TESTNET_B],
+        });
+        const err = rejected({ allowed_recipients: [TESTNET_A.toUpperCase()] }, 'mainnet');
+        expect(err.message).toContain(TESTNET_A.toUpperCase());
+      });
+
+      it('rejects mixed-case bech32 (BIP 173), however it is mixed', () => {
+        const half = (a: string) => a.slice(0, 8) + a.slice(8).toUpperCase();
+        const firstUpper = (a: string) => a[0]!.toUpperCase() + a.slice(1);
+        const hrpUpper = (a: string) => a.slice(0, 2).toUpperCase() + a.slice(2);
+        for (const mix of [half, firstUpper, hrpUpper]) {
+          for (const base of [RECIPIENT_A, RECIPIENT_B]) {
+            const entry = mix(base);
+            expect(entry).not.toBe(base);
+            expect(entry).not.toBe(base.toUpperCase());
+            expect(rejected({ allowed_recipients: [entry] }).message, entry).toContain(entry);
+          }
+        }
+      });
+
+      it('shows a bad entry safely: control characters are removed from the message', () => {
+        const err = rejected({ allowed_recipients: ['bc1q\u001b[2J\u0007evil\nline2'] });
+        expect(err.message).not.toMatch(/[\u0000-\u001F\u007F-\u009F]/);
+        expect(err.message).toContain('bc1q[2Jevil line2');
+      });
+
+      it('leaves "address-book" and the other fields alone', () => {
+        expect(parse({ allowed_recipients: 'address-book' }, 'signet')).toEqual({ allowedRecipients: 'address-book' });
+        expect(parse({ max_sats_per_tx: 5 }, 'signet')).toEqual({ maxSatsPerTx: 5 });
+        expect(parse({ allowed_recipients: [] }, 'signet')).toEqual({ allowedRecipients: [] });
+      });
+
+      it('keeps the shape errors first: a non-string or empty entry is not reported as an invalid address', () => {
+        expect(() => parse({ allowed_recipients: [RECIPIENT_A, 42] })).toThrow(/gate\.allowed_recipients\[1\].*must be a string/);
+        expect(() => parse({ allowed_recipients: [''] })).toThrow(/gate\.allowed_recipients\[0\].*must not be empty/);
+      });
     });
   });
 
   describe('max_ceremonies_per_hour and dkg_leader_allowlist', () => {
     it('rejects non-positive or fractional max_ceremonies_per_hour', () => {
-      expect(() => parsePolicyParams({ max_ceremonies_per_hour: 0 })).toThrow(/gate\.max_ceremonies_per_hour.*>= 1/);
-      expect(() => parsePolicyParams({ max_ceremonies_per_hour: 1.5 })).toThrow(
+      expect(() => parse({ max_ceremonies_per_hour: 0 })).toThrow(/gate\.max_ceremonies_per_hour.*>= 1/);
+      expect(() => parse({ max_ceremonies_per_hour: 1.5 })).toThrow(
         /gate\.max_ceremonies_per_hour.*positive integer/,
       );
     });
 
     it('rejects a dkg_leader_allowlist that is not an array of strings', () => {
-      expect(() => parsePolicyParams({ dkg_leader_allowlist: 'node-a' })).toThrow(
+      expect(() => parse({ dkg_leader_allowlist: 'node-a' })).toThrow(
         /gate\.dkg_leader_allowlist.*must be an array/,
       );
-      expect(() => parsePolicyParams({ dkg_leader_allowlist: ['node-a', 1] })).toThrow(
+      expect(() => parse({ dkg_leader_allowlist: ['node-a', 1] })).toThrow(
         /gate\.dkg_leader_allowlist\[1\].*must be a string/,
       );
     });
@@ -791,7 +939,7 @@ describe('parsePolicyParams', () => {
 
   it('carries the key path on ConfigError', () => {
     try {
-      parsePolicyParams({ max_sats_per_tx: 'oops' });
+      parse({ max_sats_per_tx: 'oops' });
       expect.fail('should have thrown');
     } catch (err) {
       expect(err).toBeInstanceOf(ConfigError);
@@ -935,10 +1083,10 @@ describe('createGate', () => {
   });
 
   it('creates PolicyGate for strategy="policy" with flat params', async () => {
-    const gate = createGate({
-      strategy: 'policy',
-      params: { max_sats_per_tx: 1000, allowed_recipients: [RECIPIENT_A] },
-    });
+    const gate = createGate(
+      { strategy: 'policy', params: { max_sats_per_tx: 1000, allowed_recipients: [RECIPIENT_A] } },
+      { network: 'mainnet' },
+    );
     expect(gate).toBeInstanceOf(PolicyGate);
     expect(await gate.approve(signing({ external: 500 }))).toBe('approve');
     expect(await gate.approve(signing({ external: 2000 }))).toBe('reject');
@@ -950,28 +1098,56 @@ describe('createGate', () => {
     const logger: Logger = { ...NOOP_LOGGER, warn: (msg) => void warnings.push(msg) };
     const gate = createGate(
       { strategy: 'policy', params: { allowed_recipients: 'address-book' } },
-      { loadAddressBook: async () => [RECIPIENT_A], logger },
+      { network: 'mainnet', loadAddressBook: async () => [RECIPIENT_A], logger },
     );
     expect(gate).toBeInstanceOf(PolicyGate);
     expect(await gate.approve(signing({ recipient: RECIPIENT_A }))).toBe('approve');
     expect(await gate.approve(signing({ recipient: RECIPIENT_EVIL }))).toBe('reject');
     expect(warnings).toEqual([]);
 
-    const noBook = createGate({ strategy: 'policy', params: { allowed_recipients: 'address-book' } }, { logger });
+    const noBook = createGate(
+      { strategy: 'policy', params: { allowed_recipients: 'address-book' } },
+      { network: 'mainnet', logger },
+    );
     expect(await noBook.approve(signing({ recipient: RECIPIENT_A }))).toBe('reject');
     expect(warnings).toHaveLength(1);
   });
 
+  it('validates allowed_recipients against deps.network at construction', async () => {
+    const entries = { allowed_recipients: [RECIPIENT_A.toUpperCase(), RECIPIENT_B] };
+    const gate = createGate({ strategy: 'policy', params: entries }, { network: 'mainnet' });
+    expect(gate).toBeInstanceOf(PolicyGate);
+    expect(await gate.approve(signing({ recipient: RECIPIENT_A }))).toBe('approve');
+    expect(await gate.approve(signing({ recipient: RECIPIENT_EVIL }))).toBe('reject');
+
+    for (const network of ['testnet4', 'signet'] as const) {
+      expect(() => createGate({ strategy: 'policy', params: entries }, { network })).toThrow(
+        new RegExp(`gate\\.allowed_recipients\\[0\\].*${network}`),
+      );
+    }
+  });
+
+  it('needs deps.network to build a policy gate, and only a policy gate', () => {
+    expect(() => createGate({ strategy: 'policy', params: { max_sats_per_tx: 1 } })).toThrow(/needs the network/);
+    expect(() => createGate({ strategy: 'policy' })).toThrow(/needs the network/);
+    expect(() => createGate({ strategy: 'auto' })).not.toThrow();
+    expect(() => createGate({ strategy: 'exec', params: { command: ['/bin/true'], timeout_sec: 10 } })).not.toThrow();
+    expect(() => createGate({ strategy: 'webhook', params: { url: 'https://x', timeout_sec: 5 } })).not.toThrow();
+  });
+
   it('creates PolicyGate with no params (empty rules = approve everything)', async () => {
-    const gate = createGate({ strategy: 'policy' });
+    const gate = createGate({ strategy: 'policy' }, { network: 'mainnet' });
     expect(await gate.approve(signing({ external: 2_100_000_000_000_000 }))).toBe('approve');
   });
 
   it('propagates policy param errors at construction time', () => {
-    expect(() => createGate({ strategy: 'policy', params: { max_sats_per_tx: -1 } })).toThrow(
+    const mainnet = { network: 'mainnet' } as const;
+    expect(() => createGate({ strategy: 'policy', params: { max_sats_per_tx: -1 } }, mainnet)).toThrow(
       /gate\.max_sats_per_tx.*must be >= 0/,
     );
-    expect(() => createGate({ strategy: 'policy', params: { max_btc_per_tx: 1 } })).toThrow(/use max_sats_per_tx/);
+    expect(() => createGate({ strategy: 'policy', params: { max_btc_per_tx: 1 } }, mainnet)).toThrow(
+      /use max_sats_per_tx/,
+    );
   });
 
   it('creates ExecGate for strategy="exec"', async () => {

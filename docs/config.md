@@ -165,7 +165,7 @@ rule is active iff its key is set, and every active rule must pass.
 |---|---|---|---|
 | `max_sats_per_tx` | integer \| decimal string | Signing | `spec.amount` ≤ cap. `amount` is the sum of non-change outputs, so change back to the vault never counts. |
 | `max_sats_per_24h` | integer \| decimal string | Signing | Sum of `amount` over this node's approvals in the last 24 h, plus this spec, ≤ cap. Recorded at approval; held in memory. |
-| `allowed_recipients` | string[] \| `"address-book"` | Signing | Every non-change output address must be in the set. With `"address-book"`, the set is this node's address book, read at each evaluation; a missing or invalid book rejects. |
+| `allowed_recipients` | string[] \| `"address-book"` | Signing | Every non-change output address must be in the set. Each array entry must be a valid address of `[network].name` (checked at startup). With `"address-book"`, the set is this node's address book, read at each evaluation; a missing or invalid book rejects. |
 | `max_fee_sats` | integer \| decimal string | Signing | `spec.fee` ≤ cap. |
 | `max_fee_rate` | number \| decimal string | Signing | `spec.feeRate` ≤ cap, in sat/vB. May be fractional. |
 | `max_ceremonies_per_hour` | integer ≥ 1 | Signing | Signing approvals by this node in the last hour < cap. |
@@ -192,6 +192,13 @@ Details:
   `allowed_recipients = "address-book"`, a missing book file, an invalid book
   file or any other failed read rejects every signing spec, even one whose
   outputs are all change.
+- **`allowed_recipients` entries are validated.** Each array entry must be a
+  valid address for `[network].name`; a typo, an address of another network
+  (`bc1…` on `testnet4`, `tb1…` on `mainnet`) or a script in hex is a
+  `ConfigError` at `gate.allowed_recipients[<i>]` that quotes the entry and
+  names the network, and the daemon does not start. Base58 addresses are kept as
+  written; an all-uppercase bech32 address is stored in lowercase, which is how
+  the analysis reports outputs; mixed-case bech32 is refused (BIP 173).
 - The address book is `/etc/otzi/address-book.otzi.json`. Editing it changes the
   allowlist without a daemon restart, which is why it is root-owned (`0640`).
 - Signing rules never apply to a DKG spec, and `dkg_leader_allowlist` never

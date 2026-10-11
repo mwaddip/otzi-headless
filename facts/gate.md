@@ -49,7 +49,7 @@
 - Exec and webhook approvers receive the spec as JSON.
 
 **Notes / gotchas:**
-- Output addresses are exactly the strings `analyzeProposal` produces (lowercase bech32/bech32m for segwit and taproot). Allowlists compare by exact string.
+- Output addresses are exactly the strings `analyzeProposal` produces (lowercase bech32/bech32m for segwit and taproot). Allowlists compare by exact string; `parsePolicyParams` therefore stores an all-uppercase bech32 `allowed_recipients` entry in lowercase (see `policy.ts`).
 
 ---
 
@@ -92,13 +92,13 @@
   - **Strict by default:** a configured rule whose input is missing rejects. With `"address-book"`, a missing book file, an invalid book file, any other failed load, or no `loadAddressBook` dependency rejects every signing spec — even one whose outputs are all change — and `PolicyGate` logs a warning through its `logger` naming the cause (`no address book loader`, or the load error's message).
   - **Windows:** every rule is evaluated first; only when the final decision is approve is the approval recorded in the hourly window (timestamp) and the 24 h window (`{ at: now(), amount }`). Entries older than 3 600 000 ms / 86 400 000 ms are pruned. The checks and the records happen in one synchronous section (after any address-book load), so concurrent evaluations cannot both pass a cap.
 
-- `parsePolicyParams(params: Record<string, unknown>): PolicyConfig`
-  - **Pre:** The `params` of `GateConfig`: every key of the `[gate]` table except `strategy`.
-  - **Post:** Validated `PolicyConfig`.
+- `parsePolicyParams(params: Record<string, unknown>, network: NetworkName): PolicyConfig`
+  - **Pre:** The `params` of `GateConfig`: every key of the `[gate]` table except `strategy`. `network` is the daemon's configured network (`[network].name`).
+  - **Post:** Validated `PolicyConfig`. Every `allowedRecipients` array entry is a valid address of `network` (`isValidAddress`), in the form the gate compares: an all-uppercase bech32 entry (`BC1…` / `TB1…`) is lowercased, anything else is stored as written.
   - **Validation:**
     - `max_sats_per_tx`, `max_sats_per_24h`, `max_fee_sats`: non-negative safe integers, given as a TOML integer or a decimal string.
     - `max_fee_rate`: non-negative number (may be fractional) or decimal string.
-    - `allowed_recipients`: an array of non-empty address strings, or the string `"address-book"`; any other string is a `ConfigError`.
+    - `allowed_recipients`: an array of non-empty strings that are each a valid address of `network`, or the string `"address-book"`; any other string is a `ConfigError`. An entry is checked after normalisation: an all-uppercase bech32 string is lowercased first (BIP 173 allows it; the analysis output is lowercase, and matching is by exact string), so it validates and is stored lowercase; base58 (case-sensitive) is validated and stored as written; mixed-case bech32 fails `isValidAddress` and is refused, as are an address of another network (a `bc1…` entry on `testnet4` / `signet`, a `tb1…` entry on `mainnet`; `testnet4` and `signet` share one address format), a regtest address, a bad checksum, surrounding whitespace and a script in hex. A bad entry is a `ConfigError` at `gate.allowed_recipients[<i>]`: `'<entry>' is not a valid <network> address`, the entry shown through `displayText` (control characters removed). `"address-book"` is not checked here; the book validates every entry on each read.
     - `max_ceremonies_per_hour`: positive integer.
     - `dkg_leader_allowlist`: array of strings.
     - Unknown keys are rejected.
@@ -291,23 +291,23 @@
   - **Post:** Returns `Promise<'approve'>`.
   - **Throws:** Never.
 
-- `createGate(config: GateConfig, deps?: { loadAddressBook?: () => Promise<string[]>; logger?: Logger; secretEnv?: readonly string[] }): ApprovalGate`
-  - **Pre:** `config` is validated `GateConfig` with strategy ∈ `GATE_STRATEGIES`. `deps.secretEnv` names environment variables a gate command must not inherit (the daemon passes `[config.share.passwordEnv]` and the `auth_token_env` name of every `http` trigger).
+- `createGate(config: GateConfig, deps?: { loadAddressBook?: () => Promise<string[]>; logger?: Logger; secretEnv?: readonly string[]; network?: NetworkName }): ApprovalGate`
+  - **Pre:** `config` is validated `GateConfig` with strategy ∈ `GATE_STRATEGIES`. `deps.secretEnv` names environment variables a gate command must not inherit (the daemon passes `[config.share.passwordEnv]` and the `auth_token_env` name of every `http` trigger). `deps.network` is the daemon's configured network; it is required for strategy `policy` (it validates `allowed_recipients`) and unused by the others.
   - **Post:** Returns `ApprovalGate` (one of AutoGate, PolicyGate, ExecGate, WebhookGate).
   - **Dispatch table:**
     - `'auto'` → `new AutoGate()`; any param → `ConfigError('gate.<key>', 'not used by strategy auto')` (the config parser already refuses them).
-    - `'policy'` → `new PolicyGate(parsePolicyParams(config.params ?? {}), { loadAddressBook: deps?.loadAddressBook, logger: deps?.logger })`.
+    - `'policy'` → `new PolicyGate(parsePolicyParams(config.params ?? {}, deps.network), { loadAddressBook: deps?.loadAddressBook, logger: deps?.logger })`; without `deps.network` it throws `Error('createGate: strategy policy needs the network in deps.network')` (a caller bug, not an operator error).
     - `'exec'` → `new ExecGate({ ...parseExecParams(config.params ?? {}), omitEnv: deps?.secretEnv })`.
     - `'webhook'` → `new WebhookGate(parseWebhookParams(config.params ?? {}))`.
     - Fallback → Throw "unreachable" (exhaustive check via TypeScript `never`).
-  - **Throws:** ConfigError from parse* helpers if params are invalid.
+  - **Throws:** ConfigError from parse* helpers if params are invalid (for `policy`, an `allowed_recipients` entry that is no address of `deps.network` included); plain `Error` for a `policy` gate without `deps.network`.
 
 **Invariants:**
 - Exactly one gate is constructed per daemon (singleton at startup, used for every ceremony, leader and participant).
 - Each strategy's `parseFooParams()` is called here; errors abort daemon startup.
 
 **Cross-component contracts:**
-- Called by `Daemon` at construction, with `loadAddressBook` reading this node's address book (a missing file is a failure) and the daemon's `logger`.
+- Called by `Daemon` at construction, with `network` = `config.network.name`, `loadAddressBook` reading this node's address book (a missing file is a failure) and the daemon's `logger`.
 - Gate instance persists for daemon lifetime (stateful for rate windows).
 
 **Notes / gotchas:**

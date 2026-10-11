@@ -14,7 +14,9 @@
  *   max_sats_per_tx = 100000              # sum of non-change outputs
  *   max_sats_per_24h = 1000000            # rolling 24 h, this node's approvals
  *   allowed_recipients = ["bc1q...", "bc1p..."]
- *                                         # every non-change output must be listed
+ *                                         # every non-change output must be listed;
+ *                                         # each entry must be a valid address of the
+ *                                         # configured network, or startup fails
  *   allowed_recipients = "address-book"   # ... or be in this node's address book,
  *                                         # read at each evaluation
  *   max_fee_sats = 20000
@@ -30,6 +32,9 @@
 
 import { ConfigError } from '../config/parse';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
+import { isValidAddress } from '../otzi/lib/bitcoin';
+import type { NetworkName } from '../otzi/lib/vault-types';
+import { displayText } from '../util/text';
 import type { ApprovalGate, CeremonySpec, Decision, DkgSpec, SigningSpec } from './types';
 
 export interface PolicyConfig {
@@ -208,7 +213,11 @@ const LEGACY_KEYS = new Map<string, string>([
   ['allowed_contracts', 'no longer supported'],
 ]);
 
-export function parsePolicyParams(params: Record<string, unknown>): PolicyConfig {
+/**
+ * `network` is the daemon's network: every `allowed_recipients` entry must be a
+ * valid address on it (a `ConfigError` at `gate.allowed_recipients[i]` otherwise).
+ */
+export function parsePolicyParams(params: Record<string, unknown>, network: NetworkName): PolicyConfig {
   for (const key of Object.keys(params)) {
     const legacy = LEGACY_KEYS.get(key);
     if (legacy !== undefined) throw new ConfigError(`gate.${key}`, legacy);
@@ -225,7 +234,7 @@ export function parsePolicyParams(params: Record<string, unknown>): PolicyConfig
     out.maxSatsPer24h = coerceSats(params.max_sats_per_24h, 'gate.max_sats_per_24h');
   }
   if (params.allowed_recipients !== undefined) {
-    out.allowedRecipients = coerceRecipients(params.allowed_recipients, 'gate.allowed_recipients');
+    out.allowedRecipients = coerceRecipients(params.allowed_recipients, 'gate.allowed_recipients', network);
   }
   if (params.max_fee_sats !== undefined) {
     out.maxFeeSats = coerceSats(params.max_fee_sats, 'gate.max_fee_sats');
@@ -305,15 +314,15 @@ function coerceStringArray(v: unknown, path: string): string[] {
   });
 }
 
-/** An array of addresses, or the string `"address-book"`. */
-function coerceRecipients(v: unknown, path: string): string[] | 'address-book' {
+/** An array of addresses valid on `network`, or the string `"address-book"` (the book validates itself on every read). */
+function coerceRecipients(v: unknown, path: string, network: NetworkName): string[] | 'address-book' {
   if (v === 'address-book') return v;
   if (typeof v === 'string')
     throw new ConfigError(path, `must be an array of addresses or the string "address-book" (got '${v}')`);
-  return coerceAddressArray(v, path);
+  return coerceAddressArray(v, path, network);
 }
 
-function coerceAddressArray(v: unknown, path: string): string[] {
+function coerceAddressArray(v: unknown, path: string, network: NetworkName): string[] {
   if (!Array.isArray(v))
     throw new ConfigError(path, `must be an array of addresses or the string "address-book" (got ${describe(v)})`);
   return v.map((item, i) => {
@@ -321,8 +330,22 @@ function coerceAddressArray(v: unknown, path: string): string[] {
       throw new ConfigError(`${path}[${i}]`, `must be a string (got ${describe(item)})`);
     if (item === '')
       throw new ConfigError(`${path}[${i}]`, 'must not be empty');
-    return item;
+    const address = normalizeAddress(item);
+    if (!isValidAddress(address, network))
+      throw new ConfigError(`${path}[${i}]`, `'${displayText(item)}' is not a valid ${network} address`);
+    return address;
   });
+}
+
+/**
+ * The form the gate compares against: the analysis reports bech32 addresses in
+ * lowercase and the gate matches exact strings, so an all-uppercase bech32 entry
+ * (valid per BIP 173, what a QR code carries) is lowercased. Anything else is
+ * kept as written: base58 is case-sensitive, and mixed-case bech32 stays invalid
+ * for `isValidAddress` to refuse. A base58 address never starts with `BC1` / `TB1`.
+ */
+function normalizeAddress(address: string): string {
+  return /^(BC|TB)1/.test(address) && address === address.toUpperCase() ? address.toLowerCase() : address;
 }
 
 function describe(v: unknown): string {

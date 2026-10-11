@@ -89,6 +89,7 @@ export class Daemon {
     // The policy rule needs a book to exist: a node without one has no recipients to allow, so its
     // policy rejects every signing spec. The labelling read below takes a missing file as no labels.
     const gate = createGate(config.gate, {
+      network,
       loadAddressBook: async () =>
         (await readAddressBook(bookPath, network, { missing: 'error' })).map(e => e.address),
       logger: this.log,
