@@ -7,7 +7,7 @@ on chain.
 
 The ceremonies are **pull-based**. Each node produces its blobs locally and stores
 them; a node that needs round-N inputs pulls them from their producers. There are
-no periodic state broadcasts, no barriers and no heartbeats. Four small control
+no periodic state broadcasts, no barriers and no ceremony heartbeats. Four small control
 messages announce and close ceremonies; everything else is blobs.
 
 ---

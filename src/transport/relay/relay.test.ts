@@ -117,7 +117,31 @@ describe('RelayServer — roster + routing', () => {
   it('rejects bind with empty host', () => {
     expect(() => new RelayServer({ listen: ':9999' })).toThrow(/invalid listen|host required/);
   });
+
+  it('stop() while start() is still binding leaves nothing listening and no heartbeat', async () => {
+    const port = await freePort();
+    const racing = new RelayServer({ listen: `127.0.0.1:${port}`, heartbeatMs: 20 });
+    const starting = racing.start(); // binding: the listen completes on a later tick
+    await racing.stop();
+    await starting;
+
+    expect(racing.address()).toBeNull();
+    expect((racing as unknown as { heartbeat: unknown }).heartbeat).toBeNull();
+    expect(await acceptsConnections(port)).toBe(false);
+  });
 });
+
+/** Whether anything accepts a TCP connection on this loopback port. */
+async function acceptsConnections(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.connect(port, '127.0.0.1');
+    sock.once('connect', () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.once('error', () => resolve(false));
+  });
+}
 
 describe('RelayTransport — 2-peer', () => {
   let server: RelayServer | null = null;

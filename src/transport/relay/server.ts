@@ -100,6 +100,11 @@ export class RelayServer {
       httpServer.listen(this.port, this.host);
     });
 
+    if (this.wss !== wss) {
+      // stop() ran while we were binding: it could not close a listener that did not exist yet.
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      return;
+    }
     this.heartbeat = setInterval(() => this.beat(wss), this.heartbeatMs);
     this.log.info('RelayServer: listening', this.address() ?? {});
   }

@@ -91,7 +91,7 @@ Four properties shape everything else:
 
 1. **Pull-based blob exchange.** Each peer produces ceremony blobs locally
    and stores them. For each round, peers pull missing inputs from
-   producers reactively. No 500 ms state ticks, no barriers, no heartbeats.
+   producers reactively. No 500 ms state ticks, no barriers, no ceremony heartbeats.
 2. **Signing is leader-driven, DKG is symmetric.** A signing trigger
    (UDS / HTTP / cron) fires on exactly one node; that node analyses the
    proposal, evaluates its gate, announces once, drives both rounds, aggregates

@@ -39,6 +39,12 @@ const peersById: ReadonlyMap<PartyId, string> = new Map([
  */
 const ONE_ATTEMPT = { maxAttempts: 1, initialDelayMs: 5, maxDelayMs: 20, deadlineMs: 60_000 };
 const DEADLINE_MS = 400;
+/**
+ * A deadline for DKGs that must get past staging, confirmation or commit
+ * before it passes: they take about 0.4 s idle and 1.1 s with the CPU
+ * oversubscribed twice over.
+ */
+const LOADED_DKG_MS = 4_000;
 const RETENTION_MS = 40;
 
 let tv: TestVault;
@@ -520,7 +526,7 @@ describe('LeaderDispatcher: a DKG that fails after its confirmation', () => {
       vault: undefined,
       slots: fakeSlots().slots,
       createStager: () => stager,
-      ceremonyDeadlines: { signingMs: 1_000, dkgMs: 1_000 },
+      ceremonyDeadlines: { signingMs: LOADED_DKG_MS, dkgMs: LOADED_DKG_MS },
       logger: { debug: () => {}, info: () => {}, warn: () => {}, error: msg => lines.push(msg) },
     });
     // The leader never gets party 1's confirmation; the co-signers get every one and commit.
@@ -531,20 +537,19 @@ describe('LeaderDispatcher: a DKG that fails after its confirmation', () => {
 
     expect(err).toBeInstanceOf(DkgShareKeptError);
     expect((err as Error).message).toMatch(
-      /^DKG aborted: ceremony deadline of 1000 ms passed; this node published its confirmation of vault tb1p[0-9a-z]+, so its staged share was kept at \/test\/share\.json\.pending: run 'otzi vault' on the other nodes/,
+      new RegExp(
+        `^DKG aborted: ceremony deadline of ${LOADED_DKG_MS} ms passed; this node published its confirmation of vault tb1p[0-9a-z]+, ` +
+          `so its staged share was kept at /test/share\\.json\\.pending: run 'otzi vault' on the other nodes`,
+      ),
     );
     expect(stager.calls).toEqual(['stage']);
     expect(lines).toEqual([`leader: dkg gen-kept failed: ${(err as Error).message}`]);
     for (const c of [c1, c2]) expect(await c.waitFor('gen-kept', 5_000)).toMatchObject({ status: 'done' });
-  });
+  }, 20_000);
 });
 
 describe('LeaderDispatcher: the deadline does not hide the failure that was thrown', () => {
-  /**
-   * The DKG must reach staging (or commit) before this deadline: that takes
-   * about 0.4 s idle and 1.1 s with the CPU oversubscribed twice over.
-   */
-  const DKG_MS = 4_000;
+  const DKG_MS = LOADED_DKG_MS;
   const deadlines = { signingMs: DKG_MS, dkgMs: DKG_MS };
 
   /** Resolves when the leader's own ceremony deadline fires. */

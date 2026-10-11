@@ -486,7 +486,7 @@
 
 - `start(): Promise<void>`
   - **Pre:** Relay not already started.
-  - **Post:** Creates HTTP server + WebSocketServer, binds to listen address, registers connection handler, starts the heartbeat.
+  - **Post:** Creates HTTP server + WebSocketServer, binds to listen address, registers connection handler, starts the heartbeat. If `stop()` runs while the bind is still in progress, `start()` closes the listener it just opened and resolves with no heartbeat: nothing keeps running.
   - **Throws:** `Error` if bind fails.
 
 - `stop(): Promise<void>`
