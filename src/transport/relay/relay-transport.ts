@@ -21,8 +21,11 @@
  *
  * Re-handshake: a broken session is replaced by a fresh handshake, always
  * started by the initiator — on its own record failure, on the next send or
- * pull, or on a re-handshake request (an empty frame) from the responder. A
- * responder accepts a fresh hs1 in any state.
+ * pull, or on a re-handshake request (an empty frame) from the responder,
+ * which a responder also sends when its own handshake fails. A request
+ * restarts the handshake from any state, at most once per
+ * `REHANDSHAKE_MIN_INTERVAL_MS` per peer. A responder accepts a fresh hs1 in
+ * any state.
  *
  * Reconnect: a relay socket that fails to open, drops, or has its hello
  * refused ends every peer session and schedules the next attempt with
@@ -108,6 +111,8 @@ interface PeerState {
   /** Initiator: when the current handshake started, and which one it is. */
   handshakeStartedAt: number;
   handshakeAttempt: number;
+  /** Initiator: when a re-handshake request last restarted the handshake (rate limit). */
+  lastRestartAt: number;
   /** Serialises every frame to this peer (handshake and records): the relay sees them in counter order. */
   sendChain: Promise<void>;
   /**
@@ -146,6 +151,8 @@ const DEFAULT_PING_INTERVAL_MS = 20_000;
 const DEFAULT_PONG_TIMEOUT_MS = 10_000;
 /** An initiator handshake without hs2 for this long may be restarted. */
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+/** A peer's re-handshake requests restart the handshake at most this often; a pair that cannot agree must not spin. */
+const REHANDSHAKE_MIN_INTERVAL_MS = 1_000;
 /** Handshake messages are raw uncompressed P-256 points. */
 const HANDSHAKE_FRAME_BYTES = 65;
 const EMPTY = new Uint8Array(0);
@@ -217,6 +224,7 @@ export class RelayTransport implements Transport {
         online: false,
         handshakeStartedAt: 0,
         handshakeAttempt: 0,
+        lastRestartAt: 0,
         sendChain: Promise.resolve(),
         pending: [],
         processing: false,
@@ -457,8 +465,13 @@ export class RelayTransport implements Transport {
 
     // Initiator.
     if (peer.status === 'waiting-for-hs2') {
-      if (isHandshakeFrame(payload) && peer.initiatorState) await this.completeInitiatorHandshake(peer, payload);
-      // Anything else is a record the responder sealed under the old session: dropped.
+      if (isHandshakeFrame(payload)) {
+        if (peer.initiatorState) await this.completeInitiatorHandshake(peer, payload);
+        return;
+      }
+      // A record the responder sealed under the old session: it holds a session, so our hs1 may
+      // have been lost. The record is dropped; a handshake under way for too long restarts.
+      this.maybeStartHandshake(peer);
       return;
     }
     if (peer.status === 'connected' && peer.session) {
@@ -483,11 +496,24 @@ export class RelayTransport implements Transport {
     if (peer.status === 'disconnected' || stale) void this.startInitiatorHandshake(peer, { restart: true });
   }
 
+  /**
+   * The responder discarded whatever it held, our hs1 included, so waiting for
+   * an hs2 cannot succeed: restart from any state. At most once per
+   * `REHANDSHAKE_MIN_INTERVAL_MS`, so a pair whose handshakes keep failing
+   * (say, mismatched keys) retries at that pace, not at network speed.
+   */
   private onRehandshakeRequest(peer: PeerState): void {
-    if (peer.status === 'waiting-for-hs2') {
-      this.maybeStartHandshake(peer); // only when stale: a handshake is already under way
+    const now = Date.now();
+    const sinceLast = now - peer.lastRestartAt;
+    // A negative interval is a clock that stepped back: not a reason to hold requests off.
+    if (sinceLast >= 0 && sinceLast < REHANDSHAKE_MIN_INTERVAL_MS) {
+      this.log.debug('relay-transport: re-handshake request ignored (rate limit)', {
+        peerPartyId: peer.partyId,
+        sinceLastRestartMs: sinceLast,
+      });
       return;
     }
+    peer.lastRestartAt = now;
     this.log.info('relay-transport: re-handshake requested', { peerPartyId: peer.partyId });
     void this.startInitiatorHandshake(peer, { restart: true });
   }
@@ -548,6 +574,9 @@ export class RelayTransport implements Transport {
   }
 
   private async completeResponderHandshake(peer: PeerState, message1: Uint8Array): Promise<void> {
+    // The relay socket the hs1 came in on. If it is gone when the answer is ready, the relay close
+    // already ended this peer's session: hs2 has nowhere to go and the initiator will start over.
+    const ws = this.ws;
     try {
       const { message2, secrets } = await responderRespond(
         this.self.identity,
@@ -555,6 +584,7 @@ export class RelayTransport implements Transport {
         peer.publicKey,
       );
       const session = await RecordSession.create(secrets);
+      if (this.ws !== ws) return;
       // One synchronous step: the old session ends, the new one is usable, and hs2
       // takes its place in the send chain ahead of every record sealed under it.
       this.endSession(peer, 'connected');
@@ -567,7 +597,11 @@ export class RelayTransport implements Transport {
         peerPartyId: peer.partyId,
         err: errMsg(err),
       });
+      if (this.ws !== ws) return; // the relay dropped meanwhile: nothing to answer over
+      // The initiator waits for an hs2 that will not come (or holds a session we no longer have):
+      // ask it to start over, as for any other session we could not keep.
       this.endSession(peer, 'waiting-for-hs1');
+      this.requestRehandshake(peer);
     }
   }
 
