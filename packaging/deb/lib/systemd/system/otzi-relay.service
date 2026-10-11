@@ -1,0 +1,60 @@
+[Unit]
+Description=Otzi-headless relay server (opaque-frame router for relay-transport rings)
+# Installed disabled. Run it on ONE coordinator host for the whole ring, behind a
+# TLS reverse proxy; enable it there with: systemctl enable --now otzi-relay
+# (docs/install.md, Relay coordinator).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=otzi
+Group=otzi
+# Listen address: OTZI_RELAY_LISTEN=<host:port> in /etc/otzi/relay.env (root:root
+# 0644, no secrets; the postinst creates it with 127.0.0.1:7100 when it is missing).
+# The host is required (an IPv6 host goes in brackets) and there is no built-in
+# default, so the relay never binds every interface by accident. systemd reads
+# the file as root before it drops to User=otzi.
+EnvironmentFile=/etc/otzi/relay.env
+ExecStart=/usr/bin/otzi relay --listen ${OTZI_RELAY_LISTEN}
+Restart=on-failure
+RestartSec=5
+
+# Hardening, the same as otzi.service. The relay is an unprivileged Node process
+# (User=otzi) that routes opaque encrypted frames between the daemons: it holds no
+# key, reads no vault file and writes nothing, so it gets no ReadWritePaths= and no
+# RuntimeDirectory=. Everything it does not need is closed off.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# A private /dev with only null, zero, full, random, urandom, tty and the pty
+# devices.
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+# AF_NETLINK: glibc's getaddrinfo (AI_ADDRCONFIG) asks the kernel over netlink
+# which address families the host has configured. Without it, resolving a listen
+# host name can fail.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+#
+# Left out on purpose:
+# - MemoryDenyWriteExecute: Node's V8 JIT needs writable+executable memory.
+# - SystemCallFilter: kept off for the same reason as otzi.service; an operator
+#   can add a filter in a drop-in (systemctl edit otzi-relay).
+# - CapabilityBoundingSet= (empty): the relay runs as the otzi user with no
+#   ambient capabilities, so it holds none already. Emptying the set would only
+#   stop an operator from granting one in a drop-in (AmbientCapabilities=
+#   CAP_NET_BIND_SERVICE to listen on a port below 1024).
+
+[Install]
+WantedBy=multi-user.target

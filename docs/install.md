@@ -5,7 +5,9 @@
 - Linux (tested: Debian 12+, Ubuntu 24.04+).
 - `nodejs` ≥ 22. On Ubuntu 24.04, the default `nodejs` package is too old —
   install [nodesource's 22.x](https://github.com/nodesource/distributions) first.
-- systemd (the .deb installs a unit file at `/lib/systemd/system/otzi.service`).
+- systemd (the .deb installs the unit files `/lib/systemd/system/otzi.service` and
+  `otzi-relay.service`; the second is installed disabled and is needed only for the
+  relay transport, see [Relay coordinator](#relay-coordinator)).
 - One open port per node for peer-mesh (default `8800`); leader nodes also
   open the bootstrap-server port temporarily (default `7090`) during initial
   pubkey exchange, reachable only by the members (see step 3 of the walkthrough). The operator API is local-only over a UDS at
@@ -47,8 +49,18 @@ follow up with `sudo apt -f install` to resolve.)
        separated `host[:port]` list of every other node — on a leaf,
        the leader is auto-derived from the bootstrap leader URL, so
        you only list peers *other than* the leader).
-     - For `relay`: **Relay URL**.
+     - For `relay`: **Relay URL** (`ws://` or `wss://`; the same on every node, see
+       [Relay coordinator](#relay-coordinator)). A relay config has no
+       `[[peers]]`, so no peer list is asked.
    - **Bootstrap bind** (leader) or **leader URL** (leaf).
+   - **Number of nodes in the ring (including this one)** — asked only on a
+     leader under `relay`. An integer from 2 to 255; it becomes `[bootstrap]
+     parties`, which tells the leader how many registrations to admit
+     (`parties − 1`). Anything else is left out of `daemon.toml` with a warning
+     on stderr, and `otzi setup` (and the daemon) then refuse the config with
+     `config bootstrap.parties: required when transport.kind = "relay" and
+     bootstrap.role = "leader"` until you add the key under `[bootstrap]`.
+     Peer-mesh counts `[[peers]]` instead, and a leaf never takes the key.
    - **Node identifier** (defaults to `hostname -s`; local logging label only).
 
 2. **Log out / log back in** (or `newgrp otzi`) so your shell picks up
@@ -116,7 +128,8 @@ follow up with `sudo apt -f install` to resolve.)
    The leader stops listening once every member has registered. Remove any
    firewall opening you made for setup.
 
-4. **Enable + start the daemon** on every node:
+4. **Enable + start the daemon** on every node (under `relay`, with the relay
+   server already running: see [Relay coordinator](#relay-coordinator)):
    ```
    sudo systemctl enable --now otzi
    ```
@@ -170,6 +183,86 @@ follow up with `sudo apt -f install` to resolve.)
 
 Logs: `journalctl -u otzi -f`.
 
+## Relay coordinator
+
+Under `[transport] kind = "relay"` the daemons do not dial each other: every node
+connects to one relay server, which routes opaque encrypted frames between them.
+Run that server on a **coordinator host**, once for the whole ring. The host can
+be one of the ring nodes or a separate machine. The `.deb` ships the server as
+`otzi-relay.service`, installed **disabled**: nothing starts it until you do.
+
+1. **Install the package on the coordinator host.** On a ring node it is already
+   there. On a separate host the debconf prompts can take any answer: the relay
+   reads nothing from `daemon.toml`, and `otzi.service` stays disabled and, with
+   no share password file, does not start.
+
+2. **Check the listen address** in `/etc/otzi/relay.env` (`root:root`, mode `0644`,
+   no secret). The postinst creates it when it is missing, and no later install,
+   upgrade or reconfigure overwrites it:
+   ```
+   OTZI_RELAY_LISTEN=127.0.0.1:7100
+   ```
+   The unit runs `otzi relay --listen ${OTZI_RELAY_LISTEN}`. The host part is
+   required: the relay has no built-in default, so it never binds every interface
+   by accident (an IPv6 host goes in brackets, `[::1]:7100`). The loopback default
+   suits a TLS reverse proxy on the same host. Edit the file as root and restart
+   the unit to change it. A port below 1024 needs a drop-in granting
+   `AmbientCapabilities=CAP_NET_BIND_SERVICE` (`sudo systemctl edit otzi-relay`).
+
+3. **Put TLS in front of it.** The relay speaks plain WebSocket and has no login
+   of its own: the Noise-KK layer between the daemons authenticates and encrypts
+   everything the relay carries, so the relay sees only opaque frames and cannot
+   read or forge them. It can still be disrupted: any host that can reach the port
+   can claim a party slot in a ring until the squatter disconnects. So keep the
+   relay on loopback behind a TLS reverse proxy, or on a VPN, and use the proxy's
+   or the firewall's own allowlist when you can. The proxy must pass WebSocket
+   upgrades and keep an idle connection open for longer than the 20 s keepalive
+   ping that both the relay and the daemons send. With nginx:
+   ```nginx
+   server {
+       listen 443 ssl;
+       server_name relay.example;
+       ssl_certificate     /etc/letsencrypt/live/relay.example/fullchain.pem;
+       ssl_certificate_key /etc/letsencrypt/live/relay.example/privkey.pem;
+
+       location / {
+           proxy_pass http://127.0.0.1:7100;
+           proxy_http_version 1.1;
+           proxy_set_header Upgrade $http_upgrade;
+           proxy_set_header Connection "upgrade";
+           proxy_read_timeout 3600s;
+           proxy_send_timeout 3600s;
+       }
+   }
+   ```
+   (Caddy needs only `relay.example { reverse_proxy 127.0.0.1:7100 }`.)
+
+4. **Start the relay** on the coordinator host:
+   ```
+   sudo systemctl enable --now otzi-relay
+   journalctl -u otzi-relay -f
+   ```
+   It logs `RelayServer: listening {"host":"127.0.0.1","port":7100}` at start, then
+   one line per connect and disconnect. It restarts itself after a crash
+   (`Restart=on-failure`). Daemons that lose the relay redial it with a backoff of
+   1 s up to 30 s and re-handshake with their peers, so a relay restart only
+   delays a ceremony in flight; it does not need a daemon restart.
+
+5. **Point every node at it.** `[transport] url` in `/etc/otzi/daemon.toml` is the
+   `wss://` URL of the proxy, the same on all nodes (`url = "wss://relay.example"`;
+   plain `ws://` is for loopback or a VPN). The installer's **Relay URL** prompt
+   writes it. Change the file by hand if the URL changes, then restart the daemon.
+
+The `otzi setup`, `otzi generate` and `otzi vault` steps are the same for both
+transports. Two differences matter during setup:
+
+- The bootstrap exchange runs over the leader's HTTP bootstrap port, not through
+  the relay, and under relay the leader admits members **by count**. Keep that
+  port reachable only by the members until setup ends (see step 3 of the
+  walkthrough).
+- The daemons connect to the relay when they start, so start the relay before
+  step 4 of the walkthrough.
+
 ## Operator API
 
 Default: UDS at `/var/run/otzi/otzi.sock` (mode 660, owned otzi:otzi).
@@ -196,9 +289,11 @@ sudo dpkg-reconfigure otzi-headless
 | `/usr/bin/otzi` | CLI wrapper | root:root 755 |
 | `/usr/lib/otzi/entrypoint.mjs` | esbuild bundle | root:root 644 |
 | `/lib/systemd/system/otzi.service` | systemd unit | root:root 644 |
+| `/lib/systemd/system/otzi-relay.service` | systemd unit of the relay server (installed disabled; see [Relay coordinator](#relay-coordinator)) | root:root 644 |
 | `/etc/otzi/` | config dir (setgid; only root writes, group otzi reads) | root:otzi 2750 |
 | `/etc/otzi/daemon.toml` | rendered config (preserved across upgrades; owner and mode re-applied on every configure) | root:otzi 640 |
 | `/etc/otzi/otzi.env` | share password for the unit (`OTZI_SHARE_PASSWORD=…`) | root:root 600 |
+| `/etc/otzi/relay.env` | listen address of `otzi-relay.service` (`OTZI_RELAY_LISTEN=127.0.0.1:7100`); created when missing, never overwritten | root:root 644 |
 | `/etc/otzi/address-book.otzi.json` | this node's address book (optional; owner and mode re-applied on every configure) | root:otzi 640 |
 | `/var/lib/otzi/` | data dir (setgid; group otzi can write) | root:otzi 2770 |
 | `/var/lib/otzi/identity.json` | ECDH identity | otzi:otzi 660 |
@@ -220,6 +315,7 @@ captures them in journald. There is no daemon-level log file to manage.
 journalctl -u otzi -f             # live tail
 journalctl -u otzi --since today  # windowed
 journalctl -u otzi -p warning     # filter by priority
+journalctl -u otzi-relay -f       # the relay server, on the coordinator host
 ```
 
 ### Disk + retention
@@ -282,11 +378,15 @@ Deliberately not set:
   the setting would only stop a drop-in from granting one, such as
   `AmbientCapabilities=CAP_NET_BIND_SERVICE` to listen on a port below 1024.
 
+`otzi-relay.service` carries the same restrictions, except that it has no
+`ReadWritePaths=` and no `RuntimeDirectory=`: the relay holds no key, reads no vault
+file and writes nothing, so its whole file system is read-only.
+
 `exec` gate commands therefore see no `/dev` beyond the basics and have no setuid
 helper to call; see [`gates.md`](./gates.md) § `exec`. To loosen any of this for
-one host, add a drop-in with `sudo systemctl edit otzi` rather than editing the
-packaged unit, which an upgrade replaces. `systemd-analyze security otzi.service`
-shows the unit's exposure.
+one host, add a drop-in with `sudo systemctl edit otzi` (or `otzi-relay`) rather than
+editing the packaged unit, which an upgrade replaces. `systemd-analyze security
+otzi.service` shows the unit's exposure.
 
 ### Address book
 
@@ -486,6 +586,10 @@ sudo apt remove otzi-headless    # keeps /etc/otzi/ and /var/lib/otzi/
 sudo apt purge otzi-headless     # ALSO removes the share + config + user
 ```
 
+The package does not stop or disable a unit you enabled yourself, so run `sudo systemctl
+disable --now otzi` (and, on the coordinator host, `otzi-relay`) first. `purge` also
+removes `/etc/otzi/relay.env` with the rest of `/etc/otzi`.
+
 > **Warning:** `purge` deletes `/var/lib/otzi/share.json`. The vault is n-of-n:
 > losing any one share without a backup makes the funds unspendable. Run
 > `sudo otzi backup` on every node before purging if you might reinstall.
@@ -494,4 +598,10 @@ sudo apt purge otzi-headless     # ALSO removes the share + config + user
 
 `scripts/test-deb-container.sh` runs the install end-to-end inside an Ubuntu
 24.04 container with pre-seeded debconf answers, and verifies the rendered
-config + bundle invocation. Useful before tagging a release.
+config + bundle invocation. Besides the peer-mesh install and the backup/restore
+round-trip it runs relay variants: a relay leader (`parties` 3) and a relay leaf,
+each of which must render a `daemon.toml` without `[[peers]]` that parses, and a
+leader with a bad ring size, which must be warned about and left out. It also
+checks that `otzi-relay.service` is installed with its sandbox directives, not
+enabled, and that `/etc/otzi/relay.env` exists with the loopback default and
+survives a reconfigure. It needs docker. Useful before tagging a release.

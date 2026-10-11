@@ -176,6 +176,12 @@ Notes on the prompts:
   leader URL above. So leaves only list peers other than the leader.
 - **"Esplora URL"** is the chain API the `otzi btc *` verbs use. Blank selects
   the mempool.space default for the network. The daemon never reads it.
+- **Relay transport.** With `relay` the table changes: there is no reachable
+  address and no peer list; every node asks for the **Relay URL**, and the
+  bootstrap leader also asks **Number of nodes in the ring** (2 to 255, itself
+  included). One host runs the relay server (`otzi-relay.service`, installed
+  disabled) behind a TLS proxy; see
+  [`docs/install.md`](docs/install.md#relay-coordinator).
 
 postinst auto-adds every operator listed at the debconf prompt to the
 `otzi` group (so they can connect to the UDS at

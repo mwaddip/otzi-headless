@@ -64,6 +64,10 @@ db_get otzi-headless/role || true
 ROLE="$RET"
 if [ "$ROLE" = "leader" ]; then
   db_input medium otzi-headless/bootstrap-bind || true
+  # A relay config has no [[peers]] to count, so the relay leader states the ring size.
+  if [ "$TRANSPORT" = "relay" ]; then
+    db_input high otzi-headless/parties || true
+  fi
 else
   db_input high otzi-headless/bootstrap-leader-url || true
 fi

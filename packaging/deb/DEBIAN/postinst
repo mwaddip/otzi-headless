@@ -53,6 +53,30 @@ case "$1" in
       fi
     done
 
+    # /etc/otzi/relay.env: the listen address of otzi-relay.service (the relay
+    # server of a relay-transport ring; docs/install.md, Relay coordinator).
+    # Created only when missing, so an operator's edit survives upgrades and
+    # reconfigures. It holds no secret, so root:root 0644. The loopback default
+    # suits a TLS reverse proxy on the same host. The unit is installed disabled
+    # and stays so: enabling it is the operator's decision on the coordinator host.
+    if [ ! -e /etc/otzi/relay.env ] && [ ! -L /etc/otzi/relay.env ]; then
+      (
+        umask 022
+        cat >/etc/otzi/relay.env <<'RELAYENV'
+# Listen address of the relay server (otzi-relay.service): host:port.
+# The host is required (an IPv6 host goes in brackets, e.g. [::1]:7100); there
+# is no built-in default. The default below is loopback only: put a TLS reverse
+# proxy on this host in front of it. Edit as root, then restart the unit:
+#   sudo systemctl restart otzi-relay
+# This file holds no secret. The otzi-headless postinst creates it when it is
+# missing and never overwrites it.
+OTZI_RELAY_LISTEN=127.0.0.1:7100
+RELAYENV
+      )
+      chown root:root /etc/otzi/relay.env
+      chmod 0644 /etc/otzi/relay.env
+    fi
+
     # Add operator users to the otzi group.
     db_get otzi-headless/operators || true
     OPERATORS="$RET"
@@ -151,6 +175,7 @@ BANNER
       db_get otzi-headless/peers || true;                 PEERS_CSV="$RET"
       db_get otzi-headless/relay-url || true;             RELAY_URL="$RET"
       db_get otzi-headless/bootstrap-bind || true;        BOOTSTRAP_BIND="$RET"
+      db_get otzi-headless/parties || true;               PARTIES="$RET"
       db_get otzi-headless/bootstrap-leader-url || true;  BOOTSTRAP_LEADER_URL="$RET"
       db_get otzi-headless/node-id || true;               NODE_ID="$RET"
 
@@ -173,6 +198,26 @@ BANNER
           ESPLORA_URL=""
           ;;
       esac
+
+      # [bootstrap] parties: the ring size, this node included. Only a relay
+      # leader takes it (a relay config has no [[peers]] to count; the parser
+      # refuses the key under peer-mesh and on a leaf). Only an integer from 2 to
+      # 255 is written; anything else is left out with a warning, and `otzi setup`
+      # then stops with the config error that names the key. Leading zeros are
+      # dropped first (a TOML integer has none); the range is matched as text so
+      # an absurdly long answer cannot overflow a numeric test.
+      PARTIES_OK=""
+      if [ "$TRANSPORT" = "relay" ] && [ "$ROLE" = "leader" ]; then
+        PARTIES="$(printf '%s' "$PARTIES" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        PARTIES_NUM="$(printf '%s' "$PARTIES" | sed -e 's/^0*\([0-9]\)/\1/')"
+        case "$PARTIES_NUM" in
+          [2-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) PARTIES_OK="$PARTIES_NUM" ;;
+          *)
+            echo "otzi-headless: WARNING — ignoring ring size '$PARTIES': the number of nodes (this one included) must be an integer from 2 to 255." >&2
+            echo "otzi-headless: set parties under [bootstrap] in /etc/otzi/daemon.toml before running 'otzi setup'." >&2
+            ;;
+        esac
+      fi
 
       ENODE_ID="$(toml_escape "$NODE_ID")"
       EESPLORA_URL="$(toml_escape "$ESPLORA_URL")"
@@ -280,8 +325,11 @@ EOF
       if [ "$ROLE" = "leader" ]; then
         cat >>/etc/otzi/daemon.toml <<EOF
 bind = "$EBOOTSTRAP_BIND"
-
 EOF
+        if [ -n "$PARTIES_OK" ]; then
+          printf 'parties = %s\n' "$PARTIES_OK" >>/etc/otzi/daemon.toml
+        fi
+        printf '\n' >>/etc/otzi/daemon.toml
       else
         cat >>/etc/otzi/daemon.toml <<EOF
 leader_url = "$EBOOTSTRAP_LEADER_URL"
@@ -304,7 +352,8 @@ EOF
 otzi-headless installed. Next steps:
 
   1. Bootstrap pubkey exchange, leader first. Compare the printed fingerprint
-     on every node before going further:
+     on every node, and confirm every key id it lists belongs to one of your
+     nodes, before going further:
        sudo -u otzi otzi setup /etc/otzi/daemon.toml
   2. Create /etc/otzi/otzi.env (owner root:root, mode 600) with one line. The
      unit loads it, and the daemon refuses to start without the password
@@ -318,6 +367,41 @@ otzi-headless installed. Next steps:
   5. Restart every daemon so it loads its share, then check the vault:
        sudo systemctl restart otzi
        otzi vault
+EOF
+
+      # Relay transport: the steps above are the same, but a relay server has to
+      # run somewhere. docs/install.md, Relay coordinator, has the details.
+      if [ "$TRANSPORT" = "relay" ]; then
+        cat <<EOF
+
+Relay coordinator (relay transport). One host runs the relay server for the
+whole ring: one of the ring nodes, or a separate host. Set it up before step 3,
+because every daemon connects to the relay when it starts:
+  a. Install this package on the coordinator host. It ships otzi-relay.service,
+     installed DISABLED: nothing starts the relay for you.
+  b. The relay listens on the address in /etc/otzi/relay.env (root:root, mode
+     644; default OTZI_RELAY_LISTEN=127.0.0.1:7100, loopback only). Edit it as
+     root if the reverse proxy runs on another host or port.
+  c. Put a TLS reverse proxy in front of it: it serves wss://<relay-host> and
+     forwards the WebSocket traffic to that address. The relay speaks plain
+     WebSocket and has no login of its own: never expose it unencrypted beyond
+     loopback or a VPN.
+  d. Start it on the coordinator host (logs: journalctl -u otzi-relay):
+       sudo systemctl enable --now otzi-relay
+  e. On every node, [transport] url in /etc/otzi/daemon.toml must be that
+     wss:// URL (this node: $RELAY_URL).
+Under relay the bootstrap leader admits members by count, so during step 1 keep
+the leader's bootstrap port reachable only by the ring members.
+EOF
+        if [ -n "$PARTIES_OK" ]; then
+          cat <<EOF
+Ring size: $PARTIES_OK nodes ([bootstrap] parties in /etc/otzi/daemon.toml); the
+leader admits $((PARTIES_OK - 1)) registrations.
+EOF
+        fi
+      fi
+
+      cat <<EOF
 
 Operators (in 'otzi' group): $OPERATORS
 Config: /etc/otzi/daemon.toml         (mode 640, owned root:otzi)

@@ -80,7 +80,21 @@ Description: Other peers (comma-separated host[:port])
 Template: otzi-headless/relay-url
 Type: string
 Description: Relay WebSocket URL
- Required when transport is "relay" — e.g. ws://relay.example:9000.
+ Required when transport is "relay" — e.g. ws://relay.example:9000, or
+ wss://relay.example when a TLS reverse proxy fronts the relay server (which
+ `otzi-relay.service` runs on the coordinator host). Every node in the ring
+ uses the same URL.
+
+Template: otzi-headless/parties
+Type: string
+Description: Number of nodes in the ring (including this one)
+ Asked only on the bootstrap leader when the transport is "relay". An integer
+ from 2 to 255, this node included. A relay config has no peer list to count,
+ so the leader needs the ring size to know how many nodes to admit during
+ `otzi setup`: it accepts that many minus one registrations and then stops.
+ A value that is not an integer from 2 to 255 is left out of
+ /etc/otzi/daemon.toml with a warning; set `parties` under [bootstrap] by hand
+ before running `otzi setup`.
 
 Template: otzi-headless/bootstrap-bind
 Type: string

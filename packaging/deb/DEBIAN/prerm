@@ -4,7 +4,10 @@ set -e
 case "$1" in
   remove|upgrade|deconfigure)
     if [ -d /run/systemd/system ]; then
-      deb-systemd-helper stop otzi.service >/dev/null 2>&1 || true
+      # otzi-relay.service gets the same treatment as the daemon unit.
+      for OTZI_UNIT in otzi.service otzi-relay.service; do
+        deb-systemd-helper stop "$OTZI_UNIT" >/dev/null 2>&1 || true
+      done
     fi
     ;;
 esac
