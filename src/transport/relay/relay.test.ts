@@ -993,15 +993,27 @@ type HandshakeInternals = {
   ws: unknown;
   peerStates: Map<
     PartyId,
-    { status: string; session: unknown; handshakeAttempt: number; handshakeStartedAt: number }
+    {
+      status: string;
+      session: unknown;
+      handshakeAttempt: number;
+      handshakeStartedAt: number;
+      lastRestartAt: number;
+      deferredRestart: NodeJS.Timeout | null;
+    }
   >;
   onIncoming(from: PartyId, payload: Uint8Array): Promise<void>;
+  onPeerLeft(partyId: PartyId): void;
   requestRehandshake(peer: unknown): void;
   startInitiatorHandshake(peer: unknown, opts?: { restart?: boolean }): Promise<void>;
   completeResponderHandshake(peer: unknown, message1: Uint8Array): Promise<void>;
   dropSocket(ws: unknown, reason: string, details: Record<string, unknown>): void;
 };
 const hsInternals = (t: RelayTransport) => t as unknown as HandshakeInternals;
+
+const DEFERRED = 'relay-transport: re-handshake request deferred (rate limit)';
+const EMPTY_FRAME = new Uint8Array(0);
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 describe('RelayTransport — re-handshake recovery', () => {
   let server: RelayServer | null = null;
@@ -1052,7 +1064,8 @@ describe('RelayTransport — re-handshake recovery', () => {
     await hsInternals(b.transport).onIncoming(0, bogusHs1);
     expect(warns.map((w) => w.msg)).toContain('relay-transport: responder handshake failed');
 
-    // The initiator sends nothing from here on: only the responder's request can bring the pair back.
+    // The initiator sends nothing from here on: only the responder's request can bring the pair back
+    // (it may wait out the initiator's rate-limit window, under a second).
     await vi.waitFor(
       async () => {
         await b.transport.broadcast(new Uint8Array([42]));
@@ -1074,7 +1087,9 @@ describe('RelayTransport — re-handshake recovery', () => {
     expect(initiator.status).toBe('waiting-for-hs2');
     const attempt = initiator.handshakeAttempt;
 
-    // The responder asks again: a handshake that is only moments old is restarted all the same.
+    // The initiator's last restart is over a second old, and the responder asks again: the handshake is
+    // restarted at once, though it is only moments old (waiting for the hs2 cannot succeed).
+    initiator.lastRestartAt -= 5_000;
     hsInternals(b.transport).requestRehandshake(responder);
     await vi.waitFor(
       () => {
@@ -1095,27 +1110,193 @@ describe('RelayTransport — re-handshake recovery', () => {
     const { logger, debugs } = capturingLogger();
     const [a] = await pair('ring-rehs-rate', { logger });
     const initiator = hsInternals(a.transport).peerStates.get(1)!;
-    const request = () => hsInternals(a.transport).onIncoming(1, new Uint8Array(0));
+    const request = () => hsInternals(a.transport).onIncoming(1, EMPTY_FRAME);
     const base = initiator.handshakeAttempt;
 
-    // Only the clock is faked: the handshakes still run on the real sockets.
+    // Only the clock is faked: the handshakes and the deferred timer still run for real.
     vi.useFakeTimers({ toFake: ['Date'] });
+    vi.advanceTimersByTime(1_100); // the window opened by the initial handshake is over
     await request();
     expect(initiator.handshakeAttempt).toBe(base + 1);
     // Let the restart finish, so the limit (not a handshake under way) is what holds the next request off.
-    for (let i = 0; i < 500 && initiator.status !== 'connected'; i++) await new Promise((r) => setTimeout(r, 20));
+    for (let i = 0; i < 500 && initiator.status !== 'connected'; i++) await sleep(20);
     expect(initiator.status).toBe('connected');
 
-    // A second request 100 ms later is ignored, with a debug log.
+    // A second request 100 ms later does not restart now: it is deferred to the end of the window ...
     vi.advanceTimersByTime(100);
     await request();
     expect(initiator.handshakeAttempt).toBe(base + 1);
-    expect(debugs.map((d) => d.msg)).toContain('relay-transport: re-handshake request ignored (rate limit)');
+    expect(debugs.filter((d) => d.msg === DEFERRED)).toHaveLength(1);
+    expect(debugs.find((d) => d.msg === DEFERRED)!.extra?.delayMs).toBe(900);
 
-    // Once the window has passed, the next one restarts again.
-    vi.advanceTimersByTime(1_000);
+    // ... where it restarts once.
+    await vi.waitFor(() => expect(initiator.handshakeAttempt).toBe(base + 2), { timeout: 10_000, interval: 20 });
+    expect(initiator.deferredRestart).toBeNull();
+  }, 30_000);
+
+  it('requests inside the window merge into one deferred restart', async () => {
+    const { logger, debugs } = capturingLogger();
+    const [a] = await pair('ring-rehs-merge', { logger });
+    const initiator = hsInternals(a.transport).peerStates.get(1)!;
+    const request = () => hsInternals(a.transport).onIncoming(1, EMPTY_FRAME);
+    const base = initiator.handshakeAttempt;
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.advanceTimersByTime(1_100);
     await request();
+    for (let i = 0; i < 500 && initiator.status !== 'connected'; i++) await sleep(20);
+    expect(initiator.handshakeAttempt).toBe(base + 1);
+
+    await request();
+    const timer = initiator.deferredRestart;
+    expect(timer).toBeTruthy();
+    for (const ms of [100, 100, 100]) {
+      vi.advanceTimersByTime(ms);
+      await request();
+      expect(initiator.deferredRestart).toBe(timer); // merged: still the first timer
+    }
+    expect(debugs.filter((d) => d.msg === DEFERRED)).toHaveLength(4);
+    expect(initiator.handshakeAttempt).toBe(base + 1);
+
+    // Exactly one restart at the end of the window, and none after it.
+    await vi.waitFor(() => expect(initiator.handshakeAttempt).toBe(base + 2), { timeout: 10_000, interval: 20 });
+    for (let i = 0; i < 500 && initiator.status !== 'connected'; i++) await sleep(20);
+    await sleep(500);
     expect(initiator.handshakeAttempt).toBe(base + 2);
+    expect(initiator.status).toBe('connected');
+  }, 30_000);
+
+  it('a request inside the window while connected is deferred, and the pair recovers with no initiator traffic', async () => {
+    const { logger, debugs } = capturingLogger();
+    const [a, b] = await pair('ring-rehs-defer-connected', { logger });
+    const initiator = hsInternals(a.transport).peerStates.get(1)!;
+    const heard: number[] = [];
+    a.transport.onBroadcast((_from, msg) => heard.push(msg[0]!));
+    const session = initiator.session;
+    const attempt = initiator.handshakeAttempt;
+
+    // The initiator restarted a moment ago, so the window is open when the responder's request arrives.
+    initiator.lastRestartAt = Date.now();
+    const bogusHs1 = new Uint8Array(65).fill(1);
+    bogusHs1[0] = 0x04;
+    await hsInternals(b.transport).onIncoming(0, bogusHs1); // the responder's handshake fails: it asks for a restart
+    await vi.waitFor(() => expect(debugs.map((d) => d.msg)).toContain(DEFERRED), { timeout: 10_000, interval: 10 });
+
+    // The initiator sends nothing: the deferred restart alone brings the pair back (within ~2 s).
+    await vi.waitFor(
+      async () => {
+        await b.transport.broadcast(new Uint8Array([42]));
+        expect(heard).toContain(42);
+      },
+      { timeout: 10_000, interval: 50 },
+    );
+    expect(initiator.session).not.toBe(session);
+    expect(initiator.handshakeAttempt).toBe(attempt + 1);
+  }, 30_000);
+
+  it('a request inside the window while waiting for hs2 is deferred, and the pair recovers', async () => {
+    const { logger, debugs } = capturingLogger();
+    const [a, b] = await pair('ring-rehs-defer-hs2', { logger });
+    const initiator = hsInternals(a.transport).peerStates.get(1)!;
+    const responder = hsInternals(b.transport).peerStates.get(0)!;
+
+    // The responder loses the initiator's hs1; the restart that sent it opened the window.
+    const lost = dropIncoming(b, 1);
+    void hsInternals(a.transport).startInitiatorHandshake(initiator, { restart: true });
+    await vi.waitFor(() => expect(lost.dropped()).toBe(1), { timeout: 10_000, interval: 10 });
+    expect(initiator.status).toBe('waiting-for-hs2');
+    const attempt = initiator.handshakeAttempt;
+
+    hsInternals(b.transport).requestRehandshake(responder);
+    await vi.waitFor(() => expect(debugs.map((d) => d.msg)).toContain(DEFERRED), { timeout: 10_000, interval: 10 });
+    await vi.waitFor(
+      () => {
+        expect(initiator.status).toBe('connected');
+        expect(responder.status).toBe('connected');
+      },
+      { timeout: 10_000, interval: 20 },
+    );
+    expect(initiator.handshakeAttempt).toBe(attempt + 1);
+
+    const fromB: number[] = [];
+    a.transport.onBroadcast((_from, msg) => fromB.push(msg[0]!));
+    await vi.waitFor(
+      async () => {
+        await b.transport.broadcast(new Uint8Array([9]));
+        expect(fromB).toContain(9);
+      },
+      { timeout: 10_000, interval: 50 },
+    );
+  }, 30_000);
+
+  it('a request that crosses an initiator restart in flight is absorbed: one handshake, no record lost', async () => {
+    const [a, b] = await pair('ring-rehs-cross');
+    const initiator = hsInternals(a.transport).peerStates.get(1)!;
+    const attempt = initiator.handshakeAttempt;
+    const atB: number[] = [];
+    const atA: number[] = [];
+    b.transport.onBroadcast((_from, msg) => atB.push(msg[0]!));
+    a.transport.onBroadcast((_from, msg) => atA.push(msg[0]!));
+
+    // The initiator restarts for its own reasons, while a request the responder sent for the old session arrives.
+    void hsInternals(a.transport).startInitiatorHandshake(initiator, { restart: true });
+    await hsInternals(a.transport).onIncoming(1, EMPTY_FRAME);
+    await vi.waitFor(() => expect(initiator.status).toBe('connected'), { timeout: 10_000, interval: 10 });
+
+    // Traffic in both directions through the end of the window (about a second): nothing may be lost.
+    const sent = Array.from({ length: 16 }, (_, i) => i);
+    for (const i of sent) {
+      await a.transport.broadcast(new Uint8Array([i]));
+      await b.transport.broadcast(new Uint8Array([i]));
+      await sleep(100);
+    }
+    await vi.waitFor(
+      () => {
+        expect(atB).toEqual(sent);
+        expect(atA).toEqual(sent);
+      },
+      { timeout: 10_000, interval: 20 },
+    );
+    expect(initiator.handshakeAttempt).toBe(attempt + 1);
+  }, 30_000);
+
+  it('stop() clears a pending deferred restart', async () => {
+    const [a] = await pair('ring-rehs-stop');
+    const initiator = hsInternals(a.transport).peerStates.get(1)!;
+    initiator.lastRestartAt = Date.now();
+    await hsInternals(a.transport).onIncoming(1, EMPTY_FRAME);
+    const timer = initiator.deferredRestart;
+    expect(timer).toBeTruthy();
+
+    const clear = vi.spyOn(globalThis, 'clearTimeout');
+    try {
+      await a.transport.stop();
+      expect(clear).toHaveBeenCalledWith(timer);
+    } finally {
+      clear.mockRestore();
+    }
+    expect(initiator.deferredRestart).toBeNull();
+  }, 30_000);
+
+  it.each([
+    ['a relay drop', (t: HandshakeInternals) => t.dropSocket(t.ws, 'test drop', {})],
+    ['peer-left', (t: HandshakeInternals) => t.onPeerLeft(1)],
+  ])('%s clears a pending deferred restart', async (_name, trigger) => {
+    const [a] = await pair(`ring-rehs-clear-${_name.replace(/\W/g, '')}`);
+    const initiator = hsInternals(a.transport).peerStates.get(1)!;
+    initiator.lastRestartAt = Date.now();
+    await hsInternals(a.transport).onIncoming(1, EMPTY_FRAME);
+    const timer = initiator.deferredRestart;
+    expect(timer).toBeTruthy();
+
+    const clear = vi.spyOn(globalThis, 'clearTimeout');
+    try {
+      trigger(hsInternals(a.transport));
+      expect(clear).toHaveBeenCalledWith(timer);
+    } finally {
+      clear.mockRestore();
+    }
+    expect(initiator.deferredRestart).toBeNull();
   }, 30_000);
 
   it('a stray record while waiting for hs2 triggers the stale check, not a silent drop', async () => {
@@ -1151,6 +1332,20 @@ describe('RelayTransport — re-handshake recovery', () => {
     const inFlight = hsInternals(b.transport).completeResponderHandshake(responder, message1);
     hsInternals(b.transport).dropSocket(hsInternals(b.transport).ws, 'test drop', {});
     await inFlight;
+
+    expect(responder.status).toBe('disconnected');
+    expect(responder.session).toBeNull();
+    expect(warns.map((w) => w.msg)).not.toContain('relay-transport: re-handshake request send failed');
+  }, 30_000);
+
+  it('a responder handshake whose relay socket is already gone does nothing', async () => {
+    const { logger, warns } = capturingLogger();
+    const [a, b] = await pair('ring-rehs-gone', { logger });
+    const responder = hsInternals(b.transport).peerStates.get(0)!;
+    const { message1 } = await initiatorBegin(a.identity);
+
+    hsInternals(b.transport).dropSocket(hsInternals(b.transport).ws, 'test drop', {});
+    await hsInternals(b.transport).completeResponderHandshake(responder, message1);
 
     expect(responder.status).toBe('disconnected');
     expect(responder.session).toBeNull();
