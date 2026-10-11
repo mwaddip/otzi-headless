@@ -44,7 +44,7 @@ import { create as tarCreate } from 'tar';
 import { parse as parseToml } from 'smol-toml';
 import { DEFAULT_ADDRESS_BOOK_PATH } from '../../address-book/store';
 import { displayText } from '../../util/text';
-import { resolveStatePaths } from '../state-paths';
+import { FIXED_STATE_FILES, FIXED_TAR_PATHS, resolveStatePaths } from '../state-paths';
 
 export { DEFAULT_ADDRESS_BOOK_PATH };
 export const DEFAULT_DAEMON_CONFIG_PATH = '/etc/otzi/daemon.toml';
@@ -62,11 +62,14 @@ export const BACKUP_HEADER_LEN =
   BACKUP_MAGIC_LEN + BACKUP_SALT_LEN + BACKUP_IV_LEN + BACKUP_TAG_LEN; // 76
 export const BACKUP_PBKDF2_ITERATIONS = 600_000;
 
-/** The tar paths of the files whose place is fixed (not named by daemon.toml). */
-const DAEMON_CONFIG_TAR = stripLeadingSlash(DEFAULT_DAEMON_CONFIG_PATH);
-const VAULT_PUBKEY_TAR = stripLeadingSlash(DEFAULT_VAULT_PUBKEY_PATH);
-const ADDRESS_BOOK_TAR = stripLeadingSlash(DEFAULT_ADDRESS_BOOK_PATH);
-const FIXED_TAR_PATHS = [DAEMON_CONFIG_TAR, VAULT_PUBKEY_TAR, ADDRESS_BOOK_TAR];
+/**
+ * The tar paths of the files whose place is fixed (not named by daemon.toml):
+ * the list of `state-paths.ts`, which restore writes from. The `DEFAULT_*_PATH`
+ * above are where backup reads them on the host (a test asserts they agree).
+ */
+const DAEMON_CONFIG_TAR = FIXED_STATE_FILES.daemonConfig;
+const VAULT_PUBKEY_TAR = FIXED_STATE_FILES.vaultPubkey;
+const ADDRESS_BOOK_TAR = FIXED_STATE_FILES.addressBook;
 
 const BASE62_ALPHABET =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';

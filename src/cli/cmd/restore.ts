@@ -12,8 +12,11 @@
  * restore`) and a system user `otzi` exists, each file placed in /var/lib/otzi
  * is also `fchown`ed to that user and group on its open handle, because a
  * root-owned 0600 share would leave the daemon (User=otzi) with EACCES. Files in
- * /etc/otzi stay root:otzi (the setgid directory gives the group). Without root
- * or without a user `otzi` (a dev machine) nothing is chowned.
+ * /etc/otzi stay root:otzi (the setgid directory gives the group). The user is
+ * looked up in /etc/passwd and /etc/group and, on the real root, by `getent`
+ * (a user that only a directory service knows). Not root: nothing is chowned.
+ * Root with no user `otzi` at all: nothing is chowned either, and the result
+ * carries a warning with the `chown` command to run once the user exists.
  *
  * The per-file mode table is hard-coded and mirrors the postinst's chmod
  * choices. It is the security-relevant invariant: changing it widens or
@@ -48,8 +51,8 @@ import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 import { Parser as TarParser } from 'tar';
 import { parse as parseToml } from 'smol-toml';
-import { displayText } from '../../util/text';
-import { resolveStatePaths } from '../state-paths';
+import { displayText, errorReason } from '../../util/text';
+import { FIXED_STATE_FILES, STATE_DIRS, resolveStatePaths } from '../state-paths';
 import {
   BACKUP_HEADER_LEN,
   BACKUP_IV_LEN,
@@ -64,15 +67,28 @@ import {
 
 const execFile = promisify(execFileCb);
 
+/** Runs a command and returns its stdout; rejects on a non-zero exit, a timeout or a missing command. */
+export type RunCommand = (
+  file: string,
+  args: readonly string[],
+  options?: { timeout?: number },
+) => Promise<{ stdout: string }>;
+
+const defaultRun: RunCommand = (file, args, options) => execFile(file, [...args], { ...options });
+
+/** How long `getent` may take: a directory service that does not answer must not hang a restore. */
+const GETENT_TIMEOUT_MS = 10_000;
+
 /**
- * Hard-coded mode table for the FIXED tar paths produced by backup.ts.
- * These paths are constants in backup.ts (not derived from daemon.toml), so
- * exact match works. Mirrors the postinst's chmod choices.
+ * Hard-coded mode table for the FIXED tar paths backup.ts packs. They are the
+ * `FIXED_STATE_FILES` of state-paths.ts (not derived from daemon.toml), so exact
+ * match works, and the type makes a fixed file without a mode here a compile
+ * error. Mirrors the postinst's chmod choices.
  */
-const FIXED_FILE_MODES: Record<string, number> = {
-  'etc/otzi/daemon.toml': 0o640,
-  'etc/otzi/address-book.otzi.json': 0o640,
-  'var/lib/otzi/vault-pubkey.json': 0o644,
+const FIXED_FILE_MODES: Record<(typeof FIXED_STATE_FILES)[keyof typeof FIXED_STATE_FILES], number> = {
+  [FIXED_STATE_FILES.daemonConfig]: 0o640,
+  [FIXED_STATE_FILES.addressBook]: 0o640,
+  [FIXED_STATE_FILES.vaultPubkey]: 0o644,
 };
 
 /**
@@ -88,8 +104,8 @@ const PUBKEYS_MODE = 0o644;
 /** meta.json lives only inside the archive — never written to disk. */
 const META_TAR_PATH = 'meta.json';
 
-/** The directory whose files belong to the daemon's user (the share is read there). */
-const STATE_DIR = 'var/lib/otzi';
+/** The directory whose files belong to the daemon's user (the share is read there): `/var/lib/otzi`. */
+const DATA_DIR = STATE_DIRS[1];
 
 /** The system user and group the daemon runs as (`User=otzi`). */
 const OTZI_NAME = 'otzi';
@@ -119,14 +135,16 @@ interface ArchiveMember {
  * Default daemon-running probe — `systemctl is-active otzi` exit code 0
  * means the unit is active. Any other exit (or systemctl absent) → false.
  */
-async function defaultDaemonStatusCheck(): Promise<boolean> {
-  try {
-    const { stdout } = await execFile('systemctl', ['is-active', 'otzi']);
-    return stdout.trim() === 'active';
-  } catch {
-    // Non-zero exit (inactive/failed/missing) OR systemctl absent → not running.
-    return false;
-  }
+function defaultDaemonStatusCheck(run: RunCommand): () => Promise<boolean> {
+  return async () => {
+    try {
+      const { stdout } = await run('systemctl', ['is-active', 'otzi']);
+      return stdout.trim() === 'active';
+    } catch {
+      // Non-zero exit (inactive/failed/missing) OR systemctl absent → not running.
+      return false;
+    }
+  };
 }
 
 /** Default config-exists probe — checks for /etc/otzi/daemon.toml. */
@@ -188,15 +206,22 @@ export interface RestoreOptions {
    */
   stdinStream?: Readable;
   /**
+   * Test seam: run an external command (`systemctl is-active otzi`, and
+   * `getent passwd otzi` / `getent group otzi` for the `otzi` user). Defaults to
+   * `child_process.execFile`.
+   */
+  execFile?: RunCommand;
+  /**
    * Test seam: whether the process runs as root. Defaults to
    * `process.getuid?.() === 0`. Files are only chowned when it is true.
    */
   isRoot?: boolean;
   /**
-   * Test seam: look up the system user `otzi`. Defaults to reading
-   * `<rootOverride>/etc/passwd` and `<rootOverride>/etc/group`
-   * (`/etc/passwd` and `/etc/group` in production). `undefined` means there is
-   * no such user, and nothing is chowned.
+   * Test seam: look up the system user `otzi`. Defaults to `readOtziOwner`:
+   * `<rootOverride>/etc/passwd` and `<rootOverride>/etc/group` (`/etc/passwd`
+   * and `/etc/group` in production, where `getent` is asked when they do not
+   * have the user). `undefined` means there is no such user, and nothing is
+   * chowned.
    */
   lookupOtziOwner?: () => Promise<OtziOwner | undefined>;
   /**
@@ -214,6 +239,12 @@ export interface RestoreResult {
   restoredFiles: { path: string; mode: number; owner?: OtziOwner }[];
   /** Tar member names that are not part of a backup; skipped, never written. */
   skippedEntries: string[];
+  /**
+   * Things the operator must act on although the restore succeeded; the CLI
+   * prints each on stderr. Today: root restored with no user `otzi`, so the
+   * files in /var/lib/otzi stay root-owned.
+   */
+  warnings: string[];
   /**
    * `partyId` from meta.json. Surfaced so the operator can confirm "yes,
    * this archive is for the right host" in the CLI banner.
@@ -237,9 +268,10 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
   const root = opts.rootOverride ?? '/';
   const configExists =
     opts.configExistsCheck ?? defaultConfigExistsCheck(opts.rootOverride);
-  const daemonRunning = opts.daemonStatusCheck ?? defaultDaemonStatusCheck;
+  const run = opts.execFile ?? defaultRun;
+  const daemonRunning = opts.daemonStatusCheck ?? defaultDaemonStatusCheck(run);
   const isRoot = opts.isRoot ?? process.getuid?.() === 0;
-  const lookupOwner = opts.lookupOtziOwner ?? (() => readOtziOwner(root));
+  const lookupOwner = opts.lookupOtziOwner ?? (() => readOtziOwner(root, run));
   const chownFile =
     opts.chownFile ?? ((handle: FileHandle, _path: string, owner: OtziOwner) => handle.chown(owner.uid, owner.gid));
 
@@ -403,11 +435,20 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
       // follows a symlink there.
       const handle = await open(dest, 'wx', mode);
       created.push(dest);
-      const fileOwner = owner !== undefined && posix.dirname(member.name) === STATE_DIR ? owner : undefined;
+      const fileOwner = owner !== undefined && posix.dirname(member.name) === DATA_DIR ? owner : undefined;
       try {
         // Right after creation and on the handle: the owner is set before the
         // file is closed, and it cannot have been swapped for another entry.
-        if (fileOwner) await chownFile(handle, dest, fileOwner);
+        if (fileOwner) {
+          try {
+            await chownFile(handle, dest, fileOwner);
+          } catch (err) {
+            throw new Error(
+              `could not give ${displayText(dest)} to ${OTZI_NAME} (${fileOwner.uid}:${fileOwner.gid}): ${displayText(errorReason(err))}`,
+              { cause: err },
+            );
+          }
+        }
         await handle.writeFile(member.data);
         // The umask may have narrowed the creation mode.
         await handle.chmod(mode);
@@ -434,9 +475,23 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
     throw err;
   }
 
+  // Root with no user `otzi`: what was placed in /var/lib/otzi stays root-owned
+  // and the daemon cannot read it. Not an error (a dev machine), but not silent.
+  const warnings: string[] = [];
+  if (isRoot && owner === undefined) {
+    const unowned = placements.filter(p => posix.dirname(p.member.name) === DATA_DIR).map(p => displayText(p.dest));
+    if (unowned.length > 0) {
+      warnings.push(
+        `no system user '${OTZI_NAME}' was found (in the passwd and group files, or by getent), so the restored files in /${DATA_DIR} stay root-owned ` +
+          `and the daemon (User=${OTZI_NAME}) will not be able to read its share. Once the user exists, run: chown ${OTZI_NAME}:${OTZI_NAME} ${unowned.join(' ')}`,
+      );
+    }
+  }
+
   return {
     restoredFiles,
     skippedEntries,
+    warnings,
     ...(metaPartyId !== undefined ? { metaPartyId } : {}),
     ...(metaCreatedAt !== undefined ? { metaCreatedAt } : {}),
     ...(metaHostname !== undefined ? { metaHostname } : {}),
@@ -466,8 +521,16 @@ export function findOtziOwner(passwd: string, group: string): OtziOwner | undefi
   return { uid, gid: wholeNumber(fields(group, OTZI_NAME)?.[2]) ?? primaryGid };
 }
 
-/** `findOtziOwner` over `<root>/etc/passwd` and `<root>/etc/group`; a missing file counts as empty. */
-async function readOtziOwner(root: string): Promise<OtziOwner | undefined> {
+/**
+ * The owner for the files restore places in /var/lib/otzi: `findOtziOwner` over
+ * `<root>/etc/passwd` and `<root>/etc/group` (a missing file counts as empty).
+ * On the real root (`/`) a user those files do not have may still exist in a
+ * directory service (LDAP, sssd, ...), so `getent passwd otzi` and `getent
+ * group otzi` are asked next; a `getent` that fails, is absent or finds nothing
+ * means no user. Another root is a test layout or a mounted image, and the host's
+ * directory service says nothing about it.
+ */
+export async function readOtziOwner(root: string, run: RunCommand = defaultRun): Promise<OtziOwner | undefined> {
   const read = async (name: string): Promise<string> => {
     try {
       return await readFile(join(root, 'etc', name), 'utf8');
@@ -476,7 +539,18 @@ async function readOtziOwner(root: string): Promise<OtziOwner | undefined> {
       throw err;
     }
   };
-  return findOtziOwner(await read('passwd'), await read('group'));
+  const local = findOtziOwner(await read('passwd'), await read('group'));
+  if (local !== undefined || root !== '/') return local;
+
+  const getent = async (database: 'passwd' | 'group'): Promise<string> => {
+    try {
+      return (await run('getent', [database, OTZI_NAME], { timeout: GETENT_TIMEOUT_MS })).stdout;
+    } catch {
+      // Exit 2 (not found), getent absent, timeout: no such entry.
+      return '';
+    }
+  };
+  return findOtziOwner(await getent('passwd'), await getent('group'));
 }
 
 /** Every tar member with its content, read from the gzipped tar in memory. */

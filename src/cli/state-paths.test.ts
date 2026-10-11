@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { STATE_DIRS, resolveStatePaths } from './state-paths';
+import { FIXED_STATE_FILES, FIXED_TAR_PATHS, STATE_DIRS, resolveStatePaths } from './state-paths';
 
-const FIXED = ['etc/otzi/daemon.toml', 'etc/otzi/address-book.otzi.json', 'var/lib/otzi/vault-pubkey.json'];
+const FIXED = FIXED_TAR_PATHS;
 
 /** The failure as `refuse` reports it: `<key>|<path>|<why>`. */
 const refusing = (key: string, path: string, why: string): Error => new Error(`${key}|${path}|${why}`);
@@ -80,5 +80,25 @@ describe('resolveStatePaths', () => {
   it('returns the error refuse built, unchanged', () => {
     const mine = new TypeError('mine');
     expect(() => resolveStatePaths([{ key: 'k', path: '/srv/x' }], FIXED, () => mine)).toThrow(mine);
+  });
+});
+
+describe('FIXED_STATE_FILES', () => {
+  it('names the files whose place daemon.toml does not choose, as tar paths', () => {
+    expect(FIXED_STATE_FILES).toEqual({
+      daemonConfig: 'etc/otzi/daemon.toml',
+      addressBook: 'etc/otzi/address-book.otzi.json',
+      vaultPubkey: 'var/lib/otzi/vault-pubkey.json',
+    });
+    expect([...FIXED_TAR_PATHS]).toEqual(Object.values(FIXED_STATE_FILES));
+  });
+
+  it('puts each directly inside a state directory, so a named path can collide with it', () => {
+    for (const tarPath of FIXED_TAR_PATHS) {
+      expect(() => resolveStatePaths([{ key: 'k', path: `/${tarPath}` }], [], refusing)).not.toThrow();
+      expect(() => resolveStatePaths([{ key: 'k', path: `/${tarPath}` }], FIXED_TAR_PATHS, refusing)).toThrow(
+        `k|/${tarPath}|names a file another key also names`,
+      );
+    }
   });
 });

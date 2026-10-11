@@ -459,6 +459,9 @@ async function runRestoreCommand(args: string[]): Promise<void> {
   for (const entry of result.skippedEntries) {
     console.error(`warning: skipped archive entry ${displayText(entry)}: not part of an otzi backup`);
   }
+  for (const warning of result.warnings) {
+    console.error(`WARNING: ${warning}`);
+  }
   console.log('Restored files:');
   for (const f of result.restoredFiles) {
     const mode = `mode 0${f.mode.toString(8).padStart(3, '0')}`;

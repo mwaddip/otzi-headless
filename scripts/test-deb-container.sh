@@ -8,6 +8,8 @@
 #   - /etc/otzi/daemon.toml is rendered with the expected fields
 #   - /lib/systemd/system/otzi.service is registered and carries the sandbox directives
 #   - otzi user/group exist
+#   - a backup/purge/restore round-trip puts the node back, and a later upgrade
+#     (reinstall) leaves the restored daemon.toml and share alone
 #   - `otzi daemon` against the rendered config gets past parse + transport
 #     init and errors on the missing OTZI_SHARE_PASSWORD env var (proves the
 #     bundle loads + the parser accepts the rendered TOML end-to-end).
@@ -261,6 +263,28 @@ grep -q "id = \"testnode-a\"" /etc/otzi/daemon.toml || {
   echo "FAIL: restored daemon.toml does not match the original"; exit 1;
 }
 echo "OK: restored layout + owners + modes match expected"
+'
+
+echo ">> verifying an upgrade after the restore leaves the restored node alone"
+# The restore branch answered "yes" to restore-from-backup and postinst took the
+# answer back; reinstalling the package (what an upgrade runs) must not restore
+# again, rewrite daemon.toml or touch the share.
+docker exec "$CONTAINER" bash -euo pipefail -c '
+export DEBIAN_FRONTEND=noninteractive
+CONFIG_SUM=$(sha256sum /etc/otzi/daemon.toml    | cut -d" " -f1)
+SHARE_SUM=$(sha256sum  /var/lib/otzi/share.json | cut -d" " -f1)
+UPGRADE_OUT=$(apt-get install -y --reinstall /tmp/otzi-headless.deb 2>&1) || {
+  echo "FAIL: reinstalling over the restored node exited non-zero:"; echo "$UPGRADE_OUT"; exit 1;
+}
+if printf "%s\n" "$UPGRADE_OUT" | grep -q "attempting restore from"; then
+  echo "FAIL: the upgrade tried to restore from backup again"; echo "$UPGRADE_OUT"; exit 1
+fi
+[ "$(sha256sum /etc/otzi/daemon.toml    | cut -d" " -f1)" = "$CONFIG_SUM" ] || { echo "FAIL: upgrade changed daemon.toml"; exit 1; }
+[ "$(sha256sum /var/lib/otzi/share.json | cut -d" " -f1)" = "$SHARE_SUM"  ] || { echo "FAIL: upgrade changed share.json"; exit 1; }
+[ "$(stat -c %U:%G /var/lib/otzi/share.json)" = "otzi:otzi" ] || { echo "FAIL: upgrade changed the owner of share.json"; exit 1; }
+ANSWER=$(printf "get otzi-headless/restore-from-backup\n" | debconf-communicate otzi-headless)
+[ "$ANSWER" = "0 false" ] || { echo "FAIL: restore-from-backup is \"$ANSWER\" after the upgrade, want \"0 false\""; exit 1; }
+echo "OK: upgrade after restore kept daemon.toml and share.json, and restore-from-backup stays false"
 '
 
 echo ">> verifying backup password wiped from debconf cache"

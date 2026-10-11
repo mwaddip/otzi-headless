@@ -22,6 +22,7 @@ import {
   BACKUP_PBKDF2_ITERATIONS,
 } from './backup';
 import * as backupModule from './backup';
+import { FIXED_STATE_FILES } from '../state-paths';
 
 interface Fixture {
   /** The install root the fixture lives under (`runBackup`'s `rootOverride`). */
@@ -254,6 +255,12 @@ describe('runBackup', () => {
     });
     expect(withoutBook.filesIncluded).not.toContain(ADDRESS_BOOK_TAR);
     expect(withoutBook.filesIncluded).toContain('etc/otzi/daemon.toml');
+  });
+
+  it('reads the fixed files at the places state-paths.ts lists (the list restore writes)', () => {
+    expect(backupModule.stripLeadingSlash(backupModule.DEFAULT_DAEMON_CONFIG_PATH)).toBe(FIXED_STATE_FILES.daemonConfig);
+    expect(backupModule.stripLeadingSlash(backupModule.DEFAULT_ADDRESS_BOOK_PATH)).toBe(FIXED_STATE_FILES.addressBook);
+    expect(backupModule.stripLeadingSlash(backupModule.DEFAULT_VAULT_PUBKEY_PATH)).toBe(FIXED_STATE_FILES.vaultPubkey);
   });
 
   it('exports default paths only for the files the vault actually has', () => {

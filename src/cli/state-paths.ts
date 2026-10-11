@@ -18,6 +18,20 @@ import { posix } from 'node:path';
 /** The directories a node's state lives in, as tar paths (no leading slash). */
 export const STATE_DIRS = ['etc/otzi', 'var/lib/otzi'] as const;
 
+/**
+ * The tar paths of the files whose place is fixed: daemon.toml does not name
+ * them. `otzi backup` packs them and `otzi restore` writes them (with the mode
+ * it gives each), and neither of them may be the file a named path resolves to.
+ */
+export const FIXED_STATE_FILES = {
+  daemonConfig: 'etc/otzi/daemon.toml',
+  addressBook: 'etc/otzi/address-book.otzi.json',
+  vaultPubkey: 'var/lib/otzi/vault-pubkey.json',
+} as const;
+
+/** `FIXED_STATE_FILES` as a list, for `resolveStatePaths`'s `fixed` argument. */
+export const FIXED_TAR_PATHS: readonly string[] = Object.values(FIXED_STATE_FILES);
+
 const OUTSIDE = 'is outside /etc/otzi and /var/lib/otzi';
 const NESTED = 'is not a direct child of /etc/otzi or /var/lib/otzi';
 const DUPLICATE = 'names a file another key also names';

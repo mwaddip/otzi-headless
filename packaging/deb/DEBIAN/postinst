@@ -78,7 +78,7 @@ case "$1" in
     db_get otzi-headless/restore-from-backup || true
     RESTORE_REQUESTED="$RET"
     if [ "$RESTORE_REQUESTED" = "true" ] && { [ -e /etc/otzi/daemon.toml ] || [ -L /etc/otzi/daemon.toml ]; }; then
-      echo "otzi-headless: /etc/otzi/daemon.toml exists; skipping the restore from backup (to restore, move it aside and run: dpkg-reconfigure otzi-headless)"
+      echo "otzi-headless: WARNING — /etc/otzi/daemon.toml exists; skipping the restore from backup (to restore, move it aside and run: dpkg-reconfigure otzi-headless)" >&2
       db_set otzi-headless/restore-from-backup false || true
       db_reset otzi-headless/backup-password 2>/dev/null || true
       db_reset otzi-headless/backup-path 2>/dev/null || true

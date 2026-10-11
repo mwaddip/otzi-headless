@@ -332,8 +332,8 @@ upgrades of the package leave the restored node alone.
 The question, and the restore, only happen while `/etc/otzi/daemon.toml` does
 not exist (a fresh install, or one where you moved it aside). On an installed
 node neither an upgrade nor `dpkg-reconfigure` asks it, and if the stored
-answer is still `Yes` (an earlier release left it so), postinst prints
-`skipping the restore from backup`, resets the answer and carries on with the
+answer is still `Yes` (an earlier release left it so), postinst prints a
+warning on stderr, `skipping the restore from backup`, resets the answer and carries on with the
 normal upgrade. To restore onto an installed node, move `daemon.toml` and the
 other files restore lists aside first (see 2. below), then run
 `dpkg-reconfigure otzi-headless` or `otzi restore`.

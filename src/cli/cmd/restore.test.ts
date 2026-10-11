@@ -32,14 +32,22 @@ import {
   BACKUP_PBKDF2_ITERATIONS,
   BACKUP_SALT_LEN,
 } from './backup';
-import { findOtziOwner, runRestore } from './restore';
+import { findOtziOwner, readOtziOwner, runRestore } from './restore';
 
 // A test can make `open` fail for one file name, to break a restore part-way.
 const failOpen = vi.hoisted(() => ({ suffix: undefined as string | undefined }));
+// ...and can stand in for the host's /etc/passwd and /etc/group (a file set to an Error fails to read with it).
+const fakeEtc = vi.hoisted(() => ({ files: undefined as Record<string, string | Error> | undefined }));
 vi.mock('node:fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return {
     ...actual,
+    readFile: async (...args: Parameters<typeof actual.readFile>) => {
+      const fake = fakeEtc.files?.[String(args[0])];
+      if (fake instanceof Error) throw fake;
+      if (fake !== undefined) return fake as never;
+      return actual.readFile(...args);
+    },
     open: async (...args: Parameters<typeof actual.open>) => {
       if (failOpen.suffix !== undefined && String(args[0]).endsWith(failOpen.suffix)) {
         throw Object.assign(new Error('EIO: simulated write failure'), { code: 'EIO' });
@@ -1320,10 +1328,60 @@ describe('runRestore — ownership of the restored files', () => {
         throw Object.assign(new Error('EPERM: operation not permitted, fchown'), { code: 'EPERM' });
       }
     };
+    const err = await restore({ isRoot: true, lookupOtziOwner: async () => OTZI, chownFile: chownFile as never }).then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    // The message names the file, the owner it was to get and the reason.
+    expect(err?.message).toBe(
+      `could not give ${join(root, 'var/lib/otzi/share.json')} to otzi (${OTZI.uid}:${OTZI.gid}): EPERM: operation not permitted, fchown`,
+    );
+    expect((err?.cause as { code?: string } | undefined)?.code).toBe('EPERM');
+    expect(await filesUnder(root)).toEqual(['var/lib/otzi/keep.txt']);
+  });
+
+  it('shows the reason of a failing chown without control characters', async () => {
+    const chownFile = async () => {
+      throw new Error('EPERM\u001b[31m\nsecond line');
+    };
     await expect(
       restore({ isRoot: true, lookupOtziOwner: async () => OTZI, chownFile: chownFile as never }),
-    ).rejects.toThrow(/EPERM/);
-    expect(await filesUnder(root)).toEqual(['var/lib/otzi/keep.txt']);
+    ).rejects.toThrow(/\(12345:23456\): EPERM\[31m second line$/);
+  });
+
+  describe('when there is no otzi user to give the files to', () => {
+    it('warns that the files stay root-owned, with the chown command for the files it placed', async () => {
+      const result = await restore({ isRoot: true, lookupOtziOwner: async () => undefined });
+      expect(result.warnings).toHaveLength(1);
+      const [warning] = result.warnings;
+      expect(warning).toMatch(/no system user 'otzi'/);
+      expect(warning).toMatch(/stay root-owned/);
+      expect(warning).toMatch(/daemon \(User=otzi\) will not be able to read its share/);
+      const command = /chown otzi:otzi (.*)$/.exec(warning!)?.[1];
+      expect(command?.split(' ').sort()).toEqual(STATE_FILES.map(f => join(root, f)).sort());
+    });
+
+    it('does not warn when the files were given to the user', async () => {
+      const { chownFile } = recorder();
+      const result = await restore({ isRoot: true, lookupOtziOwner: async () => OTZI, chownFile });
+      expect(result.warnings).toEqual([]);
+    });
+
+    it('does not warn when not running as root: the files belong to the invoking user', async () => {
+      const result = await restore({ isRoot: false, lookupOtziOwner: async () => undefined });
+      expect(result.warnings).toEqual([]);
+    });
+
+    it('asks getent only for the real root, never for a test root', async () => {
+      const calls: string[][] = [];
+      const execFile = async (file: string, args: readonly string[]) => {
+        calls.push([file, ...args]);
+        return { stdout: '' };
+      };
+      const result = await restore({ isRoot: true, execFile });
+      expect(calls).toEqual([]);
+      expect(result.warnings).toHaveLength(1);
+    });
   });
 
   it('places a share that daemon.toml puts in /etc/otzi without chowning it', async () => {
@@ -1336,6 +1394,99 @@ describe('runRestore — ownership of the restored files', () => {
     const { calls, chownFile } = recorder();
     await restore({ archivePath: custom.path, password: custom.password, isRoot: true, lookupOtziOwner: async () => OTZI, chownFile });
     expect(relative(calls)).toEqual(['var/lib/otzi/identity.json']);
+  });
+});
+
+describe('readOtziOwner', () => {
+  const PASSWD = 'root:x:0:0:root:/root:/bin/sh\notzi:x:998:997::/var/lib/otzi:/usr/sbin/nologin\n';
+  const GROUP = 'root:x:0:\notzi:x:996:\n';
+  const GETENT_PASSWD = 'otzi:x:2001:2002::/var/lib/otzi:/usr/sbin/nologin\n';
+  const GETENT_GROUP = 'otzi:*:2003:\n';
+
+  /** An `execFile` that answers `getent <db> otzi` from a table and records the calls. */
+  function fakeGetent(answers: Record<string, string | Error>) {
+    const calls: { file: string; args: readonly string[]; timeout?: number }[] = [];
+    const run = async (file: string, args: readonly string[], options?: { timeout?: number }) => {
+      calls.push({ file, args, ...(options?.timeout !== undefined ? { timeout: options.timeout } : {}) });
+      const answer = answers[args[0]!];
+      if (answer instanceof Error) throw answer;
+      return { stdout: answer ?? '' };
+    };
+    return { calls, run };
+  }
+
+  afterEach(() => {
+    fakeEtc.files = undefined;
+  });
+
+  describe('against the real root', () => {
+    it('does not ask getent when /etc/passwd has the user', async () => {
+      fakeEtc.files = { '/etc/passwd': PASSWD, '/etc/group': GROUP };
+      const { calls, run } = fakeGetent({});
+      expect(await readOtziOwner('/', run)).toEqual({ uid: 998, gid: 996 });
+      expect(calls).toEqual([]);
+    });
+
+    it('falls back to getent passwd and getent group when /etc has no otzi user', async () => {
+      fakeEtc.files = { '/etc/passwd': 'root:x:0:0:root:/root:/bin/sh\n', '/etc/group': 'root:x:0:\n' };
+      const { calls, run } = fakeGetent({ passwd: GETENT_PASSWD, group: GETENT_GROUP });
+      expect(await readOtziOwner('/', run)).toEqual({ uid: 2001, gid: 2003 });
+      expect(calls.map(c => [c.file, ...c.args])).toEqual([
+        ['getent', 'passwd', 'otzi'],
+        ['getent', 'group', 'otzi'],
+      ]);
+      // A directory service that does not answer must not hang the restore.
+      expect(calls.every(c => typeof c.timeout === 'number' && c.timeout > 0)).toBe(true);
+    });
+
+    it('falls back when /etc/passwd and /etc/group do not exist', async () => {
+      const gone = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      fakeEtc.files = { '/etc/passwd': gone, '/etc/group': gone };
+      const { run } = fakeGetent({ passwd: GETENT_PASSWD, group: GETENT_GROUP });
+      expect(await readOtziOwner('/', run)).toEqual({ uid: 2001, gid: 2003 });
+    });
+
+    it("takes the user's primary gid when getent finds no group", async () => {
+      fakeEtc.files = { '/etc/passwd': '', '/etc/group': '' };
+      const { run } = fakeGetent({ passwd: GETENT_PASSWD, group: new Error('exit 2') });
+      expect(await readOtziOwner('/', run)).toEqual({ uid: 2001, gid: 2002 });
+    });
+
+    it.each([
+      ['getent finds no user (exit 2)', { passwd: Object.assign(new Error('Command failed'), { code: 2 }) }],
+      ['getent is not installed', { passwd: Object.assign(new Error('spawn getent ENOENT'), { code: 'ENOENT' }) }],
+      ['getent answers nothing', { passwd: '' }],
+      ['getent answers a uid that is not a whole number', { passwd: 'otzi:x:abc:2002::/:/bin/false\n' }],
+    ])('finds no owner when %s', async (_name, answers) => {
+      fakeEtc.files = { '/etc/passwd': '', '/etc/group': '' };
+      const { run } = fakeGetent(answers);
+      expect(await readOtziOwner('/', run)).toBeUndefined();
+    });
+  });
+
+  describe('against another root', () => {
+    let root: string;
+    beforeEach(async () => {
+      root = await mkdtemp(join(tmpdir(), 'otzi-restore-owner-lookup-'));
+      await mkdir(join(root, 'etc'), { recursive: true });
+    });
+    afterEach(async () => {
+      await rm(root, { recursive: true, force: true });
+    });
+
+    it('reads <root>/etc/passwd and <root>/etc/group', async () => {
+      await writeFile(join(root, 'etc/passwd'), PASSWD);
+      await writeFile(join(root, 'etc/group'), GROUP);
+      const { calls, run } = fakeGetent({ passwd: GETENT_PASSWD });
+      expect(await readOtziOwner(root, run)).toEqual({ uid: 998, gid: 996 });
+      expect(calls).toEqual([]);
+    });
+
+    it('never asks getent: the host is not the root being restored into', async () => {
+      const { calls, run } = fakeGetent({ passwd: GETENT_PASSWD, group: GETENT_GROUP });
+      expect(await readOtziOwner(root, run)).toBeUndefined();
+      expect(calls).toEqual([]);
+    });
   });
 });
 
