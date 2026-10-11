@@ -87,6 +87,36 @@ describe('DaemonClient over UDS', () => {
     expect(info.address).toMatch(/^tb1p/);
   });
 
+  it('stops waiting for a daemon that never answers when the signal aborts, and frees the socket', async () => {
+    // A second daemon that accepts the request and says nothing.
+    const silentPath = join(tmp, 'silent.sock');
+    const silent = new UdsTrigger({ path: silentPath, handler: () => new Promise(() => {}) });
+    await silent.start();
+    try {
+      const cfg = parseDaemonConfigToml(buildToml(silentPath));
+      const client = DaemonClient.fromParsed(cfg);
+      const controller = new AbortController();
+      const pending = client.vaultInfo({ signal: controller.signal });
+      const outcome = pending.then(
+        () => undefined,
+        (e: Error) => e,
+      );
+      setTimeout(() => controller.abort(), 50);
+      const err = await outcome;
+      expect(err?.name).toBe('AbortError');
+      // A request aborted before it was made does not connect at all.
+      await expect(client.request({ op: 'echo' }, { signal: AbortSignal.abort() })).rejects.toMatchObject({ name: 'AbortError' });
+    } finally {
+      await silent.stop();
+    }
+  });
+
+  it('request and vaultInfo work as before without options', async () => {
+    const client = DaemonClient.fromParsed(parseDaemonConfigToml(buildToml(socketPath)));
+    expect((await client.request<{ echoed: unknown }>({ op: 'echo' }, {})).echoed).toEqual({ op: 'echo' });
+    expect(await client.vaultInfo({})).toEqual(VAULT_INFO);
+  });
+
   it('throws DaemonClientError on non-200', async () => {
     const cfg = parseDaemonConfigToml(buildToml(socketPath));
     const client = DaemonClient.fromParsed(cfg);

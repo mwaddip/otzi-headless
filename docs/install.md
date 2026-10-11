@@ -126,6 +126,8 @@ Logs: `journalctl -u otzi -f`.
 
 Default: UDS at `/var/run/otzi/otzi.sock` (mode 660, owned otzi:otzi).
 Anyone in the `otzi` group can connect via the CLI.
+The directory is sticky, so a group member cannot remove the daemon's socket. `otzi vault`
+and `otzi btc` trust what the daemon behind that socket says about the vault.
 
 To add a new operator after install:
 ```
@@ -156,6 +158,7 @@ sudo dpkg-reconfigure otzi-headless
 | `/var/lib/otzi/share.json` | encrypted Ötzi v4 share | otzi:otzi 600 |
 | `/var/lib/otzi/share.json.pending` | DKG staging file; exists while a DKG runs, or after a DKG that failed once this node had confirmed | otzi:otzi 600 |
 | `/var/lib/otzi/vault-pubkey.json` | public vault metadata | otzi:otzi 644 |
+| `/var/run/otzi/` | runtime dir for the socket (setgid and sticky: a group member cannot unlink or rename the daemon's socket and bind a look-alike; the unit's `RuntimeDirectory=` creates it with the same mode) | root:otzi 3770 |
 | `/var/run/otzi/otzi.sock` | UDS socket for operator CLI | otzi:otzi 660 |
 
 ## Operations
@@ -198,8 +201,7 @@ or ship logs to an external collector (rsyslog, Loki, Vector, etc.).
 
 A leftover `/var/lib/otzi/share.json.pending` from an interrupted DKG is logged
 at warn level on startup and never loaded. It may be this node's share of a
-vault the other nodes committed: if `otzi vault` on another node (restart its
-daemon first if it has not loaded the share) shows the
+vault the other nodes committed: if `otzi vault` on another node shows the
 address the warning names, `sudo mv /var/lib/otzi/share.json.pending
 /var/lib/otzi/share.json` and restart the daemon. Otherwise the next DKG
 overwrites it. If the file is the loaded share itself (a second name left by a

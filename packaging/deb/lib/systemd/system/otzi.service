@@ -23,9 +23,12 @@ Restart=on-failure
 RestartSec=5
 
 # /var/run/otzi must exist before bind; RuntimeDirectory creates it on unit
-# start with the unit's User/Group + RuntimeDirectoryMode.
+# start with the unit's User/Group + RuntimeDirectoryMode. 3770 = setgid (the
+# socket gets group otzi) + sticky: the CLI trusts the daemon behind this socket,
+# so a member of group otzi, who may create files here, must not be able to
+# unlink or rename the daemon's socket and bind a look-alike in its place.
 RuntimeDirectory=otzi
-RuntimeDirectoryMode=2770
+RuntimeDirectoryMode=3770
 
 # Hardening. The daemon is an unprivileged Node process (User=otzi) that reads
 # /etc/otzi, writes /var/lib/otzi, talks to its peers over TCP and to the CLI

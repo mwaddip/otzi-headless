@@ -35,6 +35,12 @@ export interface VaultInfo {
   outputKey: string;
 }
 
+/** Per-request options. */
+export interface RequestOptions {
+  /** Aborting it cancels the request and closes its connection; the promise rejects with an `AbortError`. */
+  signal?: AbortSignal;
+}
+
 interface TransportOpts {
   socketPath?: string;
   host?: string;
@@ -76,17 +82,18 @@ export class DaemonClient {
     throw new Error('daemon-client: no uds or http trigger in daemon.toml');
   }
 
-  async vaultInfo(): Promise<VaultInfo> {
-    return this.request<VaultInfo>({ op: 'vault-info' });
+  async vaultInfo(options: RequestOptions = {}): Promise<VaultInfo> {
+    return this.request<VaultInfo>({ op: 'vault-info' }, options);
   }
 
   /** Send a JSON request; throw on non-200; return the parsed body. */
-  async request<T = unknown>(body: unknown): Promise<T> {
+  async request<T = unknown>(body: unknown, options: RequestOptions = {}): Promise<T> {
     const payload = JSON.stringify(body);
     return new Promise<T>((resolve, reject) => {
       const req = http.request(
         {
           ...this.transport,
+          ...(options.signal ? { signal: options.signal } : {}),
           method: 'POST',
           path: '/',
           headers: {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { FIXED_STATE_FILES, FIXED_TAR_PATHS, STATE_DIRS, resolveStatePaths } from './state-paths';
+import { CONFIG_DIR, DATA_DIR, FIXED_STATE_FILES, FIXED_TAR_PATHS, STATE_DIRS, resolveStatePaths } from './state-paths';
 
 const FIXED = FIXED_TAR_PATHS;
 
@@ -11,6 +11,12 @@ const resolve = (named: { key: string; path: string }[]) => resolveStatePaths(na
 describe('resolveStatePaths', () => {
   it('names the two directories, tar-relative', () => {
     expect([...STATE_DIRS]).toEqual(['etc/otzi', 'var/lib/otzi']);
+  });
+
+  it('names each directory: the config directory and the data directory the daemon user owns files in', () => {
+    expect(CONFIG_DIR).toBe('etc/otzi');
+    expect(DATA_DIR).toBe('var/lib/otzi');
+    expect([...STATE_DIRS]).toEqual([CONFIG_DIR, DATA_DIR]);
   });
 
   it('returns the tar path of each path directly inside either directory, in order', () => {

@@ -12,7 +12,7 @@ import { hex } from '@scure/base';
 import * as btc from '@scure/btc-signer';
 import { schnorr } from '@noble/curves/secp256k1.js';
 import { readAddressBook, writeAddressBook } from '../../address-book/store';
-import { DaemonClientError } from '../daemon-client';
+import { DaemonClientError, type VaultInfo } from '../daemon-client';
 import { vaultPubkeyFromPackage, writeVaultPubkeyFile } from '../../daemon/vault-pubkey';
 import { finalizeSend, vaultPayment } from '../../otzi/backend/bitcoin';
 import { makeTestVault } from '../../otzi/backend/test-vault.fixture';
@@ -47,6 +47,14 @@ class FakeDaemon {
   events: string[] = [];
   fail: Error | null = null;
   reply: unknown = undefined;
+  /** Daemon and CLI calls in order: `vault-info`, `summary`, `sign`. */
+  order: string[] = [];
+  /** How many `vault-info` requests the daemon got. */
+  infoRequests = 0;
+  /** What `vault-info` answers: the vault of the file, unless a test says otherwise. */
+  info: unknown = undefined;
+  /** What `vault-info` throws (a refusal, or a connection error), instead of answering. */
+  infoError: Error | null = null;
   /** Rewrites the honest reply, as a broken or hostile daemon would. */
   tamper: ((reply: SignReply, proposal: SendProposal) => SignReply) | null = null;
 
@@ -67,6 +75,13 @@ class FakeDaemon {
 
   async request<T>(body: unknown): Promise<T> {
     const req = body as { op: string; proposal: SendProposal };
+    if (req.op === 'vault-info') {
+      this.order.push('vault-info');
+      this.infoRequests += 1;
+      if (this.infoError) throw this.infoError;
+      return this.info as T;
+    }
+    this.order.push('sign');
     this.events.push('sign');
     this.requests.push(req);
     if (this.fail) throw this.fail;
@@ -77,6 +92,21 @@ class FakeDaemon {
     return reply as T;
   }
 }
+
+/** What the daemon's `vault-info` says for the vault a file describes. */
+function infoOf(f: ReturnType<typeof vaultPubkeyFromPackage>): VaultInfo {
+  return {
+    partyIds: Array.from({ length: f.parties }, (_, i) => i),
+    threshold: f.threshold,
+    parties: f.parties,
+    network: f.network,
+    address: f.address,
+    internalKey: f.internalKey,
+    outputKey: f.outputKey,
+  };
+}
+
+const systemError = (code: string, message: string) => Object.assign(new Error(message), { code });
 
 function configToml(esploraUrl: string, network = 'testnet4'): string {
   return `
@@ -117,6 +147,7 @@ describe('otzi btc', () => {
   const deps = (): CliDeps => ({
     client,
     summary: text => {
+      client.order.push('summary');
       client.events.push('summary');
       summaries.push(text);
     },
@@ -134,6 +165,7 @@ describe('otzi btc', () => {
     esplora = await startMockEsplora();
     await writeFile(configPath, configToml(esplora.url));
     client = new FakeDaemon();
+    client.info = infoOf(file);
     summaries = [];
     warnings = [];
   });
@@ -148,28 +180,80 @@ describe('otzi btc', () => {
       esplora.fund(address, 80_000);
       esplora.fund(address, 20_000);
       esplora.fund(address, 30_000, { confirmed: false });
-      expect(await btcBalance({ configPath, vaultPath })).toBe('confirmed: 100000\nunconfirmed: 30000');
+      expect(await btcBalance({ configPath, vaultPath }, deps())).toBe('confirmed: 100000\nunconfirmed: 30000');
+      expect(warnings).toEqual([]);
     });
 
     it('formats in the requested unit', async () => {
       esplora.fund(address, 150_000);
-      expect(await btcBalance({ configPath, vaultPath, unit: 'btc' })).toBe('confirmed: 0.0015\nunconfirmed: 0');
+      expect(await btcBalance({ configPath, vaultPath, unit: 'btc' }, deps())).toBe('confirmed: 0.0015\nunconfirmed: 0');
+    });
+
+    describe('against the daemon', () => {
+      const unreachable = () => systemError('ENOENT', 'connect ENOENT /run/otzi/otzi.sock');
+      const noVault = () => new DaemonClientError(409, 'no vault loaded — run otzi generate, then restart the daemon');
+
+      it('asks the daemon for its vault before it asks Esplora, and refuses a file that differs', async () => {
+        const dead = await startMockEsplora();
+        await dead.close();
+        await writeFile(configPath, configToml(dead.url));
+        client.info = infoOf(vaultPubkeyFromPackage(fromVaultKey(makeTestVault(3, 4).vault), NETWORK));
+
+        // The mismatch, not the Esplora failure, is what comes back.
+        const err = await btcBalance({ configPath, vaultPath }, deps()).then(
+          () => undefined,
+          (e: Error) => e,
+        );
+        expect(err?.message).toMatch(/does not match the daemon's loaded share/);
+        expect(err?.message).toContain(vaultPath);
+        expect(err?.message).toContain(address);
+        expect(client.order).toEqual(['vault-info']);
+      });
+
+      it('prints the balance, with the note, when the daemon cannot be reached', async () => {
+        esplora.fund(address, 80_000);
+        client.infoError = unreachable();
+        expect(await btcBalance({ configPath, vaultPath }, deps())).toBe('confirmed: 80000\nunconfirmed: 0');
+        expect(warnings).toEqual(['not verified against the daemon (connect ENOENT /run/otzi/otzi.sock)']);
+      });
+
+      it('prints the balance, with the note, when the daemon has not loaded a vault', async () => {
+        esplora.fund(address, 80_000);
+        client.infoError = noVault();
+        expect(await btcBalance({ configPath, vaultPath }, deps())).toBe('confirmed: 80000\nunconfirmed: 0');
+        expect(warnings).toEqual(['the daemon has not loaded a vault — restart it to load the share; values not verified']);
+      });
+
+      it('connects to the daemon the config names when no client is injected', async () => {
+        esplora.fund(address, 80_000);
+        // The config's socket does not exist: unreachable, not an error.
+        expect(await btcBalance({ configPath, vaultPath }, { warn: text => warnings.push(text) })).toBe(
+          'confirmed: 80000\nunconfirmed: 0',
+        );
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toMatch(/^not verified against the daemon \(connect ENOENT .*otzi-test\.sock\)$/);
+      });
+
+      it('passes on a daemon that answers badly', async () => {
+        client.infoError = new DaemonClientError(500, 'internal error');
+        await expect(btcBalance({ configPath, vaultPath }, deps())).rejects.toMatchObject({ status: 500 });
+      });
     });
 
     it('fails with the Esplora URL when Esplora is unreachable', async () => {
       const dead = await startMockEsplora();
       await dead.close();
       await writeFile(configPath, configToml(dead.url));
-      await expect(btcBalance({ configPath, vaultPath })).rejects.toThrow(new RegExp(`Esplora ${dead.url}`));
+      await expect(btcBalance({ configPath, vaultPath }, deps())).rejects.toThrow(new RegExp(`Esplora ${dead.url}`));
     });
 
     it('points at otzi generate when there is no vault metadata', async () => {
-      await expect(btcBalance({ configPath, vaultPath: join(tmp, 'absent.json') })).rejects.toThrow(/otzi generate/);
+      await expect(btcBalance({ configPath, vaultPath: join(tmp, 'absent.json') }, deps())).rejects.toThrow(/otzi generate/);
     });
 
     it('refuses a config whose network differs from the vault', async () => {
       await writeFile(configPath, configToml(esplora.url, 'signet'));
-      await expect(btcBalance({ configPath, vaultPath })).rejects.toThrow(/testnet4.*signet|signet.*testnet4/);
+      await expect(btcBalance({ configPath, vaultPath }, deps())).rejects.toThrow(/testnet4.*signet|signet.*testnet4/);
     });
   });
 
@@ -199,6 +283,59 @@ describe('otzi btc', () => {
       const analysis = analyzeProposal(client.lastProposal, vault, NETWORK);
       expect(analysis.outputs.find(o => !o.isChange)).toMatchObject({ address: DEST, amount: 50_000 });
       expect(analysis.outputs.filter(o => o.isChange)).toHaveLength(1);
+    });
+
+    describe('the vault metadata is checked against the daemon first', () => {
+      const send = () => btcSend({ configPath, vaultPath, bookPath, to: DEST, amount: '50000' }, deps());
+
+      it('asks the daemon for its vault before the summary and the signing', async () => {
+        esplora.fund(address, 80_000);
+        await send();
+        expect(client.order).toEqual(['vault-info', 'summary', 'sign']);
+      });
+
+      it('refuses a file that differs from the daemon before Esplora is asked and nothing is signed', async () => {
+        const dead = await startMockEsplora();
+        await dead.close();
+        await writeFile(configPath, configToml(dead.url));
+        client.info = infoOf(vaultPubkeyFromPackage(fromVaultKey(makeTestVault(3, 4).vault), NETWORK));
+
+        const err = await send().then(
+          () => undefined,
+          (e: Error) => e,
+        );
+        expect(err?.message).toMatch(/does not match the daemon's loaded share/);
+        expect(err?.message).toContain(vaultPath);
+        expect(client.order).toEqual(['vault-info']);
+        expect(client.requests).toHaveLength(0);
+        expect(summaries).toEqual([]);
+        expect(esplora.broadcasts).toHaveLength(0);
+      });
+
+      it('refuses when the daemon has not loaded a vault, before Esplora is asked', async () => {
+        const dead = await startMockEsplora();
+        await dead.close();
+        await writeFile(configPath, configToml(dead.url));
+        client.infoError = new DaemonClientError(409, 'no vault loaded — run otzi generate, then restart the daemon');
+
+        await expect(send()).rejects.toThrow(/the daemon has not loaded a vault — restart it to load the share/);
+        expect(client.requests).toHaveLength(0);
+        expect(summaries).toEqual([]);
+      });
+
+      it('refuses when the daemon cannot be reached, naming the reason', async () => {
+        client.infoError = systemError('ECONNREFUSED', 'connect ECONNREFUSED /run/otzi/otzi.sock');
+        await expect(send()).rejects.toThrow(
+          /cannot check .*vault-pubkey\.json against the daemon: connect ECONNREFUSED \/run\/otzi\/otzi\.sock/,
+        );
+        expect(client.requests).toHaveLength(0);
+      });
+
+      it('refuses without a daemon check what it can refuse locally', async () => {
+        client.infoError = systemError('ECONNREFUSED', 'connect ECONNREFUSED');
+        await expect(btcSend({ configPath, vaultPath, bookPath, to: DEST, amount: '545' }, deps())).rejects.toThrow(/546 sats/);
+        expect(client.infoRequests).toBe(0);
+      });
     });
 
     it('prints the summary to the summary writer before the daemon is asked to sign', async () => {
@@ -706,7 +843,60 @@ describe('otzi btc', () => {
       expect((err as BroadcastFailedError).signedTxHex).toMatch(/^[0-9a-f]+$/);
     });
 
-    it('fails analysis before any daemon call for a proposal this vault would not sign', async () => {
+    describe('the vault metadata is checked against the daemon first', () => {
+      const proposal = () =>
+        makeProposal(vault, NETWORK, { inputs: [{ amount: 100_000 }], outputs: [{ address: DEST, amount: 50_000 }], change: 49_000 });
+      const sign = async (broadcast = false) =>
+        btcSign({ configPath, vaultPath, bookPath, proposalPath: await writeProposal(proposal()), broadcast }, deps());
+
+      it('asks the daemon for its vault before the summary and the signing', async () => {
+        await sign();
+        expect(client.order).toEqual(['vault-info', 'summary', 'sign']);
+      });
+
+      it('refuses a file that differs from the daemon: no summary, no signing, no broadcast', async () => {
+        client.info = infoOf(vaultPubkeyFromPackage(fromVaultKey(makeTestVault(3, 4).vault), NETWORK));
+        const err = await sign(true).then(
+          () => undefined,
+          (e: Error) => e,
+        );
+        expect(err?.message).toMatch(/does not match the daemon's loaded share/);
+        expect(err?.message).toContain(vaultPath);
+        expect(client.order).toEqual(['vault-info']);
+        expect(summaries).toEqual([]);
+        expect(esplora.broadcasts).toHaveLength(0);
+      });
+
+      it('names the mismatch, not an analysis failure computed from the unverified file', async () => {
+        client.info = infoOf(vaultPubkeyFromPackage(fromVaultKey(makeTestVault(3, 4).vault), NETWORK));
+        const foreign = await writeProposal(makeProposal(makeTestVault(2, 3).vault, NETWORK));
+        await expect(btcSign({ configPath, vaultPath, bookPath, proposalPath: foreign, broadcast: false }, deps())).rejects.toThrow(
+          /does not match the daemon's loaded share/,
+        );
+      });
+
+      it('refuses when the daemon has not loaded a vault', async () => {
+        client.infoError = new DaemonClientError(409, 'no vault loaded — run otzi generate, then restart the daemon');
+        await expect(sign()).rejects.toThrow(/the daemon has not loaded a vault — restart it to load the share/);
+        expect(client.requests).toHaveLength(0);
+        expect(summaries).toEqual([]);
+      });
+
+      it('refuses when the daemon cannot be reached', async () => {
+        client.infoError = systemError('ENOENT', 'connect ENOENT /run/otzi/otzi.sock');
+        await expect(sign()).rejects.toThrow(/cannot check .* against the daemon: connect ENOENT/);
+        expect(client.requests).toHaveLength(0);
+      });
+
+      it('does not ask the daemon about a proposal file it cannot read', async () => {
+        await expect(
+          btcSign({ configPath, vaultPath, bookPath, proposalPath: join(tmp, 'absent.json'), broadcast: false }, deps()),
+        ).rejects.toThrow(/absent\.json/);
+        expect(client.infoRequests).toBe(0);
+      });
+    });
+
+    it('fails analysis before the daemon is asked to sign for a proposal this vault would not sign', async () => {
       const other = makeTestVault(2, 3).vault;
       const proposalPath = await writeProposal(makeProposal(other, NETWORK));
       await expect(btcSign({ configPath, vaultPath, bookPath, proposalPath, broadcast: false }, deps())).rejects.toThrow(

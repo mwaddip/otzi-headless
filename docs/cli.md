@@ -15,8 +15,9 @@ through Esplora.
 - Verbs that read the daemon configuration accept `--config <path>` (default
   `/etc/otzi/daemon.toml`). The CLI takes the UDS path, the network and the
   Esplora URL from it. `otzi daemon` and `otzi setup` take the config path as
-  their positional argument instead. `otzi vault` takes it too, to find the
-  daemon it checks `/var/lib/otzi/vault-pubkey.json` against.
+  their positional argument instead. `otzi vault` and `otzi btc balance|send|sign`
+  also use it to find the daemon they check `/var/lib/otzi/vault-pubkey.json`
+  against.
 - Machine output (addresses, txids, signed hex, JSON) goes to stdout. Banners and
   errors go to stderr. Errors exit with status 1.
 - The CLI broadcasts only the daemon's own signed version of the transaction it asked about; a reply for a different transaction, or one missing a signature, is refused and nothing is posted.
@@ -37,15 +38,16 @@ through Esplora.
 
   Fails with `409` when this node already holds a vault, `403` when this node's gate rejects, `500` when the ceremony fails or times out. A DKG that fails before any node commits leaves no share at the share path on any node and can be re-run; a staged `<share path>.pending` left behind is overwritten by the next DKG.
 
-  A DKG can also fail on one node after another node has committed the vault (for example when a node loses its connection during the last exchange). A node that had already published its confirmation therefore never deletes its staged share: it keeps `<share path>.pending`, and the error (in the `500` reply when it is this node, in the daemon log otherwise) names the file and the vault address. Run `otzi vault` on the other nodes (a node that committed the vault shows it once its daemon has been restarted; before that `otzi vault` says to restart). If any of them shows that address, rename the `.pending` file to the share path on this node (`sudo mv <share path>.pending <share path>`) and restart its daemon. If none does, the vault was never created: remove the `.pending` files and run `otzi generate` again.
+  A DKG can also fail on one node after another node has committed the vault (for example when a node loses its connection during the last exchange). A node that had already published its confirmation therefore never deletes its staged share: it keeps `<share path>.pending`, and the error (in the `500` reply when it is this node, in the daemon log otherwise) names the file and the vault address. Run `otzi vault` on the other nodes (it shows a committed vault even before that node's daemon has been restarted, with a warning that the values are not verified). If any of them shows that address, rename the `.pending` file to the share path on this node (`sudo mv <share path>.pending <share path>`) and restart its daemon. If none does, the vault was never created: remove the `.pending` files and run `otzi generate` again.
 
 ### Vault
 
-- `otzi vault [--json] [--config <path>]` — print the vault address, the network and `<threshold>-of-<parties>`. `--json` prints `network`, `address`, `internalKey`, `outputKey`, `threshold`, `parties` and the public `vaultKey`. Any member of the `otzi` group can rewrite `/var/lib/otzi/vault-pubkey.json`, so `otzi vault` asks the daemon (the `vault-info` op) for the vault it has loaded and compares the file with the answer:
-  - **File and daemon agree** (or there is no file): the daemon's values are printed. Without a file, `--json` has no `vaultKey` and says so on stderr.
+- `otzi vault [--json] [--config <path>]` — print the vault address, the network and `<threshold>-of-<parties>`. `--json` prints `network`, `address`, `internalKey`, `outputKey`, `threshold`, `parties` and the public `vaultKey`. Any member of the `otzi` group can rewrite `/var/lib/otzi/vault-pubkey.json`, so `otzi vault` asks the daemon (the `vault-info` op, which must answer within 10 s) for the vault it has loaded and compares the file with the answer:
+  - **File and daemon agree** (or there is no file): the daemon's values are printed. With `--json`, stderr says that the per-party values of `vaultKey.verifyingShares` come from the file and are not checked against the daemon (the daemon does not send them); without a file, `--json` has no `vaultKey` and says so on stderr.
   - **They differ** (`address`, `internalKey`, `outputKey`, `threshold`, `parties`, `network`, or the file's `vaultKey` does not fit them): exit 1, nothing on stdout. The error on stderr lists each differing field as `<field>: file <x>, daemon <y>` and says the file does not match the daemon's loaded share. Do not use its address; restarting the daemon rewrites the file from its share. Find out who changed it before you do.
-  - **The daemon holds no vault** (`409`): exit 1. With no file, the error points at `otzi generate`. With a file (a DKG just ran and the daemon has not restarted since), it says the file does not match a loaded vault: restart the daemon, then run `otzi vault` again.
-  - **The daemon cannot be reached** (no socket, connection refused, socket not readable, or `--config` cannot be read): the file's values are printed as before, and stderr gets `not verified against the daemon (<reason>)`. Fails with a pointer to `otzi generate` when the file does not exist either.
+  - **The daemon holds no vault** (`409`) **and there is a file** (a DKG committed this node's share and the daemon has not restarted since to load it): the file's values are printed, exit 0, and stderr says `the daemon has not loaded a vault — restart it to load the share; values not verified`. This is how you read the vault of a node that committed it before you rename a `.pending` file on another node (see above). With no file, exit 1 and the error points at `otzi generate`.
+  - **The daemon cannot be reached** (no socket, connection refused, socket not readable, no answer within 10 s, or `--config` cannot be read): the file's values are printed as before, and stderr gets `not verified against the daemon (<reason>)`. Fails with a pointer to `otzi generate` when the file does not exist either.
+  - A file that cannot be read or validated is an error in every case.
 - `otzi btc balance [--unit sats|btc|mbtc|ubtc] [--config <path>]` — confirmed and unconfirmed vault balance from Esplora, in the chosen unit (default `sats`):
 
   ```
@@ -53,14 +55,18 @@ through Esplora.
   unconfirmed: 0
   ```
 
+  The address it queries comes from `vault-pubkey.json`, which any member of the `otzi` group can rewrite, so it first checks the file against the daemon like `otzi vault` does. A file that differs from the daemon's loaded vault is an error (exit 1, nothing on stdout: it would show the balance of the wrong address). With no daemon to ask, or a daemon that has not loaded a vault, the balance is printed with a note on stderr (`not verified against the daemon (<reason>)`, or `the daemon has not loaded a vault — restart it to load the share; values not verified`).
+
 - `otzi btc send <label|address> <amount[unit]|max> [--fee-rate N] [--config <path>]` — send from the vault. Prints the txid and the explorer URL.
   - `<label|address>`: a label from this node's address book (exact match) or a valid address for the configured network. A label that is itself an address but names a different address is refused, so a send to an address never pays another one; rename or remove that label.
   - `<amount[unit]>`: a number with an optional unit, `sats` (default), `btc`, `mbtc` or `ubtc` (`50000`, `0.001btc`). Fractional sats are rejected. `max` spends every confirmed UTXO with no change.
   - `--fee-rate N`: sat/vB, more than 0 and at most 10000. Default: Esplora's `normal` estimate; an Esplora estimate outside that range is refused (naming the Esplora URL) and you pass `--fee-rate` instead.
 
-  The steps: resolve the recipient, fetch **confirmed** UTXOs, build the proposal (largest UTXOs first; change under 330 sats goes to the fee; a send below 546 sats is refused), refuse a send that needs more than 255 inputs (consolidate UTXOs first), print the summary (outputs with their address-book labels, change, fee, fee rate) to stderr, call the daemon's `sign` op, check that the reply is the transaction that was built and is signed on every input, broadcast it. The node you run it on is the ceremony leader.
+  The steps: resolve the recipient and check the amount and fee rate, check `vault-pubkey.json` against the daemon, fetch **confirmed** UTXOs, build the proposal (largest UTXOs first; change under 330 sats goes to the fee; a send below 546 sats is refused), refuse a send that needs more than 255 inputs (consolidate UTXOs first), print the summary (outputs with their address-book labels, change, fee, fee rate) to stderr, call the daemon's `sign` op, check that the reply is the transaction that was built and is signed on every input, broadcast it. The node you run it on is the ceremony leader.
 
-- `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` — sign a proposal someone else built. `proposal.json` holds `{ "network", "tx", "prevouts" }` (see [`api.md`](./api.md) § `op: "sign"`). Analysis runs locally first, so a proposal this vault would not sign fails before any daemon call. The analysis summary (outputs with their address-book labels, change, fee, fee rate) goes to stderr before the daemon is asked to sign; stdout gets the txid and the signed hex. Without `--broadcast` nothing is posted; with it, the CLI posts the transaction and prints the explorer URL as a third stdout line.
+  The change address and the keys come from `vault-pubkey.json`, so `send` (and `sign`) require the daemon to vouch for the file: the daemon's loaded vault must match it. If it differs, if the daemon has not loaded a vault (restart it), or if the daemon cannot be reached, the command stops with an error before Esplora is asked and before anything is built, summarised or signed; stdout stays empty.
+
+- `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` — sign a proposal someone else built. `proposal.json` holds `{ "network", "tx", "prevouts" }` (see [`api.md`](./api.md) § `op: "sign"`). The file is checked against the daemon first, as for `send`; then analysis runs locally, so a proposal this vault would not sign fails before the daemon is asked to sign. The analysis summary (outputs with their address-book labels, change, fee, fee rate) goes to stderr before the daemon is asked to sign; stdout gets the txid and the signed hex. Without `--broadcast` nothing is posted; with it, the CLI posts the transaction and prints the explorer URL as a third stdout line.
 
 Every node in the signer set analyses the proposal against its own key and runs its own gate. If a node declines, the leader's ceremony fails and the command exits with the daemon's `500` error.
 

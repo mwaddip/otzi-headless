@@ -15,8 +15,14 @@
 
 import { posix } from 'node:path';
 
+/** `/etc/otzi`, as a tar path (no leading slash): daemon.toml, the address book. */
+export const CONFIG_DIR = 'etc/otzi';
+
+/** `/var/lib/otzi`, as a tar path: the share and the rest of the daemon's own state, owned by the user `otzi`. */
+export const DATA_DIR = 'var/lib/otzi';
+
 /** The directories a node's state lives in, as tar paths (no leading slash). */
-export const STATE_DIRS = ['etc/otzi', 'var/lib/otzi'] as const;
+export const STATE_DIRS = [CONFIG_DIR, DATA_DIR] as const;
 
 /**
  * The tar paths of the files whose place is fixed: daemon.toml does not name
@@ -24,9 +30,9 @@ export const STATE_DIRS = ['etc/otzi', 'var/lib/otzi'] as const;
  * it gives each), and neither of them may be the file a named path resolves to.
  */
 export const FIXED_STATE_FILES = {
-  daemonConfig: 'etc/otzi/daemon.toml',
-  addressBook: 'etc/otzi/address-book.otzi.json',
-  vaultPubkey: 'var/lib/otzi/vault-pubkey.json',
+  daemonConfig: `${CONFIG_DIR}/daemon.toml`,
+  addressBook: `${CONFIG_DIR}/address-book.otzi.json`,
+  vaultPubkey: `${DATA_DIR}/vault-pubkey.json`,
 } as const;
 
 /** `FIXED_STATE_FILES` as a list, for `resolveStatePaths`'s `fixed` argument. */

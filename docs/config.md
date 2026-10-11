@@ -304,9 +304,12 @@ path = "/var/run/otzi/otzi.sock"
 ```
 
 Permission model: filesystem ACL on the socket file gates access. The
-deb's postinst sets `/var/run/otzi/` to `chmod 2770 root:otzi` (setgid),
-so the socket lands at `chmod 660 root:otzi`. Any user in the `otzi`
-group can connect; nobody else.
+deb's postinst sets `/var/run/otzi/` to `chmod 3770 root:otzi` (setgid and
+sticky), so the socket lands at `chmod 660 root:otzi`. Any user in the `otzi`
+group can connect; nobody else. The sticky bit keeps a group member from
+unlinking or renaming the daemon's socket and binding a look-alike, which the
+CLI would trust (`otzi vault` and `otzi btc` check what they print against the
+daemon behind this socket).
 
 ### `kind = "http"` (loopback only)
 

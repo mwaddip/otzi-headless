@@ -77,9 +77,10 @@ a fresh one.
 ## `op: "vault-info"`
 
 Read-only vault metadata for operator backends and tooling: the vault address and
-keys, the network, the threshold and the ring's party IDs. `otzi vault` calls it
-and compares the answer with `vault-pubkey.json`, which other members of the
-`otzi` group can rewrite (see [`cli.md`](./cli.md)).
+keys, the network, the threshold and the ring's party IDs. `otzi vault` and
+`otzi btc balance|send|sign` call it and compare the answer with
+`vault-pubkey.json`, which other members of the `otzi` group can rewrite (see
+[`cli.md`](./cli.md)); they give up on a daemon that does not answer within 10 s.
 
 Request:
 

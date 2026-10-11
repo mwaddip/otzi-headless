@@ -51,8 +51,8 @@ import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 import { Parser as TarParser } from 'tar';
 import { parse as parseToml } from 'smol-toml';
-import { displayText, errorReason } from '../../util/text';
-import { FIXED_STATE_FILES, STATE_DIRS, resolveStatePaths } from '../state-paths';
+import { displayText, errorReason, shellQuote } from '../../util/text';
+import { DATA_DIR, FIXED_STATE_FILES, resolveStatePaths } from '../state-paths';
 import {
   BACKUP_HEADER_LEN,
   BACKUP_IV_LEN,
@@ -104,9 +104,6 @@ const PUBKEYS_MODE = 0o644;
 /** meta.json lives only inside the archive — never written to disk. */
 const META_TAR_PATH = 'meta.json';
 
-/** The directory whose files belong to the daemon's user (the share is read there): `/var/lib/otzi`. */
-const DATA_DIR = STATE_DIRS[1];
-
 /** The system user and group the daemon runs as (`User=otzi`). */
 const OTZI_NAME = 'otzi';
 
@@ -150,9 +147,7 @@ function defaultDaemonStatusCheck(run: RunCommand): () => Promise<boolean> {
 /** Default config-exists probe — checks for /etc/otzi/daemon.toml. */
 function defaultConfigExistsCheck(rootOverride?: string): () => Promise<boolean> {
   return async () => {
-    const p = rootOverride
-      ? join(rootOverride, 'etc/otzi/daemon.toml')
-      : '/etc/otzi/daemon.toml';
+    const p = join(rootOverride ?? '/', FIXED_STATE_FILES.daemonConfig);
     try {
       await stat(p);
       return true;
@@ -299,10 +294,7 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
 
   // --- Pre-flight check 2: refuse if /etc/otzi/daemon.toml exists.
   if (await configExists()) {
-    const configPath =
-      root === '/'
-        ? '/etc/otzi/daemon.toml'
-        : join(root, 'etc/otzi/daemon.toml');
+    const configPath = join(root, FIXED_STATE_FILES.daemonConfig);
     throw new Error(`config already present at ${configPath}; move it aside first`);
   }
 
@@ -385,7 +377,7 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
 
   // --- The targets: the fixed paths, plus the three paths the archived
   // daemon.toml names, each a direct child of /etc/otzi or /var/lib/otzi.
-  const targets = targetModes(files.get('etc/otzi/daemon.toml'));
+  const targets = targetModes(files.get(FIXED_STATE_FILES.daemonConfig));
   for (const d of directories) {
     if (targets.has(d.name)) {
       throw new Error(`archive entry ${displayText(d.rawName)}: directory where a regular file is expected refused`);
@@ -479,7 +471,7 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
   // and the daemon cannot read it. Not an error (a dev machine), but not silent.
   const warnings: string[] = [];
   if (isRoot && owner === undefined) {
-    const unowned = placements.filter(p => posix.dirname(p.member.name) === DATA_DIR).map(p => displayText(p.dest));
+    const unowned = placements.filter(p => posix.dirname(p.member.name) === DATA_DIR).map(p => shellQuote(displayText(p.dest)));
     if (unowned.length > 0) {
       warnings.push(
         `no system user '${OTZI_NAME}' was found (in the passwd and group files, or by getent), so the restored files in /${DATA_DIR} stay root-owned ` +
@@ -596,7 +588,7 @@ function checkMemberName(rawName: string): void {
 function targetModes(daemonToml: ArchiveMember | undefined): Map<string, number> {
   let rawConfig: Record<string, unknown>;
   try {
-    if (!daemonToml) throw new Error('etc/otzi/daemon.toml is not in the archive');
+    if (!daemonToml) throw new Error(`${FIXED_STATE_FILES.daemonConfig} is not in the archive`);
     // Loose TOML parse — restore must work even if the backed-up daemon.toml
     // wouldn't pass full validation (e.g. mid-bootstrap, missing peers).
     rawConfig = parseToml(daemonToml.data.toString('utf8')) as Record<string, unknown>;

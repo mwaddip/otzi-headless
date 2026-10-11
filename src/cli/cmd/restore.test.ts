@@ -17,6 +17,7 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -1235,6 +1236,10 @@ describe('runRestore — ownership of the restored files', () => {
     await rm(tmp, { recursive: true, force: true });
   });
 
+  /** The words a real shell reads in `command`. */
+  const wordsOf = (command: string): string[] =>
+    execFileSync('sh', ['-c', `printf '%s\\0' ${command}`], { encoding: 'utf8' }).split('\0').slice(0, -1);
+
   /** A chown seam that records what it is asked to do. */
   function recorder() {
     const calls: { path: string; uid: number; gid: number; open: boolean }[] = [];
@@ -1358,7 +1363,16 @@ describe('runRestore — ownership of the restored files', () => {
       expect(warning).toMatch(/stay root-owned/);
       expect(warning).toMatch(/daemon \(User=otzi\) will not be able to read its share/);
       const command = /chown otzi:otzi (.*)$/.exec(warning!)?.[1];
-      expect(command?.split(' ').sort()).toEqual(STATE_FILES.map(f => join(root, f)).sort());
+      expect(wordsOf(command!).sort()).toEqual(STATE_FILES.map(f => join(root, f)).sort());
+    });
+
+    it('quotes every path in the chown command, so a space or a quote in it cannot split or end a word', async () => {
+      const odd = join(tmp, "my root's dir; touch pwned");
+      const result = await restore({ rootOverride: odd, isRoot: true, lookupOtziOwner: async () => undefined });
+      const command = /chown otzi:otzi (.*)$/.exec(result.warnings[0]!)?.[1];
+      // Each word is single-quoted whole, an embedded quote as '\''.
+      expect(command).toContain(`'${join(odd, 'var/lib/otzi/share.json').replace(/'/g, "'\\''")}'`);
+      expect(wordsOf(command!).sort()).toEqual(STATE_FILES.map(f => join(odd, f)).sort());
     });
 
     it('does not warn when the files were given to the user', async () => {

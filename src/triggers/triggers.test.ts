@@ -386,6 +386,36 @@ describe('UdsTrigger', () => {
   });
 });
 
+describe('UdsTrigger in the sticky runtime directory', () => {
+  // /var/run/otzi is 3770 (setgid + sticky): a group member must not be able to replace the daemon's socket.
+  // Only the daemon's own socket is ever removed or recreated, so restarts keep working.
+  it('starts, stops and restarts in a directory with mode 3770, replacing a stale socket of its own', async () => {
+    const { chmod, mkdtemp, rm, stat, writeFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const dir = await mkdtemp(join(tmpdir(), 'otzi-uds-sticky-'));
+    try {
+      await chmod(dir, 0o3770);
+      const path = join(dir, 'otzi.sock');
+      const make = () => new UdsTrigger({ path, handler: async () => ({ status: 200 }) });
+
+      const first = make();
+      await first.start();
+      expect((await stat(path)).isSocket()).toBe(true);
+      await first.stop();
+
+      // A hard exit leaves its socket behind; the next start replaces it.
+      await writeFile(path, '', { mode: 0o660 });
+      const second = make();
+      await second.start();
+      expect((await stat(path)).isSocket()).toBe(true);
+      await second.stop();
+      await expect(stat(path)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('HttpTrigger — Host header on a loopback bind', () => {
   let cleanup: Array<() => Promise<void>> = [];
   afterEach(async () => {

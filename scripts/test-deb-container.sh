@@ -118,7 +118,7 @@ stat -c "%a %U:%G" /etc/otzi      | grep -q "^2750 root:otzi$"     || { echo "FA
 stat -c "%a %U:%G" /etc/otzi/daemon.toml | grep -q "^640 root:otzi$" || { echo "FAIL: daemon.toml mode/owner";    exit 1; }
 stat -c "%a %U:%G" /var/lib/otzi  | grep -q "^2770 root:otzi$"     || { echo "FAIL: /var/lib/otzi mode/owner";   exit 1; }
 test -d /var/run/otzi             || { echo "FAIL: /var/run/otzi missing"; exit 1; }
-stat -c "%a %U:%G" /var/run/otzi  | grep -q "^2770 root:otzi$"     || { echo "FAIL: /var/run/otzi mode/owner";   exit 1; }
+stat -c "%a %U:%G" /var/run/otzi  | grep -q "^3770 root:otzi$"     || { echo "FAIL: /var/run/otzi mode/owner (want setgid + sticky)"; exit 1; }
 echo "OK: phase 9a perms"
 '
 

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -82,6 +82,12 @@ describe('vault command', () => {
       expect(JSON.parse(out)).toEqual(file);
       expect(out).toBe(JSON.stringify(JSON.parse(await readFile(vaultPath, 'utf8')), null, 2));
       expect(JSON.parse(out).vaultKey.minSigners).toBe(2);
+      // The daemon does not send the per-party verifying shares, so the file's are printed unchecked: said on stderr.
+      expect(notes).toEqual([`the per-party values of vaultKey.verifyingShares come from ${vaultPath} and are not checked against the daemon`]);
+    });
+
+    it('says nothing about the verifying shares in text mode', async () => {
+      await vault({ configPath, vaultPath }, { client: fakeClient(infoOf(file)), warn });
       expect(notes).toEqual([]);
     });
 
@@ -184,26 +190,62 @@ describe('vault command', () => {
     });
   });
 
-  describe('daemon reachable, no vault (409)', () => {
+  describe('daemon reachable, no vault loaded (409)', () => {
     const noVault = () => new DaemonClientError(409, 'no vault loaded — run otzi generate, then restart the daemon');
+    const NOT_LOADED = 'the daemon has not loaded a vault — restart it to load the share; values not verified';
 
     it('points at otzi generate when there is no file either', async () => {
       await rm(vaultPath);
       await expect(vault({ configPath, vaultPath }, { client: fakeClient(noVault()), warn })).rejects.toThrow(
         /otzi generate/,
       );
+      expect(notes).toEqual([]);
     });
 
-    it('says the file does not match a loaded vault when it exists anyway', async () => {
-      const err = await vault({ configPath, vaultPath }, { client: fakeClient(noVault()), warn }).then(
-        () => undefined,
-        (e: Error) => e,
+    // A committed-but-not-restarted node (partly failed DKG): its file is the only place the vault shows.
+    it('prints the file values with a warning on stderr when the file exists', async () => {
+      const out = await vault({ configPath, vaultPath }, { client: fakeClient(noVault()), warn });
+      expect(out.split('\n')).toEqual(['network:   testnet4', `address:   ${file.address}`, 'threshold: 2-of-3']);
+      expect(notes).toEqual([NOT_LOADED]);
+    });
+
+    it('prints the file as pretty JSON with --json', async () => {
+      const out = await vault({ configPath, vaultPath, json: true }, { client: fakeClient(noVault()), warn });
+      expect(out).toBe(JSON.stringify(JSON.parse(await readFile(vaultPath, 'utf8')), null, 2));
+      expect(JSON.parse(out)).toEqual(file);
+      expect(notes).toEqual([NOT_LOADED]);
+    });
+
+    it('keeps the warning out of the returned (stdout) text', async () => {
+      for (const json of [false, true]) {
+        const out = await vault({ configPath, vaultPath, json }, { client: fakeClient(noVault()), warn });
+        expect(out).not.toMatch(/not loaded|not verified|restart/i);
+      }
+    });
+
+    it('writes the warning to stderr and nothing but the values to stdout by default', async () => {
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await vault({ configPath, vaultPath }, { client: fakeClient(noVault()) });
+        expect(log).not.toHaveBeenCalled();
+        expect(error.mock.calls).toEqual([[NOT_LOADED]]);
+      } finally {
+        log.mockRestore();
+        error.mockRestore();
+      }
+    });
+
+    it('still fails when the file is unreadable or invalid', async () => {
+      await writeFile(vaultPath, JSON.stringify({ network: 'testnet4' }));
+      await expect(vault({ configPath, vaultPath }, { client: fakeClient(noVault()), warn })).rejects.toThrow(
+        /vault metadata/,
       );
-      expect(err!.message).toMatch(/no vault loaded/);
-      expect(err!.message).toMatch(/does not match a loaded vault/);
-      expect(err!.message).toContain(vaultPath);
-      expect(err!.message).toMatch(/restart the daemon/);
-      expect(err!.message).not.toContain(file.address);
+      await writeFile(vaultPath, 'not json');
+      await expect(vault({ configPath, vaultPath }, { client: fakeClient(noVault()), warn })).rejects.toThrow(
+        /not valid JSON/,
+      );
+      expect(notes).toEqual([]);
     });
   });
 
@@ -263,6 +305,30 @@ describe('vault command', () => {
       expect(out).toContain(file.address);
       expect(notes).toHaveLength(1);
       expect(notes[0]).toMatch(/^not verified against the daemon \(.*absent\.toml.*\)$/);
+    });
+
+    it('counts a daemon that does not answer within 10 s as unreachable', async () => {
+      vi.useFakeTimers();
+      try {
+        let signal: AbortSignal | undefined;
+        const silent = {
+          vaultInfo: (options?: { signal?: AbortSignal }) => {
+            signal = options?.signal;
+            return new Promise<VaultInfo>(() => {});
+          },
+        };
+        const pending = vault({ configPath, vaultPath }, { client: silent, warn });
+        await vi.advanceTimersByTimeAsync(9_999);
+        expect(notes).toEqual([]);
+        await vi.advanceTimersByTimeAsync(1);
+        const out = await pending;
+        expect(out).toContain(file.address);
+        expect(notes).toEqual(['not verified against the daemon (no answer within 10 s)']);
+        // The request is cancelled, so the CLI process can exit.
+        expect(signal?.aborted).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('shows the reason without control characters', async () => {
@@ -338,6 +404,14 @@ path = "${socketPath}"
       await serve();
       await rm(vaultPath);
       await expect(vault({ configPath, vaultPath }, { warn })).rejects.toThrow(/otzi generate/);
+    });
+
+    it('shows the file with a warning when the daemon answers 409 and the file exists', async () => {
+      reply = { status: 409, body: { error: 'no vault loaded — run otzi generate, then restart the daemon' } };
+      await serve();
+      const out = await vault({ configPath, vaultPath }, { warn });
+      expect(out).toContain(file.address);
+      expect(notes).toEqual(['the daemon has not loaded a vault — restart it to load the share; values not verified']);
     });
 
     it('falls back to the file when nothing listens on the socket', async () => {

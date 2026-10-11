@@ -112,7 +112,7 @@ Cross-cutting truths that hold everywhere; subsystem sections may restate them f
 - **Don't force-close (`closeAllConnections`)** the bootstrap master after completion; graceful `server.close()` lets in-flight responses flush.
 
 ### Operator API surface (load-bearing)
-- The daemon's operator API binds to a UDS socket by default (`[[triggers]] kind="uds" path="/var/run/otzi/otzi.sock"`). Filesystem permissions (chmod 660 root:otzi) are the auth model.
+- The daemon's operator API binds to a UDS socket by default (`[[triggers]] kind="uds" path="/var/run/otzi/otzi.sock"`). Filesystem permissions (socket chmod 660 root:otzi, in a setgid and sticky `/var/run/otzi` 3770, so a group member cannot replace the daemon's socket) are the auth model.
 - An optional `kind="http"` trigger is supported for the remote-CLI case, but the parser ENFORCES that the bind host is loopback (`127.0.0.1`, `::1`, `localhost`) or a UDS path. External binds are rejected at parse time.
 - Ops: `vault-info`, `dkg`, `sign` (see [facts/daemon.md](facts/daemon.md)). Unknown ops and unknown top-level request fields are rejected with 400.
 - Group-membership-based access is the precondition for `feedback_cli_is_primary_entrypoint` — the CLI is THE operator surface, and any user in the `otzi` group can run it without sudo.
