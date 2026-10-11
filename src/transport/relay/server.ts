@@ -285,7 +285,13 @@ export class RelayServer {
 function parseBind(bind: string): { host: string; port: number } {
   const m = /^(.+):(\d+)$/.exec(bind);
   if (!m) throw new Error(`RelayServer: invalid listen '${bind}' — expected 'host:port'`);
-  const host = m[1]!;
+  let host = m[1]!;
+  // An IPv6 literal is written in brackets (`[::1]:7100`); `listen` and DNS take it without them.
+  // Only a matched pair is stripped; a lone bracket is a malformed address.
+  const bracketed = /^\[(.+)\]$/.exec(host);
+  if (bracketed) host = bracketed[1]!;
+  else if (host.startsWith('[') || host.endsWith(']'))
+    throw new Error(`RelayServer: invalid listen '${bind}' — unbalanced brackets around the host`);
   const port = Number(m[2]);
   if (!Number.isInteger(port) || port < 0 || port > 65_535)
     throw new Error(`RelayServer: invalid port '${m[2]}'`);

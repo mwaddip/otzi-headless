@@ -119,6 +119,37 @@ describe('RelayServer — roster + routing', () => {
     expect(() => new RelayServer({ listen: ':9999' })).toThrow(/invalid listen|host required/);
   });
 
+  it('takes a bracketed IPv6 host without its brackets', () => {
+    const parsed = (listen: string) => {
+      const s = new RelayServer({ listen }) as unknown as { host: string; port: number };
+      return { host: s.host, port: s.port };
+    };
+    expect(parsed('[::1]:7100')).toEqual({ host: '::1', port: 7100 });
+    expect(parsed('[2a11:6c7::11]:0')).toEqual({ host: '2a11:6c7::11', port: 0 });
+    // Other hosts are untouched.
+    expect(parsed('127.0.0.1:7100')).toEqual({ host: '127.0.0.1', port: 7100 });
+    expect(parsed('relay.example:7100')).toEqual({ host: 'relay.example', port: 7100 });
+  });
+
+  it('rejects a bracketed host that is empty or unbalanced', () => {
+    for (const listen of ['[]:7100', '[::1:7100', '::1]:7100', '[::1]', '[::1]:99999']) {
+      expect(() => new RelayServer({ listen }), listen).toThrow(/RelayServer: invalid|host required/);
+    }
+  });
+
+  it('start() on a bracketed IPv6 loopback binds, or fails for lack of IPv6, never on the name', async () => {
+    // `[::1]` once reached getaddrinfo with its brackets and failed with ENOTFOUND. A host without
+    // IPv6 loopback (a sandbox, a container) still fails to bind, but with its own error.
+    server = new RelayServer({ listen: '[::1]:0' });
+    try {
+      await server.start();
+      expect(server.address()!.host).toBe('::1');
+    } catch (err) {
+      expect((err as NodeJS.ErrnoException).code).not.toBe('ENOTFOUND');
+      expect(['EAFNOSUPPORT', 'EADDRNOTAVAIL']).toContain((err as NodeJS.ErrnoException).code);
+    }
+  });
+
   it('stop() while start() is still binding leaves nothing listening and no heartbeat', async () => {
     const port = await freePort();
     const racing = new RelayServer({ listen: `127.0.0.1:${port}`, heartbeatMs: 20 });

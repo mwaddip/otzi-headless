@@ -475,14 +475,14 @@
 **Purpose:** Tiny dumb relay router; per-ring connection roster, peer-joined/peer-left notifications, frame forwarding by partyId.
 
 **Public surface:**
-- `RelayServerOptions` — Configuration with listen address ("host:port" required), optional `heartbeatMs` (default 20 000) and optional logger.
+- `RelayServerOptions` — Configuration with listen address ("host:port" required; an IPv6 host is written in brackets, `[::1]:7100`), optional `heartbeatMs` (default 20 000) and optional logger.
 
 - `RelayServer` — Immutable relay state machine; owns per-ring rosters and WebSocket server. Internally serialized; concurrent peer joins/frames handled safely.
 
 - `constructor(options: RelayServerOptions)`
   - **Pre:** `options.listen` is valid "host:port".
-  - **Post:** Initializes relay state (rings map). Does not start listening yet.
-  - **Throws:** `Error` if bind format is invalid, or `heartbeatMs` is not a finite number ≥ 1.
+  - **Post:** Initializes relay state (rings map). Does not start listening yet. A bracketed IPv6 host is stored without its brackets (`[::1]:7100` binds host `::1`, and `address()` reports `::1`), as `src/config/parse.ts` reads a bracketed bind host; `listen` and DNS never see the brackets.
+  - **Throws:** `Error` if bind format is invalid (including an empty host, `[]`, or brackets that do not pair up: `[::1:7100`, `::1]:7100`), or `heartbeatMs` is not a finite number ≥ 1.
 
 - `start(): Promise<void>`
   - **Pre:** Relay not already started.
