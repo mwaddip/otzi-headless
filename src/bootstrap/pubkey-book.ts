@@ -8,9 +8,13 @@
  * the raw pubkey bytes in partyId order, rendered as 96 bits in the form
  * `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx`.
  *
+ * `advertisedEndpoint` is optional: relay nodes have none. The fingerprint
+ * hashes pubkeys only, so it does not depend on endpoints.
+ *
  * On-disk format: pretty-printed JSON, operator-readable.
  */
 
+import { createHash } from 'node:crypto';
 import type { PartyId } from '../core/types';
 import { fromHex, toHex } from '../otzi/lib/hex';
 
@@ -18,8 +22,12 @@ export interface PubkeyBookEntry {
   partyId: PartyId;
   /** 130-char hex; the raw 65-byte uncompressed P-256 point. */
   publicKeyHex: string;
-  /** Canonical `host:port` form (use `canonicalizeEndpoint`). */
-  advertisedEndpoint: string;
+  /**
+   * Canonical `host:port` form (use `canonicalizeEndpoint`). Absent for relay
+   * nodes, which are reached through the relay and have no dialable address;
+   * peer-mesh requires it on every peer. When present it is non-empty.
+   */
+  advertisedEndpoint?: string;
 }
 
 export interface PubkeyBook {
@@ -57,12 +65,13 @@ export function parseBook(text: string): PubkeyBook {
       throw new Error(`parseBook: entries[${i}].partyId must be a non-negative integer`);
     if (typeof o.publicKeyHex !== 'string')
       throw new Error(`parseBook: entries[${i}].publicKeyHex must be a string`);
-    if (typeof o.advertisedEndpoint !== 'string')
+    if (o.advertisedEndpoint !== undefined && typeof o.advertisedEndpoint !== 'string')
       throw new Error(`parseBook: entries[${i}].advertisedEndpoint must be a string`);
+    // An absent endpoint stays absent: the entry gets no `advertisedEndpoint` key.
     const entry: PubkeyBookEntry = {
       partyId: o.partyId,
       publicKeyHex: o.publicKeyHex,
-      advertisedEndpoint: o.advertisedEndpoint,
+      ...(o.advertisedEndpoint !== undefined ? { advertisedEndpoint: o.advertisedEndpoint } : {}),
     };
     validateEntry(entry, `entries[${i}]`);
     return entry;
@@ -98,6 +107,21 @@ export async function computeFingerprint(book: PubkeyBook): Promise<string> {
   return Array.from({ length: 6 }, (_, i) => hex.slice(i * 4, i * 4 + 4)).join('-');
 }
 
+/**
+ * Key id — the first 8 lowercase hex characters of SHA-256 over the raw
+ * 65-byte pubkey. A short per-key label for operators to confirm that every
+ * entry in the book belongs to one of their own nodes. The fingerprint proves
+ * all nodes hold the same book; key ids prove the book holds only your keys.
+ */
+export function keyId(publicKeyHex: string): string {
+  if (publicKeyHex.length !== PUBKEY_HEX_LEN)
+    throw new Error(
+      `keyId: publicKeyHex must be ${PUBKEY_HEX_LEN} chars (65 bytes), got ${publicKeyHex.length}`,
+    );
+  if (!/^[0-9a-f]+$/i.test(publicKeyHex)) throw new Error('keyId: publicKeyHex must be hex');
+  return createHash('sha256').update(fromHex(publicKeyHex)).digest('hex').slice(0, 8);
+}
+
 function validateEntry(e: PubkeyBookEntry, path: string): void {
   if (e.publicKeyHex.length !== PUBKEY_HEX_LEN)
     throw new Error(
@@ -110,7 +134,7 @@ function validateEntry(e: PubkeyBookEntry, path: string): void {
     throw new Error(`${path}.publicKeyHex must start with 0x04 (uncompressed P-256)`);
   if (e.partyId < 0 || !Number.isInteger(e.partyId))
     throw new Error(`${path}.partyId must be a non-negative integer`);
-  if (e.advertisedEndpoint.length === 0)
+  if (e.advertisedEndpoint !== undefined && e.advertisedEndpoint.length === 0)
     throw new Error(`${path}.advertisedEndpoint must be non-empty`);
 }
 

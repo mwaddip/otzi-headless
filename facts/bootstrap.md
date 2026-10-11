@@ -10,7 +10,7 @@
 **Public surface:**
 - `PubkeyBookEntry`
   - **Pre:** none
-  - **Post:** Immutable entry with non-negative integer `partyId`, 130-char lowercase hex `publicKeyHex` (65-byte uncompressed P-256 point starting with `0x04`), and non-empty `advertisedEndpoint` in canonical `host:port` form (see `src/util/endpoint.ts::canonicalizeEndpoint`).
+  - **Post:** Immutable entry with non-negative integer `partyId`, 130-char lowercase hex `publicKeyHex` (65-byte uncompressed P-256 point starting with `0x04`), and an optional `advertisedEndpoint`. When present it is non-empty and in canonical `host:port` form (see `src/util/endpoint.ts::canonicalizeEndpoint`). When absent the entry has no `advertisedEndpoint` key at all (relay nodes are reached through the relay and have no dialable address); peer-mesh requires one on every peer (see `transport-factory`).
   - **Throws:** n/a (interface)
   - **Concurrency:** none (immutable value type)
 
@@ -21,45 +21,52 @@
   - **Concurrency:** none (read-only after construction)
 
 - `buildBook(entries: Iterable<PubkeyBookEntry>): PubkeyBook`
-  - **Pre:** All entries have distinct `partyId` and distinct `publicKeyHex`. Each `publicKeyHex` is valid 65-byte hex; each `advertisedEndpoint` is non-empty.
+  - **Pre:** All entries have distinct `partyId` and distinct `publicKeyHex`. Each `publicKeyHex` is valid 65-byte hex; each `advertisedEndpoint`, when present, is non-empty (an absent endpoint is valid; an empty string is not).
   - **Post:** Returns `PubkeyBook` with entries sorted by `partyId`. Canonical order ensures byte-identical fingerprints across all nodes.
   - **Throws:** `Error` if duplicate `partyId`, duplicate `publicKeyHex`, or entry validation fails.
   - **Concurrency:** None (pure function).
 
 - `serializeBook(book: PubkeyBook): string`
   - **Pre:** book is valid `PubkeyBook`.
-  - **Post:** Returns JSON string (pretty-printed, 2-space indent); operator-readable.
+  - **Post:** Returns JSON string (pretty-printed, 2-space indent); operator-readable. An entry without `advertisedEndpoint` is written without the key (never `null`).
   - **Throws:** Never.
   - **Concurrency:** None (pure function).
 
 - `parseBook(text: string): PubkeyBook`
   - **Pre:** text is JSON string matching the expected structure.
-  - **Post:** Returns validated `PubkeyBook`; entries sorted by `partyId` (calls `buildBook` internally).
-  - **Throws:** `Error` if JSON is invalid, structure missing, fields are wrong type, entry validation fails, or any entry carries a legacy `nodeId` field (Phase F dropped it; book files generated pre-Phase-F must be regenerated via `otzi setup`).
+  - **Post:** Returns validated `PubkeyBook`; entries sorted by `partyId` (calls `buildBook` internally). An entry without an `advertisedEndpoint` key reads back without the key, so `serializeBook` then `parseBook` round-trips a book with no endpoints exactly.
+  - **Throws:** `Error` if JSON is invalid, structure missing, fields are wrong type (a present `advertisedEndpoint` must be a string; `null` is rejected, and so is the empty string), entry validation fails, or any entry carries a legacy `nodeId` field (Phase F dropped it; book files generated pre-Phase-F must be regenerated via `otzi setup`).
   - **Concurrency:** None (pure function).
 
 - `computeFingerprint(book: PubkeyBook): Promise<string>`
   - **Pre:** book is valid `PubkeyBook`.
-  - **Post:** Returns the 96-bit fingerprint: the first 12 bytes of SHA-256 over the concatenated raw pubkey bytes (65B each) in book order (ascending `partyId` = ascending raw pubkey bytes), as lowercase hex in six groups of 4 joined by `-` — `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` (29 characters).
+  - **Post:** Returns the 96-bit fingerprint: the first 12 bytes of SHA-256 over the concatenated raw pubkey bytes (65B each) in book order (ascending `partyId` = ascending raw pubkey bytes), as lowercase hex in six groups of 4 joined by `-` — `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` (29 characters). Endpoints are not an input: the same pubkeys give the same fingerprint with, without, or with different endpoints.
   - **Throws:** Never (crypto operation assumed to succeed).
   - **Concurrency:** Async; safe to call in parallel.
+
+- `keyId(publicKeyHex: string): string`
+  - **Pre:** `publicKeyHex` is 130 hex characters (65 bytes; either case).
+  - **Post:** Returns the first 8 lowercase hex characters of SHA-256 over the raw 65 pubkey bytes. The same key gives the same id on every node. The fingerprint proves every node holds the same book; key ids let an operator check that the book holds only their own nodes' keys.
+  - **Throws:** `Error` if the input is not 130 hex characters.
+  - **Concurrency:** None (pure, synchronous).
 
 **Invariants:**
 - `PubkeyBook.entries` is immutable (readonly array); sorted by `partyId` ascending.
 - Every `publicKeyHex` is exactly 130 chars (65 bytes), lowercase, starts with `04`.
 - `partyId` values are unique and non-negative integers, derived during bootstrap from sorted-pubkey-bytes order (every peer assigns identical mapping).
-- `advertisedEndpoint` is in canonical form (lowercase host, default port 8800 filled in, RFC 5952 IPv6, no wildcards) — caller must apply `canonicalizeEndpoint` before construction.
-- Fingerprint is computed over the sorted raw pubkey bytes (no metadata), so all nodes derive the same `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` string.
+- `advertisedEndpoint`, when present, is in canonical form (lowercase host, default port 8800 filled in, RFC 5952 IPv6, no wildcards) — caller must apply `canonicalizeEndpoint` before construction. It is optional on every entry; only peer-mesh startup and the endpoint-allowlist bootstrap (`runMasterBootstrap` / `runMemberRegister`) read it.
+- Fingerprint is computed over the sorted raw pubkey bytes (no metadata, no endpoints), so all nodes derive the same `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` string. The ring id in `transport-factory` hashes the same bytes and is likewise endpoint-independent.
 - JSON serialization is stable (JSON.stringify with fixed 2-space indent); re-parsing the same book yields the same sorted order.
 
 **Cross-component contracts:**
-- Depends on: Web Crypto API (crypto.subtle.digest for SHA-256), hex utilities (fromHex, toHex), `canonicalizeEndpoint` from `src/util/endpoint.ts`.
-- Used by: `runMasterBootstrap` and `runMemberRegister` to build and distribute the final book; `transport-factory.resolveSelfFromBook` (pubkey-match) and `transport-factory.validatePeersAgainstBook` (canonical-endpoint match) at daemon startup; fingerprint shown to operators.
+- Depends on: Web Crypto API (crypto.subtle.digest for SHA-256, fingerprint), `node:crypto` `createHash` (key id), hex utilities (fromHex, toHex), `canonicalizeEndpoint` from `src/util/endpoint.ts`.
+- Used by: `runMasterBootstrap` and `runMemberRegister` to build and distribute the final book (both still require and write an endpoint for every entry); `transport-factory.resolveSelfFromBook` (pubkey-match) and, for peer-mesh only, `transport-factory.validatePeersAgainstBook` (canonical-endpoint match) at daemon startup; fingerprint shown to operators.
 - Wire/byte format: On-disk JSON (pretty-printed); in-memory entries array sorted by partyId.
 
 **Notes / gotchas:**
 - `buildBook` sorts entries *in-place* after copying (not lazy); ensures canonical order immediately.
 - `computeFingerprint` hashes raw P-256 bytes (0x04 || X || Y), not compressed or any other format.
+- `keyId` hashes the same raw bytes, not the hex text; uppercase and lowercase hex of one key give one id.
 - Operators compare the 96-bit fingerprint out of band across all daemons before any DKG; mismatch = abort + redo bootstrap.
 - Legacy `nodeId` field: dropped in Phase F. `parseBook` strict-rejects entries containing it; cross-node identity is by raw pubkey, local labels live only in `config.node.id`.
 

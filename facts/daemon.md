@@ -339,8 +339,8 @@
 
 - `buildTransportFromFiles(state, options): Promise<TransportBundle>`
   - **Pre:** `config.node.identityKeyFile` + `pubkeyBookFile` paths are set.
-  - **Post:** Loads identity + book from disk, runs `resolveSelfFromBook`, runs `validatePeersAgainstBook` for peer-mesh, derives ringId + peersById, returns bundle.
-  - **Throws:** `Error` on file read, JSON parse, identity-not-in-book, `[[peers]]`/book mismatch, missing paths, or share/book disagreement.
+  - **Post:** Loads identity + book from disk, runs `resolveSelfFromBook`, runs `validatePeersAgainstBook` for peer-mesh (after the endpoint check below), derives ringId + peersById, returns bundle.
+  - **Throws:** `Error` on file read, JSON parse, identity-not-in-book, `[[peers]]`/book mismatch, a peer-mesh book entry without an `advertisedEndpoint`, missing paths, or share/book disagreement.
 
 - `buildTransportFromMemory(state, identity, book, options): Promise<TransportBundle>`
   - **Pre:** Identity + book are pre-built (test path).
@@ -348,21 +348,26 @@
 
 - **Identity file format** (JSON): `{ pkcs8Hex: <hex>, publicKeyHex: <hex> }` — PKCS#8 DER, 130-char hex uncompressed P-256 public key.
 
-- **Pubkey book format:** produced by bootstrap (`runMasterBootstrap` / `runMemberRegister`), parsed by `parseBook`. Entries: `{ partyId, publicKeyHex (130-char), advertisedEndpoint (canonical host:port) }`.
+- **Pubkey book format:** produced by bootstrap (`runMasterBootstrap` / `runMemberRegister`), parsed by `parseBook`. Entries: `{ partyId, publicKeyHex (130-char), advertisedEndpoint? (canonical host:port) }`. `advertisedEndpoint` is optional in the file (a relay book has none); only peer-mesh reads it.
 
 - **`resolveSelfFromBook(identity, book)`** (internal)
   - **Post:** Returns the book entry whose `publicKeyHex` (case-insensitive) matches the loaded identity. When a share is loaded: `share.partyId === selfEntry.partyId` and `share.parties === book.entries.length`.
   - **Throws:** `Error` if no entry matches the identity (re-run `otzi setup` for a stale book); if `share.partyId` disagrees with the book; `Error('share is for <p> parties but the pubkey book has <n>')`.
 
+- **`requireBookEndpoint(entry)`** (internal, peer-mesh only)
+  - **Post:** Returns the entry's `advertisedEndpoint`.
+  - **Throws:** `Error('transport-factory: pubkey book entry for party <id> has no advertisedEndpoint; peer-mesh needs one for every peer')` when the entry has none. The peer-mesh branch applies it to every non-self book entry, in ascending `partyId` order, before `validatePeersAgainstBook`, so the first endpoint-less party is the one named. The self entry needs no endpoint: self listens on `config.transport.advertisedEndpoint`.
+
 - **`validatePeersAgainstBook(book, configPeers, selfPartyId)`** (internal, peer-mesh only)
+  - **Pre:** Every non-self book entry has an `advertisedEndpoint` (`requireBookEndpoint` throws otherwise).
   - **Post:** Returns when the set of non-self book `advertisedEndpoint` values equals the set of `[[peers]].endpoint` values. The book is authoritative for partyId + pubkey; `[[peers]]` is a typo check.
   - **Throws:** `Error` on any endpoint present on one side only.
 
-- **ringId derivation:** SHA-256 over all raw pubkeys concatenated in partyId order, hex-encoded. Identical on every peer.
+- **ringId derivation:** SHA-256 over all raw pubkeys concatenated in partyId order, hex-encoded. Identical on every peer. Endpoints are not an input, so a book with and without endpoints for the same keys gives the same ringId.
 
 - **Transport branching**
-  - **peer-mesh:** requires `config.transport.advertisedEndpoint`; runs `validatePeersAgainstBook`; builds `PeerMeshTransport` from the book (`endpoint: ws://${advertisedEndpoint}`).
-  - **relay:** requires `config.transport.url`; builds `RelayTransport` with partyId + pubkey per book entry. The relay routes by partyId; cryptographic auth alone gates relay traffic.
+  - **peer-mesh:** requires `config.transport.advertisedEndpoint`; requires an `advertisedEndpoint` on every non-self book entry (`requireBookEndpoint`); runs `validatePeersAgainstBook`; builds `PeerMeshTransport` from the book (`endpoint: ws://${advertisedEndpoint}`).
+  - **relay:** requires `config.transport.url`; builds `RelayTransport` with partyId + pubkey per book entry. Never reads a book endpoint, so a book without endpoints is accepted (and `[[peers]]` may be empty). The relay routes by partyId; cryptographic auth alone gates relay traffic.
 
 **Invariants:**
 - The private key is loaded once at startup and never leaves the daemon.
@@ -376,7 +381,7 @@
 - Used by: `entrypoint.ts` (`buildTransportFromFiles`); tests via `buildTransportFromMemory`.
 
 **Notes / gotchas:**
-- `book.advertisedEndpoint` is bare `host:port`; transport-factory prepends `ws://` for `PeerMeshTransport`.
+- `book.advertisedEndpoint` (when present) is bare `host:port`; transport-factory prepends `ws://` for `PeerMeshTransport`.
 - `peersById` reaches the `Daemon` via `DaemonDeps.peersById`; `peersById.size` is the ring size used for DKG `parties` and the default `signers`.
 
 ---

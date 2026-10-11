@@ -6,6 +6,7 @@ import { toHex } from '../otzi/lib/hex';
 import {
   buildBook,
   computeFingerprint,
+  keyId,
   parseBook,
   serializeBook,
   type PubkeyBookEntry,
@@ -153,9 +154,41 @@ describe('pubkey-book — advertisedEndpoint', () => {
     expect(parsed.entries[0]!.advertisedEndpoint).toBe('node-b.example.com:8800');
   });
 
-  it('rejects entries missing advertisedEndpoint', () => {
+  it('round-trips a book whose entries have no advertisedEndpoint', () => {
+    const book = buildBook([
+      { partyId: 0, publicKeyHex: '04' + '11'.repeat(64) },
+      { partyId: 1, publicKeyHex: '04' + '22'.repeat(64) },
+    ]);
+    const text = serializeBook(book);
+    // The key is omitted from the file, not written as null.
+    expect(text).not.toContain('advertisedEndpoint');
+    const parsed = parseBook(text);
+    expect(parsed.entries).toStrictEqual(book.entries);
+    for (const e of parsed.entries) expect('advertisedEndpoint' in e).toBe(false);
+  });
+
+  it('round-trips a book that mixes entries with and without advertisedEndpoint', () => {
+    const book = buildBook([
+      { partyId: 0, publicKeyHex: '04' + '11'.repeat(64), advertisedEndpoint: '127.0.0.1:18800' },
+      { partyId: 1, publicKeyHex: '04' + '22'.repeat(64) },
+    ]);
+    const parsed = parseBook(serializeBook(book));
+    expect(parsed.entries).toStrictEqual(book.entries);
+    expect(parsed.entries[0]!.advertisedEndpoint).toBe('127.0.0.1:18800');
+    expect('advertisedEndpoint' in parsed.entries[1]!).toBe(false);
+  });
+
+  it('rejects an empty-string advertisedEndpoint', () => {
+    const entry = { partyId: 0, publicKeyHex: VALID_PUBKEY, advertisedEndpoint: '' };
+    expect(() => buildBook([entry])).toThrow(/advertisedEndpoint must be non-empty/);
+    expect(() => parseBook(JSON.stringify({ entries: [entry] }))).toThrow(
+      /advertisedEndpoint must be non-empty/,
+    );
+  });
+
+  it('rejects a null advertisedEndpoint (present means a string)', () => {
     const obj = {
-      entries: [{ partyId: 0, publicKeyHex: VALID_PUBKEY }],
+      entries: [{ partyId: 0, publicKeyHex: VALID_PUBKEY, advertisedEndpoint: null }],
     };
     expect(() => parseBook(JSON.stringify(obj))).toThrow(/advertisedEndpoint must be a string/);
   });
@@ -181,6 +214,51 @@ describe('pubkey-book — advertisedEndpoint', () => {
       ],
     };
     expect(() => parseBook(JSON.stringify(obj))).toThrow(/nodeId is no longer supported/);
+  });
+});
+
+describe('pubkey-book — key ids', () => {
+  it('keyId is the first 8 hex chars of sha256(raw pubkey)', async () => {
+    const identity = await generateIdentity();
+    const hex = toHex(identity.publicKeyRaw);
+    const expected = createHash('sha256').update(Buffer.from(hex, 'hex')).digest('hex').slice(0, 8);
+    expect(keyId(hex)).toBe(expected);
+    expect(keyId(hex)).toMatch(/^[0-9a-f]{8}$/);
+    // Fixed vector: sha256 of 04 || 64 x 0x11.
+    const fixed = '04' + '11'.repeat(64);
+    expect(keyId(fixed)).toBe(
+      createHash('sha256').update(Buffer.from(fixed, 'hex')).digest('hex').slice(0, 8),
+    );
+  });
+
+  it('keyId is lowercase whatever the case of the input hex', () => {
+    const lower = '04' + 'ab'.repeat(64);
+    expect(keyId(lower.toUpperCase())).toBe(keyId(lower));
+    expect(keyId(lower)).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  it('keyId rejects input that is not a 65-byte hex pubkey', () => {
+    expect(() => keyId('04abc')).toThrow(/130/);
+    expect(() => keyId('zz'.repeat(65))).toThrow(/hex/);
+  });
+
+  it('fingerprint ignores endpoints', async () => {
+    const [a, b] = await Promise.all([makePeer('a', 18800), makePeer('b', 18801)]);
+    const withEndpoints = buildBook([
+      { partyId: 0, publicKeyHex: toHex(a.identity.publicKeyRaw), advertisedEndpoint: a.advertisedEndpoint },
+      { partyId: 1, publicKeyHex: toHex(b.identity.publicKeyRaw), advertisedEndpoint: b.advertisedEndpoint },
+    ]);
+    const withoutEndpoints = buildBook([
+      { partyId: 0, publicKeyHex: toHex(a.identity.publicKeyRaw) },
+      { partyId: 1, publicKeyHex: toHex(b.identity.publicKeyRaw) },
+    ]);
+    const differentEndpoints = buildBook([
+      { partyId: 0, publicKeyHex: toHex(a.identity.publicKeyRaw), advertisedEndpoint: 'other.example:9000' },
+      { partyId: 1, publicKeyHex: toHex(b.identity.publicKeyRaw) },
+    ]);
+    const fp = await computeFingerprint(withEndpoints);
+    expect(await computeFingerprint(withoutEndpoints)).toBe(fp);
+    expect(await computeFingerprint(differentEndpoints)).toBe(fp);
   });
 });
 
