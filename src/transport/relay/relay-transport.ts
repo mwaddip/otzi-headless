@@ -23,11 +23,12 @@
  * started by the initiator — on its own record failure, on the next send or
  * pull, or on a re-handshake request (an empty frame) from the responder,
  * which a responder also sends when its own handshake fails. A request
- * restarts the handshake from any state. Restarts a request triggers are
- * limited to one per peer per `REHANDSHAKE_MIN_INTERVAL_MS` after the last
- * restart of any kind; a request inside that window is deferred to its end,
- * not dropped (the responder sends it once). A responder accepts a fresh hs1
- * in any state.
+ * restarts the handshake from any state. Every initiator restart, whatever
+ * triggers it (the roster, a record failure, a stale handshake, a request),
+ * takes place at most once per `REHANDSHAKE_MIN_INTERVAL_MS` per peer: a
+ * trigger inside the window is deferred to its end, never dropped, so a pair
+ * that cannot agree retries once per window, not at the pace of its traffic.
+ * A responder accepts a fresh hs1 in any state.
  *
  * Reconnect: a relay socket that fails to open, drops, or has its hello
  * refused ends every peer session and schedules the next attempt with
@@ -113,14 +114,17 @@ interface PeerState {
   /** Initiator: when the current handshake started, and which one it is. */
   handshakeStartedAt: number;
   handshakeAttempt: number;
-  /** Initiator: when the handshake last (re)started, for any reason (rate limit on requests). */
+  /** Initiator: when the handshake last (re)started, for any reason: the rate limit counts from it. */
   lastRestartAt: number;
   /**
-   * Initiator: the timer that restarts the handshake at the end of the rate-limit window, for the
-   * re-handshake requests that arrived inside it (merged: at most one per peer), and the session
-   * the initiator held when the latest of them arrived.
+   * Initiator: the timer that starts the handshake at the end of the rate-limit window, for the
+   * triggers that arrived inside it (merged: at most one per peer). `deferredRequestOnly`: every
+   * one of them was a re-handshake request, and `deferredForSession` is the session held when the
+   * latest request arrived: a session that has replaced it by the time the timer fires has
+   * answered such requests. Any other trigger (record failure, ...) is not answered that way.
    */
   deferredRestart: NodeJS.Timeout | null;
+  deferredRequestOnly: boolean;
   deferredForSession: RecordSession | null;
   /** Serialises every frame to this peer (handshake and records): the relay sees them in counter order. */
   sendChain: Promise<void>;
@@ -235,6 +239,7 @@ export class RelayTransport implements Transport {
         handshakeAttempt: 0,
         lastRestartAt: 0,
         deferredRestart: null,
+        deferredRequestOnly: false,
         deferredForSession: null,
         sendChain: Promise.resolve(),
         pending: [],
@@ -401,7 +406,7 @@ export class RelayTransport implements Transport {
       const peer = this.peerStates.get(partyId);
       if (!peer) continue;
       peer.online = true;
-      if (peer.role === 'initiator') void this.startInitiatorHandshake(peer);
+      if (peer.role === 'initiator') this.startInitiatorHandshake(peer);
       else peer.status = 'waiting-for-hs1';
     }
   }
@@ -411,7 +416,7 @@ export class RelayTransport implements Transport {
     if (!peer) return;
     peer.online = true;
     // A (re)joined peer holds no session: any handshake in flight went to its previous connection.
-    if (peer.role === 'initiator') void this.startInitiatorHandshake(peer, { restart: true });
+    if (peer.role === 'initiator') this.startInitiatorHandshake(peer, { restart: true });
     else this.endSession(peer, 'waiting-for-hs1');
   }
 
@@ -489,8 +494,10 @@ export class RelayTransport implements Transport {
     }
     if (peer.status === 'connected' && peer.session) {
       if (await this.handleConnectedIncoming(peer, payload)) return;
-      this.log.warn('relay-transport: record auth failed; re-handshaking', { peerPartyId: peer.partyId });
-      void this.startInitiatorHandshake(peer, { restart: true });
+      // One warning per pending restart, not one per frame that fails while it waits for its window.
+      if (!peer.deferredRestart)
+        this.log.warn('relay-transport: record auth failed; re-handshaking', { peerPartyId: peer.partyId });
+      this.startInitiatorHandshake(peer, { restart: true });
       return;
     }
     // A record while this node holds no session: the responder still holds one.
@@ -506,65 +513,17 @@ export class RelayTransport implements Transport {
     if (peer.role !== 'initiator' || !peer.online) return;
     const stale =
       peer.status === 'waiting-for-hs2' && Date.now() - peer.handshakeStartedAt > HANDSHAKE_TIMEOUT_MS;
-    if (peer.status === 'disconnected' || stale) void this.startInitiatorHandshake(peer, { restart: true });
+    if (peer.status === 'disconnected' || stale) this.startInitiatorHandshake(peer, { restart: true });
   }
 
   /**
    * The responder discarded whatever it held, our hs1 included, so waiting for
-   * an hs2 cannot succeed: restart from any state. A request inside
-   * `REHANDSHAKE_MIN_INTERVAL_MS` of the last restart (of any kind) is not
-   * dropped, since the responder sends it once and nothing else would tell us
-   * (our own traffic may be idle): it is deferred to the end of the window.
-   * So a pair whose handshakes keep failing (say, mismatched keys) retries
-   * once per window, not at network speed.
+   * an hs2 cannot succeed: restart from any state (subject to the window, see
+   * `startInitiatorHandshake`).
    */
   private onRehandshakeRequest(peer: PeerState): void {
-    const sinceLast = Date.now() - peer.lastRestartAt;
-    // A negative interval is a clock that stepped back: not a reason to hold requests off.
-    if (sinceLast >= 0 && sinceLast < REHANDSHAKE_MIN_INTERVAL_MS) {
-      this.deferRestart(peer, REHANDSHAKE_MIN_INTERVAL_MS - sinceLast);
-      return;
-    }
-    this.log.info('relay-transport: re-handshake requested', { peerPartyId: peer.partyId });
-    void this.startInitiatorHandshake(peer, { restart: true });
-  }
-
-  /** Restart `delayMs` from now unless something else restarts first; repeated requests share one timer. */
-  private deferRestart(peer: PeerState, delayMs: number): void {
-    // The session this request is about. One that replaces it before the timer fires has answered it.
-    peer.deferredForSession = peer.session;
-    if (peer.deferredRestart) {
-      this.log.debug('relay-transport: re-handshake request deferred (rate limit)', {
-        peerPartyId: peer.partyId,
-        delayMs,
-        merged: true,
-      });
-      return;
-    }
-    this.log.debug('relay-transport: re-handshake request deferred (rate limit)', {
-      peerPartyId: peer.partyId,
-      delayMs,
-    });
-    peer.deferredRestart = setTimeout(() => {
-      const since = peer.deferredForSession;
-      peer.deferredRestart = null;
-      peer.deferredForSession = null;
-      if (this.stopped) return;
-      if (peer.status === 'connected' && peer.session && peer.session !== since) {
-        this.log.debug('relay-transport: deferred re-handshake request already answered by a newer session', {
-          peerPartyId: peer.partyId,
-        });
-        return;
-      }
-      this.log.info('relay-transport: re-handshake requested (deferred)', { peerPartyId: peer.partyId });
-      void this.startInitiatorHandshake(peer, { restart: true });
-    }, delayMs);
-  }
-
-  private clearDeferredRestart(peer: PeerState): void {
-    if (peer.deferredRestart) clearTimeout(peer.deferredRestart);
-    peer.deferredRestart = null;
-    peer.deferredForSession = null;
+    this.log.debug('relay-transport: re-handshake requested', { peerPartyId: peer.partyId });
+    this.startInitiatorHandshake(peer, { restart: true, request: true });
   }
 
   /** Responder: ask the initiator for a fresh handshake (an empty frame). */
@@ -577,11 +536,78 @@ export class RelayTransport implements Transport {
     );
   }
 
-  private async startInitiatorHandshake(peer: PeerState, opts: { restart?: boolean } = {}): Promise<void> {
-    if (this.stopped || !this.ws || peer.role !== 'initiator') return;
+  /**
+   * Initiator: the only way a handshake starts, for every trigger (the roster, a record
+   * failure, a stale handshake, a re-handshake `request`, ...). Starts one with an online
+   * peer that has none, or with `restart` ends the current one and starts over.
+   *
+   * At most one start per peer per `REHANDSHAKE_MIN_INTERVAL_MS`, counted from the last one
+   * of any kind. A trigger inside the window is deferred, not dropped (nobody retries it: the
+   * responder sends a request once, and our own traffic may be idle): one timer per peer starts
+   * the handshake when the window ends, and further triggers merge into it. A peer's first
+   * handshake is immediate. So a pair whose handshakes keep failing (say, mismatched keys)
+   * restarts once per window however much traffic arrives, not at the pace of that traffic.
+   */
+  private startInitiatorHandshake(peer: PeerState, opts: { restart?: boolean; request?: boolean } = {}): void {
+    if (!this.canHandshake(peer)) return;
     if (peer.status !== 'disconnected' && !opts.restart) return;
+    const sinceLast = Date.now() - peer.lastRestartAt;
+    // A negative interval is a clock that stepped back: not a reason to hold anything off.
+    if (sinceLast >= 0 && sinceLast < REHANDSHAKE_MIN_INTERVAL_MS) {
+      this.deferStart(peer, REHANDSHAKE_MIN_INTERVAL_MS - sinceLast, opts.request === true);
+      return;
+    }
+    void this.beginInitiatorHandshake(peer);
+  }
+
+  /** Start `delayMs` from now unless something else starts one first; triggers share one timer. */
+  private deferStart(peer: PeerState, delayMs: number, request: boolean): void {
+    // The session a request is about: one that replaces it before the timer fires has answered it.
+    if (request) peer.deferredForSession = peer.session;
+    if (peer.deferredRestart) {
+      peer.deferredRequestOnly = peer.deferredRequestOnly && request;
+      return;
+    }
+    peer.deferredRequestOnly = request;
+    this.log.debug('relay-transport: handshake restart deferred (rate limit)', {
+      peerPartyId: peer.partyId,
+      delayMs,
+      request,
+    });
+    peer.deferredRestart = setTimeout(() => {
+      const requestOnly = peer.deferredRequestOnly;
+      const since = peer.deferredForSession;
+      peer.deferredRestart = null;
+      peer.deferredRequestOnly = false;
+      peer.deferredForSession = null;
+      if (!this.canHandshake(peer)) return;
+      if (requestOnly && peer.status === 'connected' && peer.session && peer.session !== since) {
+        this.log.debug('relay-transport: deferred re-handshake request already answered by a newer session', {
+          peerPartyId: peer.partyId,
+        });
+        return;
+      }
+      void this.beginInitiatorHandshake(peer);
+    }, delayMs);
+  }
+
+  private clearDeferredRestart(peer: PeerState): void {
+    if (peer.deferredRestart) clearTimeout(peer.deferredRestart);
+    peer.deferredRestart = null;
+    peer.deferredRequestOnly = false;
+    peer.deferredForSession = null;
+  }
+
+  /** The relay is up and this is an initiator's online peer. */
+  private canHandshake(peer: PeerState): boolean {
+    return !this.stopped && this.ws !== null && peer.role === 'initiator' && peer.online;
+  }
+
+  /** Begin a handshake now (the window has been checked): the old session ends and hs1 goes out. */
+  private async beginInitiatorHandshake(peer: PeerState): Promise<void> {
+    if (!this.canHandshake(peer)) return;
     // Synchronously: the old session ends (its pulls resolve null) and later triggers see a handshake under way.
-    // A request deferred until now is answered by this restart (a later one will be deferred anew).
+    // A start deferred until now is answered by this one (a later trigger will be deferred anew).
     this.clearDeferredRestart(peer);
     this.endSession(peer, 'waiting-for-hs2');
     peer.handshakeStartedAt = peer.lastRestartAt = Date.now();
@@ -670,7 +696,7 @@ export class RelayTransport implements Transport {
   private sessionBroken(peer: PeerState, reason: string): void {
     this.log.warn('relay-transport: session broken', { peerPartyId: peer.partyId, reason });
     if (peer.role === 'initiator') {
-      void this.startInitiatorHandshake(peer, { restart: true });
+      this.startInitiatorHandshake(peer, { restart: true });
     } else {
       this.endSession(peer, 'waiting-for-hs1');
       this.requestRehandshake(peer);
