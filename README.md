@@ -326,6 +326,7 @@ daemon UDS are reserved for tests + debugging.
 | Verb | Purpose |
 |---|---|
 | `otzi daemon <config>` | Run the daemon (long-lived; usually started by systemd). |
+| `otzi relay --listen <host:port>` | Run the relay server for relay-transport rings (long-lived; behind a TLS reverse proxy). |
 | `otzi setup <config>` | Bootstrap pubkey exchange. Reads `[bootstrap].role`. Prints the 96-bit fingerprint. |
 | `otzi generate` | Run the run-once DKG through the local daemon; prints the vault address. |
 | `otzi vault [--json] [--config <path>]` | Print the vault address, network and threshold/parties (keys with `--json`), checked against the daemon's loaded share. |

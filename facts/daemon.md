@@ -325,7 +325,7 @@
 - Stdout is never written (it carries CLI output).
 
 **Cross-component contracts:**
-- Used by: `entrypoint.ts` (`runDaemonCommand`; the CLI verbs keep `NOOP_LOGGER`).
+- Used by: `entrypoint.ts` (`runDaemonCommand` and `runRelayCommand`; the other CLI verbs keep `NOOP_LOGGER`).
 - `examples/fail2ban/otzi.conf` matches `WARN peer-allowlist: dropped connection from non-peer source {"ip":"<HOST>"…` at the start of the line (after journald's optional `<host> <ident>[<pid>]: ` prefix).
 
 ---
@@ -387,13 +387,14 @@
 ---
 
 ### `entrypoint.ts`
-**Purpose:** The `otzi` executable. Dispatches verbs, runs the daemon, prints operator banners, maps errors to exit codes.
+**Purpose:** The `otzi` executable. Dispatches verbs, runs the daemon and the relay server, prints operator banners, maps errors to exit codes.
 
 **Verbs:**
 
 | Verb | Behaviour |
 |---|---|
 | `otzi daemon <config>` | Run the daemon (`runDaemonCommand`). |
+| `otzi relay --listen <host:port>` | Run the relay server for `[transport] kind = "relay"` rings (`runRelayCommand`); needs no config and no vault. |
 | `otzi setup <config>` | Bootstrap pubkey exchange (endpoint allowlist under peer-mesh, count under relay); prints the 96-bit fingerprint and the key ids of this node and every ring entry. |
 | `otzi generate [--config <path>] [--ceremony-id <id>]` | Daemon `dkg` op (`generate`); banner prints the vault address and the restart instruction. |
 | `otzi vault [--json] [--config <path>]` | Address, network, threshold/parties, checked against the daemon's loaded share (`vault`); the full file (keys included) with `--json`. |
@@ -408,7 +409,7 @@
 | `otzi backup` / `otzi restore <archive> [--password-stdin]` | Archive and restore node state. |
 
 - `--config` defaults to `/etc/otzi/daemon.toml`. Every `book` verb takes it too, to learn the network, and `vault` to find the daemon.
-- CLI verbs other than `daemon` keep `NOOP_LOGGER` and write machine output to stdout only; banners, summaries and errors go to stderr. Stdout per verb: `vault` the text or JSON; `btc balance` the two balance lines; `btc send` the txid, then the explorer URL; `btc sign` the txid, then the signed hex, then (with `--broadcast`) the explorer URL; `book list` one tab-separated line per entry; `book import` the line `added <a>, updated <u>, unchanged <n>, removed <r>`; `book export` the book file when no path is given. `generate`, `book add` and `book remove` print only to stderr, as does `book export <path>`.
+- CLI verbs other than `daemon` and `relay` keep `NOOP_LOGGER` and write machine output to stdout only; banners, summaries and errors go to stderr. Stdout per verb: `vault` the text or JSON; `btc balance` the two balance lines; `btc send` the txid, then the explorer URL; `btc sign` the txid, then the signed hex, then (with `--broadcast`) the explorer URL; `book list` one tab-separated line per entry; `book import` the line `added <a>, updated <u>, unchanged <n>, removed <r>`; `book export` the book file when no path is given. `generate`, `book add` and `book remove` print only to stderr, as does `book export <path>`.
 - `parseVerbArgs(args, { values?, booleans? }): { positional: string[]; flags: Map<string, string> }` — positionals and `--flags` in any order. A `values` flag takes the next argument (`flag '--x' needs a value` when it is missing or starts with `--`); a `booleans` flag takes none (so `btc sign --broadcast <file>` works); any other `--flag` is `unknown flag '--x'`, so a typo never falls back to a default.
 - `reportCliError(err, write?)` — the message on stderr. A `BroadcastFailedError` also prints a line naming the txid and saying the transaction is signed but not broadcast, then the signed transaction hex as the last line, so the operator can broadcast it by other means. The process exits 1 on any error.
 - `otzi generate` takes no positional argument; a positional (the pre-0.3 `otzi generate <config.toml>`) fails with a hint to use `--config`. Its banner (stderr) prints the ceremony ID, network, vault address, share path and `Restart every daemon to load its share before signing.`
@@ -418,12 +419,18 @@
 - **`runDaemonCommand`**
   - **Post:** `loadAndValidate(configPath, { logger })` → `buildTransportFromFiles` → `Daemon` → `start`; SIGINT/SIGTERM stop the daemon and the transport, then exit 0. The startup line names the mode: signing (vault loaded) or setup (no vault). In setup mode it states that signing requests are rejected until the DKG runs (`otzi generate`) and every daemon restarts to load its share. The ceremony pull backoff comes from `pullOpts` (`initialDelayMs` 100, `maxDelayMs` 2 000); orchestrator and leader replace its `deadlineMs` and `maxAttempts` with the ceremony deadlines. The stale-`.pending` warning and the `vault-pubkey.json` rewrite come from `loadAndValidate` (through the logger passed in); `runDaemonCommand` does not warn a second time.
 
+- **`runRelayCommand(args: string[]): Promise<void>`**
+  - **Pre:** `args` holds exactly `--listen <host:port>`. The host is required and there is no default: the verb never binds every interface by accident (the packaged default `127.0.0.1:7100` lives in `/etc/otzi/relay.env`, which the unit passes as `--listen`).
+  - **Post:** `parseVerbArgs(args, { values: ['listen'] })`, then a `RelayServer({ listen, logger: createConsoleLogger() })` is started (default heartbeat). Resolves once the relay is listening; the open listener keeps the process alive. The console logger's `RelayServer: listening {"host":…,"port":…}` line on stderr is the listen line (the real port when `--listen` names port 0), followed by one line per connect and disconnect. SIGINT/SIGTERM log `received <signal>, shutting down`, stop the server, then exit 0. Nothing is written to stdout.
+  - **Throws:** `unknown flag '--x'` for any other flag; `flag '--listen' needs a value`; `unexpected argument '<x>'` plus the usage for a positional; `otzi relay needs --listen <host:port>` plus the usage when `--listen` is absent; `RelayServer`'s `invalid listen '<x>' — expected 'host:port'` / `invalid port` for a malformed address; the bind error (e.g. `listen EADDRINUSE: address already in use …`) when the address cannot be bound. In every case the process exits 1 through `reportCliError`, and no signal handler is installed (they are installed after the bind).
+  - **Scope:** the relay serves plain WebSocket and has no TLS; anything beyond loopback or a VPN goes behind a TLS reverse proxy (`wss://`). It reads no daemon config, share, identity or pubkey book.
+
 **Invariants:**
-- The daemon is the only long-lived verb; every other verb talks to it over the daemon client (UDS by default) or works on local files.
-- TOML + share password are required by the daemon; absence fails at load time.
+- The daemon and the relay are the only long-lived verbs; every other verb talks to the daemon over the daemon client (UDS by default) or works on local files.
+- TOML + share password are required by the daemon; absence fails at load time. `otzi relay` needs neither.
 
 **Cross-component contracts:**
-- Depends on: `config-merge`, `transport-factory`, `Daemon`, `setup`, `src/cli/cmd/*`.
+- Depends on: `config-merge`, `transport-factory`, `Daemon`, `setup`, `src/cli/cmd/*`, `RelayServer` (`src/transport/relay/server.ts`; see [transport.md](transport.md)), `console-logger`.
 
 ---
 

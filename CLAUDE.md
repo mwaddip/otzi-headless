@@ -72,7 +72,7 @@ Default is `auto` everywhere. The gate is opt-in per node, not required infrastr
 
 Config-selectable:
 1. **Peer mesh** — direct WebSocket connections between daemons. Fits permanent federations with stable identities.
-2. **Relay** — the headless relay server (`src/transport/relay/server.ts`), a dumb router of opaque encrypted frames. Simpler, but requires a coordinator online. otzi-headless never joins an Ötzi relay session.
+2. **Relay** — the headless relay server (`src/transport/relay/server.ts`), a dumb router of opaque encrypted frames. Simpler, but requires a coordinator online. Operators run it with `otzi relay --listen <host:port>` on the coordinator host, behind a TLS reverse proxy (`wss://`), shipped as `otzi-relay.service`. otzi-headless never joins an Ötzi relay session.
 
 Both share the same E2E encrypted wire format (Noise-KK over ECDH P-256, AES-256-GCM records).
 

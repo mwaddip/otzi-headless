@@ -3,6 +3,7 @@
  *
  *   otzi daemon <config.toml>                   — run the daemon
  *   otzi setup <config.toml>                    — run bootstrap (reads [bootstrap].role from config)
+ *   otzi relay --listen <host:port>             — run the relay server (transport = "relay" deployments)
  *   otzi generate [--config <path>] [...]       — run the DKG through the local daemon
  *   otzi vault [--json] [--config <path>]       — print vault metadata, checked against the daemon
  *   otzi btc balance [--unit ...]               — vault balance from Esplora
@@ -14,6 +15,8 @@
  *
  * The `daemon` subcommand loads config + share + identity + pubkey book and
  * starts the transport + Daemon. SIGINT/SIGTERM trigger graceful shutdown.
+ * The `relay` subcommand is the other long-lived verb: it needs no config and
+ * no vault, only the address to listen on, and stops the same way.
  * If the configured share file is missing, the daemon comes up in setup
  * mode (signing rejected; DKG works) — the operator runs `otzi generate` on
  * one node, then restarts every daemon to load its new share.
@@ -28,6 +31,7 @@
 import { BroadcastFailedError } from '../cli/cmd/btc';
 import type { BtcUnit } from '../cli/units';
 import { loadDaemonConfig } from '../config/load';
+import { RelayServer } from '../transport/relay/server';
 import { loadAndValidate } from './config-merge';
 import { createConsoleLogger } from './console-logger';
 import { Daemon } from './daemon';
@@ -45,6 +49,9 @@ export async function main(argv: readonly string[]): Promise<void> {
       return;
     case 'setup':
       await runSetupCommand(rest);
+      return;
+    case 'relay':
+      await runRelayCommand(rest);
       return;
     case 'generate':
       await runGenerateCommand(rest);
@@ -74,6 +81,7 @@ function usage(): string {
     'usage:',
     '  otzi daemon <path/to/daemon.toml>',
     '  otzi setup <path/to/daemon.toml>',
+    '  otzi relay --listen <host:port>',
     '  otzi generate [--config <path>] [--ceremony-id <id>]',
     '  otzi vault [--json] [--config <path>]',
     '  otzi btc balance [--unit sats|btc|mbtc|ubtc] [--config <path>]',
@@ -182,6 +190,37 @@ async function runSetupCommand(args: string[]): Promise<void> {
   if (!config.bootstrap.leaderUrl)
     throw new Error('otzi setup: bootstrap.leader_url missing for role=leaf');
   await setupMember(configPath, config.bootstrap.leaderUrl);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `otzi relay`
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Run the relay server (`RelayServer`) until SIGINT or SIGTERM. Needs no daemon
+ * config and no vault. There is no default address: the host is required, so a
+ * relay never binds to every interface by accident. Logs through the console
+ * logger (stderr); stdout stays empty.
+ */
+export async function runRelayCommand(args: string[]): Promise<void> {
+  const { positional, flags } = parseVerbArgs(args, { values: ['listen'] });
+  noPositional(positional);
+  const listen = flags.get('listen');
+  if (listen === undefined) throw new Error(`otzi relay needs --listen <host:port>\n${usage()}`);
+
+  const server = new RelayServer({ listen, logger: createConsoleLogger() });
+  await server.start();
+
+  const shutdown = async (signal: string) => {
+    console.error(`received ${signal}, shutting down`);
+    try {
+      await server.stop();
+    } finally {
+      process.exit(0);
+    }
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
