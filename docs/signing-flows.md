@@ -139,8 +139,9 @@ vault key over the same transcript and has staged its share durably to disk.
 **Failure at any step.** The failing node broadcasts `signoff-aborted
 {ceremonyId, reason}` and settles as aborted. Because the DKG is symmetric, a node
 accepts a DKG `signoff-aborted` from any ring member and stops. A node that had
-not yet published its `dkg-verified` deletes its `.pending` file: no node can have
-committed without its confirmation. A node that had published it keeps the file,
+not yet published its `dkg-verified` deletes the `.pending` file this ceremony
+staged, if any (a ceremony that staged nothing leaves an existing `.pending`
+alone): no node can have committed without its confirmation. A node that had published it keeps the file,
 because another node may already have committed the vault, and logs an error
 naming the file, the vault address and the recovery: run `otzi vault` on the
 other nodes; if any shows that address, rename `.pending` to the share path and
