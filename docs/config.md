@@ -110,7 +110,7 @@ signet.
 |---|---|---|
 | `kind` | `"peer-mesh"` \| `"relay"` | See `CLAUDE.md` § Transport. `peer-mesh` = direct WebSocket between daemons. `relay` = the headless relay server (`src/transport/relay/server.ts`) routes opaque encrypted frames. |
 | `advertised_endpoint` | string | Required when `kind="peer-mesh"`. This node's reachable `host[:port]` (canonical form post-parse; see § Canonical endpoint form). Peers will dial here. Wildcards (`0.0.0.0`, `::`) rejected. |
-| `url` | string | Required when `kind="relay"`. `ws://` URL of the relay (e.g. `ws://relay.example:9000`). |
+| `url` | string | Required when `kind="relay"`. WebSocket URL of the relay: `ws://` on loopback or a VPN (e.g. `ws://relay.example:9000`), or `wss://` through a TLS reverse proxy in front of the relay. The daemon redials a relay that is down or drops the connection (backoff 1 s … 30 s). Both the daemon and the relay send a keepalive ping every 20 s, so a proxy idle timeout above 20 s keeps the connection open. |
 
 The parser rejects a `listen` field with an error pointing at
 `advertised_endpoint`.

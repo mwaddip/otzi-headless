@@ -13,6 +13,9 @@
  *   - Per-ring connection roster + peer-joined/peer-left notifications.
  *   - Routing `frame { to, payload }` from sender's ring to the target peer.
  *   - First-come-first-served partyId slot per ring (rejects dup connects).
+ *   - Heartbeat: every connection is pinged each `heartbeatMs`; one that has
+ *     not answered the previous ping is terminated, which frees its slot and
+ *     tells the ring `peer-left` like any close.
  *
  * Deployment: bind to loopback + front with TLS/firewall, or put on a VPN.
  * Anyone who reaches the port can claim a partyId slot — Noise KK still
@@ -35,8 +38,12 @@ import {
 export interface RelayServerOptions {
   /** `"host:port"` — host required (no 0.0.0.0 default). */
   listen: string;
+  /** Ping interval; a connection that missed the previous ping's pong is terminated. Default 20 000 ms. */
+  heartbeatMs?: number;
   logger?: Logger;
 }
+
+const DEFAULT_HEARTBEAT_MS = 20_000;
 
 interface PartyConnection {
   partyId: PartyId;
@@ -55,12 +62,19 @@ export class RelayServer {
   private readonly rings = new Map<string, Ring>();
   private wss: WebSocketServer | null = null;
   private httpServer: http.Server | null = null;
+  private readonly heartbeatMs: number;
+  private heartbeat: NodeJS.Timeout | null = null;
+  /** Connections that have not answered the latest ping. */
+  private readonly awaitingPong = new WeakSet<WebSocket>();
 
   constructor(options: RelayServerOptions) {
     const { host, port } = parseBind(options.listen);
     this.host = host;
     this.port = port;
     this.log = options.logger ?? NOOP_LOGGER;
+    this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    if (!Number.isFinite(this.heartbeatMs) || this.heartbeatMs < 1)
+      throw new Error(`RelayServer: heartbeatMs must be a finite number of ms, at least 1 (got ${this.heartbeatMs})`);
   }
 
   async start(): Promise<void> {
@@ -86,11 +100,14 @@ export class RelayServer {
       httpServer.listen(this.port, this.host);
     });
 
+    this.heartbeat = setInterval(() => this.beat(wss), this.heartbeatMs);
     this.log.info('RelayServer: listening', this.address() ?? {});
   }
 
   async stop(): Promise<void> {
     if (!this.wss) return;
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = null;
     for (const ring of this.rings.values()) {
       for (const conn of ring.parties.values()) conn.ws.close();
     }
@@ -115,7 +132,27 @@ export class RelayServer {
 
   // ─────────────────────────────────────────────────────────────────────
 
+  /** Terminate every connection that missed the previous ping; ping the rest. */
+  private beat(wss: WebSocketServer): void {
+    for (const ws of wss.clients) {
+      if (this.awaitingPong.has(ws)) {
+        // Its close handler frees the slot and sends peer-left.
+        this.log.warn('relay: terminating a connection that did not answer a ping');
+        ws.terminate();
+        continue;
+      }
+      this.awaitingPong.add(ws);
+      try {
+        ws.ping();
+      } catch {
+        /* closing: its close event cleans up */
+      }
+    }
+  }
+
   private handleConnection(ws: WebSocket): void {
+    ws.on('pong', () => this.awaitingPong.delete(ws));
+
     let state: { ringId: string; partyId: PartyId } | null = null;
 
     const send = (msg: RelayServerMsg) => {

@@ -414,13 +414,27 @@ describe('LeaderDispatcher.runDkg', () => {
 // ─── Ceremony deadline (R26) ─────────────────────────────────────────────
 
 describe('LeaderDispatcher ceremony deadline', () => {
-  const CEREMONY_MS = 1_000;
-  /** Node 1's round-1 blob reaches the leader this late; per-pull deadlines alone would fail at ≥ 1 700 ms. */
-  const LATE_MS = 700;
+  const CEREMONY_MS = 2_000;
+  /**
+   * Node 1's round-1 blob reaches the leader this late. A per-pull or per-round
+   * deadline would then fail at least CEREMONY_MS after round 1 completes; the
+   * ceremony deadline fails CEREMONY_MS after the start. Both margins (round 1
+   * done before the deadline; the failure well under CEREMONY_MS after round 1)
+   * are 1 s, many times what round 1 takes even under CPU load.
+   */
+  const LATE_MS = 1_000;
   /** The leader does not get `held` blobs from its peers while `held` says so. */
   function holdBack(node: RingNode, held: (key: BlobKey) => boolean): void {
     const pull = node.io.transport.pull.bind(node.io.transport);
     node.io.transport.pull = async key => (held(key) ? null : pull(key));
+  }
+  /** When `node` first stores a blob `matches` accepts (epoch ms), or null while it has not. */
+  function firstStored(node: RingNode, matches: (key: BlobKey) => boolean): { at: number | null } {
+    const seen: { at: number | null } = { at: null };
+    node.io.store.onPut(key => {
+      if (seen.at === null && matches(key)) seen.at = Date.now();
+    });
+    return seen;
   }
 
   it('a leader whose co-signer never answers round 2 fails at the signing deadline', async () => {
@@ -433,16 +447,20 @@ describe('LeaderDispatcher ceremony deadline', () => {
       ring[0]!,
       k => k.from === 1 && (k.round === 'sign-r2' || (k.round === 'sign-r1' && Date.now() - started < LATE_MS)),
     );
+    const round1Done = firstStored(ring[0]!, k => k.ceremonyId === 'pay-late' && k.round === 'sign-r2' && k.from === 0);
 
     const err = await rejection(
       leader.sign({ ceremonyId: 'pay-late', signers: [0, 1, 2], proposal: makeProposal(tv.vaultKey, NET) }),
     );
-    const elapsed = Date.now() - started;
+    const failedAt = Date.now();
     expect((err as Error).message).toBe(`ceremony deadline of ${CEREMONY_MS} ms passed`);
-    expect(elapsed).toBeGreaterThanOrEqual(CEREMONY_MS - 50);
-    expect(elapsed).toBeLessThan(LATE_MS + CEREMONY_MS - 300);
-    // The leader got past round 1 (it produced its own sign-r2) before the deadline stopped it.
+    expect(failedAt - started).toBeGreaterThanOrEqual(CEREMONY_MS - 50);
+    // The leader got past round 1 (it produced its own sign-r2) before the deadline stopped it,
+    // and failed less than CEREMONY_MS after that: the deadline runs from the start, not per pull.
     expect(ring[0]!.io.store.has({ ceremonyId: 'pay-late', round: 'sign-r2', from: 0 })).toBe(true);
+    expect(round1Done.at).not.toBeNull();
+    expect(round1Done.at! - started).toBeGreaterThanOrEqual(LATE_MS);
+    expect(failedAt - round1Done.at!).toBeLessThan(CEREMONY_MS);
     expect(slots.signingEnds).toBe(1);
     for (const c of [c1, c2]) {
       expect(await c.waitFor('pay-late', 5_000)).toMatchObject({
@@ -450,7 +468,7 @@ describe('LeaderDispatcher ceremony deadline', () => {
         reason: `ceremony deadline of ${CEREMONY_MS} ms passed`,
       });
     }
-  });
+  }, 20_000);
 
   it('a leader whose co-signer never answers DKG round 2 fails at the DKG deadline', async () => {
     const ring = makeRing(3, ONE_ATTEMPT);
@@ -468,14 +486,18 @@ describe('LeaderDispatcher ceremony deadline', () => {
       ring[0]!,
       k => k.from === 1 && (k.round === 'dkg-r2' || (k.round === 'dkg-r1' && Date.now() - started < LATE_MS)),
     );
+    const round1Done = firstStored(ring[0]!, k => k.ceremonyId === 'gen-late' && k.round === 'dkg-r2' && k.from === 0);
 
     const err = await rejection(leader.runDkg({ ceremonyId: 'gen-late' }));
-    const elapsed = Date.now() - started;
+    const failedAt = Date.now();
     expect((err as Error).message).toBe(`DKG aborted: ceremony deadline of ${CEREMONY_MS} ms passed`);
-    expect(elapsed).toBeGreaterThanOrEqual(CEREMONY_MS - 50);
-    expect(elapsed).toBeLessThan(LATE_MS + CEREMONY_MS - 300);
-    // Round 1 completed (the leader produced its round-2 shares) before the deadline stopped it.
+    expect(failedAt - started).toBeGreaterThanOrEqual(CEREMONY_MS - 50);
+    // Round 1 completed (the leader produced its round-2 shares) before the deadline stopped it,
+    // and the DKG failed less than CEREMONY_MS after that: the deadline runs from the start, not per pull.
     expect(ring[0]!.io.store.list('gen-late', 'dkg-r2').filter(b => b.key.from === 0)).toHaveLength(2);
+    expect(round1Done.at).not.toBeNull();
+    expect(round1Done.at! - started).toBeGreaterThanOrEqual(LATE_MS);
+    expect(failedAt - round1Done.at!).toBeLessThan(CEREMONY_MS);
     expect(stager.calls).toEqual(['discard']);
     expect(slots.dkgEnds).toBe(1);
     // The leader announced the abort itself: the ceremony's own abort path stays silent on a signal.
@@ -485,7 +507,7 @@ describe('LeaderDispatcher ceremony deadline', () => {
         reason: `ceremony deadline of ${CEREMONY_MS} ms passed`,
       });
     }
-  });
+  }, 20_000);
 });
 
 describe('LeaderDispatcher: a DKG that fails after its confirmation', () => {
@@ -518,49 +540,79 @@ describe('LeaderDispatcher: a DKG that fails after its confirmation', () => {
 });
 
 describe('LeaderDispatcher: the deadline does not hide the failure that was thrown', () => {
-  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  /**
+   * The DKG must reach staging (or commit) before this deadline: that takes
+   * about 0.4 s idle and 1.1 s with the CPU oversubscribed twice over.
+   */
+  const DKG_MS = 4_000;
+  const deadlines = { signingMs: DKG_MS, dkgMs: DKG_MS };
+
+  /** Resolves when the leader's own ceremony deadline fires. */
+  function deadlinePassed(leader: LeaderDispatcher): Promise<void> {
+    const internals = leader as unknown as { startDeadline(kind: string): { signal: AbortSignal } };
+    const startDeadline = internals.startDeadline.bind(leader);
+    return new Promise(resolve => {
+      internals.startDeadline = kind => {
+        const deadline = startDeadline(kind);
+        deadline.signal.addEventListener('abort', () => resolve(), { once: true });
+        return deadline;
+      };
+    });
+  }
 
   it('a DKG whose staging fails as the deadline passes names both', async () => {
     const ring = makeRing(3);
     cosigner(ring[1]!);
     cosigner(ring[2]!);
     const stager = recordingStager();
+    const leader = leaderOn(ring[0]!, {
+      vault: undefined,
+      slots: fakeSlots().slots,
+      createStager: () => stager,
+      ceremonyDeadlines: deadlines,
+    });
+    const passed = deadlinePassed(leader);
     stager.stage = async () => {
       stager.calls.push('stage');
-      await sleep(DEADLINE_MS + 200);
+      await passed; // the failure strikes once the deadline has passed
       throw new Error('disk full');
     };
-    const leader = leaderOn(ring[0]!, { vault: undefined, slots: fakeSlots().slots, createStager: () => stager });
 
     const err = await rejection(leader.runDkg({ ceremonyId: 'gen-disk' }));
 
-    expect((err as Error).message).toBe(`DKG aborted: ceremony deadline of ${DEADLINE_MS} ms passed (disk full)`);
+    expect((err as Error).message).toBe(`DKG aborted: ceremony deadline of ${DKG_MS} ms passed (disk full)`);
     expect(((err as Error).cause as Error).message).toBe('DKG aborted: disk full');
-  });
+  }, 20_000);
 
   it('a kept share is reported with the failure that was thrown and the recovery', async () => {
     const ring = makeRing(3);
     cosigner(ring[1]!);
     cosigner(ring[2]!);
     const stager = recordingStager();
+    const leader = leaderOn(ring[0]!, {
+      vault: undefined,
+      slots: fakeSlots().slots,
+      createStager: () => stager,
+      ceremonyDeadlines: deadlines,
+    });
+    const passed = deadlinePassed(leader);
     stager.commit = async () => {
       stager.calls.push('commit');
-      await sleep(DEADLINE_MS + 200);
+      await passed;
       throw new Error('share path already exists: /test/share.json');
     };
-    const leader = leaderOn(ring[0]!, { vault: undefined, slots: fakeSlots().slots, createStager: () => stager });
 
     const err = await rejection(leader.runDkg({ ceremonyId: 'gen-exists' }));
 
     expect(err).toBeInstanceOf(DkgShareKeptError);
     expect((err as Error).message).toMatch(
       new RegExp(
-        `^DKG aborted: ceremony deadline of ${DEADLINE_MS} ms passed \\(share path already exists: /test/share\\.json\\); ` +
+        `^DKG aborted: ceremony deadline of ${DKG_MS} ms passed \\(share path already exists: /test/share\\.json\\); ` +
           `this node published its confirmation of vault tb1p[0-9a-z]+, so its staged share was kept at /test/share\\.json\\.pending: `,
       ),
     );
     expect(stager.calls).toEqual(['stage', 'commit']);
-  });
+  }, 20_000);
 });
 
 describe('LeaderDispatcher with this node\'s orchestrator as its slots', () => {

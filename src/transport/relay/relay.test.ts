@@ -520,6 +520,35 @@ const REGISTERED = 'relay-transport: registered with the relay';
 /** Small backoff values: tests see several attempts quickly. */
 const FAST = { initialMs: 50, maxMs: 400 };
 
+/** A one-peer ring member with `FAST` backoff. */
+async function soloTransport(
+  url: string,
+  partyId: PartyId,
+  ringId: string,
+  extra: Partial<RelayTransportOptions> = {},
+): Promise<RelayTransport> {
+  const [identity, other] = await Promise.all([generateIdentity(), generateIdentity()]);
+  return new RelayTransport({
+    self: { partyId, identity },
+    relayUrl: url,
+    ringId,
+    peers: [{ partyId: partyId === 0 ? 1 : 0, publicKey: other.publicKeyRaw }],
+    reconnect: FAST,
+    ...extra,
+  });
+}
+
+/** A listener that accepts TCP but never answers the WebSocket upgrade; `held` collects its sockets. */
+async function silentTcp(held: net.Socket[]): Promise<{ server: net.Server; url: string }> {
+  const server = net.createServer((sock) => {
+    held.push(sock);
+    sock.on('error', () => {});
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const { port } = server.address() as net.AddressInfo;
+  return { server, url: `ws://127.0.0.1:${port}` };
+}
+
 describe('RelayTransport — reconnect', () => {
   let server: RelayServer | null = null;
   let nodes: RelayTestNode[] = [];
@@ -543,15 +572,7 @@ describe('RelayTransport — reconnect', () => {
     ringId: string,
     extra: Partial<RelayTransportOptions> = {},
   ): Promise<RelayTransport> {
-    const [identity, other] = await Promise.all([generateIdentity(), generateIdentity()]);
-    const transport = new RelayTransport({
-      self: { partyId, identity },
-      relayUrl: url,
-      ringId,
-      peers: [{ partyId: partyId === 0 ? 1 : 0, publicKey: other.publicKeyRaw }],
-      reconnect: FAST,
-      ...extra,
-    });
+    const transport = await soloTransport(url, partyId, ringId, extra);
     transports.push(transport);
     return transport;
   }
@@ -686,14 +707,10 @@ describe('RelayTransport — reconnect', () => {
   }, 20_000);
 
   it('stop() during a connection attempt aborts it, and start() resolves', async () => {
-    // A listener that accepts TCP but never answers the WebSocket upgrade.
-    tcp = net.createServer((sock) => {
-      held.push(sock);
-      sock.on('error', () => {});
-    });
-    await new Promise<void>((r) => tcp!.listen(0, '127.0.0.1', () => r()));
-    const { port } = tcp.address() as net.AddressInfo;
-    const transport = await solo(`ws://127.0.0.1:${port}`, 0, 'ring-abort');
+    const silent = await silentTcp(held);
+    tcp = silent.server;
+    const { logger, infos } = capturingLogger();
+    const transport = await solo(silent.url, 0, 'ring-abort', { logger });
 
     const started = transport.start();
     await vi.waitFor(() => expect(held).toHaveLength(1), { timeout: 5_000, interval: 10 });
@@ -701,6 +718,8 @@ describe('RelayTransport — reconnect', () => {
     await expect(started).resolves.toBeUndefined();
     await new Promise((r) => setTimeout(r, 4 * FAST.maxMs));
     expect(held).toHaveLength(1);
+    // A start that stop() cut short is not reported as started.
+    expect(infos.map((l) => l.msg)).not.toContain('relay-transport: started');
   }, 20_000);
 
   it('a refused hello is a failed attempt: the client retries until its partyId slot frees', async () => {
@@ -767,4 +786,175 @@ describe('RelayTransport — reconnect', () => {
     await pulling;
     expect(store.get(key)).toEqual(blob);
   }, 60_000);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Liveness: connect / ack timeouts, client keepalive, server heartbeat
+// (facts/transport.md relay-transport.ts and server.ts)
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('RelayTransport / RelayServer — liveness', () => {
+  let server: RelayServer | null = null;
+  let fake: WebSocketServer | null = null;
+  let tcp: net.Server | null = null;
+  const held: net.Socket[] = [];
+  let transports: RelayTransport[] = [];
+  const raws: WebSocket[] = [];
+  afterEach(async () => {
+    await Promise.all(transports.map((t) => t.stop()));
+    transports = [];
+    for (const r of raws.splice(0)) r.terminate();
+    if (server) await server.stop();
+    server = null;
+    if (fake) {
+      for (const c of fake.clients) c.terminate();
+      await new Promise<void>((r) => fake!.close(() => r()));
+    }
+    fake = null;
+    for (const s of held.splice(0)) s.destroy();
+    if (tcp) await new Promise<void>((r) => tcp!.close(() => r()));
+    tcp = null;
+  });
+
+  async function solo(url: string, ringId: string, extra: Partial<RelayTransportOptions>): Promise<RelayTransport> {
+    const transport = await soloTransport(url, 0, ringId, extra);
+    transports.push(transport);
+    return transport;
+  }
+
+  /** A relay stand-in: it acks every hello with an empty roster (or never answers), and pongs (or not). */
+  async function fakeRelay(opts: { ack: boolean; autoPong: boolean }): Promise<{ url: string; connections: () => number }> {
+    let connections = 0;
+    fake = new WebSocketServer({ host: '127.0.0.1', port: 0, autoPong: opts.autoPong });
+    fake.on('connection', (sock) => {
+      connections += 1;
+      sock.on('error', () => {});
+      if (opts.ack) sock.once('message', () => sock.send(JSON.stringify({ kind: 'ack', roster: [] })));
+    });
+    await new Promise<void>((r) => fake!.once('listening', () => r()));
+    const { port } = fake.address() as net.AddressInfo;
+    return { url: `ws://127.0.0.1:${port}`, connections: () => connections };
+  }
+
+  type ServerMsg = { kind: string; partyId?: number; roster?: number[]; message?: string };
+  async function rawClient(
+    url: string,
+    hello: { ringId: string; partyId: number },
+    opts: { autoPong?: boolean } = {},
+  ): Promise<{ ws: WebSocket; msgs: ServerMsg[]; closed: Promise<void> }> {
+    const ws = new WebSocket(url, { autoPong: opts.autoPong ?? true });
+    raws.push(ws);
+    const msgs: ServerMsg[] = [];
+    ws.on('message', (d) => msgs.push(JSON.parse(d.toString()) as ServerMsg));
+    ws.on('error', () => {});
+    const closed = new Promise<void>((r) => ws.once('close', () => r()));
+    await new Promise<void>((r, j) => {
+      ws.once('open', () => r());
+      ws.once('error', j);
+    });
+    ws.send(JSON.stringify({ kind: 'hello', ...hello }));
+    await vi.waitFor(() => expect(msgs.length).toBeGreaterThanOrEqual(1), { timeout: 5_000, interval: 5 });
+    return { ws, msgs, closed };
+  }
+
+  const warnsMatching = (warns: LogLine[], re: RegExp) => warns.filter((w) => re.test(w.msg));
+
+  it.each([
+    ['reconnect.initialMs 0', { reconnect: { initialMs: 0 } }],
+    ['reconnect.initialMs NaN', { reconnect: { initialMs: Number.NaN } }],
+    ['reconnect.maxMs Infinity', { reconnect: { maxMs: Number.POSITIVE_INFINITY } }],
+    ['reconnect.maxMs below initialMs', { reconnect: { initialMs: 500, maxMs: 100 } }],
+    ['liveness.pongMs 0', { liveness: { pongMs: 0 } }],
+    ['liveness.pingIntervalMs -1', { liveness: { pingIntervalMs: -1 } }],
+  ] as Array<[string, Partial<RelayTransportOptions>]>)('the constructor refuses %s', async (_label, bad) => {
+    await expect(soloTransport('ws://127.0.0.1:1', 0, 'ring-bad', bad)).rejects.toThrow(/RelayTransport: /);
+  });
+
+  it('an upgrade that never completes is abandoned after connectMs and retried', async () => {
+    const silent = await silentTcp(held);
+    tcp = silent.server;
+    const { logger, warns } = capturingLogger();
+    const transport = await solo(silent.url, 'ring-noupgrade', { logger, liveness: { connectMs: 100 } });
+
+    // start() returns once the first attempt times out.
+    await transport.start();
+    expect(warnsMatching(warns, /attempt failed/)[0]?.extra?.err).toMatch(/timed out/);
+    await vi.waitFor(() => expect(held.length).toBeGreaterThanOrEqual(3), { timeout: 15_000, interval: 20 });
+  }, 20_000);
+
+  it('a relay that never acks the hello is dropped after ackMs and retried with growing backoff', async () => {
+    const relay = await fakeRelay({ ack: false, autoPong: true });
+    const { logger, warns } = capturingLogger();
+    const transport = await solo(relay.url, 'ring-noack', { logger, liveness: { ackMs: 100 } });
+    await transport.start();
+
+    await vi.waitFor(() => expect(warnsMatching(warns, /did not acknowledge/).length).toBeGreaterThanOrEqual(3), {
+      timeout: 15_000,
+      interval: 20,
+    });
+    // A missing ack is a failed attempt: the backoff is not reset.
+    const delays = reconnectDelays(warnsMatching(warns, /did not acknowledge/));
+    [50, 100, 200].forEach((base, i) => {
+      expect(delays[i]).toBeGreaterThanOrEqual(base);
+      expect(delays[i]).toBeLessThanOrEqual(base * 1.1);
+    });
+    expect(relay.connections()).toBeGreaterThanOrEqual(3);
+  }, 20_000);
+
+  it('a relay that stops answering pings is dropped after pongMs and redialled', async () => {
+    const relay = await fakeRelay({ ack: true, autoPong: false });
+    const { logger, infos, warns } = capturingLogger();
+    const transport = await solo(relay.url, 'ring-nopong', { logger, liveness: { pingIntervalMs: 50, pongMs: 100 } });
+    await transport.start();
+    await vi.waitFor(() => expect(infos.map((l) => l.msg)).toContain(REGISTERED), { timeout: 5_000, interval: 10 });
+
+    await vi.waitFor(() => expect(warnsMatching(warns, /did not answer a ping/).length).toBeGreaterThanOrEqual(1), {
+      timeout: 10_000,
+      interval: 20,
+    });
+    await vi.waitFor(() => expect(relay.connections()).toBeGreaterThanOrEqual(2), { timeout: 10_000, interval: 20 });
+  }, 20_000);
+
+  it('keepalive pings leave a live relay connection up', async () => {
+    const port = await freePort();
+    server = new RelayServer({ listen: `127.0.0.1:${port}` });
+    await server.start();
+    const { logger, infos, warns } = capturingLogger();
+    const transport = await solo(`ws://127.0.0.1:${port}`, 'ring-alive', {
+      logger,
+      liveness: { pingIntervalMs: 20, pongMs: 300 },
+    });
+    await transport.start();
+    await vi.waitFor(() => expect(infos.map((l) => l.msg)).toContain(REGISTERED), { timeout: 5_000, interval: 10 });
+
+    // Five pong deadlines' worth of pings: each pong clears its deadline, so nothing drops.
+    await new Promise((r) => setTimeout(r, 5 * 300));
+    expect(reconnectDelays(warns)).toEqual([]);
+    expect(infos.filter((l) => l.msg === REGISTERED)).toHaveLength(1);
+  }, 20_000);
+
+  it('the relay server evicts a client that stops answering pings: peers see peer-left and the slot frees', async () => {
+    const port = await freePort();
+    const url = `ws://127.0.0.1:${port}`;
+    server = new RelayServer({ listen: `127.0.0.1:${port}`, heartbeatMs: 200 });
+    await server.start();
+
+    const mute = await rawClient(url, { ringId: 'ring-hb', partyId: 0 }, { autoPong: false });
+    expect(mute.msgs[0]).toEqual({ kind: 'ack', roster: [] });
+    const live = await rawClient(url, { ringId: 'ring-hb', partyId: 1 });
+    expect(live.msgs[0]).toEqual({ kind: 'ack', roster: [0] });
+
+    await vi.waitFor(() => expect(live.msgs).toContainEqual({ kind: 'peer-left', partyId: 0 }), {
+      timeout: 10_000,
+      interval: 20,
+    });
+    await mute.closed;
+    const again = await rawClient(url, { ringId: 'ring-hb', partyId: 0 });
+    expect(again.msgs[0]).toEqual({ kind: 'ack', roster: [1] });
+
+    // A client that answers its pings stays through several heartbeats.
+    await new Promise((r) => setTimeout(r, 5 * 200));
+    expect(live.ws.readyState).toBe(WebSocket.OPEN);
+    expect(again.ws.readyState).toBe(WebSocket.OPEN);
+  }, 20_000);
 });
