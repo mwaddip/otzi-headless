@@ -32,7 +32,7 @@ kind                 = "peer-mesh"                       # "peer-mesh" | "relay"
 advertised_endpoint  = "node-a.example:8800"             # required for peer-mesh; canonical host[:port]
 # url                = "ws://relay.example:9000"         # required iff kind = "relay"
 
-[[peers]]
+[[peers]]                                                # required for peer-mesh; optional under relay (not used)
 endpoint = "node-b.example:8800"                         # required; canonical host[:port]
 
 [gate]
@@ -115,12 +115,17 @@ signet.
 The parser rejects a `listen` field with an error pointing at
 `advertised_endpoint`.
 
-## `[[peers]]` (required — at least one)
+## `[[peers]]` (peer-mesh: required, at least one; relay: optional)
 
 One entry per *other* node in the ring (this node is implied by `[node]`).
 Order does not matter — partyIds are derived from the pubkey book, not
 peer-array index. `[[peers]]` is a local sanity-check against the
 authoritative book; bidirectional endpoint match is enforced at startup.
+
+Under `transport.kind = "relay"` the section may be left out, and a relay config
+normally is: the relay routes by `partyId` and the pubkey book names the ring, so
+there is no peer list to check. If you do list peers under relay, each entry is
+validated as below but nothing uses it.
 
 | Key | Type | Notes |
 |---|---|---|
@@ -358,13 +363,33 @@ config.
 | `role` | `'leader'` \| `'leaf'` | yes | Leader hosts the registration server; leaves POST to it. |
 | `bind` | string | leader-only | `host:port` for the leader's bootstrap HTTP listener. |
 | `leader_url` | string | leaf-only | Full URL of the leader's bootstrap endpoint. |
+| `parties` | integer, 2 to 255 | relay leader only | Ring size, this node included. A relay config has no `[[peers]]` to count, so the leader states the size; under peer-mesh the size is the number of `[[peers]]` plus this node, and `parties` is refused. A leaf never takes it. |
 
-Example (leader):
+The parser applies the `parties` rules to every config it reads, `otzi setup`
+and daemon start alike. A relay leader whose `[bootstrap]` lacks `parties` fails
+with:
+
+```
+config bootstrap.parties: required when transport.kind = "relay" and bootstrap.role = "leader"
+```
+
+Leaving the section in place after setup is fine as long as it stays valid.
+
+Example (peer-mesh leader):
 
 ```toml
 [bootstrap]
 role = "leader"
 bind = "0.0.0.0:7090"
+```
+
+Example (relay leader, a ring of 3):
+
+```toml
+[bootstrap]
+role = "leader"
+bind = "0.0.0.0:7090"
+parties = 3
 ```
 
 Example (leaf):
@@ -381,6 +406,10 @@ Parse-time checks:
 
 - `transport.advertised_endpoint` required when `transport.kind = "peer-mesh"`.
 - `transport.url` required when `transport.kind = "relay"`.
+- `[[peers]]` has at least one entry when `transport.kind = "peer-mesh"`; under
+  `"relay"` it may be absent or empty.
+- `[bootstrap] parties` (integer, 2 to 255) is required on a leader when
+  `transport.kind = "relay"`, and refused under `"peer-mesh"` and on a leaf.
 - Endpoint canonicalization (see § Canonical endpoint form) on
   `transport.advertised_endpoint` and every `[[peers]].endpoint`.
 

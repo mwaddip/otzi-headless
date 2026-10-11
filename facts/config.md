@@ -33,7 +33,7 @@
 
 - `PeerEntry` — `{ endpoint: string }`
   - **Pre:** `endpoint` is canonical `host:port` (post-parse, after `canonicalizeEndpoint`).
-  - **Post:** One peer's reachable address. Order does not matter; `[[peers]]` is a typo check against the authoritative book (bidirectional endpoint match in transport-factory).
+  - **Post:** One peer's reachable address. Order does not matter; `[[peers]]` is a typo check against the authoritative book (bidirectional endpoint match in transport-factory). Under `transport.kind = "relay"` the entries are parsed and validated but not used.
 
 - `GateConfig` — `{ strategy: GateStrategy; params?: Record<string, unknown> }`
   - **Post:** Gate activation and raw strategy-specific fields, narrowed by the gate's `parse*Params` (see [gate.md](gate.md)).
@@ -42,15 +42,15 @@
   - **Pre:** Integers from 1 to 2 147 483 647 (`MAX_DEADLINE_MS`, Node's `setTimeout` maximum, about 24.8 days). The parser rejects a value outside that range at `deadlines.signing_ms` / `deadlines.dkg_ms` with a `ConfigError` that names the limit; a larger value would make every deadline timer fire at once.
   - **Post:** Ceremony deadlines.
 
-- `BootstrapConfig` — `{ role: 'leader' | 'leaf'; bind?: string; leaderUrl?: string }`
-  - **Pre:** For `'leader'`, `bind` is `host:port`. For `'leaf'`, `leaderUrl` is a full URL. Enforced by the parser per role.
-  - **Post:** Read by `otzi setup` to dispatch to the leader or leaf bootstrap path. Dormant after the pubkey book is written; harmless to leave in config.
+- `BootstrapConfig` — `{ role: 'leader' | 'leaf'; bind?: string; leaderUrl?: string; parties?: number }`
+  - **Pre:** For `'leader'`, `bind` is `host:port`. For `'leaf'`, `leaderUrl` is a full URL. `parties` is an integer from 2 to 255. Enforced by the parser per role and transport kind.
+  - **Post:** Read by `otzi setup` to dispatch to the leader or leaf bootstrap path. Dormant after the pubkey book is written; harmless to leave in config. `parties` is the ring size, this node included; it is set only for `role = 'leader'` under `transport.kind = 'relay'`, where there is no `[[peers]]` list to count. Under peer-mesh the ring size is `[[peers]].length + 1`.
 
 - `TriggerEntry` — `{ kind: TriggerKind; params?: Record<string, unknown> }`
   - **Post:** One trigger source (http, uds, or cron).
 
 - `DaemonConfig` — `{ share; node; network; transport; peers; gate; deadlines; triggers; bootstrap? }`
-  - **Post:** Complete daemon startup configuration. The share file is not read here.
+  - **Post:** Complete daemon startup configuration. The share file is not read here. `peers` has at least one entry under peer-mesh and may be `[]` under relay.
 
 - `DEFAULT_SIGNING_DEADLINE_MS`, `DEFAULT_DKG_DEADLINE_MS` — `300_000` (5 min) and `900_000` (15 min), used when `[deadlines]` is absent.
 - `MAX_DEADLINE_MS` — `2_147_483_647`, the largest accepted `signing_ms` / `dkg_ms`.
@@ -64,6 +64,7 @@
 
 **Notes / gotchas:**
 - `[[peers]]` carries only `endpoint`; per-peer identifiers live in the pubkey book.
+- A relay config needs no `[[peers]]`: the pubkey book alone names the ring. The relay leader's `[bootstrap] parties` stands in for the peer count during setup.
 
 ---
 
@@ -76,7 +77,7 @@
   - **Post:** `.name = 'ConfigError'`; `message = "config <path>: <message>"`; `.path` names the offending key.
 
 - `parseDaemonConfigToml(text: string): DaemonConfig`
-  - **Pre:** `text` is TOML; `[deadlines]` / `[[triggers]]` / `[bootstrap]` optional.
+  - **Pre:** `text` is TOML; `[deadlines]` / `[[triggers]]` / `[bootstrap]` optional; `[[peers]]` optional under relay.
   - **Post:** Validated `DaemonConfig` with defaults applied.
   - **Throws:** `ConfigError` on missing required fields, type mismatches, enum violations or rejected keys; the TOML library's `Error` on unparseable text.
 
@@ -87,8 +88,9 @@
 - `asObject(v, path)`, `asString(v, path)`, `asInteger(v, path, min)`, `asArray(v, path)`, `asEnum(v, path, choices)` — helpers
   - **Post:** Coerced value, or `ConfigError`. `asInteger` accepts `number` and `bigint` within the safe range.
 
-- Section parsers: `parseShare`, `parseNode`, `parseNetwork`, `parseTransport`, `parsePeer(raw, i)`, `parsePeers`, `parseGate`, `parseDeadlines`, `parseTrigger(raw, i)`, `parseTriggers`, `parseBootstrap`
+- Section parsers: `parseShare`, `parseNode`, `parseNetwork`, `parseTransport`, `parsePeer(raw, i)`, `parsePeers(raw, kind)`, `parseGate`, `parseDeadlines`, `parseTrigger(raw, i)`, `parseTriggers`, `parseBootstrap(raw, kind)`
   - **Post:** Typed section objects. `parseTransport` and `parsePeer` apply `canonicalizeEndpoint` to every endpoint; the resulting `DaemonConfig` always stores canonical form.
+  - **Order:** `parseDaemonConfig` parses `[transport]` first and passes its `kind` to `parsePeers` and `parseBootstrap`, which both depend on it. A config with several faults therefore reports a `[transport]` fault before any other.
 
 - **`[network]`** (`parseNetwork`)
   ```toml
@@ -104,7 +106,16 @@
   - `kind = "uds"`: `params.path` is an absolute socket path. No `bind`, no `auth_token_env`.
   - `kind = "cron"`: `job_name`, `schedule`, optional `timezone`.
 
-- **`[bootstrap]`** (`parseBootstrap`): `role ∈ {'leader', 'leaf'}`; `bind` required for leader, `leader_url` (`http(s)://…`) required for leaf.
+- **`[[peers]]`** (`parsePeers(raw, kind)`):
+  - `transport.kind = "peer-mesh"`: required, at least one entry (`peers: missing required array (at least one peer)`, `peers: must contain at least one peer`).
+  - `transport.kind = "relay"`: optional. Absent or `peers = []` gives `[]`. Entries present are validated as above (`endpoint` required and canonical, unknown and retired keys rejected) but not used.
+
+- **`[bootstrap]`** (`parseBootstrap(raw, kind)`): `role ∈ {'leader', 'leaf'}`; `bind` required for leader, `leader_url` (`http(s)://…`) required for leaf.
+  - `parties`: an integer from 2 to 255 (`ConfigError('bootstrap.parties', 'must be an integer from 2 to 255 (got …)')`).
+    - Leader under relay: required (`ConfigError('bootstrap.parties', 'required when transport.kind = "relay" and bootstrap.role = "leader"')`).
+    - Leader under peer-mesh: rejected (`ConfigError('bootstrap.parties', 'only used with transport.kind = "relay"; peer-mesh counts [[peers]]')`). Checked before the unknown-key rule, like the retired keys.
+    - Leaf, under either transport: an unknown key (`ConfigError('bootstrap.parties', 'unknown key (expected one of role, leader_url)')`).
+  - The requirement applies at every parse of the config, `otzi setup` and daemon start alike: `[bootstrap]` is setup-only, but the parser is shared.
 
 - `validateCoherence(cfg)` — hook for cross-field checks after parsing (no mutation). Endpoint matching against the pubkey book happens in transport-factory.
 
@@ -121,8 +132,9 @@
 | `gate.max_amount`, `gate.max_btc_per_tx` | `use max_sats_per_tx` (raised by `parsePolicyParams`) |
 | `gate.allowed_btc_recipients`, `gate.destination_allowlist` | `use allowed_recipients` (raised by `parsePolicyParams`) |
 | `gate.method_allowlist`, `gate.allowed_contracts` | `no longer supported` (raised by `parsePolicyParams`) |
+| `bootstrap.parties` (leader, peer-mesh) | `only used with transport.kind = "relay"; peer-mesh counts [[peers]]` |
 
-- **Unknown keys** — every table rejects a key it does not take, with `ConfigError('<dotted key>', 'unknown key (expected one of …)')` (`network.esplora_uri`, `peers[0].port`, `triggers[1].mode`, a stray top-level `logging`). The keys each table takes: root `share, node, network, transport, peers, gate, deadlines, triggers, bootstrap`; `[share]` `path, password_env`; `[node]` `id, identity_key_file, pubkey_book_file`; `[network]` `name, esplora_url`; `[transport]` `kind, url` (relay) or `kind, advertised_endpoint` (peer-mesh); `[[peers]]` `endpoint`; `[deadlines]` `signing_ms, dkg_ms`; `[[triggers]]` `kind` plus `bind, auth_token_env` (http), `path` (uds), `schedule, job_name, timezone` (cron); `[bootstrap]` `role` plus `bind` (leader) or `leader_url` (leaf). The rejected keys above keep their specific messages (checked first). `[gate]` params are checked by the strategy's parser (`parsePolicyParams`, `parseExecParams`, `parseWebhookParams`, all of which reject unknown keys) when the daemon builds its gate (`parsePolicyParams` also takes `[network].name` and refuses an `allowed_recipients` entry that is no address of that network); under `auto` the config parser refuses every param itself.
+- **Unknown keys** — every table rejects a key it does not take, with `ConfigError('<dotted key>', 'unknown key (expected one of …)')` (`network.esplora_uri`, `peers[0].port`, `triggers[1].mode`, a stray top-level `logging`). The keys each table takes: root `share, node, network, transport, peers, gate, deadlines, triggers, bootstrap`; `[share]` `path, password_env`; `[node]` `id, identity_key_file, pubkey_book_file`; `[network]` `name, esplora_url`; `[transport]` `kind, url` (relay) or `kind, advertised_endpoint` (peer-mesh); `[[peers]]` `endpoint`; `[deadlines]` `signing_ms, dkg_ms`; `[[triggers]]` `kind` plus `bind, auth_token_env` (http), `path` (uds), `schedule, job_name, timezone` (cron); `[bootstrap]` `role` plus `bind` and, under relay, `parties` (leader) or `leader_url` (leaf). The rejected keys above keep their specific messages (checked first). `[gate]` params are checked by the strategy's parser (`parsePolicyParams`, `parseExecParams`, `parseWebhookParams`, all of which reject unknown keys) when the daemon builds its gate (`parsePolicyParams` also takes `[network].name` and refuses an `allowed_recipients` entry that is no address of that network); under `auto` the config parser refuses every param itself.
 
 **Invariants:**
 - All section paths use snake_case (e.g., `share.password_env`); coerced to camelCase in types.
@@ -131,7 +143,8 @@
 - `strategy = "auto"` takes no params: any other key in `[gate]` is `ConfigError('gate.<key>', 'not used by strategy auto')`, so leftover policy keys never look like rules that are not enforced.
 - Deadlines default to 5 min / 15 min if the section is missing.
 - `transport.url` required for relay; `transport.advertised_endpoint` optional at parse time for peer-mesh (transport-factory hard-errors if missing).
-- Peers must have at least one entry; each entry has a canonical `endpoint`.
+- Under peer-mesh, `[[peers]]` must have at least one entry; under relay it may be absent or empty. Every entry present has a canonical `endpoint`.
+- A relay leader's `[bootstrap]` carries `parties`; no other `[bootstrap]` does.
 - **HTTP trigger loopback enforcement** is load-bearing: the CLI is THE operator surface, and a non-loopback HTTP bind would let remote callers forge ceremony triggers.
 
 **Cross-component contracts:**

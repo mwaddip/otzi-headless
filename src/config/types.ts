@@ -27,6 +27,12 @@ export interface BootstrapConfig {
   bind?: string;
   /** Required when role === 'leaf'. Full URL of the leader's bootstrap endpoint. */
   leaderUrl?: string;
+  /**
+   * Ring size, this node included: an integer from 2 to 255. Set only when
+   * role === 'leader' and the transport is relay, which has no `[[peers]]` list to
+   * count; required there, rejected everywhere else.
+   */
+  parties?: number;
 }
 
 export { NETWORK_NAMES } from '../otzi/backend/types';
@@ -101,6 +107,7 @@ export interface DaemonConfig {
   node: NodeConfig;
   network: NetworkConfig;
   transport: TransportConfig;
+  /** At least one entry under peer-mesh; may be `[]` under relay, which does not use it. */
   peers: PeerEntry[];
   gate: GateConfig;
   deadlines: DeadlineConfig;
