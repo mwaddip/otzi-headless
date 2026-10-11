@@ -487,7 +487,7 @@
 - `start(): Promise<void>`
   - **Pre:** Relay not already started.
   - **Post:** Creates HTTP server + WebSocketServer, binds to listen address, registers connection handler, starts the heartbeat. If `stop()` runs while the bind is still in progress, `start()` closes the listener it just opened and resolves with no heartbeat: nothing keeps running.
-  - **Throws:** `Error` if bind fails.
+  - **Throws:** the bind error (`EADDRINUSE`, `EACCES`, …) as the rejection of `start()`, never as an uncaught `'error'` event. A failed bind leaves the instance as if `start()` had not run: `address()` is `null` and a later `start()` binds normally. Once listening, a server-level error is logged at warn level (`RelayServer: server error`) and does not stop the relay.
 
 - `stop(): Promise<void>`
   - **Pre:** Relay started or already stopped (idempotent).

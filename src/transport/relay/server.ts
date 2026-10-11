@@ -85,20 +85,36 @@ export class RelayServer {
     this.wss = wss;
 
     wss.on('connection', (ws) => this.handleConnection(ws));
-
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => {
-        httpServer.off('listening', onListening);
-        reject(err);
-      };
-      const onListening = () => {
-        httpServer.off('error', onError);
-        resolve();
-      };
-      httpServer.once('error', onError);
-      httpServer.once('listening', onListening);
-      httpServer.listen(this.port, this.host);
+    // `ws` re-emits the HTTP server's 'error' on `wss` first, and an 'error' event with no listener
+    // throws before the bind promise below sees it: a taken address would crash the process and
+    // `start()` would never settle. A failed bind is reported through that promise, not here.
+    wss.on('error', (err) => {
+      if (httpServer.listening) this.log.warn('RelayServer: server error', { err: err.message });
     });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onError = (err: Error) => {
+          httpServer.off('listening', onListening);
+          reject(err);
+        };
+        const onListening = () => {
+          httpServer.off('error', onError);
+          resolve();
+        };
+        httpServer.once('error', onError);
+        httpServer.once('listening', onListening);
+        httpServer.listen(this.port, this.host);
+      });
+    } catch (err) {
+      // Nothing is bound: leave the instance as if `start()` had not run, so it can be started again.
+      if (this.wss === wss) {
+        this.wss = null;
+        this.httpServer = null;
+      }
+      wss.close();
+      throw err;
+    }
 
     if (this.wss !== wss) {
       // stop() ran while we were binding: it could not close a listener that did not exist yet.

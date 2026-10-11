@@ -130,6 +130,32 @@ describe('RelayServer — roster + routing', () => {
     expect((racing as unknown as { heartbeat: unknown }).heartbeat).toBeNull();
     expect(await acceptsConnections(port)).toBe(false);
   });
+
+  it('start() rejects when the address is taken, and starts once the address is free', async () => {
+    const port = await freePort();
+    server = new RelayServer({ listen: `127.0.0.1:${port}` });
+    await server.start();
+
+    const second = new RelayServer({ listen: `127.0.0.1:${port}` });
+    const outcome = await Promise.race([
+      second.start().then(
+        () => 'started',
+        (err: NodeJS.ErrnoException) => err.code,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve('start() never settled'), 3_000)),
+    ]);
+    expect(outcome).toBe('EADDRINUSE');
+    expect(second.address()).toBeNull();
+
+    // The failed start left nothing behind: the same instance can start on a free address.
+    await server.stop();
+    await second.start();
+    try {
+      expect(second.address()!.port).toBe(port);
+    } finally {
+      await second.stop();
+    }
+  });
 });
 
 /** Whether anything accepts a TCP connection on this loopback port. */
