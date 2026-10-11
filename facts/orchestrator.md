@@ -77,6 +77,9 @@
 **Purpose:** Long-lived participant-side listener. Parses ceremony messages, applies the participant checks, analyses proposals against this node's own key, gates, runs DKG and signing participation, verifies signoffs, enforces deadlines, schedules blob cleanup, holds this node's single DKG slot, and reserves the ids of ceremonies this node leads.
 
 **Public surface:**
+- `export const MAX_LIVE_SIGNINGS_PER_LEADER = 32`
+  - **Meaning:** the most signing ceremonies one remote leader may have live on this node at once (see `announce-sign`, step 5). Every live signing tracker holds a deadline timer, an abort controller and a pull loop — for an `exec` or `webhook` gate until the operator decides — so a ring member that announces without end must not make every participant hold trackers without bound. DKG is unaffected (at most one DKG is live per node). The ceremonies this node leads itself are local slots, never trackers, so they are not counted.
+
 - `class Orchestrator`
   - **`constructor(deps: OrchestratorDeps)`**
     - **Pre:** `deps.io.transport` is started; `deps.node.partyId === deps.io.transport.partyId`.
@@ -139,16 +142,17 @@ Every announce first passes the duplicate checks: no tracker exists for the `cer
   2. this node has a vault loaded (`deps.vault`);
   3. this node is in `signers` (info when not); the sender is in `signers`; `signers` has no duplicates, contains only ring members, and has at least `vault.threshold` entries;
   4. the proposal has at most 255 inputs (`MAX_INPUTS`; the parser enforces it on `prevouts`);
-  5. `analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), deps.network)` succeeds;
-  6. the gate approves `buildSigningSpec(analysis, { ceremonyId, leader: resolveLeaderId(from), role: 'participant' }, network, labelFor)`. With `deps.addressBook`, `labelFor(address)` is otzi `labelFor(entries, address)`; a rejected `addressBook()` means no labels and one warn line, never a failed ceremony.
+  5. the sender has fewer than `MAX_LIVE_SIGNINGS_PER_LEADER` (32) live signing trackers on this node — warn drop naming the limit, no tracker, no outcome. A tracker is live from the announce until it settles (signoff, abort, `timeout`, `rejected`) or `stop()` runs, so a ceremony waiting on a slow gate counts. The count is per sender; another leader is unaffected, and a slot freed by a settle admits a new announce at once (a dropped id leaves no record, so it can be announced again). The check and the tracker's creation share one synchronous step, so concurrent announces cannot overshoot;
+  6. `analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), deps.network)` succeeds;
+  7. the gate approves `buildSigningSpec(analysis, { ceremonyId, leader: resolveLeaderId(from), role: 'participant' }, network, labelFor)`. With `deps.addressBook`, `labelFor(address)` is otzi `labelFor(entries, address)`; a rejected `addressBook()` means no labels and one warn line, never a failed ceremony.
 
-  Before step 5 the orchestrator creates the tracker (leader pinned = sender) and starts the `signingMs` deadline. Then: keep the analysed sighashes for signoff verification and run `participateInSigning(io, { ceremonyId, signers, sighashes, keyPackage, publicKeyPackage, rng }, signal)`. A failure settles `aborted` with the reason; success leaves the tracker live until a signoff or the deadline (`timeout`).
+  Before step 6 the orchestrator creates the tracker (leader pinned = sender) and starts the `signingMs` deadline. Then: keep the analysed sighashes for signoff verification and run `participateInSigning(io, { ceremonyId, signers, sighashes, keyPackage, publicKeyPackage, rng }, signal)`. A failure settles `aborted` with the reason; success leaves the tracker live until a signoff or the deadline (`timeout`).
 
 - **`signoff-done`** — accepted only from the pinned leader of a live signing tracker. Settles `done` (with `signaturesHex`) when the count equals the kept sighash count and every signature passes `verifySignature(sig, sighash, vault.publicKeyPackage.verifyingKey)`; otherwise settles `invalid-signoff`, logged at error level.
 
 - **`signoff-aborted`** — for signing, accepted only from the pinned leader; for DKG, from any ring member. Aborts the tracker's controller and settles `aborted` with the message's `reason` (or `aborted by party <from>` without one). A DKG `signoff-aborted` from any ring member for the `ceremonyId` of the local DKG slot aborts the slot's `signal`.
 
-**Rejected participation vs. structural drops.** A failed analysis (step 5 of `announce-sign`) or a gate non-approve (`reject`, `pending`, or a gate that throws; either kind) sends nothing to peers and settles the ceremony as `rejected` with the reason, so `waitFor` resolves and `onCompleted` fires. Every earlier check is a structural drop: a parse failure, a non-leader or duplicate announce, a ceremony that already ended, a live DKG, a wrong network or party count, a vault present for a DKG, a signer-list failure, or no vault for signing. A structural drop is logged only — no tracker survives it and no outcome is emitted.
+**Rejected participation vs. structural drops.** A failed analysis (step 6 of `announce-sign`) or a gate non-approve (`reject`, `pending`, or a gate that throws; either kind) sends nothing to peers and settles the ceremony as `rejected` with the reason, so `waitFor` resolves and `onCompleted` fires. Every earlier check is a structural drop: a parse failure, a non-leader or duplicate announce, a ceremony that already ended, a live DKG, a wrong network or party count, a vault present for a DKG, a signer-list failure, a leader at its live-signing limit, or no vault for signing. A structural drop is logged only — no tracker survives it and no outcome is emitted.
 
 **Gate:** evaluated once per ceremony (signing has no retries; a second announce for the `ceremonyId` is a duplicate). A gate that throws counts as `reject`.
 
@@ -161,6 +165,7 @@ Every announce first passes the duplicate checks: no tracker exists for the `cer
 **Invariants:**
 - Orchestrator is a long-lived listener, NOT per-ceremony.
 - First announce wins: once a tracker is live, its leader cannot change and no second announce for that `ceremonyId` is processed.
+- Bounded trackers: a node holds at most `MAX_LIVE_SIGNINGS_PER_LEADER` live signing trackers per remote leader, so a compromised ring member cannot make participants hold unbounded timers, controllers and pull loops.
 - Verify-before-gate: the gate never sees a spec this node did not derive from its own analysis.
 - No DKG while a vault exists: the vault check runs on every `announce-dkg`. A `.pending` file does not count as a vault; a committed share file does.
 - At most one live DKG per node, whichever node leads it.

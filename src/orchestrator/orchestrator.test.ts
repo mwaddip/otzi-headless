@@ -18,7 +18,7 @@ import type { DecryptedShare } from '../otzi/lib/share-file';
 import type { NetworkName, SendProposal } from '../otzi/lib/vault-types';
 import { makeProposal, testVault, type TestVault } from '../testing/proposal';
 import { makeRing, type RingNode } from '../testing/ring';
-import { Orchestrator } from './orchestrator';
+import { MAX_LIVE_SIGNINGS_PER_LEADER, Orchestrator } from './orchestrator';
 import type { CeremonyOutcome, Logger, OrchestratorDeps } from './types';
 
 const NET: NetworkName = 'testnet4';
@@ -958,5 +958,107 @@ describe('Orchestrator: proposal signing', () => {
     for (const call of pullAll.mock.calls) {
       expect(call[1]).toEqual({ ...ringPullOpts, deadlineMs: 4_000, maxAttempts: Number.MAX_SAFE_INTEGER });
     }
+  });
+
+  describe('live signing cap per leader', () => {
+    /** Never decides: every accepted announce keeps its tracker live until a signoff, the deadline or stop(). */
+    const undecided: ApprovalGate = { approve: () => new Promise<Decision>(() => {}) };
+    const LIMIT = MAX_LIVE_SIGNINGS_PER_LEADER;
+    const capId = (i: number) => `sign-cap-${i}`;
+
+    /** Node `leader` announces `count` ceremonies `sign-cap-<from>..`. */
+    async function announceMany(from: number, count: number, leader: PartyId = 0): Promise<void> {
+      const proposal = makeProposal(tv.vaultKey, NET);
+      for (let i = from; i < from + count; i++) await broadcastFrom(ring, leader, announceSign(capId(i), proposal));
+    }
+
+    it('pins the limit at 32', () => {
+      expect(MAX_LIVE_SIGNINGS_PER_LEADER).toBe(32);
+    });
+
+    it('drops the announce that would exceed the limit, without a tracker or an outcome', async () => {
+      const [p1] = participants([{ gate: undecided }]);
+      const outcomes: CeremonyOutcome[] = [];
+      p1.orch.onCompleted(o => outcomes.push(o));
+
+      await announceMany(0, LIMIT);
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT));
+      expect(p1.log.lines.filter(l => l.level === 'warn')).toEqual([]);
+
+      const extra = capId(LIMIT);
+      await announceMany(LIMIT, 1);
+
+      const lines = p1.log.about(extra);
+      expect(lines).toEqual([expect.objectContaining({ level: 'warn' })]);
+      expect(lines[0]!.msg).toContain(`at most ${LIMIT}`);
+      expect(lines[0]!.msg).toContain(`party 0 already leads ${LIMIT} live signing ceremonies`);
+      // Nothing was analysed, gated or stored for it, and it left no outcome behind.
+      await new Promise(r => setTimeout(r, 20));
+      expect(p1.gate.specs).toHaveLength(LIMIT);
+      expect(ring[1]!.io.store.list(extra)).toEqual([]);
+      expect(outcomes).toEqual([]);
+      await expect(p1.orch.waitFor(extra, 50)).rejects.toThrow(/timed out/);
+      expect(p1.orch.ceremonyIdInUse(extra)).toBe(false);
+    });
+
+    it('still accepts announces from a different leader while one leader is at the limit', async () => {
+      const [p1] = participants([{ gate: undecided }]);
+
+      await announceMany(0, LIMIT + 1); // the last is dropped
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT));
+
+      await broadcastFrom(ring, 2, announceSign('sign-other-leader', makeProposal(tv.vaultKey, NET)));
+
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT + 1));
+      expect(p1.gate.specs[LIMIT]).toMatchObject({ ceremonyId: 'sign-other-leader', leader: 'node-2' });
+      expect(p1.log.about('sign-other-leader')).toEqual([]);
+    });
+
+    it('accepts a new announce once one of the leader\'s ceremonies has settled', async () => {
+      const [p1] = participants([{ gate: undecided }]);
+
+      await announceMany(0, LIMIT + 1);
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT));
+      expect(p1.log.about(capId(LIMIT))).toEqual([expect.objectContaining({ level: 'warn' })]);
+
+      // The leader aborts one ceremony: its slot frees.
+      await broadcastFrom(ring, 0, { v: 2, kind: 'signoff-aborted', ceremonyId: capId(0), reason: 'done with it' });
+      expect(await p1.orch.waitFor(capId(0), WAIT_MS)).toMatchObject({ status: 'aborted' });
+
+      // The id dropped earlier left no trace, so it can be announced again.
+      await announceMany(LIMIT, 1);
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT + 1));
+      expect(p1.gate.specs[LIMIT]).toMatchObject({ ceremonyId: capId(LIMIT) });
+
+      // Back at the limit.
+      await announceMany(LIMIT + 1, 1);
+      expect(p1.log.about(capId(LIMIT + 1))).toEqual([expect.objectContaining({ level: 'warn' })]);
+      expect(p1.gate.specs).toHaveLength(LIMIT + 1);
+    });
+
+    it('frees the slot when a ceremony times out', async () => {
+      const [p1] = participants([{ gate: undecided, ceremonyDeadlines: { signingMs: 1_500, dkgMs: 8_000 } }]);
+
+      await announceMany(0, LIMIT);
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT));
+      await announceMany(LIMIT, 1);
+      expect(p1.log.about(capId(LIMIT))).toEqual([expect.objectContaining({ level: 'warn' })]);
+
+      expect(await p1.orch.waitFor(capId(0), WAIT_MS)).toMatchObject({ status: 'timeout' });
+
+      await announceMany(LIMIT, 1);
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT + 1));
+    });
+
+    it('does not count ceremonies this node leads against a remote leader', async () => {
+      const [p1] = participants([{ gate: undecided }]);
+      const slots = Array.from({ length: LIMIT + 8 }, (_, i) => p1.orch.beginLocalSigning(`sign-led-${i}`));
+      expect(slots.every(s => s !== null)).toBe(true);
+
+      await announceMany(0, LIMIT);
+      await eventually(() => expect(p1.gate.specs).toHaveLength(LIMIT));
+      // And the other direction: remote trackers never block this node from leading.
+      expect(p1.orch.beginLocalSigning('sign-led-after')).not.toBeNull();
+    });
   });
 });

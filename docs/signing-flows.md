@@ -230,6 +230,10 @@ unless all of these hold:
   contains only ring members, and has at least as many entries as the share's
   threshold;
 - the proposal has at most 255 inputs;
+- the leader has fewer than 32 signing ceremonies live on this node (a
+  ceremony is live until its sign-off, abort or deadline, or until it is
+  rejected; one waiting on a slow gate counts), so a compromised ring member
+  cannot make every participant hold ceremonies without bound;
 - the proposal passes the same analysis against this node's own key package and
   network;
 - this node's gate approves the spec built from that analysis.
@@ -271,6 +275,7 @@ A participant stays live until the leader's sign-off or its signing deadline.
 | Proposal analysis against the node's **own** key and network | Leader before the announce; every participant on the announce | Leader `400`; participant silent drop |
 | Gate on a spec built from that analysis | Leader before the announce; every participant on the announce | Leader `403`; participant silent drop |
 | Announce comes from the pinned leader; `ceremonyId` is new | Participant | Dropped, logged |
+| The leader has fewer than 32 live signing ceremonies on this node | Participant | Dropped, logged (warn); the 33rd is accepted once one settles |
 | `signers` valid: contains self and leader, unique, ring members, at least the threshold | Participant | Dropped, logged |
 | DKG announce: no vault, matching network, `parties` = ring size, `2 ≤ threshold ≤ parties`, gate | Each node | Dropped; the `dkg` op returns `409` when the receiving node holds a vault |
 | Sender binding on every pulled blob | Every node, both ceremonies | Ceremony aborts, reason names the sender |
