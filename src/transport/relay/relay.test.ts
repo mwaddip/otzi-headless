@@ -4,8 +4,11 @@ import type { PartyId } from '../../core/types';
 import { generateIdentity, type IdentityKeyPair } from '../identity';
 import { WebSocket, WebSocketServer } from 'ws';
 import { encodePullResponse } from '../peer-mesh/wire';
+import { BlobPuller } from '../../core/blob-puller';
+import { BlobStore } from '../../core/blob-store';
+import type { Logger } from '../../orchestrator/types';
 import { RelayServer } from './server';
-import { RelayTransport } from './relay-transport';
+import { RelayTransport, type RelayTransportOptions } from './relay-transport';
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -30,7 +33,12 @@ interface RelayTestNode {
   transport: RelayTransport;
 }
 
-async function buildRelayRing(n: number, relayUrl: string, ringId: string): Promise<RelayTestNode[]> {
+async function buildRelayRing(
+  n: number,
+  relayUrl: string,
+  ringId: string,
+  opts: Pick<RelayTransportOptions, 'reconnect' | 'logger'> = {},
+): Promise<RelayTestNode[]> {
   const identities = await Promise.all(Array.from({ length: n }, () => generateIdentity()));
   const nodes: RelayTestNode[] = [];
   for (let i = 0; i < n; i++) {
@@ -45,6 +53,7 @@ async function buildRelayRing(n: number, relayUrl: string, ringId: string): Prom
       ringId,
       peers,
       pullTimeoutMs: 5_000,
+      ...opts,
     });
     nodes.push({ partyId: i, identity: identities[i]!, transport });
   }
@@ -73,6 +82,19 @@ async function waitForRing(nodes: RelayTestNode[]): Promise<void> {
       if (peer.partyId === node.partyId) continue;
       await waitUntilConnected(node, peer.partyId);
     }
+  }
+}
+
+/** `p`'s value, or 'still pending' after `ms` (the guard timer is cleared either way). */
+async function settledWithin<T>(p: Promise<T>, ms: number): Promise<T | 'still pending'> {
+  let timer: NodeJS.Timeout | undefined;
+  const guard = new Promise<'still pending'>((r) => {
+    timer = setTimeout(() => r('still pending'), ms);
+  });
+  try {
+    return await Promise.race([p, guard]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -254,9 +276,9 @@ describe('RelayTransport — 3-peer mesh via relay', () => {
       peers: [{ partyId: 1, publicKey: other.publicKeyRaw }],
     });
     await dup.start();
-    // Dup's ws stays open but its hello was rejected by the server — it
-    // should log an error and stay disconnected. Confirm by attempting to
-    // broadcast (nothing to broadcast to, no-op).
+    // The server refuses dup's hello: a failed attempt, so dup drops the
+    // socket and retries with backoff, holding no session meanwhile. Its
+    // broadcast reaches nobody (a no-op).
     await dup.broadcast(new Uint8Array([1]));
 
     await transport.stop();
@@ -352,11 +374,7 @@ describe('RelayTransport — send ordering, transient failures and recovery', ()
     await b!.transport.stop();
     nodes = [a!];
 
-    const outcome = await Promise.race([
-      pending,
-      new Promise((r) => setTimeout(() => r('still pending'), 10_000)),
-    ]);
-    expect(outcome).toBeNull();
+    expect(await settledWithin(pending, 10_000)).toBeNull();
   }, 30_000);
 
   it.each([
@@ -474,4 +492,279 @@ describe('RelayTransport / RelayServer — frame size and response binding', () 
 
     await expect(pending).resolves.toBeNull();
   }, 20_000);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Reconnect (facts/transport.md, relay-transport.ts; spec §3.2, §4)
+// ─────────────────────────────────────────────────────────────────────────
+
+type LogLine = { msg: string; extra?: Record<string, unknown> };
+function capturingLogger(): { logger: Logger; infos: LogLine[]; warns: LogLine[] } {
+  const infos: LogLine[] = [];
+  const warns: LogLine[] = [];
+  const logger: Logger = {
+    debug: () => {},
+    info: (msg, extra) => infos.push({ msg, extra }),
+    warn: (msg, extra) => warns.push({ msg, extra }),
+    error: () => {},
+  };
+  return { logger, infos, warns };
+}
+
+/** The delays of the scheduled reconnects, in order (each failed attempt is a warn naming its next delay). */
+const reconnectDelays = (warns: LogLine[]): number[] =>
+  warns.flatMap((w) => (typeof w.extra?.delayMs === 'number' ? [w.extra.delayMs] : []));
+
+const REGISTERED = 'relay-transport: registered with the relay';
+
+/** Small backoff values: tests see several attempts quickly. */
+const FAST = { initialMs: 50, maxMs: 400 };
+
+describe('RelayTransport — reconnect', () => {
+  let server: RelayServer | null = null;
+  let nodes: RelayTestNode[] = [];
+  let transports: RelayTransport[] = [];
+  let tcp: net.Server | null = null;
+  const held: net.Socket[] = [];
+  afterEach(async () => {
+    await Promise.all([...nodes.map((n) => n.transport), ...transports].map((t) => t.stop()));
+    nodes = [];
+    transports = [];
+    if (server) await server.stop();
+    server = null;
+    for (const s of held.splice(0)) s.destroy();
+    if (tcp) await new Promise<void>((r) => tcp!.close(() => r()));
+    tcp = null;
+  });
+
+  async function solo(
+    url: string,
+    partyId: PartyId,
+    ringId: string,
+    extra: Partial<RelayTransportOptions> = {},
+  ): Promise<RelayTransport> {
+    const [identity, other] = await Promise.all([generateIdentity(), generateIdentity()]);
+    const transport = new RelayTransport({
+      self: { partyId, identity },
+      relayUrl: url,
+      ringId,
+      peers: [{ partyId: partyId === 0 ? 1 : 0, publicKey: other.publicKeyRaw }],
+      reconnect: FAST,
+      ...extra,
+    });
+    transports.push(transport);
+    return transport;
+  }
+
+  async function broadcastArrives(from: RelayTestNode, to: RelayTestNode, tag: number): Promise<void> {
+    const heard: number[] = [];
+    const off = to.transport.onBroadcast((_f, msg) => heard.push(msg[0]!));
+    try {
+      await vi.waitFor(
+        async () => {
+          await from.transport.broadcast(new Uint8Array([tag]));
+          expect(heard).toContain(tag);
+        },
+        { timeout: 15_000, interval: 100 },
+      );
+    } finally {
+      off();
+    }
+  }
+
+  it('reconnects after the relay server restarts and re-handshakes with peers', async () => {
+    const port = await freePort();
+    const listen = `127.0.0.1:${port}`;
+    server = new RelayServer({ listen });
+    await server.start();
+    nodes = await buildRelayRing(2, `ws://${listen}`, 'ring-restart', { reconnect: FAST });
+    await Promise.all(nodes.map((n) => n.transport.start()));
+    await waitForRing(nodes);
+    await broadcastArrives(nodes[0]!, nodes[1]!, 1);
+
+    await server.stop();
+    server = null;
+    for (const n of nodes) {
+      await vi.waitFor(() => expect(relayInternals(n.transport).peerStates.get(1 - n.partyId)!.status).toBe('disconnected'), {
+        timeout: 10_000,
+        interval: 20,
+      });
+    }
+
+    // A new relay on the same address: both nodes come back without a restart.
+    server = new RelayServer({ listen });
+    await server.start();
+    await waitForRing(nodes);
+    await broadcastArrives(nodes[0]!, nodes[1]!, 2);
+    await broadcastArrives(nodes[1]!, nodes[0]!, 3);
+  }, 40_000);
+
+  it('start() succeeds when the relay is down and connects once it comes up', async () => {
+    const port = await freePort();
+    const listen = `127.0.0.1:${port}`;
+    const { logger, warns } = capturingLogger();
+    nodes = await buildRelayRing(2, `ws://${listen}`, 'ring-late', { reconnect: FAST, logger });
+
+    // Nothing listens yet: start() resolves anyway, warning that it will retry.
+    await Promise.all(nodes.map((n) => n.transport.start()));
+    expect(reconnectDelays(warns).length).toBeGreaterThanOrEqual(1);
+
+    server = new RelayServer({ listen });
+    await server.start();
+    await waitForRing(nodes);
+    await broadcastArrives(nodes[0]!, nodes[1]!, 1);
+  }, 40_000);
+
+  it('start() still rejects a malformed relay URL (a config error, not an outage)', async () => {
+    const transport = await solo('relay.example:7100', 0, 'ring-badurl');
+    await expect(transport.start()).rejects.toThrow(SyntaxError);
+  });
+
+  it('backoff doubles to the cap and resets after a successful hello', async () => {
+    const port = await freePort();
+    const listen = `127.0.0.1:${port}`;
+    const { logger, infos, warns } = capturingLogger();
+    const transport = await solo(`ws://${listen}`, 0, 'ring-backoff', { logger });
+    await transport.start();
+
+    // Each failed attempt logs its next delay: initialMs · 2^attempt, capped at maxMs, plus up to 10 % jitter.
+    await vi.waitFor(() => expect(reconnectDelays(warns).length).toBeGreaterThanOrEqual(6), {
+      timeout: 20_000,
+      interval: 20,
+    });
+    const bases = [50, 100, 200, 400, 400, 400];
+    reconnectDelays(warns)
+      .slice(0, bases.length)
+      .forEach((delay, i) => {
+        expect(delay).toBeGreaterThanOrEqual(bases[i]!);
+        expect(delay).toBeLessThanOrEqual(bases[i]! * 1.1);
+      });
+
+    // The relay comes up; its ack to our hello resets the backoff.
+    server = new RelayServer({ listen });
+    await server.start();
+    await vi.waitFor(() => expect(infos.map((l) => l.msg)).toContain(REGISTERED), { timeout: 10_000, interval: 20 });
+    const before = reconnectDelays(warns).length;
+
+    // The next drop starts again at initialMs.
+    await server.stop();
+    server = null;
+    await vi.waitFor(() => expect(reconnectDelays(warns).length).toBeGreaterThan(before), {
+      timeout: 10_000,
+      interval: 20,
+    });
+    const next = reconnectDelays(warns)[before]!;
+    expect(next).toBeGreaterThanOrEqual(50);
+    expect(next).toBeLessThanOrEqual(55);
+  }, 40_000);
+
+  it('stop() cancels a pending reconnect', async () => {
+    const port = await freePort();
+    let dials = 0;
+    class CountingWebSocket extends WebSocket {
+      constructor(...args: unknown[]) {
+        super(...(args as ConstructorParameters<typeof WebSocket>));
+        dials += 1;
+      }
+    }
+    const { logger, warns } = capturingLogger();
+    const transport = await solo(`ws://127.0.0.1:${port}`, 0, 'ring-cancel', {
+      wsCtor: CountingWebSocket,
+      reconnect: { initialMs: 100, maxMs: 100 },
+      logger,
+    });
+    await transport.start();
+    expect(dials).toBe(1);
+    const [delay] = reconnectDelays(warns);
+    expect(delay).toBeDefined(); // the first attempt failed; the next one is scheduled
+
+    await transport.stop();
+    // Well past the scheduled delay: no further attempt.
+    await new Promise((r) => setTimeout(r, 4 * delay!));
+    expect(dials).toBe(1);
+    expect((transport as unknown as { reconnectTimer: unknown }).reconnectTimer).toBeNull();
+  }, 20_000);
+
+  it('stop() during a connection attempt aborts it, and start() resolves', async () => {
+    // A listener that accepts TCP but never answers the WebSocket upgrade.
+    tcp = net.createServer((sock) => {
+      held.push(sock);
+      sock.on('error', () => {});
+    });
+    await new Promise<void>((r) => tcp!.listen(0, '127.0.0.1', () => r()));
+    const { port } = tcp.address() as net.AddressInfo;
+    const transport = await solo(`ws://127.0.0.1:${port}`, 0, 'ring-abort');
+
+    const started = transport.start();
+    await vi.waitFor(() => expect(held).toHaveLength(1), { timeout: 5_000, interval: 10 });
+    await transport.stop();
+    await expect(started).resolves.toBeUndefined();
+    await new Promise((r) => setTimeout(r, 4 * FAST.maxMs));
+    expect(held).toHaveLength(1);
+  }, 20_000);
+
+  it('a refused hello is a failed attempt: the client retries until its partyId slot frees', async () => {
+    const port = await freePort();
+    const listen = `127.0.0.1:${port}`;
+    server = new RelayServer({ listen });
+    await server.start();
+    const holder = await solo(`ws://${listen}`, 0, 'ring-slot');
+    await holder.start();
+
+    const { logger, infos, warns } = capturingLogger();
+    const late = await solo(`ws://${listen}`, 0, 'ring-slot', { logger });
+    await late.start();
+    await vi.waitFor(
+      () => expect(warns.some((w) => /refused/.test(w.msg) && typeof w.extra?.delayMs === 'number')).toBe(true),
+      { timeout: 10_000, interval: 20 },
+    );
+    expect(infos.map((l) => l.msg)).not.toContain(REGISTERED);
+
+    await holder.stop();
+    await vi.waitFor(() => expect(infos.map((l) => l.msg)).toContain(REGISTERED), { timeout: 10_000, interval: 20 });
+  }, 20_000);
+
+  it('pulls during an outage return null and succeed after the reconnect', async () => {
+    const port = await freePort();
+    const listen = `127.0.0.1:${port}`;
+    server = new RelayServer({ listen });
+    await server.start();
+    nodes = await buildRelayRing(2, `ws://${listen}`, 'ring-outage', { reconnect: FAST });
+    await Promise.all(nodes.map((n) => n.transport.start()));
+    await waitForRing(nodes);
+    const [a, b] = nodes;
+    const key = { ceremonyId: 'c', round: 'r1', from: 1 };
+    const blob = new Uint8Array([0xb1, 0x0b]);
+    b!.transport.servePulls((_who, k) => (k.ceremonyId === 'c' && k.round === 'r1' ? blob : null));
+    expect(await a!.transport.pull(key)).toEqual(blob);
+
+    // A pull in flight when the relay drops resolves null at once, not at its timeout.
+    relayInternals(a!.transport).pullTimeoutMs = 120_000;
+    const bIncoming = b!.transport as unknown as { onIncoming: unknown };
+    bIncoming.onIncoming = async () => {}; // node 1 does not answer this one
+    const inFlight = a!.transport.pull(key);
+    const pulls = (a!.transport as unknown as { pendingPulls: Map<string, unknown> }).pendingPulls;
+    await vi.waitFor(() => expect(pulls.size).toBe(1), { timeout: 5_000, interval: 5 });
+    await server.stop();
+    server = null;
+    expect(await settledWithin(inFlight, 10_000)).toBeNull();
+    delete bIncoming.onIncoming; // node 1 answers again
+
+    // During the outage a pull returns null; the puller retries until the relay is back.
+    expect(await a!.transport.pull(key)).toBeNull();
+    const store = new BlobStore();
+    const pulling = new BlobPuller(a!.transport, store).pullAll([key], {
+      maxAttempts: 1_000,
+      initialDelayMs: 50,
+      maxDelayMs: 200,
+      deadlineMs: 30_000,
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(store.has(key)).toBe(false);
+
+    server = new RelayServer({ listen });
+    await server.start();
+    await pulling;
+    expect(store.get(key)).toEqual(blob);
+  }, 60_000);
 });

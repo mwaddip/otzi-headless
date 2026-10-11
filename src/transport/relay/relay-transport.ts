@@ -23,6 +23,11 @@
  * started by the initiator — on its own record failure, on the next send or
  * pull, or on a re-handshake request (an empty frame) from the responder. A
  * responder accepts a fresh hs1 in any state.
+ *
+ * Reconnect: a relay socket that fails to open, drops, or has its hello
+ * refused ends every peer session and schedules the next attempt with
+ * exponential backoff (`reconnect`); the relay's ack to a hello resets it.
+ * `start()` resolves after the first attempt either way; `stop()` cancels.
  */
 
 import { WebSocket } from 'ws';
@@ -69,6 +74,11 @@ export interface RelayTransportOptions {
   peers: ReadonlyArray<RelayTransportPeer>;
   wsCtor?: typeof WebSocket;
   pullTimeoutMs?: number;
+  /**
+   * Relay reconnect backoff: attempt k (from 0) waits min(maxMs, initialMs·2^k)
+   * plus up to 10 % jitter. Defaults 1000 / 30000 ms.
+   */
+  reconnect?: { initialMs?: number; maxMs?: number };
   logger?: Logger;
 }
 
@@ -107,6 +117,10 @@ interface PendingPull {
 }
 
 const DEFAULT_PULL_TIMEOUT_MS = 30_000;
+const DEFAULT_RECONNECT_INITIAL_MS = 1_000;
+const DEFAULT_RECONNECT_MAX_MS = 30_000;
+/** A reconnect delay grows by up to this fraction, so a ring that lost its relay does not redial in lockstep. */
+const RECONNECT_JITTER = 0.1;
 /** An initiator handshake without hs2 for this long may be restarted. */
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 /** Handshake messages are raw uncompressed P-256 points. */
@@ -124,10 +138,19 @@ export class RelayTransport implements Transport {
   private readonly broadcastHandlers = new Set<(from: PartyId, msg: Uint8Array) => void>();
   private pullHandler: ((from: PartyId, key: BlobKey) => Uint8Array | null) | null = null;
   private readonly pendingPulls = new Map<string, PendingPull>();
+  /** The current relay socket, from its connection attempt until it drops or `stop()`. */
   private ws: WebSocket | null = null;
+  /** The relay acked this socket's hello. */
+  private registered = false;
   private readonly wsCtor: typeof WebSocket;
   private readonly log: Logger;
   private readonly pullTimeoutMs: number;
+  private readonly reconnectInitialMs: number;
+  private readonly reconnectMaxMs: number;
+  /** Failed attempts since the last ack: the exponent of the next delay. */
+  private reconnectAttempt = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private started = false;
   private stopped = false;
 
   constructor(options: RelayTransportOptions) {
@@ -140,6 +163,8 @@ export class RelayTransport implements Transport {
     this.wsCtor = options.wsCtor ?? WebSocket;
     this.log = options.logger ?? NOOP_LOGGER;
     this.pullTimeoutMs = options.pullTimeoutMs ?? DEFAULT_PULL_TIMEOUT_MS;
+    this.reconnectInitialMs = options.reconnect?.initialMs ?? DEFAULT_RECONNECT_INITIAL_MS;
+    this.reconnectMaxMs = options.reconnect?.maxMs ?? DEFAULT_RECONNECT_MAX_MS;
 
     for (const peer of options.peers) {
       if (peer.partyId === this.partyId)
@@ -161,48 +186,28 @@ export class RelayTransport implements Transport {
     }
   }
 
+  /** Resolves after the first connection attempt, whether or not it reached the relay; later attempts follow the backoff. */
   async start(): Promise<void> {
-    if (this.ws) return;
-    const ws = new this.wsCtor(this.relayUrl, { maxPayload: MAX_FRAME_BYTES });
-    this.ws = ws;
-
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => {
-        ws.off('open', onOpen);
-        reject(err);
-      };
-      const onOpen = () => {
-        ws.off('error', onError);
-        resolve();
-      };
-      ws.once('error', onError);
-      ws.once('open', onOpen);
-    });
-
-    ws.on('message', (data) => {
-      void this.onRelayMessage(data);
-    });
-    ws.on('close', () => this.handleRelayClose());
-    ws.on('error', () => this.handleRelayClose());
-
-    await this.sendToRelay({
-      kind: 'hello',
-      ringId: this.ringId,
-      partyId: this.self.partyId,
-    });
-
+    if (this.started) return;
+    this.started = true;
+    await this.connect();
     this.log.info('relay-transport: started', { ringId: this.ringId, partyId: this.self.partyId });
   }
 
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     for (const pending of this.pendingPulls.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('relay-transport: stopping'));
     }
     this.pendingPulls.clear();
     if (this.ws) {
+      // Open or still connecting: either way it closes, and its close event is ignored (stopped).
       const ws = this.ws;
       this.ws = null;
       try {
@@ -291,7 +296,7 @@ export class RelayTransport implements Transport {
   // Relay message dispatch
   // ─────────────────────────────────────────────────────────────────────
 
-  private async onRelayMessage(data: unknown): Promise<void> {
+  private async onRelayMessage(ws: WebSocket, data: unknown): Promise<void> {
     const text = typeof data === 'string' ? data : Buffer.from(data as ArrayBuffer).toString('utf8');
     const msg = parseServerMsg(text);
     if (!msg) {
@@ -312,12 +317,22 @@ export class RelayTransport implements Transport {
         await this.onIncoming(msg.from, fromHex(msg.payloadHex));
         return;
       case 'error':
+        if (!this.registered) {
+          // An error before the ack: the relay refused our hello (say, a connection it has
+          // not yet seen drop still holds our partyId). A failed attempt: drop it and retry.
+          this.handleRelayClose(ws, 'relay refused hello', { message: msg.message });
+          ws.close();
+          return;
+        }
         this.log.warn('relay-transport: relay error', { message: msg.message });
         return;
     }
   }
 
   private async onAck(roster: PartyId[]): Promise<void> {
+    this.registered = true;
+    this.reconnectAttempt = 0;
+    this.log.info('relay-transport: registered with the relay', { roster });
     for (const partyId of roster) {
       const peer = this.peerStates.get(partyId);
       if (!peer) continue;
@@ -645,23 +660,94 @@ export class RelayTransport implements Transport {
 
   private sendToRelay(msg: RelayClientMsg): Promise<void> {
     const ws = this.ws;
-    if (!ws) return Promise.reject(new Error('relay-transport: not connected to the relay'));
+    if (!ws || ws.readyState !== WebSocket.OPEN)
+      return Promise.reject(new Error('relay-transport: not connected to the relay'));
     return new Promise<void>((resolve, reject) => {
       ws.send(encodeClientMsg(msg), (err) => (err ? reject(err) : resolve()));
     });
   }
 
-  private handleRelayClose(): void {
+  // ─────────────────────────────────────────────────────────────────────
+  // Relay connection lifecycle
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * One connection attempt: open a socket to the relay and send `hello`.
+   * Resolves once the hello is written or the attempt has failed. A failure,
+   * and any later drop, schedules the next attempt (`handleRelayClose`).
+   */
+  private async connect(): Promise<void> {
     if (this.stopped) return;
-    this.log.warn('relay-transport: relay connection closed');
+    const ws = new this.wsCtor(this.relayUrl, { maxPayload: MAX_FRAME_BYTES });
+    this.ws = ws;
+    this.registered = false;
+    let opened = false;
+    ws.once('open', () => {
+      opened = true;
+    });
+    ws.on('message', (data) => {
+      if (this.ws === ws) void this.onRelayMessage(ws, data);
+    });
+    // One drop can fire both `error` and `close`: the first one handles it.
+    ws.on('error', (err) =>
+      this.handleRelayClose(ws, opened ? 'relay connection failed' : 'relay connection attempt failed', {
+        err: errMsg(err),
+      }),
+    );
+    ws.on('close', (code) =>
+      this.handleRelayClose(ws, opened ? 'relay connection closed' : 'relay connection attempt failed', { code }),
+    );
+
+    await new Promise<void>((resolve) => {
+      ws.once('open', resolve);
+      ws.once('error', () => resolve());
+      ws.once('close', () => resolve());
+    });
+    if (!opened || this.ws !== ws) return; // failed (next attempt scheduled) or stopped
+
+    try {
+      await this.sendToRelay({ kind: 'hello', ringId: this.ringId, partyId: this.self.partyId });
+    } catch (err) {
+      this.handleRelayClose(ws, 'relay hello send failed', { err: errMsg(err) });
+      ws.terminate();
+    }
+  }
+
+  /**
+   * The current relay socket failed to open, dropped, or had its hello refused:
+   * every peer goes offline (sessions end, pending pulls resolve null, queued
+   * frames from the old socket are discarded) and the next attempt is scheduled.
+   * Events from any other socket, and anything after `stop()`, are ignored.
+   */
+  private handleRelayClose(ws: WebSocket, reason: string, details: Record<string, unknown>): void {
+    if (this.stopped || this.ws !== ws) return;
+    this.ws = null;
+    this.registered = false;
     for (const peer of this.peerStates.values()) {
       peer.online = false;
+      peer.pending.length = 0;
       this.endSession(peer, 'disconnected');
     }
-    this.ws = null;
-    // Reconnection to the relay is not implemented in phase 3e — operator
-    // restarts the daemon. Phase 3f integration can add exponential backoff
-    // if real deployments want it.
+    this.scheduleReconnect(reason, details);
+  }
+
+  /** Attempt k (from 0) waits min(maxMs, initialMs·2^k) plus up to 10 % jitter. */
+  private scheduleReconnect(reason: string, details: Record<string, unknown>): void {
+    if (this.stopped || this.reconnectTimer) return;
+    const base = Math.min(this.reconnectMaxMs, this.reconnectInitialMs * 2 ** this.reconnectAttempt);
+    const delayMs = base + Math.floor(Math.random() * base * RECONNECT_JITTER);
+    this.reconnectAttempt += 1;
+    this.log.warn(`relay-transport: ${reason}; reconnecting`, {
+      ...details,
+      attempt: this.reconnectAttempt,
+      delayMs,
+    });
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect().catch((err) =>
+        this.log.error('relay-transport: reconnect failed to start', { err: errMsg(err) }),
+      );
+    }, delayMs);
   }
 }
 

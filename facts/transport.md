@@ -417,7 +417,7 @@
 - Wire/byte format: WebSocket per peer pair, Noise-KK + AES-GCM encrypted, JSON app messages.
 
 **Notes / gotchas:**
-- Reconnect is initiator-only (asymmetric); responder is passive. Operator restart required for relay reconnect.
+- Reconnect is initiator-only (asymmetric); responder is passive. (The relay transport redials the relay on its own: see `relay-transport.ts`, Reconnect.)
 - Broadcast is fan-out with independent encryption per peer (not a single encrypt shared to all).
 - Pull timeout returning null is not an error; caller is responsible for retry logic.
 - Server bind is "host:port" (no default 0.0.0.0); explicit host required.
@@ -529,7 +529,7 @@
 **Public surface:**
 - `RelayTransportPeer` — Immutable peer descriptor with partyId and 65-byte publicKey.
 
-- `RelayTransportOptions` — Configuration with self identity, relay URL, ringId, peers, optional WebSocket constructor, pull timeout, logger.
+- `RelayTransportOptions` — Configuration with self identity, relay URL, ringId, peers, optional WebSocket constructor, pull timeout, `reconnect?: { initialMs?, maxMs? }` (relay reconnect backoff, default 1000 / 30000 ms; the daemon passes none), logger.
 
 - `RelayTransport` (implements Transport) — Transport layer over shared relay; single WebSocket to relay, per-peer Noise-KK sessions. Internally serialized; broadcast and pull are concurrent-safe.
 
@@ -539,13 +539,13 @@
   - **Throws:** `Error` if self is in peer list.
 
 - `start(): Promise<void>`
-  - **Pre:** Transport not already started.
-  - **Post:** Connects to relay WebSocket. Registers message handler. Sends hello with ringId and partyId. Relay responds with ack + roster; triggers handshakes for all peers in roster (initiators send hs1, responders wait for hs1).
-  - **Throws:** `Error` if relay connection fails.
+  - **Pre:** none; a second call is a no-op.
+  - **Post:** Makes the first connection attempt: opens the relay WebSocket and sends hello with ringId and partyId. Resolves once the hello is written **or the attempt has failed** — a relay that is down or unreachable does not fail `start()`; the failure is logged at warn and the next attempt scheduled (see Reconnect). Relay responds with ack + roster; triggers handshakes for all peers in roster (initiators send hs1, responders wait for hs1).
+  - **Throws:** `SyntaxError` (from `ws`) only when the relay URL is malformed — no attempt is made. Never for an unreachable relay.
 
 - `stop(): Promise<void>`
   - **Pre:** Transport started or already stopped (idempotent).
-  - **Post:** Rejects pending pulls, closes relay WebSocket, clears peer states.
+  - **Post:** Cancels any pending reconnect, rejects pending pulls, closes the relay WebSocket (aborting an attempt still connecting, whose `start()` then resolves), clears peer states. No connection attempt follows.
 
 - `broadcast(msg: Uint8Array): Promise<void>`
   - **Post:** Encrypts msg independently for each connected peer; sends via relay frames. Silently skips offline peers. Logs warn if individual sends fail.
@@ -572,7 +572,13 @@
 - Per-peer send chain serializes every frame to that peer — hs1, hs2 and seal-then-send of records — so frames reach the relay in counter order. A responder enqueues hs2 in the same synchronous step that makes the session usable, so no record overtakes it. A record queued under a session that has since been replaced is dropped, not sent.
 - Handshake: initiator sends message1 (raw 65-byte ephemeral, not encrypted), responder replies with message2 (also raw), then both derive AES-GCM session.
 - Peer roster discovered via relay's ack + peer-joined/peer-left events. Initiators trigger handshake on roster update (a join restarts any handshake in flight).
-- Relay reconnect is NOT implemented; operator restart on relay drop.
+- **Reconnect.** A relay socket ends when it fails to open, drops (`close` or `error`; one drop schedules one attempt), or the relay answers hello with an `error` before the ack (a refused hello, e.g. a connection the relay has not yet seen drop still holds this partyId). Unless `stop()` was called:
+  - every peer goes offline: `disconnected`, session and initiator state cleared, pending pulls resolve null, incoming frames still queued from the old socket discarded;
+  - a warn names the reason, the attempt number and the next delay (`delayMs`);
+  - the next attempt runs after `min(maxMs, initialMs·2^k)` plus up to 10 % random jitter, where k counts failed attempts since the last ack (defaults 1000 / 30000 ms: 1 s, 2 s, 4 s … 30 s);
+  - the relay's ack to a hello resets k to 0, and the roster logic (ack, `peer-joined`) restarts the handshakes;
+  - retries continue until `stop()`. Only events and messages from the current socket count.
+- While disconnected from the relay, broadcasts skip every peer and pulls return null (transient: ceremony pulls retry until their deadline, so an outage shorter than the deadline only delays a ceremony).
 - Broadcast is fan-out with independent encryption per peer.
 - Pull timeout returning null is transient; BlobPuller's retry handles retries.
 - **Re-handshake.** A peer whose session breaks is re-keyed by a fresh handshake, always started by the initiator:
@@ -592,7 +598,7 @@
 - The re-handshake request is unauthenticated (it carries nothing); whoever can inject relay frames can force re-handshakes, which is no more than the relay can do by dropping frames.
 - Broadcast and pull are independent per-peer; one peer's failure doesn't affect others.
 
-**Reconnect behavior (operator-facing):** No automatic reconnect. If the relay WebSocket drops mid-session, `handleRelayClose()` sets all peers to disconnected and clears sessions; subsequent broadcasts silently no-op (offline peers are skipped) and pulls return null. The daemon does NOT re-dial. Operators recover via `systemctl restart otzi`. Acceptable for short-lived federations; production federations that need stability should use peer-mesh transport, which has initiator-side exponential-backoff reconnect built in.
+**Reconnect behavior (operator-facing):** Automatic; no operator restart. A relay that is down when the daemon starts, restarts, or drops the connection is redialled with backoff (1 s, 2 s, 4 s … capped at 30 s, plus up to 10 % jitter), each failed attempt logged at warn with its next delay. The daemon starts and stays up meanwhile (no crash-loop under systemd). A ceremony running during the outage sees null pulls, keeps retrying, and completes after the reconnect if that comes before its deadline; otherwise it times out as usual. The client notices a drop only when the socket reports it (no heartbeat).
 
 ---
 
