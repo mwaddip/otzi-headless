@@ -15,11 +15,14 @@ case "$1" in
               --home /var/lib/otzi --shell /usr/sbin/nologin otzi
     fi
 
-    # /etc/otzi: 2770 root:otzi (setgid) so group-otzi members can edit/install
-    # manifests; new files inherit group otzi via setgid.
+    # /etc/otzi: 2750 root:otzi (setgid). Only root writes: the config, the
+    # address book and the share-password file all decide what the node signs.
+    # Group otzi reads and traverses, so the daemon (User=otzi) and operators
+    # in the group can read daemon.toml and the address book. New files inherit
+    # group otzi via setgid.
     [ -d /etc/otzi ] || mkdir -p /etc/otzi
     chown root:otzi /etc/otzi
-    chmod 2770 /etc/otzi
+    chmod 2750 /etc/otzi
 
     # /var/lib/otzi: 2770 root:otzi so group-otzi members can run setup
     # (writes identity.json + pubkeys.json) — daemon (otzi user) reads via
@@ -34,6 +37,20 @@ case "$1" in
     chown root:otzi /var/run/otzi
     chmod 2770 /var/run/otzi
 
+    # Leftovers of earlier releases; nothing reads these files any more.
+    rm -f /var/lib/otzi/bootstrap-secret /etc/otzi/manifest.otzi.json
+
+    # daemon.toml and the address book decide what this node signs: root writes
+    # them, group otzi reads them. Re-applied on every configure, so a mode or
+    # owner loosened since (an editor, a copy) is put back. Symlinks are left
+    # alone rather than followed.
+    for OTZI_FILE in /etc/otzi/daemon.toml /etc/otzi/address-book.otzi.json; do
+      if [ -f "$OTZI_FILE" ] && [ ! -L "$OTZI_FILE" ]; then
+        chown root:otzi "$OTZI_FILE"
+        chmod 0640 "$OTZI_FILE"
+      fi
+    done
+
     # Add operator users to the otzi group.
     db_get otzi-headless/operators || true
     OPERATORS="$RET"
@@ -46,9 +63,9 @@ case "$1" in
       fi
     done
 
-    # Restore-from-backup branch (run BEFORE bootstrap-secret + daemon.toml
-    # render). If the operator picked "yes" at the debconf prompt, pipe the
-    # password to `otzi restore --password-stdin <path>` and short-circuit the
+    # Restore-from-backup branch (run BEFORE the daemon.toml render). If the
+    # operator picked "yes" at the debconf prompt, pipe the password to
+    # `otzi restore --password-stdin <path>` and short-circuit the
     # fresh-install path. NEVER pass the password as an argv flag — it would
     # leak via /proc/<pid>/cmdline + ps. db_reset wipes the password from
     # /var/cache/debconf/passwords.dat on EVERY exit path.
@@ -84,6 +101,11 @@ case "$1" in
 
   Verify the restored config:
     sudo cat /etc/otzi/daemon.toml
+  Create /etc/otzi/otzi.env (owner root:root, mode 600) with one line;
+  the backup does not contain it, and the daemon refuses to start without
+  the password:
+    sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env
+    sudoedit /etc/otzi/otzi.env   # OTZI_SHARE_PASSWORD=<this node's share password>
   Then start the daemon:
     sudo systemctl enable --now otzi
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -101,22 +123,11 @@ BANNER
       fi
     fi
 
-    # Persist the bootstrap secret. It will be wiped by the daemon after
-    # the first successful DKG.
-    db_get otzi-headless/bootstrap-secret || true
-    BOOTSTRAP_SECRET="$RET"
-    if [ -n "$BOOTSTRAP_SECRET" ]; then
-      umask 027
-      printf '%s\n' "$BOOTSTRAP_SECRET" >/var/lib/otzi/bootstrap-secret
-      chown root:otzi /var/lib/otzi/bootstrap-secret
-      chmod 660 /var/lib/otzi/bootstrap-secret
-    fi
-
     # Render daemon.toml only if missing — preserve operator edits across upgrades.
     if [ ! -f /etc/otzi/daemon.toml ]; then
       db_get otzi-headless/role || true;                  ROLE="$RET"
       db_get otzi-headless/network || true;               NETWORK="$RET"
-      db_get otzi-headless/opnet-rpc || true;             OPNET_RPC="$RET"
+      db_get otzi-headless/esplora-url || true;           ESPLORA_URL="$RET"
       db_get otzi-headless/transport || true;             TRANSPORT="$RET"
       db_get otzi-headless/advertised-endpoint || true;   ADVERTISED="$RET"
       db_get otzi-headless/peers || true;                 PEERS_CSV="$RET"
@@ -126,14 +137,27 @@ BANNER
       db_get otzi-headless/node-id || true;               NODE_ID="$RET"
 
       [ -n "$NODE_ID" ]        || NODE_ID="$(hostname -s 2>/dev/null || hostname)"
-      [ -n "$NETWORK" ]        || NETWORK="testnet"
-      [ -n "$OPNET_RPC" ]      || OPNET_RPC="https://testnet.opnet.org"
+      [ -n "$NETWORK" ]        || NETWORK="testnet4"
       [ -n "$TRANSPORT" ]      || TRANSPORT="peer-mesh"
       [ -n "$ROLE" ]           || ROLE="leaf"
       [ -n "$BOOTSTRAP_BIND" ] || BOOTSTRAP_BIND="0.0.0.0:7090"
 
+      # Optional: a blank (or whitespace-only) answer leaves esplora_url out, and
+      # the CLI uses the mempool.space default of the network.
+      ESPLORA_URL="$(printf '%s' "$ESPLORA_URL" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      # The daemon refuses to start on an esplora_url that is not an http(s) URL, so a
+      # value without the scheme is left out of the config rather than written into it.
+      case "$ESPLORA_URL" in
+        ""|http://?*|https://?*) ;;
+        *)
+          echo "otzi-headless: WARNING — ignoring Esplora URL '$ESPLORA_URL': it must start with http:// or https://." >&2
+          echo "otzi-headless: the CLI will use the mempool.space default; set esplora_url under [network] in /etc/otzi/daemon.toml to change it." >&2
+          ESPLORA_URL=""
+          ;;
+      esac
+
       ENODE_ID="$(toml_escape "$NODE_ID")"
-      EOPNET_RPC="$(toml_escape "$OPNET_RPC")"
+      EESPLORA_URL="$(toml_escape "$ESPLORA_URL")"
       EADVERTISED="$(toml_escape "$ADVERTISED")"
       ERELAY_URL="$(toml_escape "$RELAY_URL")"
       EBOOTSTRAP_BIND="$(toml_escape "$BOOTSTRAP_BIND")"
@@ -156,9 +180,14 @@ pubkey_book_file = "/var/lib/otzi/pubkeys.json"
 
 [network]
 name = "$NETWORK"
-opnet_rpc = "$EOPNET_RPC"
-
 EOF
+
+      if [ -n "$ESPLORA_URL" ]; then
+        cat >>/etc/otzi/daemon.toml <<EOF
+esplora_url = "$EESPLORA_URL"
+EOF
+      fi
+      printf '\n' >>/etc/otzi/daemon.toml
 
       if [ "$TRANSPORT" = "relay" ]; then
         cat >>/etc/otzi/daemon.toml <<EOF
@@ -251,20 +280,32 @@ EOF
       chown root:otzi /etc/otzi/daemon.toml
       chmod 640 /etc/otzi/daemon.toml
 
-      # Print role-conditional next steps.
+      # Print the next steps, in the order docs/install.md walks through.
       cat <<EOF
 
 otzi-headless installed. Next steps:
 
-  1. Bootstrap pubkey exchange:
+  1. Bootstrap pubkey exchange, leader first. Compare the printed fingerprint
+     on every node before going further:
        sudo -u otzi otzi setup /etc/otzi/daemon.toml
-  2. Generate the threshold share:
-       sudo -u otzi otzi generate /etc/otzi/daemon.toml
-  3. Enable + start the daemon:
+  2. Create /etc/otzi/otzi.env (owner root:root, mode 600) with one line. The
+     unit loads it, and the daemon refuses to start without the password
+     (systemd interprets quotes and backslashes there: avoid them):
+       sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env
+       sudoedit /etc/otzi/otzi.env   # OTZI_SHARE_PASSWORD=<a strong password>
+  3. Enable + start the daemon on every node:
        sudo systemctl enable --now otzi
+  4. Run the DKG on one node (every other daemon must be running):
+       sudo -u otzi otzi generate
+  5. Restart every daemon so it loads its share, then check the vault:
+       sudo systemctl restart otzi
+       otzi vault
 
 Operators (in 'otzi' group): $OPERATORS
-Config: /etc/otzi/daemon.toml (chmod 640, owned root:otzi)
+Config: /etc/otzi/daemon.toml         (mode 640, owned root:otzi)
+        /etc/otzi/                    (mode 2750, owned root:otzi setgid;
+                                       only root writes, group otzi reads)
+Secret: /etc/otzi/otzi.env            (you create it: mode 600, owned root:root)
 Data:   /var/lib/otzi/                (mode 2770, owned root:otzi setgid)
 UDS:    /var/run/otzi/otzi.sock       (mode 660, owned otzi:otzi)
 Logs:   journalctl -u otzi

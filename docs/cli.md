@@ -1,56 +1,95 @@
 # otzi CLI reference
 
-Operator-facing reference for `otzi <verb>`. The CLI talks to the local daemon over a Unix domain socket (typically `/var/run/otzi/otzi.sock`); access is gated by membership in the `otzi` Unix group (set up by the .deb postinst).
+Operator-facing reference for `otzi <verb>`. The CLI is the operator surface: it
+talks to the local daemon over a Unix domain socket (typically
+`/var/run/otzi/otzi.sock`), reads the chain through Esplora, and works on local
+files. Access to the socket is gated by membership in the `otzi` Unix group (set
+up by the .deb postinst).
 
-The default config path is `/etc/otzi/daemon.toml` — operators can override per-invocation with `--config <path>`.
+The daemon never touches the chain. The CLI builds the transaction proposal from
+Esplora data, asks the daemon to sign it, and broadcasts the signed transaction
+through Esplora.
+
+## Conventions
+
+- Verbs that read the daemon configuration accept `--config <path>` (default
+  `/etc/otzi/daemon.toml`). The CLI takes the UDS path, the network and the
+  Esplora URL from it. `otzi daemon` and `otzi setup` take the config path as
+  their positional argument instead. `otzi vault` reads only
+  `/var/lib/otzi/vault-pubkey.json`.
+- Machine output (addresses, txids, signed hex, JSON) goes to stdout. Banners and
+  errors go to stderr. Errors exit with status 1.
+- The CLI broadcasts only the daemon's own signed version of the transaction it asked about; a reply for a different transaction, or one missing a signature, is refused and nothing is posted.
+- If a broadcast fails after signing, the CLI prints the signed transaction hex
+  to stderr and exits 1, so the operator can broadcast it by other means.
+- Esplora defaults to mempool.space for the configured network
+  (`https://mempool.space/testnet4/api` on testnet4). `[network].esplora_url`
+  overrides it. Only `otzi btc *` verbs call Esplora; run them on a host that can
+  reach it.
 
 ## Verbs
 
 ### Daemon lifecycle
 
-- `otzi daemon <config.toml>` — run the daemon (long-lived; usually started by systemd, not by hand).
-- `otzi setup <config.toml>` — bootstrap pubkey exchange. Reads `[bootstrap].role` from the config and runs leader or leaf flow accordingly.
-- `otzi generate <config.toml> [--ceremony-id <id>]` — trigger combined DKG against the local daemon. The leader derives `parties` from its configured peer set (`peers.length + 1`) and uses `threshold = parties` (v0.1 is n-of-n by design — see `INTERFACES.md` § Trust model). Banner prints the resulting BTC + OPNet vault addresses on success.
+- `otzi daemon <config.toml>` — run the daemon (long-lived; usually started by systemd, not by hand). A node with a share loaded starts in signing mode; a node without one starts in setup mode, where `sign` returns `409` until a DKG completes and the daemon restarts.
+- `otzi setup <config.toml>` — bootstrap pubkey exchange. Reads `[bootstrap].role` from the config and runs the leader or leaf flow. Prints the 96-bit fingerprint of the resulting pubkey book as `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx`. **Compare it out of band with every other operator before any DKG.** Re-running on a node that already has a pubkey book re-prints the fingerprint.
+- `otzi generate [--config <path>] [--ceremony-id <id>]` — run the run-once DKG through the local daemon (the `dkg` op). Run it on exactly one node; every other daemon in the ring must be running. The vault is n-of-n: `parties` is the ring size and `threshold = parties`. The banner prints the vault address, the network, the share path, and the instruction to **restart every daemon** so each loads its new share.
 
-### Manifest
+  Fails with `409` when this node already holds a vault, `403` when this node's gate rejects, `500` when the ceremony fails or times out. A DKG that fails before any node commits leaves no share at the share path on any node and can be re-run; a staged `<share path>.pending` left behind is overwritten by the next DKG.
 
-- `otzi install <path>` — install a `.otzi.json` manifest at `/etc/otzi/manifest.otzi.json`. Validates against `headless-manifest-v1` (see `docs/headless-manifest-schema.json`). Refuses if a manifest is already installed; run `otzi uninstall` first.
-- `otzi sync <path>` — distribute a manifest to ALL peers in the federation. Validates locally, computes HMAC-SHA-256 over the verbatim text using `/var/lib/otzi/bootstrap-secret`, and broadcasts via the daemon's control plane. Bootstrap-window-only: after DKG completes, this command exits with `control plane closed` — operators must run `otzi install <new file>` locally on each node from then on. Prints the per-call `ceremonyId` and the count of peers notified; check each peer's `otzi list` to confirm install.
-- `otzi list` — show the installed manifest as a numbered/lettered tree.
-- `otzi uninstall` — remove the installed manifest (idempotent).
+  A DKG can also fail on one node after another node has committed the vault (for example when a node loses its connection during the last exchange). A node that had already published its confirmation therefore never deletes its staged share: it keeps `<share path>.pending`, and the error (in the `500` reply when it is this node, in the daemon log otherwise) names the file and the vault address. Run `otzi vault` on the other nodes. If any of them shows that address, rename the `.pending` file to the share path on this node (`sudo mv <share path>.pending <share path>`) and restart its daemon. If none does, the vault was never created: remove the `.pending` files and run `otzi generate` again.
 
-### Signing (manifest-driven)
+### Vault
 
-- `otzi sign <contract> <method> <args...>` — encode the call, run threshold ML-DSA pre-sign + FROST broadcast through the daemon. Prints the resulting `transactionId`.
-  - `<contract>`: 1-based index from `otzi list` (e.g. `1`) or contract name (e.g. `Shitcoin`).
-  - `<method>`: letter (e.g. `a`) or method name (e.g. `transfer`).
-  - `<args>`: positional, parsed per the resolved ABI types. Decimal for uints, `0x…` for addresses, `true`/`false` for bools, `0x…` for bytes.
-  - `--fee-rate <sat/vB>` (optional): override the auto-fetched mempool fee rate.
+- `otzi vault [--json]` — print the vault address, the network and `<threshold>-of-<parties>`, read from `/var/lib/otzi/vault-pubkey.json`. `--json` prints the whole file: `network`, `address`, `internalKey`, `outputKey`, `threshold`, `parties` and the public `vaultKey`. Works without the daemon. Fails with a pointer to `otzi generate` when the file does not exist.
+- `otzi btc balance [--unit sats|btc|mbtc|ubtc] [--config <path>]` — confirmed and unconfirmed vault balance from Esplora, in the chosen unit (default `sats`):
 
-Two ceremonies happen under the hood: ML-DSA pre-sign over `sha256(calldata)` (the OPNet construction-params API requires this) followed by FROST sign + broadcast via `protocol: 'opnet-params'`. Operators see one command.
+  ```
+  confirmed: 150000
+  unconfirmed: 0
+  ```
 
-### BTC vault
+- `otzi btc send <label|address> <amount[unit]|max> [--fee-rate N] [--config <path>]` — send from the vault. Prints the txid and the explorer URL.
+  - `<label|address>`: a label from this node's address book (exact match) or a valid address for the configured network. A label that is itself an address but names a different address is refused, so a send to an address never pays another one; rename or remove that label.
+  - `<amount[unit]>`: a number with an optional unit, `sats` (default), `btc`, `mbtc` or `ubtc` (`50000`, `0.001btc`). Fractional sats are rejected. `max` spends every confirmed UTXO with no change.
+  - `--fee-rate N`: sat/vB, more than 0 and at most 10000. Default: Esplora's `normal` estimate; an Esplora estimate outside that range is refused (naming the Esplora URL) and you pass `--fee-rate` instead.
 
-- `otzi btc send <address> <amount>[unit]` — send BTC from the vault to an external address. Units: `sats` (default), `btc`, `mbtc`, `ubtc`. Auto-fetches fee rate from mempool.space; override with `--fee-rate <sat/vB>`.
-- `otzi btc balance [--unit <sats|btc|mbtc|ubtc>]` — read vault BTC balance. Read-only; no daemon round-trip.
+  The steps: resolve the recipient, fetch **confirmed** UTXOs, build the proposal (largest UTXOs first; change under 330 sats goes to the fee; a send below 546 sats is refused), refuse a send that needs more than 255 inputs (consolidate UTXOs first), print the summary (outputs with their address-book labels, change, fee, fee rate) to stderr, call the daemon's `sign` op, check that the reply is the transaction that was built and is signed on every input, broadcast it. The node you run it on is the ceremony leader.
 
-### Reads
+- `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` — sign a proposal someone else built. `proposal.json` holds `{ "network", "tx", "prevouts" }` (see [`api.md`](./api.md) § `op: "sign"`). Analysis runs locally first, so a proposal this vault would not sign fails before any daemon call. The analysis summary (outputs with their address-book labels, change, fee, fee rate) goes to stderr before the daemon is asked to sign; stdout gets the txid and the signed hex. Without `--broadcast` nothing is posted; with it, the CLI posts the transaction and prints the explorer URL as a third stdout line.
 
-- `otzi vault [--json]` — print vault BTC + OPNet addresses (and the underlying pubkeys when `--json`).
-- `otzi op20 balance <ticker|ID>` — read the vault's balance for an OP20/OP20S contract from the manifest. Output respects the manifest-stored `decimals`.
+Every node in the signer set analyses the proposal against its own key and runs its own gate. If a node declines, the leader's ceremony fails and the command exits with the daemon's `500` error.
+
+### Address book
+
+Each node has its own address book at `/etc/otzi/address-book.otzi.json` (Ötzi's address-book file format, owner `root:otzi`, mode `0640`). It labels recipients in gate specs and CLI output, resolves `otzi btc send <label>`, and can serve as the policy recipient allowlist (`allowed_recipients = "address-book"`). Nodes do not share or sync books.
+
+**Reading needs `otzi` group membership; writing needs root** (`sudo otzi book add …`), because the book can widen a policy allowlist and so carries the same privilege as editing `daemon.toml`. Every write validates the whole book and replaces the file atomically.
+
+- `otzi book list` — one line per entry on stdout: label, address, note, separated by tabs. Control characters in a label or note are not shown; the stored book is not changed.
+- `otzi book add <label> <address> [--note <text>]` — add an entry, or update the label and note of the entry with the same address (an update without `--note` clears the note).
+- `otzi book remove <label|address>` — remove the entry whose address matches, or else the one whose label matches. Fails when nothing matches, or when a label matches more than one entry (remove it by address).
+- `otzi book import <file> [--replace]` — merge an Ötzi address-book file (default) or replace the book with it. Prints `added <a>, updated <u>, unchanged <n>, removed <r>` on stdout; `removed` counts the entries `--replace` dropped (always 0 for a merge). A file for another network is refused and nothing is written.
+- `otzi book export [path]` — write the book as an Ötzi address-book file (stdout without a path). A file written to `path` gets mode `0640`, like the book.
+
+Every `book` verb takes `--config <path>` (default `/etc/otzi/daemon.toml`) and reads the network from it. Confirmations go to stderr; errors exit 1.
+
+Entry rules: trimmed label of 1 to 64 characters, an address valid for the configured network, unique addresses, a note of at most 256 characters, at most 1000 entries. The file's network must equal the configured network. Labels are not required to be unique, but `btc send` takes the first match, so keep them unique. Export and import files move between nodes and web Ötzi unchanged.
 
 ### Backup + restore
 
-- `otzi backup` — produce a password-protected archive of the full daemon state at `~/otzi-backup-<ISO>.otzi-backup` (mode 0600). Captures `daemon.toml`, share, identity, pubkey book, manifest (if installed), vault-pubkey cache, bootstrap-secret (pre-DKG only), and a `meta.json`. AES-256-GCM with PBKDF2-SHA256 (600k iterations). The 32-char password is auto-generated (~190 bits entropy) and printed once to stdout in a banner; write it down. Exit code 0 on success.
+- `sudo otzi backup` — produce a password-protected archive of the full node state at `~/otzi-backup-<ISO>.otzi-backup` (mode 0600). It holds `daemon.toml`, the share, the identity key, the pubkey book, `vault-pubkey.json` and the address book (when present), and a `meta.json`. AES-256-GCM with PBKDF2-SHA256 (600k iterations). The 32-character password is auto-generated (~190 bits of entropy) and printed once to stdout in a banner; write it down. Exit code 0 on success.
 
   ```bash
-  otzi backup
+  sudo otzi backup
   ```
+
+  It needs root: the share file is readable only by its owner. Under plain `sudo` the archive lands in root's home directory (`/root`, as in the banner below); copy it off the host.
 
   Output:
   ```
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    Backup written: /home/operator/otzi-backup-2026-04-26T12-34-56Z.otzi-backup
+    Backup written: /root/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
     Password:       a8K2zP4mQ9xR7sN3vL5jB6tH1wF0gY9c
 
     WRITE THIS DOWN. There is no recovery path if you lose this password.
@@ -58,51 +97,64 @@ Two ceremonies happen under the hood: ML-DSA pre-sign over `sha256(calldata)` (t
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ```
 
-- `otzi restore <archive-path> [--password-stdin]` — decrypt an `otzi-backup` archive and restore files to their canonical paths with canonical modes. Without `--password-stdin`, the CLI prompts for the password interactively (TTY-masked). With `--password-stdin`, reads the password from stdin until newline — used by debconf during fresh installs and by scripted runs.
+- `otzi restore <archive-path> [--password-stdin]` — decrypt an `otzi-backup` archive and restore files to their canonical paths with canonical modes. Without `--password-stdin`, the CLI prompts for the password on the terminal; what you type is shown (the prompt does not mask it), so prefer `--password-stdin` where others can see the screen. With `--password-stdin`, it reads the password from stdin until newline — used by debconf during fresh installs and by scripted runs.
+
+  Restore only creates files. It writes the vault's own files — `daemon.toml`, the address book, `vault-pubkey.json`, and the share, identity and pubkey book at the paths the archived `daemon.toml` names — and only directly inside `/etc/otzi` and `/var/lib/otzi` (not in a subdirectory of them). Any other entry in the archive is skipped with a warning. If it fails part-way, it removes the files it created; nothing that existed before is touched.
 
   Refuses (exit 1) if:
-  - `/etc/otzi/daemon.toml` already exists. Run `sudo rm /etc/otzi/daemon.toml` first.
+  - `/etc/otzi/daemon.toml` already exists. Move it aside first (`sudo mv /etc/otzi/daemon.toml /root/`).
   - `systemctl is-active otzi` returns 0. Run `sudo systemctl stop otzi` first.
-  - Archive magic isn't `OTZI-BACKUP-V1`.
-  - Decryption fails — wrong password OR tampered archive (same error; doesn't leak which).
+  - The archive magic isn't `OTZI-BACKUP-V1`.
+  - Decryption fails — wrong password or tampered archive (same error; it doesn't say which).
+  - Any file it would write already exists. The error lists them; move them aside (don't delete a share — it is key material) and run restore again.
+  - The archive's `daemon.toml` puts the share, identity or pubkey book anywhere but directly inside `/etc/otzi` or `/var/lib/otzi` (a subdirectory such as `/var/lib/otzi/keys/` is refused too), or the archive holds a symlink, hardlink, device, FIFO, `..` or absolute entry, a directory where a file belongs, or a file twice.
 
   ```bash
   sudo systemctl stop otzi
-  sudo rm /etc/otzi/daemon.toml
-  sudo otzi restore ~/otzi-backup-2026-04-26T12-34-56Z.otzi-backup
+  sudo mv /etc/otzi/daemon.toml /root/
+  sudo otzi restore ~/otzi-backup-2026-10-10T12-34-56Z.otzi-backup
 
   # Or scripted:
   echo "$BACKUP_PWD" | sudo otzi restore --password-stdin ~/otzi-backup-...otzi-backup
   ```
 
-  On success, prints a per-file summary and a `Run systemctl start otzi` next-step.
+  On success, prints a per-file summary, a warning line for each skipped entry, and the next steps: create `/etc/otzi/otzi.env` with the share password (the archive does not contain it; `sudo install -m 600 -o root -g root /dev/null /etc/otzi/otzi.env`, then edit it), then `sudo systemctl start otzi`.
 
   **Why stdin and not a `--password=<pwd>` flag?** A CLI flag would leak the password via `/proc/<pid>/cmdline` and `ps`. Stdin is the only safe non-interactive channel.
 
 ## Examples
 
+All addresses below are testnet4.
+
 ```bash
-# After `otzi generate` completes successfully and daemons restart…
-otzi vault                                 # show the vault addresses
+# One-time setup, after `otzi setup` fingerprints match on every node
+otzi generate                              # on one node; then restart every daemon
+sudo systemctl restart otzi                # on every node
 
-# Manifest-driven signing
-otzi install ./shitcoin.otzi.json
-otzi list
-otzi sign 1 a 0x<recipient-64hex> 25000000   # transfer 25,000,000 atomic units
-
-# Direct BTC vault transfer (no manifest needed)
+otzi vault                                 # same address on every node
 otzi btc balance --unit btc
-otzi btc send opt1p<destination> 0.001btc
 
-# OP20 balance read
-otzi op20 balance Shitcoin
+# Send to an address, or to a label from the address book
+otzi btc send tb1p…recipient 50000 --fee-rate 5
+sudo otzi book add treasury tb1p…recipient --note "cold storage"
+otzi btc send treasury 0.001btc
+otzi btc send treasury max
+
+# Sign a proposal built elsewhere, then broadcast it
+otzi btc sign ./proposal.json
+otzi btc sign ./proposal.json --broadcast
+
+# Address-book files move between nodes and web Ötzi
+otzi book export ./book.otzi.json
+sudo otzi book import ./book.otzi.json
+sudo otzi book import ./book.otzi.json --replace
 ```
 
 ## Configuration
 
 The CLI reads:
-- `/etc/otzi/daemon.toml` — daemon TOML (UDS path, network, peers, …). Override with `--config`.
-- `/etc/otzi/manifest.otzi.json` — installed manifest. Override per-command path is not currently exposed; install/uninstall manage this file.
-- `/var/lib/otzi/vault-pubkey.json` — vault metadata cache (read-only).
+- `/etc/otzi/daemon.toml` — daemon TOML (UDS path, network, Esplora URL, …). Override with `--config`.
+- `/var/lib/otzi/vault-pubkey.json` — public vault metadata, written by the daemon (read-only for the CLI).
+- `/etc/otzi/address-book.otzi.json` — this node's address book.
 
-See `docs/headless-manifest-schema.json` for the manifest JSON Schema and `docs/api.md` for the daemon HTTP/UDS API.
+See [`api.md`](./api.md) for the daemon UDS API and [`config.md`](./config.md) for `daemon.toml`.

@@ -35,26 +35,21 @@ Description: Operator usernames (space-separated)
  add operators manually later via `sudo usermod -aG otzi <user>` or
  `sudo dpkg-reconfigure otzi-headless`.
 
-Template: otzi-headless/bootstrap-secret
-Type: password
-Description: Bootstrap secret (shared passphrase)
- Operators agree on this string out-of-band BEFORE install. It
- authenticates control-plane CLI operations (e.g. `otzi sync`) during
- the bootstrap window. Wiped from disk after DKG completes; cannot be
- recovered. After DKG, manifest changes are operator-local per node.
-
 Template: otzi-headless/network
 Type: select
-Choices: mainnet, testnet, regtest
-Default: testnet
+Choices: mainnet, testnet4, signet
+Default: testnet4
 Description: Bitcoin network
+ The network of the vault. Every node in the ring must use the same one.
 
-Template: otzi-headless/opnet-rpc
+Template: otzi-headless/esplora-url
 Type: string
-Description: OPNet RPC URL
- Operator-side broadcast paths default to this URL. Per-network
- defaults: https://api.opnet.org (mainnet), https://testnet.opnet.org
- (testnet), http://127.0.0.1:9001 (regtest).
+Description: Esplora REST API URL (optional)
+ Base URL of the Esplora API that the `otzi btc` commands use to read
+ balances and UTXOs and to broadcast. It must start with http:// or
+ https:// (for example https://mempool.space/testnet4/api); a value without
+ that scheme is ignored. Leave blank to use the mempool.space default for
+ the network. The daemon itself never contacts it.
 
 Template: otzi-headless/transport
 Type: select

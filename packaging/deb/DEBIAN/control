@@ -7,11 +7,13 @@ Priority: optional
 Depends: nodejs (>= 22), adduser, debconf (>= 0.5) | debconf-2.0
 Description: Headless daemon for Ötzi threshold signing
  otzi-headless is a daemon variant of Ötzi for automated and federated
- threshold-signing systems (bridge reserves, liquidity pools, multi-party
- server vaults). Machine-triggered ML-DSA + FROST ceremonies over OPNet
- Bitcoin L1.
+ custody (bridge reserves, liquidity pools, multi-party server vaults). N
+ daemons hold FROST key shares of one key-path-only Taproot key and jointly
+ sign Bitcoin spends that every node has checked against its own key and
+ its own approval gate.
  .
- The daemon is a signing backend for critical-infrastructure keys: it
- holds threshold-shared key material across a ring of trust and signs
- what authorized operators POST to its HTTP API. Triggers, chain
- watching, and decision logic live in operator infrastructure.
+ The daemon is a signing backend: an authorized operator sends it a
+ proposal over its local API and gets the signed transaction back. It has
+ no chain access; the caller builds the proposal and broadcasts the result.
+ Triggers, chain watching, and decision logic live in operator
+ infrastructure.

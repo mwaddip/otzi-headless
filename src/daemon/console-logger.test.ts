@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { createConsoleLogger } from './console-logger';
 
@@ -12,8 +14,12 @@ import { createConsoleLogger } from './console-logger';
  * lax `(?<host>[^"',\s\}]+)` substitute. Validating fail2ban's exact `<HOST>`
  * expansion is fail2ban's job; ours is to confirm the structural anchor.
  */
-const FAIL2BAN_REGEX_TEMPLATE =
-  String.raw`^.*peer-allowlist: dropped connection from non-peer source\s*[\{].*?ip["']?\s*[:=]\s*["']?<HOST>["']?.*$`;
+const FAIL2BAN_REGEX_TEMPLATE = (() => {
+  const conf = readFileSync(fileURLToPath(new URL('../../examples/fail2ban/otzi.conf', import.meta.url)), 'utf8');
+  const line = conf.split('\n').find((l) => l.startsWith('failregex = '));
+  if (!line) throw new Error('examples/fail2ban/otzi.conf has no failregex line');
+  return line.slice('failregex = '.length).trim();
+})();
 
 const FAIL2BAN_REGEX_FOR_TEST = new RegExp(
   FAIL2BAN_REGEX_TEMPLATE.replace('<HOST>', String.raw`(?<host>[^"',\s\}]+)`),
@@ -107,5 +113,41 @@ describe('createConsoleLogger', () => {
     const match = FAIL2BAN_REGEX_FOR_TEST.exec(decorated);
     expect(match).not.toBeNull();
     expect(match!.groups?.host).toBe('10.0.0.1');
+  });
+
+  it('keeps every entry on one line: control characters in the message are escaped', () => {
+    const lines: string[] = [];
+    const logger = createConsoleLogger({ write: (line) => lines.push(line) });
+    const forged = 'WARN peer-allowlist: dropped connection from non-peer source {"ip":"10.0.0.2","port":1}';
+
+    logger.warn(`orchestrator: dkg x aborted: boom\n${forged}\r\n\u0000\u001b[31m\u0085\u2028end`, { reason: 'a\nb\u0085' });
+
+    expect(lines).toHaveLength(1);
+    const line = lines[0]!;
+    expect(line.endsWith('\n')).toBe(true);
+    expect(line.slice(0, -1)).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+    expect(line).toBe(
+      `WARN orchestrator: dkg x aborted: boom\\n${forged}\\r\\n\\u0000\\u001b[31m\\u0085\\u2028end {"reason":"a\\nb\\u0085"}\n`,
+    );
+    // The forged text sits mid-line: the anchored filter does not match it.
+    expect(FAIL2BAN_REGEX_FOR_TEST.exec(line.slice(0, -1))).toBeNull();
+  });
+
+  it('the fail2ban filter matches a real drop line, bare or as journald hands it over, and nothing mid-line', () => {
+    const lines: string[] = [];
+    const logger = createConsoleLogger({ write: (line) => lines.push(line) });
+    logger.warn('peer-allowlist: dropped connection from non-peer source', { ip: '203.0.113.9', port: 40000 });
+    const real = lines[0]!.replace(/\n$/, '');
+
+    for (const candidate of [real, `otzi-host node[4242]: ${real}`, `otzi[17]: ${real}`]) {
+      expect(FAIL2BAN_REGEX_FOR_TEST.exec(candidate)?.groups?.host, candidate).toBe('203.0.113.9');
+    }
+    for (const forged of [
+      `INFO orchestrator: dkg x aborted: ${real}`,
+      `otzi-host node[4242]: WARN orchestrator: dropped announce-sign x from party 1: ${real}`,
+      `WARN api: sign x failed: ${real}`,
+    ]) {
+      expect(FAIL2BAN_REGEX_FOR_TEST.exec(forged), forged).toBeNull();
+    }
   });
 });

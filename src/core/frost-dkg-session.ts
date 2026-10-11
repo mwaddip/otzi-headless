@@ -8,8 +8,11 @@
  *     and group `PublicKeyPackage` (with BIP341 post-DKG tap tweak applied).
  *
  * Party identifiers: the daemon uses 0-indexed `PartyId`; FROST uses
- * 1-indexed `bigint`. Conversion lives in `src/wire/dkg.ts`
- * (`partyIdToFrostId` / `frostIdToPartyId`).
+ * 1-indexed `bigint`. Conversion lives in `src/otzi/lib/dkg.ts`
+ * (`partyIdToFrostId` / `frostIdToPartyId`), as do the blob codecs.
+ *
+ * `addBlob` binds every blob to the authenticated peer it was pulled from
+ * (`from`): the party named inside the blob must be that peer.
  */
 
 import {
@@ -31,7 +34,7 @@ import {
   decodeFrostRound2,
   partyIdToFrostId,
   frostIdToPartyId,
-} from '../wire/dkg';
+} from '../otzi/lib/dkg';
 import type { PartyId } from './types';
 
 export interface FrostDkgSession {
@@ -168,50 +171,83 @@ export function finalize(session: FrostDkgSession): {
     receivedR2.set(partyIdToFrostId(senderPartyId), pkg);
   }
 
-  session.result = libDkgFinalize(session.r2Secret, receivedR1, receivedR2);
+  try {
+    session.result = libDkgFinalize(session.r2Secret, receivedR1, receivedR2);
+  } catch (err) {
+    throw err instanceof Error ? namePartiesInFrostError(err) : err;
+  }
   return session.result;
+}
+
+/**
+ * frots names the sender of a bad share by FROST identifier (`party + 1`);
+ * every other message names parties. `from sender 3` becomes `from party 2`.
+ */
+function namePartiesInFrostError(err: Error): Error {
+  const renamed = err.message.replace(/\bfrom sender (\d+)\b/g, (_m, id: string) =>
+    `from party ${frostIdToPartyId(BigInt(id))}`,
+  );
+  return renamed === err.message ? err : new Error(renamed, { cause: err });
 }
 
 export type FrostDkgRound = 'r1' | 'r2';
 
+type AddBlobResult = { ok: true } | { ok: false; error: string };
+
+/**
+ * Store a pulled blob. `from` is the authenticated peer the blob was pulled
+ * from; the party named inside the blob must be `from`, so a peer cannot
+ * contribute a package in another party's name.
+ */
 export function addBlob(
   session: FrostDkgSession,
   blob: string,
   round: FrostDkgRound,
-): { ok: true } | { ok: false; error: string } {
+  from: PartyId,
+): AddBlobResult {
   if (session.destroyed) return { ok: false, error: 'session destroyed' };
+  if (from === session.partyId) return { ok: false, error: `${round} blob from party ${from}: cannot add own blob` };
+  if (!Number.isInteger(from) || from < 0 || from >= session.parties) {
+    return { ok: false, error: `sender partyId ${from} out of range` };
+  }
 
   if (round === 'r1') {
     const decoded = decodeFrostRound1(blob);
-    if (!decoded) return { ok: false, error: 'invalid frost-dkg-r1 blob' };
-    const senderPartyId = frostIdToPartyId(decoded.identifier);
-    if (senderPartyId === session.partyId) return { ok: false, error: 'cannot add own r1 blob' };
-    if (senderPartyId < 0 || senderPartyId >= session.parties) {
-      return { ok: false, error: `partyId ${senderPartyId} out of range` };
+    if (!decoded) return { ok: false, error: `invalid frost-dkg-r1 blob from party ${from}` };
+    const claimed = frostIdToPartyId(decoded.identifier);
+    if (claimed !== from) {
+      return { ok: false, error: `r1 blob from party ${from} claims party ${claimed}` };
     }
-    if (session.collectedR1.has(senderPartyId)) {
-      return { ok: false, error: `already have r1 from party ${senderPartyId}` };
+    if (decoded.commitment.length !== session.threshold) {
+      return {
+        ok: false,
+        error: `r1 blob from party ${from}: expected ${session.threshold} commitments, got ${decoded.commitment.length}`,
+      };
     }
-    session.collectedR1.set(senderPartyId, decoded);
+    if (session.collectedR1.has(from)) {
+      return { ok: false, error: `already have r1 from party ${from}` };
+    }
+    session.collectedR1.set(from, decoded);
     return { ok: true };
   }
 
-  // r2
   const decoded = decodeFrostRound2(blob);
-  if (!decoded) return { ok: false, error: 'invalid frost-dkg-r2 blob' };
-  const senderPartyId = frostIdToPartyId(decoded.sender);
-  const recipientPartyId = frostIdToPartyId(decoded.recipient);
-  if (senderPartyId === session.partyId) return { ok: false, error: 'cannot add own r2 blob' };
-  if (recipientPartyId !== session.partyId) {
-    return { ok: false, error: `r2 blob is addressed to party ${recipientPartyId}, not ${session.partyId}` };
+  if (!decoded) return { ok: false, error: `invalid frost-dkg-r2 blob from party ${from}` };
+  const claimed = frostIdToPartyId(decoded.sender);
+  if (claimed !== from) {
+    return { ok: false, error: `r2 blob from party ${from} claims party ${claimed}` };
   }
-  if (senderPartyId < 0 || senderPartyId >= session.parties) {
-    return { ok: false, error: `sender partyId ${senderPartyId} out of range` };
+  const recipient = frostIdToPartyId(decoded.recipient);
+  if (recipient !== session.partyId) {
+    return {
+      ok: false,
+      error: `r2 blob from party ${from} is addressed to party ${recipient}, not ${session.partyId}`,
+    };
   }
-  if (session.collectedR2.has(senderPartyId)) {
-    return { ok: false, error: `already have r2 from party ${senderPartyId}` };
+  if (session.collectedR2.has(from)) {
+    return { ok: false, error: `already have r2 from party ${from}` };
   }
-  session.collectedR2.set(senderPartyId, decoded);
+  session.collectedR2.set(from, decoded);
   return { ok: true };
 }
 

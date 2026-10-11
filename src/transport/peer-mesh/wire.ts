@@ -16,11 +16,18 @@
  */
 
 import type { BlobKey, PartyId } from '../../core/types';
-import { fromHex, toHex } from '../../wire/hex';
+import { fromHex, toHex } from '../../otzi/lib/hex';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Handshake
 // ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * The largest WebSocket message either transport accepts (`maxPayload` on
+ * every socket). The largest legitimate frame is about 1.4 MB; anything over
+ * this closes the connection instead of being buffered.
+ */
+export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 
 export interface Handshake1 {
   kind: 'hs1';

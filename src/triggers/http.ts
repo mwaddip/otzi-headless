@@ -14,8 +14,10 @@
  * shape and it composes with standard infra.
  */
 
+import { createHash, timingSafeEqual } from 'node:crypto';
 import * as http from 'node:http';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
+import { isLoopbackHost } from '../util/endpoint';
 import type { HttpHandler, HttpRequest, HttpResponse, HttpTriggerConfig, TriggerSource } from './types';
 
 const MAX_BODY_BYTES = 1 << 20; // 1 MB
@@ -82,6 +84,13 @@ export class HttpTrigger implements TriggerSource {
     this.log.info('HttpTrigger: stopped');
   }
 
+  /** True iff `value` names a loopback host with the port this server listens on. */
+  private hostHeaderAllowed(value: string | undefined): boolean {
+    const parsed = value ? splitHostHeader(value) : null;
+    const port = this.address()?.port;
+    return parsed !== null && parsed.port !== undefined && parsed.port === port && isLoopbackHost(parsed.host);
+  }
+
   /** Active listen address, only valid after `start()` completes. Useful for tests binding to port 0. */
   address(): { host: string; port: number } | null {
     const server = this.server;
@@ -94,9 +103,15 @@ export class HttpTrigger implements TriggerSource {
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const requestId = (globalThis.crypto?.randomUUID?.() ?? String(Date.now()));
     try {
+      // On a loopback bind, only a request addressed to a loopback name for
+      // this port is ours: anything else is a browser page reaching the API
+      // through DNS rebinding.
+      if (isLoopbackHost(this.host) && !this.hostHeaderAllowed(headerString(req.headers.host))) {
+        return respondJson(res, 403, { error: 'forbidden host' });
+      }
       if (this.authToken) {
-        const auth = headerString(req.headers.authorization);
-        if (auth !== `Bearer ${this.authToken}`) {
+        const auth = headerString(req.headers.authorization) ?? '';
+        if (!sameSecret(auth, `Bearer ${this.authToken}`)) {
           return respondJson(res, 401, { error: 'unauthorized' });
         }
       }
@@ -143,6 +158,19 @@ export class HttpTrigger implements TriggerSource {
 // ─────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
+
+/** Constant-time comparison: equal-length SHA-256 digests through `timingSafeEqual`. */
+function sameSecret(given: string, expected: string): boolean {
+  const digest = (s: string) => createHash('sha256').update(s, 'utf8').digest();
+  return timingSafeEqual(digest(given), digest(expected));
+}
+
+/** `host[:port]` → its parts; IPv6 in brackets. `port` is undefined when absent. */
+function splitHostHeader(value: string): { host: string; port: number | undefined } | null {
+  const m = /^(\[[^\]]+\]|[^:[\]]+)(?::(\d+))?$/.exec(value.trim());
+  if (!m) return null;
+  return { host: m[1]!, port: m[2] === undefined ? undefined : Number(m[2]) };
+}
 
 function parseBind(bind: string): { host: string; port: number } {
   const m = /^(.+):(\d+)$/.exec(bind);

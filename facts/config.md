@@ -5,73 +5,65 @@
 ## src/config/
 
 ### `types.ts`
-**Purpose:** Type definitions for daemon runtime configuration shape.
+**Purpose:** Type definitions for the daemon runtime configuration shape.
 
 **Public surface:**
-- `TRANSPORT_KINDS`, `GATE_STRATEGIES`, `TRIGGER_KINDS`, `NETWORK_NAMES` — const string tuples (readonly arrays)
-  - **Post:** Used as discriminators in union types and enum validation. Exported for re-export in other modules.
-  - **Note:** `TRIGGER_KINDS = ['http', 'uds', 'cron']` as of phase 9a; `'uds'` is the default for operator API in deb-installed daemons.
+- `TRANSPORT_KINDS`, `GATE_STRATEGIES`, `TRIGGER_KINDS` — const string tuples (readonly arrays)
+  - **Post:** Used as discriminators in union types and enum validation.
+  - **Note:** `TRIGGER_KINDS = ['http', 'uds', 'cron']`; `'uds'` is the default operator API in deb-installed daemons.
 
-- `NetworkConfig` — interface
-  - **Pre:** `name` ∈ `NETWORK_NAMES`; `opnetRpc` is a non-empty string (not validated here).
-  - **Post:** Holds network identity (`mainnet|testnet|regtest`) and RPC URL for operator broadcast.
+- `NETWORK_NAMES`, `NetworkName` — re-exported from `src/otzi/backend/types.ts`
+  - **Post:** `NETWORK_NAMES = ['mainnet', 'testnet4', 'signet']` — exactly Ötzi's network set.
 
-- `ShareConfig` — interface
-  - **Pre:** `path` is absolute path; `passwordEnv` is a non-empty env var name.
-  - **Post:** Locates Ötzi-compatible share file and its decryption password source.
+- `NetworkConfig` — `{ name: NetworkName; esploraUrl?: string }`
+  - **Pre:** `name` ∈ `NETWORK_NAMES`; `esploraUrl`, when set, is an `http://` or `https://` URL.
+  - **Post:** `name` is the vault's network: the share, every `announce-dkg` and every proposal must match it. `esploraUrl` is the Esplora base the CLI uses; when unset the CLI uses Ötzi's per-network default (`chainApiUrl`). The daemon never reads `esploraUrl`.
 
-- `NodeConfig` — interface
-  - **Pre:** `id` is a logical identifier (local logging label only); `identityKeyFile`, `pubkeyBookFile` optional (but required for real transports at construction time).
-  - **Post:** Identifies this node locally and points at its cryptographic key files. `id` is *not* a cross-node identity — peers can name node N anything they want; the pubkey book is the cross-node identity primitive. Files are absent in in-memory tests.
-  - **Phase F:** `partyId` removed — derived at startup from the pubkey book by pubkey match; see `facts/daemon.md::transport-factory.ts::resolveSelfFromBook`.
+- `ShareConfig` — `{ path: string; passwordEnv: string }`
+  - **Pre:** `path` is an absolute path; `passwordEnv` is a non-empty env var name.
+  - **Post:** Locates the Ötzi v4 share file (`.pending` staging file next to it) and its password source.
 
-- `TransportConfig` — interface
-  - **Pre:** `kind` ∈ `TRANSPORT_KINDS`. If `kind === 'relay'`, `url` present. If `kind === 'peer-mesh'`, `advertisedEndpoint` is set (canonical `host:port` form post-parse); transport-factory hard-errors at startup if absent.
-  - **Post:** Specifies peer communication channel. `advertisedEndpoint` is the address peers dial to reach this daemon.
-  - **Phase F:** `listen` field removed; renamed to `advertisedEndpoint`. Parser strict-rejects the legacy key.
+- `NodeConfig` — `{ id: string; identityKeyFile?: string; pubkeyBookFile?: string }`
+  - **Pre:** `id` is a local logging label; `identityKeyFile`, `pubkeyBookFile` required for real transports at construction time.
+  - **Post:** `id` is *not* a cross-node identity — the pubkey book is the cross-node identity primitive, and `partyId` is derived from it at startup (`transport-factory.resolveSelfFromBook`). Files are absent in in-memory tests.
 
-- `PeerEntry` — interface
-  - **Pre:** `endpoint` is a canonical `host:port` (post-parse, after `canonicalizeEndpoint`).
-  - **Post:** Records one peer's reachable address. Order does not matter — partyIds are derived from the pubkey book by sorted-pubkey-bytes order. `[[peers]]` is a typo-detection sanity check against the authoritative book (bidirectional endpoint match enforced in transport-factory).
-  - **Phase F:** `id`, `partyId`, `walletAddress` all removed — those identifiers live in the pubkey book. Parser strict-rejects all three legacy keys.
+- `TransportConfig` — `{ kind: TransportKind; url?: string; advertisedEndpoint?: string }`
+  - **Pre:** If `kind === 'relay'`, `url` present. If `kind === 'peer-mesh'`, `advertisedEndpoint` is set (canonical `host:port`); transport-factory hard-errors at startup if absent.
+  - **Post:** `advertisedEndpoint` is the address peers dial to reach this daemon.
 
-- `GateConfig` — interface
-  - **Pre:** `strategy` ∈ `GATE_STRATEGIES`; `params` opaque at this stage.
-  - **Post:** Gate activation and raw strategy-specific fields.
+- `PeerEntry` — `{ endpoint: string }`
+  - **Pre:** `endpoint` is canonical `host:port` (post-parse, after `canonicalizeEndpoint`).
+  - **Post:** One peer's reachable address. Order does not matter; `[[peers]]` is a typo check against the authoritative book (bidirectional endpoint match in transport-factory).
 
-- `DeadlineConfig` — interface
-  - **Pre:** `signingMs`, `dkgMs` positive integers (validated in parser).
-  - **Post:** Ceremony timeout overrides.
+- `GateConfig` — `{ strategy: GateStrategy; params?: Record<string, unknown> }`
+  - **Post:** Gate activation and raw strategy-specific fields, narrowed by the gate's `parse*Params` (see [gate.md](gate.md)).
 
-- `BootstrapConfig` — interface
-  - **Pre:** `role` ∈ `{'leader', 'leaf'}`. For `'leader'`, `bind` is `host:port`. For `'leaf'`, `leaderUrl` is full URL. Both fields optional in TS but enforced by parser at runtime per role.
-  - **Post:** Read by `otzi setup` (zero-arg) to dispatch to leader or leaf bootstrap path. Dormant after `pubkeys.json` is written; harmless to leave in config.
+- `DeadlineConfig` — `{ signingMs: number; dkgMs: number }`
+  - **Pre:** Integers from 1 to 2 147 483 647 (`MAX_DEADLINE_MS`, Node's `setTimeout` maximum, about 24.8 days). The parser rejects a value outside that range at `deadlines.signing_ms` / `deadlines.dkg_ms` with a `ConfigError` that names the limit; a larger value would make every deadline timer fire at once.
+  - **Post:** Ceremony deadlines.
 
-- `DaemonConfig.bootstrap?: BootstrapConfig` — optional
-  - **Post:** Present in deb-rendered `daemon.toml`; absent in test fixtures.
+- `BootstrapConfig` — `{ role: 'leader' | 'leaf'; bind?: string; leaderUrl?: string }`
+  - **Pre:** For `'leader'`, `bind` is `host:port`. For `'leaf'`, `leaderUrl` is a full URL. Enforced by the parser per role.
+  - **Post:** Read by `otzi setup` to dispatch to the leader or leaf bootstrap path. Dormant after the pubkey book is written; harmless to leave in config.
 
-- `TriggerEntry` — interface
-  - **Pre:** `kind` ∈ `TRIGGER_KINDS`; `params` opaque.
-  - **Post:** One trigger for ceremony activation (http, uds, or cron).
+- `TriggerEntry` — `{ kind: TriggerKind; params?: Record<string, unknown> }`
+  - **Post:** One trigger source (http, uds, or cron).
 
-- `DaemonConfig` — interface
-  - **Pre:** All sub-interfaces must satisfy their constraints. Coherence checks run post-parse (no self-collisions, etc.).
-  - **Post:** Complete daemon startup configuration. Share file is NOT decrypted yet; cross-validation deferred to phase 5e.
+- `DaemonConfig` — `{ share; node; network; transport; peers; gate; deadlines; triggers; bootstrap? }`
+  - **Post:** Complete daemon startup configuration. The share file is not read here.
 
-- `DEFAULT_SIGNING_DEADLINE_MS`, `DEFAULT_DKG_DEADLINE_MS` — const numbers
-  - **Post:** 300_000 ms (5 min) and 900_000 ms (15 min), fallback when `[deadlines]` section absent.
+- `DEFAULT_SIGNING_DEADLINE_MS`, `DEFAULT_DKG_DEADLINE_MS` — `300_000` (5 min) and `900_000` (15 min), used when `[deadlines]` is absent.
+- `MAX_DEADLINE_MS` — `2_147_483_647`, the largest accepted `signing_ms` / `dkg_ms`.
 
 **Invariants:**
-- `DaemonConfig` is Ötzi-agnostic; share file stays Ötzi-compatible JSON.
+- `DaemonConfig` is separate from Ötzi's `VaultConfig`; the share file stays Ötzi-compatible JSON.
 - TOML → TS mapping uses snake_case (TOML) → camelCase (TS).
-- `GateConfig.params` and `TriggerEntry.params` are narrowed by phase 5b and 5d respectively; raw `params` here.
 
 **Cross-component contracts:**
-- Imported by `parse.ts`, `load.ts`; re-exported for type-safe construction in daemon entrypoint.
+- Imported by `parse.ts`, `load.ts`, the daemon, the CLI.
 
 **Notes / gotchas:**
-- `identityKeyFile`, `pubkeyBookFile` optional in types but required at transport factory time if not in-memory relay.
-- `[[peers]]` post-Phase-F carries only `endpoint`; per-peer identifiers live in the pubkey book.
+- `[[peers]]` carries only `endpoint`; per-peer identifiers live in the pubkey book.
 
 ---
 
@@ -80,60 +72,73 @@
 
 **Public surface:**
 - `ConfigError` — class extends Error
-  - **Pre:** Constructor takes `path` (TOML key path, e.g. "gate.max_amount") and `message`.
-  - **Post:** Thrown when validation fails. `.name = 'ConfigError'`; `message = "config <path>: <message>"`.
-  - **Invariant:** `.path` field points to the offending TOML key; used for precise error attribution in logs.
+  - **Pre:** Constructor takes `path` (TOML key path, e.g. `network.name`) and `message`.
+  - **Post:** `.name = 'ConfigError'`; `message = "config <path>: <message>"`; `.path` names the offending key.
 
-- `parseDaemonConfigToml(text: string)` — function
-  - **Pre:** `text` is valid TOML syntax; may lack `[deadlines]` / `[[triggers]]` (optional).
-  - **Post:** Returns validated `DaemonConfig` with all cross-field checks run. Defaults applied for missing optional sections.
-  - **Throws:** `ConfigError` on invalid TOML, missing required fields, type mismatches, enum violations, or coherence violations. Standard `Error` if TOML syntax is unparseable (from `smol-toml`).
+- `parseDaemonConfigToml(text: string): DaemonConfig`
+  - **Pre:** `text` is TOML; `[deadlines]` / `[[triggers]]` / `[bootstrap]` optional.
+  - **Post:** Validated `DaemonConfig` with defaults applied.
+  - **Throws:** `ConfigError` on missing required fields, type mismatches, enum violations or rejected keys; the TOML library's `Error` on unparseable text.
 
-- `parseDaemonConfig(raw: unknown)` — function
-  - **Pre:** `raw` is already parsed from TOML (parsed object, not string).
-  - **Post:** Same guarantees as `parseDaemonConfigToml`.
-  - **Throws:** `ConfigError` for all validation failure modes.
+- `parseDaemonConfig(raw: unknown): DaemonConfig`
+  - **Pre:** `raw` is an already-parsed TOML object.
+  - **Post / Throws:** Same as `parseDaemonConfigToml`.
 
-- `asObject(v, path)`, `asString(v, path)`, `asInteger(v, path, min)`, `asArray(v, path)`, `asEnum(v, path, choices)` — helper functions
-  - **Pre:** `v` is unknown; `path` for error reporting; `min` optional lower bound.
-  - **Post:** Coerced to target type, or throws.
-  - **Throws:** `ConfigError` when type mismatch, out-of-range, not in enum, etc.
-  - **Notes:** `asInteger` accepts both `number` and `bigint` (TOML can emit large numbers as bigint); coerces to safe Number range.
+- `asObject(v, path)`, `asString(v, path)`, `asInteger(v, path, min)`, `asArray(v, path)`, `asEnum(v, path, choices)` — helpers
+  - **Post:** Coerced value, or `ConfigError`. `asInteger` accepts `number` and `bigint` within the safe range.
 
-- `parseShare`, `parseNode`, `parseNetwork`, `parseTransport`, `parsePeer(raw, i)`, `parsePeers`, `parseGate`, `parseDeadlines`, `parseTrigger(raw, i)`, `parseTriggers` — section-level parsers
-  - **Pre:** Each receives raw section from TOML parse tree.
-  - **Post:** Typed section object (e.g., `ShareConfig`). `parseTransport` and `parsePeer` apply `canonicalizeEndpoint` to every endpoint field; the resulting `DaemonConfig` always stores canonical form.
-  - **Throws:** `ConfigError` with key paths like "share.path", "transport.advertised_endpoint", "gate.strategy", etc.
-  - **Phase F legacy-key rejection:** `parseNode` rejects `party_id`; `parsePeer` rejects `id`, `party_id`, `wallet_address`; `parseTransport` rejects `listen`. Each error message points operators at the replacement key or `otzi setup`.
-  - **UDS trigger params:** `params.path` is the absolute UDS socket path. No `bind`, no `auth_token_env`. Validated at parse time as a non-empty string starting with `/`.
+- Section parsers: `parseShare`, `parseNode`, `parseNetwork`, `parseTransport`, `parsePeer(raw, i)`, `parsePeers`, `parseGate`, `parseDeadlines`, `parseTrigger(raw, i)`, `parseTriggers`, `parseBootstrap`
+  - **Post:** Typed section objects. `parseTransport` and `parsePeer` apply `canonicalizeEndpoint` to every endpoint; the resulting `DaemonConfig` always stores canonical form.
 
-- `parseBootstrap(raw)` — section-level parser for `[bootstrap]`
-  - **Pre:** Optional in tests (returns `undefined`); required in production daemon.toml rendered by debconf.
-  - **Post:** Returns `BootstrapConfig | undefined`; validates `role ∈ {'leader', 'leaf'}`; for leader, `bind` is required `host:port`; for leaf, `leader_url` is required `http(s)://...`.
-  - **Throws:** `ConfigError` on missing required fields or invalid role.
+- **`[network]`** (`parseNetwork`)
+  ```toml
+  [network]
+  name = "mainnet"          # mainnet | testnet4 | signet
+  # esplora_url = "https://mempool.example/api"   # optional; CLI only
+  ```
+  - `name` required, one of `NETWORK_NAMES`.
+  - `esplora_url` optional; must be an `http://` or `https://` URL.
 
-- `validateCoherence(cfg)` — function
-  - **Pre:** Fully parsed `DaemonConfig`.
-  - **Post:** None (checks only; no mutation).
-  - **Phase F:** Body is currently a no-op. Pre-Phase-F it checked for duplicate node/peer `id` and `partyId`; both fields are gone post-Phase-F. Remaining cross-field constraints (endpoint matching) are enforced by `transport-factory.validatePeersAgainstBook` against the authoritative pubkey book.
+- **Triggers:**
+  - `kind = "http"`: `params.bind` is `host:port` with a loopback host (`127.0.0.1`, `::1`, `localhost`) or an absolute UDS path; any other host is rejected. Optional `auth_token_env`.
+  - `kind = "uds"`: `params.path` is an absolute socket path. No `bind`, no `auth_token_env`.
+  - `kind = "cron"`: `job_name`, `schedule`, optional `timezone`.
+
+- **`[bootstrap]`** (`parseBootstrap`): `role ∈ {'leader', 'leaf'}`; `bind` required for leader, `leader_url` (`http(s)://…`) required for leaf.
+
+- `validateCoherence(cfg)` — hook for cross-field checks after parsing (no mutation). Endpoint matching against the pubkey book happens in transport-factory.
+
+**Rejected keys** — each throws `ConfigError` at the named path with the message shown:
+
+| Key | Message |
+|---|---|
+| `network.opnet_rpc` | `no longer supported — remove it; the CLI reaches the chain through network.esplora_url` |
+| `network.name = "testnet"` | `use testnet4 or signet` |
+| `network.name = "regtest"` | `not supported` |
+| `node.party_id` | `no longer supported — partyId is derived from the pubkey book at startup` |
+| `peers[i].id`, `peers[i].party_id`, `peers[i].wallet_address` | ``no longer supported — peers carry only `endpoint` post-cleanup`` |
+| `transport.listen` | `no longer supported — use transport.advertised_endpoint` |
+| `gate.max_amount`, `gate.max_btc_per_tx` | `use max_sats_per_tx` (raised by `parsePolicyParams`) |
+| `gate.allowed_btc_recipients`, `gate.destination_allowlist` | `use allowed_recipients` (raised by `parsePolicyParams`) |
+| `gate.method_allowlist`, `gate.allowed_contracts` | `no longer supported` (raised by `parsePolicyParams`) |
+
+- **Unknown keys** — every table rejects a key it does not take, with `ConfigError('<dotted key>', 'unknown key (expected one of …)')` (`network.esplora_uri`, `peers[0].port`, `triggers[1].mode`, a stray top-level `logging`). The keys each table takes: root `share, node, network, transport, peers, gate, deadlines, triggers, bootstrap`; `[share]` `path, password_env`; `[node]` `id, identity_key_file, pubkey_book_file`; `[network]` `name, esplora_url`; `[transport]` `kind, url` (relay) or `kind, advertised_endpoint` (peer-mesh); `[[peers]]` `endpoint`; `[deadlines]` `signing_ms, dkg_ms`; `[[triggers]]` `kind` plus `bind, auth_token_env` (http), `path` (uds), `schedule, job_name, timezone` (cron); `[bootstrap]` `role` plus `bind` (leader) or `leader_url` (leaf). The rejected keys above keep their specific messages (checked first). `[gate]` params are checked by the strategy's parser (`parsePolicyParams`, `parseExecParams`, `parseWebhookParams`, all of which reject unknown keys) when the daemon builds its gate; under `auto` the config parser refuses every param itself.
 
 **Invariants:**
 - All section paths use snake_case (e.g., `share.password_env`); coerced to camelCase in types.
-- `gate.params` and `triggers[i].params` remain raw `Record<string, unknown>` here; narrowed in phases 5b/5d.
-- Deadlines default to 5min / 15min if section missing.
-- Transport.url required for relay; Transport.advertisedEndpoint optional at parse time for peer-mesh (transport-factory hard-errors if missing).
+- A misspelt key is an error, never a silently missing setting.
+- The `params` of `[gate]` (every key beside `strategy`) and of `[[triggers]]` (every key beside `kind`) stay raw `Record<string, unknown>` here; the gate and trigger builders narrow them. Strategy params are flat keys directly under `[gate]`.
+- `strategy = "auto"` takes no params: any other key in `[gate]` is `ConfigError('gate.<key>', 'not used by strategy auto')`, so leftover policy keys never look like rules that are not enforced.
+- Deadlines default to 5 min / 15 min if the section is missing.
+- `transport.url` required for relay; `transport.advertised_endpoint` optional at parse time for peer-mesh (transport-factory hard-errors if missing).
 - Peers must have at least one entry; each entry has a canonical `endpoint`.
-- Legacy fields (`node.party_id`, `[[peers]].{id,party_id,wallet_address}`, `transport.listen`) are strict-rejected with operator-friendly errors.
-- **HTTP trigger loopback enforcement.** When `kind = "http"`, `parseTrigger` validates that the bind host is `127.0.0.1`, `::1`, `localhost`, or a UDS-style absolute path. Any other host (e.g. `0.0.0.0`, external IP) is rejected with a clear error. Localhost binding is load-bearing for the security posture (CLI is THE operator surface; non-loopback HTTP would let external attackers forge ceremony triggers).
+- **HTTP trigger loopback enforcement** is load-bearing: the CLI is THE operator surface, and a non-loopback HTTP bind would let remote callers forge ceremony triggers.
 
 **Cross-component contracts:**
-- Used by `load.ts` to wrap file I/O.
-- Used by gate/trigger factory phases (5b, 5d) to parse strategy-specific params.
+- Used by `load.ts`; `ConfigError` is also thrown by `src/gate/*` param parsers.
 
 **Notes / gotchas:**
 - TOML `[[triggers]]` array is optional (parsed as empty if absent).
-- `partyId` coerced to safe integer, minimum 0.
-- Bigint in TOML (e.g., large numbers) handled in `asInteger`; compared to `Number.MAX_SAFE_INTEGER`.
 - `describe(v)` helper for error messages (null → "null", array → "array", typeof fallback).
 
 ---
@@ -143,19 +148,18 @@
 
 **Public surface:**
 - `loadDaemonConfig(path: string)` — async function
-  - **Pre:** `path` is absolute file path to a readable TOML file.
-  - **Post:** Returns `DaemonConfig`, fully validated and coherence-checked.
+  - **Pre:** `path` is a readable TOML file.
+  - **Post:** Returns `DaemonConfig`, fully validated.
   - **Throws:** I/O errors (file not found, permission denied) as thrown by `readFile`; `ConfigError` from parse failures.
 
 **Invariants:**
 - No caching; each call re-reads and re-parses.
-- Share file decryption and cross-validation (phase 5e) are NOT in this module.
+- Share file decryption and the share/book cross-checks are NOT in this module (`src/daemon/config-merge.ts`, `transport-factory.ts`).
 
 **Cross-component contracts:**
-- Imported by daemon entrypoint (phase 5a bootstrap).
+- Imported by the daemon entrypoint, `config-merge.ts` and the CLI (`DaemonClient.fromConfig`, verbs that need the network or the Esplora URL).
 
 **Notes / gotchas:**
 - Errors from I/O are bare Node.js errors; callers should distinguish from `ConfigError` for better UX.
 
 ---
-

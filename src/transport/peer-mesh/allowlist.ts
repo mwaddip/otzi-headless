@@ -1,7 +1,7 @@
 /**
  * `PeerAllowlist` — L4 source-IP filter for peer-mesh inbound connections.
  *
- * Cryptographic auth (Noise-KK + ML-DSA pubkey book) is the primary line of
+ * Cryptographic auth (Noise-KK handshake against the P-256 pubkey book) is the primary line of
  * defense; this filter is *additional*, dropping random scanners before they
  * reach the handshake. Defense-in-depth, not a replacement for crypto.
  *

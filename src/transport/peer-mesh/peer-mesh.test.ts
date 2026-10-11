@@ -1,5 +1,5 @@
 import * as net from 'node:net';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BlobKey, PartyId } from '../../core/types';
 import { generateIdentity, type IdentityKeyPair } from '../identity';
 import { PeerMeshTransport } from './peer-mesh';
@@ -90,8 +90,9 @@ describe('PeerMeshTransport — 2-peer basics', () => {
     nodes = await buildRing(2);
     await Promise.all(nodes.map((n) => n.transport.start()));
     await waitForRing(nodes);
-    expect(nodes[0]!.transport.peers).toEqual([1]);
-    expect(nodes[1]!.transport.peers).toEqual([0]);
+    // `peers` is the whole ring, self included.
+    expect(nodes[0]!.transport.peers).toEqual([0, 1]);
+    expect(nodes[1]!.transport.peers).toEqual([0, 1]);
   }, 15_000);
 
   it('broadcast from peer 0 reaches peer 1', async () => {
@@ -172,7 +173,7 @@ describe('PeerMeshTransport — 3-peer mesh', () => {
     await Promise.all(nodes.map((n) => n.transport.start()));
     await waitForRing(nodes);
 
-    for (const n of nodes) expect(n.transport.peers).toHaveLength(2);
+    for (const n of nodes) expect(n.transport.peers).toEqual([0, 1, 2]);
   }, 20_000);
 
   it('broadcast from peer 1 reaches both peer 0 and peer 2', async () => {
@@ -271,4 +272,128 @@ describe('PeerMeshTransport — lifecycle', () => {
       await transport.stop();
     }
   }, 10_000);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Send ordering and transient failures (facts/transport.md, connection.ts / peer-mesh.ts)
+// ─────────────────────────────────────────────────────────────────────────
+
+type MeshInternals = {
+  peerStates: Map<PartyId, { connection: { send: (m: unknown) => Promise<void>; close(): Promise<void> } | null }>;
+};
+const internals = (t: PeerMeshTransport) => t as unknown as MeshInternals;
+
+describe('PeerMeshTransport — send ordering and transient failures', () => {
+  let nodes: RingNode[] = [];
+  afterEach(async () => {
+    await Promise.all(nodes.map((n) => n.transport.stop()));
+    nodes = [];
+  });
+
+  it('large and small messages sent concurrently on one connection arrive in send order, without a teardown', async () => {
+    nodes = await buildRing(2);
+    await Promise.all(nodes.map((n) => n.transport.start()));
+    await waitForRing(nodes);
+    const conn = internals(nodes[0]!.transport).peerStates.get(1)!.connection;
+
+    const received: number[] = [];
+    nodes[1]!.transport.onBroadcast((_from, msg) => received.push(msg[0]!));
+    // Big frames take longer to encrypt than small ones: unserialised, the small
+    // ones would reach the wire first, out of counter order.
+    const msgs = Array.from({ length: 12 }, (_, i) => {
+      const m = new Uint8Array(i % 2 === 0 ? 1_000_000 : 200);
+      m[0] = i;
+      return m;
+    });
+    await Promise.all(msgs.map((m) => nodes[0]!.transport.broadcast(m)));
+
+    await vi.waitFor(() => expect(received).toHaveLength(msgs.length), { timeout: 10_000, interval: 20 });
+    expect(received).toEqual(msgs.map((_, i) => i));
+    expect(internals(nodes[0]!.transport).peerStates.get(1)!.connection).toBe(conn);
+  }, 30_000);
+
+  it('pull returns null when sending the request fails', async () => {
+    nodes = await buildRing(2);
+    await Promise.all(nodes.map((n) => n.transport.start()));
+    await waitForRing(nodes);
+    internals(nodes[0]!.transport).peerStates.get(1)!.connection!.send = () =>
+      Promise.reject(new Error('socket write failed'));
+
+    await expect(nodes[0]!.transport.pull({ ceremonyId: 'c', round: 'r', from: 1 })).resolves.toBeNull();
+  }, 15_000);
+
+  it('a pending pull resolves null as soon as its connection closes', async () => {
+    nodes = await buildRing(2);
+    for (const n of nodes) {
+      // A long pull timeout: only the close can resolve the pull in time.
+      (n.transport as unknown as { pullTimeoutMs: number }).pullTimeoutMs = 120_000;
+    }
+    await Promise.all(nodes.map((n) => n.transport.start()));
+    await waitForRing(nodes);
+    // Node 1 never answers pulls.
+    const responder = internals(nodes[1]!.transport).peerStates.get(0)!.connection!;
+    responder.send = () => new Promise(() => {});
+
+    const pending = nodes[0]!.transport.pull({ ceremonyId: 'c', round: 'r', from: 1 });
+    await new Promise((r) => setTimeout(r, 100));
+    await responder.close();
+
+    const outcome = await Promise.race([
+      pending,
+      new Promise((r) => setTimeout(() => r('still pending'), 10_000)),
+    ]);
+    expect(outcome).toBeNull();
+  }, 30_000);
+});
+
+describe('PeerMeshTransport — frame size and response binding', () => {
+  let nodes: RingNode[] = [];
+  afterEach(async () => {
+    await Promise.all(nodes.map((n) => n.transport.stop()));
+    nodes = [];
+  });
+
+  it.each([
+    ['dialer to listener', 0, 1],
+    ['listener to dialer', 1, 0],
+  ])('refuses a frame over 4 MiB (%s) and still carries a 2 MiB one', async (_dir, from, to) => {
+    nodes = await buildRing(2);
+    await Promise.all(nodes.map((n) => n.transport.start()));
+    await waitForRing(nodes);
+    const sizes: number[] = [];
+    nodes[to]!.transport.onBroadcast((_f, msg) => sizes.push(msg.length));
+
+    await nodes[from]!.transport.broadcast(new Uint8Array(2 * 1024 * 1024));
+    await vi.waitFor(() => expect(sizes).toEqual([2 * 1024 * 1024]), { timeout: 10_000, interval: 20 });
+
+    // 3.5 MiB of payload is more than 4 MiB on the wire (base64 inside the record).
+    await nodes[from]!.transport.broadcast(new Uint8Array(3.5 * 1024 * 1024));
+    await vi.waitFor(() => expect(internals(nodes[to]!.transport).peerStates.get(from)!.connection).toBeNull(), {
+      timeout: 10_000,
+      interval: 20,
+    });
+    expect(sizes).toEqual([2 * 1024 * 1024]);
+  }, 30_000);
+
+  it('ignores a pull response that comes from another peer than the one pulled', async () => {
+    nodes = await buildRing(3);
+    await Promise.all(nodes.map((n) => n.transport.start()));
+    await waitForRing(nodes);
+    // Node 1 never answers; node 2 tries to answer node 0's pull to node 1 in its place.
+    internals(nodes[1]!.transport).peerStates.get(0)!.connection!.send = () => new Promise(() => {});
+    (nodes[0]!.transport as unknown as { pullTimeoutMs: number }).pullTimeoutMs = 2_000;
+
+    const pending = nodes[0]!.transport.pull({ ceremonyId: 'c', round: 'r', from: 1 });
+    const pulls = (nodes[0]!.transport as unknown as { pendingPulls: Map<string, unknown> }).pendingPulls;
+    await vi.waitFor(() => expect(pulls.size).toBe(1), { timeout: 5_000, interval: 5 });
+    const [requestId] = [...pulls.keys()];
+    await internals(nodes[2]!.transport).peerStates.get(0)!.connection!.send({
+      kind: 'pull-resp',
+      requestId,
+      blobB64: btoa('forged'),
+    });
+
+    // The forged answer is dropped; the pull ends at its timeout with null.
+    await expect(pending).resolves.toBeNull();
+  }, 20_000);
 });

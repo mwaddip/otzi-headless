@@ -57,9 +57,8 @@ apt-get install -y -qq nodejs >/dev/null
 debconf-set-selections <<'EOF'
 otzi-headless otzi-headless/role select leader
 otzi-headless otzi-headless/operators string
-otzi-headless otzi-headless/bootstrap-secret password test-bootstrap-secret
-otzi-headless otzi-headless/network select testnet
-otzi-headless otzi-headless/opnet-rpc string https://testnet.opnet.org
+otzi-headless otzi-headless/network select testnet4
+otzi-headless otzi-headless/esplora-url string https://esplora.example/testnet4/api
 otzi-headless otzi-headless/transport select peer-mesh
 otzi-headless otzi-headless/advertised-endpoint string 192.0.2.1:8800
 otzi-headless otzi-headless/peers string 192.0.2.2:8800,192.0.2.3:8800
@@ -75,6 +74,8 @@ docker exec "$CONTAINER" bash -euo pipefail -c '
 test -x /usr/bin/otzi              || { echo "missing /usr/bin/otzi"; exit 1; }
 test -f /usr/lib/otzi/entrypoint.mjs || { echo "missing entrypoint bundle"; exit 1; }
 test -f /lib/systemd/system/otzi.service || { echo "missing systemd unit"; exit 1; }
+grep -qx "EnvironmentFile=-/etc/otzi/otzi.env" /lib/systemd/system/otzi.service \
+                                       || { echo "unit does not load /etc/otzi/otzi.env"; exit 1; }
 test -f /etc/otzi/daemon.toml      || { echo "missing daemon.toml"; exit 1; }
 getent passwd otzi >/dev/null      || { echo "missing otzi user"; exit 1; }
 getent group otzi >/dev/null       || { echo "missing otzi group"; exit 1; }
@@ -84,8 +85,8 @@ echo "OK: layout"
 echo ">> verifying daemon.toml carries our debconf answers"
 docker exec "$CONTAINER" bash -euo pipefail -c '
 grep -q "id = \"testnode-a\""                      /etc/otzi/daemon.toml
-grep -q "name = \"testnet\""                       /etc/otzi/daemon.toml
-grep -q "opnet_rpc = \"https://testnet"            /etc/otzi/daemon.toml
+grep -q "^name = \"testnet4\"$"                    /etc/otzi/daemon.toml
+grep -q "^esplora_url = \"https://esplora.example/testnet4/api\"$" /etc/otzi/daemon.toml
 grep -q "kind = \"peer-mesh\""                     /etc/otzi/daemon.toml
 grep -q "advertised_endpoint = \"192.0.2.1:8800\"" /etc/otzi/daemon.toml
 grep -q "endpoint = \"192.0.2.2:8800\""            /etc/otzi/daemon.toml
@@ -98,18 +99,30 @@ grep -q "^bind = \"0.0.0.0:7090\""                 /etc/otzi/daemon.toml
 ! grep -q "party_id"     /etc/otzi/daemon.toml || { echo "FAIL: legacy party_id present";     exit 1; }
 ! grep -q "wallet_address" /etc/otzi/daemon.toml || { echo "FAIL: legacy wallet_address present"; exit 1; }
 ! grep -qE "^listen = "  /etc/otzi/daemon.toml || { echo "FAIL: legacy listen = present";    exit 1; }
+! grep -q "opnet_rpc"    /etc/otzi/daemon.toml || { echo "FAIL: legacy opnet_rpc present";    exit 1; }
 echo "OK: rendered toml"
 '
 
-echo ">> verifying phase 9a perms + bootstrap-secret"
+echo ">> verifying phase 9a perms"
 docker exec "$CONTAINER" bash -euo pipefail -c '
-stat -c "%a %U:%G" /etc/otzi      | grep -q "^2770 root:otzi$"     || { echo "FAIL: /etc/otzi mode/owner";       exit 1; }
+stat -c "%a %U:%G" /etc/otzi      | grep -q "^2750 root:otzi$"     || { echo "FAIL: /etc/otzi mode/owner";       exit 1; }
+stat -c "%a %U:%G" /etc/otzi/daemon.toml | grep -q "^640 root:otzi$" || { echo "FAIL: daemon.toml mode/owner";    exit 1; }
 stat -c "%a %U:%G" /var/lib/otzi  | grep -q "^2770 root:otzi$"     || { echo "FAIL: /var/lib/otzi mode/owner";   exit 1; }
 test -d /var/run/otzi             || { echo "FAIL: /var/run/otzi missing"; exit 1; }
 stat -c "%a %U:%G" /var/run/otzi  | grep -q "^2770 root:otzi$"     || { echo "FAIL: /var/run/otzi mode/owner";   exit 1; }
-test -f /var/lib/otzi/bootstrap-secret                              || { echo "FAIL: bootstrap-secret missing";  exit 1; }
-stat -c "%a %U:%G" /var/lib/otzi/bootstrap-secret | grep -q "^660 root:otzi$" || { echo "FAIL: bootstrap-secret perms"; exit 1; }
 echo "OK: phase 9a perms"
+'
+
+echo ">> verifying postinst removes files earlier releases left behind"
+docker exec "$CONTAINER" bash -euo pipefail -c '
+export DEBIAN_FRONTEND=noninteractive
+touch /var/lib/otzi/bootstrap-secret /etc/otzi/manifest.otzi.json
+CONFIG_SUM=$(sha256sum /etc/otzi/daemon.toml | cut -d" " -f1)
+dpkg-reconfigure otzi-headless >/dev/null
+! test -e /var/lib/otzi/bootstrap-secret || { echo "FAIL: bootstrap-secret not removed";    exit 1; }
+! test -e /etc/otzi/manifest.otzi.json   || { echo "FAIL: manifest.otzi.json not removed"; exit 1; }
+[ "$(sha256sum /etc/otzi/daemon.toml | cut -d" " -f1)" = "$CONFIG_SUM" ] || { echo "FAIL: reconfigure rewrote daemon.toml"; exit 1; }
+echo "OK: leftovers removed, daemon.toml kept"
 '
 
 echo ">> running otzi (usage banner)"
@@ -147,11 +160,6 @@ echo "OK: daemon rejects unset password env var (parse + load reached)"
 
 echo ">> synthesizing post-bootstrap daemon state for backup"
 docker exec "$CONTAINER" bash -euo pipefail -c '
-# Manifest is optional; create one so the round-trip exercises that branch too.
-printf "%s\n" "{\"v\":1,\"manifest\":\"placeholder\"}" >/etc/otzi/manifest.otzi.json
-chown root:otzi /etc/otzi/manifest.otzi.json
-chmod 660 /etc/otzi/manifest.otzi.json
-
 # Required files: share, identity, pubkeys.
 printf "%s\n" "{\"v\":1,\"data\":\"synthetic-share-payload\"}" >/var/lib/otzi/share.json
 printf "%s\n" "{\"pkcs8Hex\":\"deadbeef\",\"publicKeyHex\":\"cafe\"}" >/var/lib/otzi/identity.json
@@ -218,14 +226,12 @@ INSIDE
 echo ">> verifying restored layout"
 docker exec "$CONTAINER" bash -euo pipefail -c '
 test -f /etc/otzi/daemon.toml          || { echo "FAIL: daemon.toml not restored";          exit 1; }
-test -f /etc/otzi/manifest.otzi.json   || { echo "FAIL: manifest.otzi.json not restored";   exit 1; }
 test -f /var/lib/otzi/share.json       || { echo "FAIL: share.json not restored";           exit 1; }
 test -f /var/lib/otzi/identity.json    || { echo "FAIL: identity.json not restored";        exit 1; }
 test -f /var/lib/otzi/pubkeys.json     || { echo "FAIL: pubkeys.json not restored";         exit 1; }
 
 # Per-file modes (mirrors restore.ts FIXED_FILE_MODES + dynamic table).
 stat -c "%a" /etc/otzi/daemon.toml         | grep -q "^640$" || { echo "FAIL: daemon.toml mode";       exit 1; }
-stat -c "%a" /etc/otzi/manifest.otzi.json  | grep -q "^660$" || { echo "FAIL: manifest mode";          exit 1; }
 stat -c "%a" /var/lib/otzi/share.json      | grep -q "^600$" || { echo "FAIL: share.json mode";        exit 1; }
 stat -c "%a" /var/lib/otzi/identity.json   | grep -q "^660$" || { echo "FAIL: identity.json mode";     exit 1; }
 stat -c "%a" /var/lib/otzi/pubkeys.json    | grep -q "^644$" || { echo "FAIL: pubkeys.json mode";      exit 1; }

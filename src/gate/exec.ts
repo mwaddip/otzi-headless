@@ -11,19 +11,26 @@
  * The Promise resolves only when the command exits — for human-in-the-loop
  * setups the operator's script is expected to block (inotifywait on a
  * decision file, poll an approval queue, etc.) until the operator responds.
- * Bound by `timeout_sec`.
+ * Bound by `timeout_sec`: the call fails at once, the command gets SIGTERM,
+ * and SIGKILL after a grace period if it is still running.
  *
- * TOML shape (under `[gate]`):
+ * The command never takes the daemon down: a command that exits without
+ * reading its stdin (a large spec fills the pipe) only causes a stdin error
+ * that is ignored, and its stdout / stderr are read up to 64 KiB each. It does
+ * not inherit the secrets the daemon names in `omitEnv`: the share password
+ * variable and the HTTP triggers' token variables.
+ *
+ * TOML shape (under `[gate]`, parameters sit directly next to `strategy`):
  *   strategy = "exec"
- *   [gate.params]
  *   command = ["/etc/otzi/approve.sh"]   # argv; command[0] is the executable
  *   timeout_sec = 86400                  # hard cap on child lifetime
  *   working_dir = "/var/otzi"            # optional cwd
- *   env = { FOO = "bar" }                # optional env merged into process.env
+ *   env = { FOO = "bar" }                # optional env merged into the inherited one
  */
 
 import { spawn } from 'node:child_process';
 import { ConfigError } from '../config/parse';
+import { parseGateTimeoutSec } from './timeout';
 import type { ApprovalGate, CeremonySpec, Decision } from './types';
 
 export interface ExecGateConfig {
@@ -33,57 +40,76 @@ export interface ExecGateConfig {
   timeoutSec: number;
   workingDir?: string;
   env?: Record<string, string>;
+  /** Variables removed from the inherited environment (the share password's, the HTTP trigger tokens'); `env` applies after. */
+  omitEnv?: readonly string[];
+  /** Time between the timeout's SIGTERM and SIGKILL, in ms. Default 5000. */
+  killGraceMs?: number;
 }
+
+/** stdout and stderr are kept up to this many bytes each; the rest is ignored. */
+const MAX_OUTPUT_BYTES = 64 * 1024;
+const DEFAULT_KILL_GRACE_MS = 5_000;
 
 export class ExecGate implements ApprovalGate {
   constructor(private readonly config: ExecGateConfig) {}
 
   async approve(spec: CeremonySpec): Promise<Decision> {
-    const { command, timeoutSec, workingDir, env } = this.config;
+    const { command, timeoutSec, workingDir, env, omitEnv, killGraceMs = DEFAULT_KILL_GRACE_MS } = this.config;
     return new Promise<Decision>((resolve, reject) => {
       const [executable, ...args] = command;
       if (!executable) {
         reject(new Error('ExecGate: command is empty'));
         return;
       }
+      const inherited: NodeJS.ProcessEnv = { ...process.env };
+      for (const name of omitEnv ?? []) delete inherited[name];
       const child = spawn(executable, args, {
         cwd: workingDir,
-        env: env ? { ...process.env, ...env } : process.env,
+        env: { ...inherited, ...env },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
+      let killTimer: NodeJS.Timeout | undefined;
       const timer = setTimeout(() => {
         child.kill('SIGTERM');
+        // A command that ignores SIGTERM must not outlive its decision window.
+        killTimer = setTimeout(() => child.kill('SIGKILL'), killGraceMs);
         reject(new Error(`ExecGate: command '${executable}' timed out after ${timeoutSec}s`));
       }, timeoutSec * 1000);
 
-      let stdout = '';
-      let stderr = '';
-      child.stdout?.on('data', (chunk: Buffer) => {
-        stdout += chunk.toString('utf8');
-      });
-      child.stderr?.on('data', (chunk: Buffer) => {
-        stderr += chunk.toString('utf8');
-      });
+      const stdout = cappedCollector();
+      const stderr = cappedCollector();
+      child.stdout?.on('data', stdout.add);
+      child.stderr?.on('data', stderr.add);
+      // Read errors on the output pipes end in 'close' like everything else.
+      child.stdout?.on('error', () => {});
+      child.stderr?.on('error', () => {});
+      // A command may exit without reading its stdin; writing the rest of a large spec
+      // then fails (EPIPE, ERR_STREAM_DESTROYED). The exit status and stdout decide.
+      child.stdin?.on('error', () => {});
 
       child.on('error', (err) => {
         clearTimeout(timer);
+        clearTimeout(killTimer);
         reject(new Error(`ExecGate: failed to spawn '${executable}': ${err.message}`));
       });
 
       child.on('close', (code) => {
         clearTimeout(timer);
+        clearTimeout(killTimer);
+        const stdoutText = stdout.text();
+        const stderrText = stderr.text();
         if (code !== 0) {
           reject(new Error(
-            `ExecGate: '${executable}' exited with code ${code}${stderr ? `; stderr: ${stderr.slice(0, 500)}` : ''}`,
+            `ExecGate: '${executable}' exited with code ${code}${stderrText ? `; stderr: ${stderrText.slice(0, 500)}` : ''}`,
           ));
           return;
         }
-        const line = stdout.trim().split('\n')[0]?.trim().toLowerCase();
+        const line = stdoutText.trim().split('\n')[0]?.trim().toLowerCase();
         if (line === 'approve') resolve('approve');
         else if (line === 'reject') resolve('reject');
         else reject(new Error(
-          `ExecGate: unexpected output '${stdout.slice(0, 200)}' — expected first line to be 'approve' or 'reject'`,
+          `ExecGate: unexpected output '${stdoutText.slice(0, 200)}' — expected first line to be 'approve' or 'reject'`,
         ));
       });
 
@@ -91,6 +117,21 @@ export class ExecGate implements ApprovalGate {
       child.stdin?.end(body + '\n');
     });
   }
+}
+
+/** Keeps the first `MAX_OUTPUT_BYTES` of a stream; later chunks are dropped. */
+function cappedCollector(): { add: (chunk: Buffer) => void; text: () => string } {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  return {
+    add: (chunk: Buffer) => {
+      if (size >= MAX_OUTPUT_BYTES) return;
+      const part = chunk.subarray(0, MAX_OUTPUT_BYTES - size);
+      chunks.push(part);
+      size += part.length;
+    },
+    text: () => Buffer.concat(chunks).toString('utf8'),
+  };
 }
 
 /** Serialize `CeremonySpec` to JSON, converting bigints to decimal strings. */
@@ -116,9 +157,7 @@ export function parseExecParams(params: Record<string, unknown>): ExecGateConfig
     return item;
   });
 
-  if (typeof params.timeout_sec !== 'number' || !Number.isFinite(params.timeout_sec) || params.timeout_sec <= 0)
-    throw new ConfigError('gate.timeout_sec', 'must be a positive number (seconds)');
-  const timeoutSec = params.timeout_sec;
+  const timeoutSec = parseGateTimeoutSec(params.timeout_sec);
 
   const out: ExecGateConfig = { command, timeoutSec };
 

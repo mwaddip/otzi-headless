@@ -1,200 +1,136 @@
 /**
- * Composition root for the headless daemon.
+ * Composition root for the headless daemon (facts/daemon.md, `daemon.ts`).
  *
  * Wires:
- *   - Blob infrastructure (BlobStore, BlobServer, BlobPuller)
- *   - CeremonyRunner
- *   - Approval gate (from `DaemonConfig.gate`)
- *   - Participant-side Orchestrator
- *   - Leader-side dispatcher
- *   - Triggers (HTTP + cron, from `DaemonConfig.triggers`)
+ *   - blob infrastructure (`BlobStore`, `BlobServer`, `BlobPuller`) into one
+ *     `CeremonyIo`;
+ *   - the approval gate (from `DaemonConfig.gate`), with this node's address
+ *     book for `allowed_recipients = "address-book"`;
+ *   - the participant-side `Orchestrator` and the leader-side
+ *     `LeaderDispatcher`, sharing the I/O, the gate, the vault and this node's
+ *     address book (output labels in gate specs), with the orchestrator
+ *     holding the node's ceremony slots for both;
+ *   - triggers (HTTP, UDS, cron, from `DaemonConfig.triggers`) and the
+ *     operator API handler (`vault-info`, `dkg`, `sign`).
  *
- * Transport is injected — phase 3 (peer-mesh / relay) will supply a real
- * implementation; tests use the in-memory ring. The daemon explicitly does
- * NOT call `initEccLib` (phase-4d trap: double-init misroutes the FROST
- * legacy-sig monkey-patch — see SESSION_CONTEXT § Phase-4d findings).
+ * The transport is injected: peer-mesh or relay in production, the in-memory
+ * ring in tests. The daemon has no chain access; signed transactions are
+ * returned to the caller, which broadcasts them.
  */
 
-import type { KeyPackage, PublicKeyPackage, Rng } from '@mwaddip/frots';
+import type { Rng } from '@mwaddip/frots';
+import { DEFAULT_ADDRESS_BOOK_PATH, readAddressBook } from '../address-book/store';
 import type { PullOpts } from '../core/blob-puller';
 import { BlobPuller } from '../core/blob-puller';
 import { BlobServer } from '../core/blob-server';
 import { BlobStore } from '../core/blob-store';
-import { CeremonyRunner } from '../core/ceremony-runner';
+import type { CeremonyIo } from '../core/ceremony-io';
 import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
+import type { TriggerEntry } from '../config/types';
 import { createGate } from '../gate/factory';
-import type { ApprovalGate } from '../gate/types';
-import { getProvider } from '../node/opnet-client';
-import type { NetworkName as NodeNetworkName } from '../node/types';
 import { Orchestrator } from '../orchestrator/orchestrator';
-import {
-  NOOP_LOGGER,
-  type CeremonyOutcome,
-  type Logger,
-} from '../orchestrator/types';
+import { NOOP_LOGGER, type CeremonyOutcome, type Logger } from '../orchestrator/types';
 import { CronTrigger } from '../triggers/cron';
 import { HttpTrigger } from '../triggers/http';
+import type { CronHandler, HttpHandler, HttpRequest, HttpResponse, TriggerSource } from '../triggers/types';
 import { UdsTrigger } from '../triggers/uds';
-import type {
-  CronHandler,
-  HttpHandler,
-  HttpRequest,
-  HttpResponse,
-  TriggerSource,
-} from '../triggers/types';
-import { encodeCeremonyMessage, manifestPushMessage } from '../core/ceremony-messages';
-import { toHex } from '../wire/hex';
-import { fromHex } from '../wire/hex';
+import { NO_VAULT_MESSAGE, parseDkgRequest, parseSignRequest, parseVaultInfoRequest, RequestError } from './api';
 import type { LoadedDaemonState } from './config-merge';
-import {
-  ControlPlane,
-  ControlPlaneClosed,
-  type ControlPlaneOpts,
-} from './control-plane';
 import { GateRejection, LeaderDispatcher } from './leader';
-import { deriveVaultAddresses } from './vault-pubkey';
-import type { NetworkName } from '../config/types';
+import { vaultPubkeyFromPackage } from './vault-pubkey';
+import { createShareStager, vaultFileExists } from './vault-share';
 
 export interface DaemonDeps {
   state: LoadedDaemonState;
   transport: Transport;
-  /**
-   * Self's partyId, resolved from the pubkey book by pubkey match. Caller
-   * obtains this from `TransportBundle.selfPartyId`.
-   */
+  /** Self's partyId, resolved from the pubkey book by pubkey match (`TransportBundle.selfPartyId`). */
   selfPartyId: number;
   /**
-   * Logging-label map for orchestrator + leader. Built by transport-factory
-   * from book entries (synth `peer-${partyId}` labels for non-self; self
-   * uses operator's local `node.id`). Caller obtains from
-   * `TransportBundle.peersById`.
+   * Every ring member's label, self included (`TransportBundle.peersById`):
+   * `peer-<partyId>` for others, `config.node.id` for self. Its size is the
+   * ring size used for DKG `parties` and the default signer set.
    */
   peersById: ReadonlyMap<PartyId, string>;
   rng: Rng;
+  /** Pull backoff for every ceremony; orchestrator and leader replace `deadlineMs` and `maxAttempts`. */
   pullOpts: PullOpts;
-  /** FROST key material, when the share was produced by a V3 combined DKG. */
-  frostKeyPackage?: KeyPackage;
-  frostPublicKeyPackage?: PublicKeyPackage;
   logger?: Logger;
-  /** Override the HTTP handler. Defaults to `buildDefaultHttpHandler(leader)`. */
+  /** Override the operator API handler. Defaults to `buildDefaultHttpHandler`. */
   httpHandler?: HttpHandler;
-  /**
-   * Registry of cron jobs. Each entry binds a `jobName` (matching
-   * `DaemonConfig.triggers[].params.jobName`) to an async handler. Unknown
-   * job names cause `start()` to fail.
-   */
+  /** Cron jobs by `job_name`; a configured cron trigger without a handler fails construction. */
   cronHandlers?: ReadonlyMap<string, CronHandler>;
-  /** Optional env override for HTTP auth token lookup. Defaults to `process.env`. */
+  /** Env source; not read by the daemon itself (triggers read `process.env`). */
   env?: Readonly<Record<string, string | undefined>>;
-  /**
-   * OPNet provider — exposes `utxoManager.getUTXOs` + `getChallenge` for the
-   * `opnet-params` leader flow. Defaults to a live `JSONRpcProvider` bound
-   * to `config.network.name`; tests inject a stub.
-   */
-  opnetProvider?: {
-    utxoManager: { getUTXOs: (args: { address: string }) => Promise<unknown[]> };
-    getChallenge: () => Promise<unknown>;
-  };
-  /** Seed fill for the 32B opnet-params random seed. Defaults to WebCrypto. */
-  opnetSeedFill?: (buf: Uint8Array) => void;
-  /**
-   * Override the control-plane file paths (Phase 9c). Defaults to
-   * `/var/lib/otzi/bootstrap-secret` + `/etc/otzi/manifest.otzi.json`.
-   * Tests inject tmpdir-scoped paths.
-   */
-  controlPlaneOpts?: Pick<ControlPlaneOpts, 'secretPath' | 'manifestPath'>;
+  /** Where a DKG commit writes `vault-pubkey.json`; the path given to `loadAndValidate`. */
+  vaultPubkeyPath?: string;
+  /** This node's address book; default `DEFAULT_ADDRESS_BOOK_PATH`. Tests point it at a temporary file. */
+  addressBookPath?: string;
 }
 
 export class Daemon {
-  readonly orchestrator: Orchestrator;
-  readonly leader: LeaderDispatcher;
-  readonly controlPlane: ControlPlane;
-  private readonly store: BlobStore;
+  private readonly orchestrator: Orchestrator;
+  private readonly leader: LeaderDispatcher;
   private readonly server: BlobServer;
   private readonly triggers: TriggerSource[];
   private readonly log: Logger;
   private started = false;
 
   constructor(deps: DaemonDeps) {
+    const { state, transport, selfPartyId, peersById, rng } = deps;
+    const { config } = state;
+    const network = config.network.name;
     this.log = deps.logger ?? NOOP_LOGGER;
 
-    this.store = new BlobStore();
-    this.server = new BlobServer(deps.transport, this.store);
-    const puller = new BlobPuller(deps.transport, this.store);
-    const runner = new CeremonyRunner(deps.transport, this.store, puller);
-    const gate: ApprovalGate = createGate(deps.state.config.gate);
-
-    // `node/types.NetworkName` is narrower than `config/types.NetworkName`:
-    // key-link only supports mainnet + testnet (chain-ID bound). Regtest
-    // daemons still do DKG but skip the key-link phase; operators can't
-    // use such vaults for OPNet contract calls, which matches regtest's
-    // dev-only posture.
-    const configNetwork = deps.state.config.network.name;
-    const keylinkNetwork: NodeNetworkName | undefined =
-      configNetwork === 'regtest' ? undefined : configNetwork;
-
-    // `opnetProvider` is shared between orchestrator and leader for the
-    // `opnet-params` flow. Only used when keylinkNetwork is set — regtest skips it.
-    const opnetProvider = deps.opnetProvider
-      ?? (keylinkNetwork ? getProvider(keylinkNetwork) : undefined);
-
-    const controlPlane = new ControlPlane({
-      ...(deps.controlPlaneOpts?.secretPath ? { secretPath: deps.controlPlaneOpts.secretPath } : {}),
-      ...(deps.controlPlaneOpts?.manifestPath ? { manifestPath: deps.controlPlaneOpts.manifestPath } : {}),
+    const store = new BlobStore();
+    this.server = new BlobServer(transport, store);
+    const io: CeremonyIo = { transport, store, puller: new BlobPuller(transport, store), pullOpts: deps.pullOpts };
+    const bookPath = deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH;
+    // The policy rule needs a book to exist: a node without one has no recipients to allow, so its
+    // policy rejects every signing spec. The labelling read below takes a missing file as no labels.
+    const gate = createGate(config.gate, {
+      loadAddressBook: async () =>
+        (await readAddressBook(bookPath, network, { missing: 'error' })).map(e => e.address),
       logger: this.log,
+      // An exec gate's command never sees the share password or an HTTP trigger's token.
+      secretEnv: [config.share.passwordEnv, ...triggerTokenEnvNames(config.triggers)],
     });
-    this.controlPlane = controlPlane;
-
-    this.orchestrator = new Orchestrator({
-      transport: deps.transport,
-      runner,
+    this.log.info(`daemon: gate strategy ${config.gate.strategy}`, { strategy: config.gate.strategy });
+    const node = { id: config.node.id, partyId: selfPartyId };
+    const sharePath = config.share.path;
+    const vaultExists = async () => state.share !== undefined || (await vaultFileExists(sharePath));
+    // The password reaches only the stager, which encrypts the share a DKG produces
+    // (an exec gate's command does not inherit its variable: `secretEnv` above).
+    const createStager = () =>
+      createShareStager({
+        path: sharePath,
+        password: state.password,
+        network,
+        partyId: selfPartyId,
+        vaultPubkeyPath: deps.vaultPubkeyPath,
+        logger: this.log,
+      });
+    const shared = {
+      io,
       gate,
-      node: { id: deps.state.config.node.id, partyId: deps.selfPartyId },
-      peersById: deps.peersById,
-      share: deps.state.share,
-      frostKeyPackage: deps.frostKeyPackage ?? deps.state.share?.frostKeyPackage,
-      frostPublicKeyPackage: deps.frostPublicKeyPackage ?? deps.state.frostPublicKeyPackage,
-      rng: deps.rng,
-      pullOpts: deps.pullOpts,
-      ceremonyDeadlines: deps.state.config.deadlines,
-      network: keylinkNetwork,
-      ...(deps.state.frostLegacySig ? { frostLegacySig: deps.state.frostLegacySig } : {}),
-      persistDkgShare: deps.state.persistDkgShare,
-      controlPlane,
+      node,
+      peersById,
+      network,
+      vault: state.share,
+      vaultExists,
+      createStager,
+      rng,
+      ceremonyDeadlines: config.deadlines,
+      addressBook: () => readAddressBook(bookPath, network),
       logger: this.log,
-    });
+    };
 
-    this.leader = new LeaderDispatcher({
-      runner,
-      gate,
-      node: { id: deps.state.config.node.id, partyId: deps.selfPartyId },
-      peersById: deps.peersById,
-      share: deps.state.share,
-      frostKeyPackage: deps.frostKeyPackage ?? deps.state.share?.frostKeyPackage,
-      frostPublicKeyPackage: deps.frostPublicKeyPackage ?? deps.state.frostPublicKeyPackage,
-      rng: deps.rng,
-      pullOpts: deps.pullOpts,
-      network: keylinkNetwork,
-      ...(deps.state.frostLegacySig ? { frostLegacySig: deps.state.frostLegacySig } : {}),
-      ...(opnetProvider ? { opnetProvider } : {}),
-      ...(deps.opnetSeedFill ? { opnetSeedFill: deps.opnetSeedFill } : {}),
-      persistDkgShare: deps.state.persistDkgShare,
-      logger: this.log,
-    });
+    this.orchestrator = new Orchestrator(shared);
+    this.leader = new LeaderDispatcher({ ...shared, slots: this.orchestrator });
 
     const httpHandler =
-      deps.httpHandler
-      ?? buildDefaultHttpHandler(
-        this.leader,
-        configNetwork,
-        deps.state,
-        deps.peersById,
-        controlPlane,
-        deps.transport,
-        this.log,
-      );
-    this.triggers = buildTriggers(deps.state.config.triggers, httpHandler, deps.cronHandlers, this.log);
+      deps.httpHandler ?? buildDefaultHttpHandler(this.leader, state, peersById, selfPartyId, this.log);
+    this.triggers = buildTriggers(config.triggers, httpHandler, deps.cronHandlers, this.log);
   }
 
   async start(): Promise<void> {
@@ -219,19 +155,16 @@ export class Daemon {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Trigger assembly
-// ─────────────────────────────────────────────────────────────────────────
+// ─── Trigger assembly ────────────────────────────────────────────────────
 
 function buildTriggers(
-  entries: ReadonlyArray<import('../config/types').TriggerEntry>,
+  entries: readonly TriggerEntry[],
   httpHandler: HttpHandler,
   cronHandlers: ReadonlyMap<string, CronHandler> | undefined,
   log: Logger,
 ): TriggerSource[] {
   const out: TriggerSource[] = [];
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i]!;
+  entries.forEach((entry, i) => {
     const path = `triggers[${i}]`;
     switch (entry.kind) {
       case 'http': {
@@ -254,390 +187,121 @@ function buildTriggers(
           throw new Error(
             `daemon: ${path}.job_name='${jobName}' has no registered handler (supply via DaemonDeps.cronHandlers)`,
           );
-        out.push(
-          new CronTrigger({ jobName, schedule, handler, timezone, logger: log }),
-        );
+        out.push(new CronTrigger({ jobName, schedule, handler, timezone, logger: log }));
         break;
       }
     }
-  }
+  });
   return out;
 }
 
-function requireStringParam(
-  params: Record<string, unknown> | undefined,
-  key: string,
-  path: string,
-): string {
+function requireStringParam(params: Record<string, unknown> | undefined, key: string, path: string): string {
   const v = params?.[key];
-  if (typeof v !== 'string')
-    throw new Error(`daemon: ${path}.${key} missing or not a string`);
+  if (typeof v !== 'string') throw new Error(`daemon: ${path}.${key} missing or not a string`);
   return v;
 }
 
-function optionalStringParam(
-  params: Record<string, unknown> | undefined,
-  key: string,
-  path: string,
-): string | undefined {
+/** The `auth_token_env` variable names of the HTTP triggers: secrets an exec gate's command must not inherit. */
+export function triggerTokenEnvNames(entries: readonly TriggerEntry[]): string[] {
+  const names: string[] = [];
+  entries.forEach((entry, i) => {
+    if (entry.kind !== 'http') return;
+    const name = optionalStringParam(entry.params, 'auth_token_env', `triggers[${i}]`);
+    if (name) names.push(name);
+  });
+  return names;
+}
+
+function optionalStringParam(params: Record<string, unknown> | undefined, key: string, path: string): string | undefined {
   const v = params?.[key];
   if (v === undefined) return undefined;
-  if (typeof v !== 'string')
-    throw new Error(`daemon: ${path}.${key} must be a string`);
+  if (typeof v !== 'string') throw new Error(`daemon: ${path}.${key} must be a string`);
   return v;
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Default HTTP handler — dispatches `op` to leader primitives.
-// ─────────────────────────────────────────────────────────────────────────
+// ─── Operator API ────────────────────────────────────────────────────────
 
+/** The `vault-info`, `dkg` and `sign` ops (facts/daemon.md, `buildDefaultHttpHandler`). */
 export function buildDefaultHttpHandler(
   leader: LeaderDispatcher,
-  network: NetworkName,
   state: LoadedDaemonState,
   peersById: ReadonlyMap<PartyId, string>,
-  controlPlane: ControlPlane,
-  transport: Transport,
-  logger: Logger = NOOP_LOGGER,
+  selfPartyId: PartyId,
+  logger: Logger,
 ): HttpHandler {
+  const network = state.config.network.name;
+  const partyIds = [...peersById.keys()].sort((a, b) => a - b);
+
+  const vaultInfo = (body: Record<string, unknown>): HttpResponse => {
+    parseVaultInfoRequest(body);
+    const { share } = state;
+    if (!share) throw new RequestError(409, NO_VAULT_MESSAGE);
+    const meta = vaultPubkeyFromPackage(share.publicKeyPackage, network);
+    return {
+      status: 200,
+      body: {
+        partyIds,
+        threshold: share.threshold,
+        parties: share.parties,
+        network,
+        address: meta.address,
+        internalKey: meta.internalKey,
+        outputKey: meta.outputKey,
+      },
+    };
+  };
+
   return async (req: HttpRequest): Promise<HttpResponse> => {
     if (req.method !== 'POST') return { status: 405, body: { error: 'method not allowed' } };
     const body = req.body;
-    if (!body || typeof body !== 'object' || Array.isArray(body))
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
       return { status: 400, body: { error: 'body must be a JSON object' } };
+    }
     const b = body as Record<string, unknown>;
     const op = b.op;
     if (typeof op !== 'string') return { status: 400, body: { error: "missing 'op' field" } };
-    const ceremonyId = typeof b.ceremonyId === 'string'
-      ? b.ceremonyId
-      : `${op}-${(globalThis.crypto?.randomUUID?.() ?? String(Date.now()))}`;
 
+    let ceremonyId: string | undefined;
     try {
       switch (op) {
-        case 'sync': {
-          // Phase 9c: HMAC-authenticated manifest distribution. Bootstrap-window-only.
-          // Local install runs first (so failure on this node short-circuits the
-          // broadcast — peers don't need to know about a manifest the operator's
-          // own node refused). On success, broadcast `manifest-push` to all peers.
-          const manifest = requireString(b, 'manifest');
-          const hmacHex = requireString(b, 'hmac');
-          try {
-            await controlPlane.installPushedManifest({ manifest, hmacHex });
-          } catch (err) {
-            if (err instanceof ControlPlaneClosed) {
-              return { status: 410, body: { error: 'control plane closed', ceremonyId } };
-            }
-            return {
-              status: 400,
-              body: {
-                error: (err as Error).message,
-                kind: (err as Error).name,
-                ceremonyId,
-              },
-            };
-          }
-          // Transport.broadcast fans out to all peers in one call; per-peer
-          // ack/error is not exposed by the transport surface (broadcast is
-          // best-effort fire-and-forget). Operators verify peer state via
-          // logs / `otzi list` on each node if they need confirmation.
-          const peerCount = peersById.size - 1;
-          if (peerCount > 0) {
-            try {
-              await transport.broadcast(
-                encodeCeremonyMessage(manifestPushMessage({ manifest, hmac: hmacHex })),
-              );
-            } catch (err) {
-              logger.warn('op:sync: broadcast failed (manifest installed locally)', {
-                err: err instanceof Error ? err.message : String(err),
-              });
-              return {
-                status: 502,
-                body: {
-                  error: 'manifest installed locally; broadcast to peers failed',
-                  kind: 'BroadcastFailed',
-                  ceremonyId,
-                },
-              };
-            }
-          }
+        case 'vault-info':
+          return vaultInfo(b);
+        case 'dkg': {
+          ({ ceremonyId } = parseDkgRequest(b));
+          const r = await leader.runDkg({ ceremonyId });
           return {
             status: 200,
-            body: { ceremonyId, status: 'done', peersNotified: peerCount },
-          };
-        }
-        case 'vault-info': {
-          // Read-only metadata: peer set + threshold + cached vault
-          // addresses. Used by the CLI to discover the signer set + verify
-          // the vault's identity before signing.
-          if (!state.share || !state.share.frostKeyPackage) {
-            return {
-              status: 409,
-              body: { error: 'vault-info: no share loaded (run `otzi generate` first)' },
-            };
-          }
-          const partyIds = [...peersById.keys()].sort((a, b) => a - b);
-          const { btcAddress, opnetAddress } = deriveVaultAddresses(
-            network,
-            state.share.frostKeyPackage.untweakedVerifyingKey,
-            fromHex(state.share.publicKey),
-          );
-          return {
-            status: 200,
-            body: {
-              partyIds,
-              threshold: state.share.threshold,
-              parties: state.share.parties,
-              network,
-              btcAddress,
-              opnetAddress,
-            },
-          };
-        }
-        case 'dkg-combined': {
-          // n derived from configured peer set (peersById includes self).
-          // v0.1 is n-of-n by design: threshold == parties. ML-DSA level
-          // is fixed at 44 (only level supported on OPNet).
-          const parties = peersById.size;
-          const result = await leader.runCombinedDkg({
-            ceremonyId,
-            threshold: parties,
-            parties,
-            level: 44,
-          });
-          // Compute the operator-facing addresses on the fly so the response
-          // matches what `otzi generate` will print AND what
-          // /var/lib/otzi/vault-pubkey.json will hold post-restart. Failure
-          // (e.g. invalid pubkey on a corrupted DKG output) is surfaced as a
-          // 500 — the DKG itself succeeded, but the operator can't proceed.
-          const { btcAddress, opnetAddress } = deriveVaultAddresses(
-            network,
-            result.frost.keyPackage.untweakedVerifyingKey,
-            result.mldsa.publicKey,
-          );
-          return {
-            status: 200,
-            body: {
-              ceremonyId,
-              status: 'done',
-              mldsaPublicKeyHex: toHex(result.mldsa.publicKey),
-              frostVerifyingKeyHex: toHex(result.frost.publicKeyPackage.verifyingKey),
-              btcAddress,
-              opnetAddress,
-              network,
-            },
-          };
-        }
-        case 'dkg-mldsa': {
-          const parties = peersById.size;
-          const result = await leader.runMldsaDkg({
-            ceremonyId,
-            threshold: parties,
-            parties,
-            level: 44,
-          });
-          return {
-            status: 200,
-            body: { ceremonyId, status: 'done', mldsaPublicKeyHex: toHex(result.publicKey) },
-          };
-        }
-        case 'dkg-frost': {
-          const parties = peersById.size;
-          const result = await leader.runFrostDkg({
-            ceremonyId,
-            threshold: parties,
-            parties,
-          });
-          return {
-            status: 200,
-            body: {
-              ceremonyId,
-              status: 'done',
-              frostVerifyingKeyHex: toHex(result.publicKeyPackage.verifyingKey),
-            },
+            body: { ceremonyId: r.ceremonyId, status: 'done', address: r.address, internalKey: r.internalKey, network: r.network },
           };
         }
         case 'sign': {
-          const scheme = requireString(b, 'scheme');
-          if (scheme !== 'frost' && scheme !== 'mldsa')
-            return { status: 400, body: { error: "'scheme' must be 'frost' or 'mldsa'" } };
-          const protocol = requireString(b, 'protocol');
-          const signers = requireNumberArray(b, 'signers');
-
-          let result: Awaited<ReturnType<typeof leader.sign>>;
-          if (scheme === 'mldsa') {
-            if (protocol !== 'raw')
-              return { status: 400, body: { error: "scheme='mldsa' requires protocol='raw'" } };
-            result = await leader.sign({
-              ceremonyId,
-              scheme: 'mldsa',
-              protocol: 'raw',
-              message: fromHex(requireString(b, 'messageHex')),
-              signers,
-            });
-          } else if (protocol === 'btc') {
-            const btc = requireObject(b, 'btc');
-            const network = requireString(btc, 'network');
-            if (network !== 'mainnet' && network !== 'testnet')
-              return { status: 400, body: { error: "btc.network must be 'mainnet' or 'testnet'" } };
-            const utxosRaw = btc.utxos;
-            if (!Array.isArray(utxosRaw))
-              return { status: 400, body: { error: "btc.utxos must be an array" } };
-            const utxos = utxosRaw.map((u, i) => {
-              if (!u || typeof u !== 'object')
-                throw new Error(`btc.utxos[${i}] must be { transactionId, outputIndex, valueSat }`);
-              const item = u as Record<string, unknown>;
-              return {
-                transactionId: requireString(item, 'transactionId'),
-                outputIndex: requireNumber(item, 'outputIndex'),
-                value: BigInt(requireString(item, 'valueSat')),
-              };
-            });
-            result = await leader.sign({
-              ceremonyId,
-              scheme: 'frost',
-              protocol: 'btc',
-              signers,
-              btc: {
-                to: requireString(btc, 'to'),
-                amountSat: BigInt(requireString(btc, 'amountSat')),
-                feeRate: requireNumber(btc, 'feeRate'),
-                network,
-                frostP2tr: requireString(btc, 'frostP2tr'),
-                frostUntweakedPubKey: fromHex(requireString(btc, 'frostUntweakedPubKeyHex')),
-                utxos,
-              },
-            });
-          } else if (protocol === 'opnet') {
-            // DEPRECATED: raw unsigned-tx path. Participants extract sighashes
-            // from operator-supplied bytes but CANNOT independently verify them
-            // against the announced contract/method/amount — `hints` are advisory
-            // only, so gate policy evaluates untrusted fields. A rogue leader can
-            // sign something other than what the operator intended; threshold
-            // bounds DoS but not theft-by-misdirection within an allowlist.
-            //
-            // Use `protocol: 'opnet-params'` (Phase 8) for any new work — every
-            // node rebuilds the tx independently from construction params and
-            // sighash-checks before signing.
-            //
-            // Re-enable here only if you accept the above and have a use case the
-            // SDK can't reach via construction params (e.g. multi-op packages,
-            // contract deployments). The underlying helpers in
-            // src/broadcast/opnet-capture.ts and opnet-broadcast.ts remain in
-            // place; only the public HTTP entry point is gated off.
-            return {
-              status: 400,
-              body: {
-                error: "protocol 'opnet' is deprecated — use 'opnet-params' instead. See docs/api.md.",
-              },
-            };
-          } else if (protocol === 'opnet-params') {
-            const rawParams = b.params;
-            if (!Array.isArray(rawParams))
-              return { status: 400, body: { error: "'params' must be an array for protocol='opnet-params'" } };
-            let paramTypes: readonly ('address' | 'u256' | 'bytes')[] | undefined;
-            if (b.paramTypes !== undefined) {
-              if (!Array.isArray(b.paramTypes))
-                return { status: 400, body: { error: "'paramTypes' must be an array" } };
-              const out: Array<'address' | 'u256' | 'bytes'> = [];
-              for (const t of b.paramTypes) {
-                if (t !== 'address' && t !== 'u256' && t !== 'bytes')
-                  return { status: 400, body: { error: `paramTypes entries must be 'address' | 'u256' | 'bytes' (got '${String(t)}')` } };
-                out.push(t);
-              }
-              paramTypes = out;
-            }
-            const hintsRaw = b.hints;
-            let hints: { amountTokenAtomic?: string } | undefined;
-            if (hintsRaw && typeof hintsRaw === 'object') {
-              const h = hintsRaw as Record<string, unknown>;
-              hints = {};
-              if (typeof h.amountTokenAtomic === 'string') hints.amountTokenAtomic = h.amountTokenAtomic;
-            }
-            result = await leader.sign({
-              ceremonyId,
-              scheme: 'frost',
-              protocol: 'opnet-params',
-              signers,
-              contractAddress: requireString(b, 'contractAddress'),
-              method: requireString(b, 'method'),
-              params: [...rawParams],
-              ...(paramTypes ? { paramTypes } : {}),
-              mldsaThresholdSignature: fromHex(requireString(b, 'mldsaThresholdSignatureHex')),
-              ...(typeof b.feeRate === 'number' ? { feeRate: b.feeRate } : {}),
-              ...(typeof b.priorityFeeSat === 'string' ? { priorityFee: BigInt(b.priorityFeeSat) } : {}),
-              ...(typeof b.maxSatToSpendSat === 'string' ? { maximumAllowedSatToSpend: BigInt(b.maxSatToSpendSat) } : {}),
-              ...(hints ? { hints } : {}),
-            });
-          } else {
-            return { status: 400, body: { error: "'protocol' must be 'raw', 'btc', 'opnet', or 'opnet-params'" } };
-          }
-          if (result.scheme === 'mldsa') {
-            return {
-              status: 200,
-              body: {
-                ceremonyId,
-                status: 'done',
-                scheme: 'mldsa',
-                signatureHex: toHex(result.signature),
-              },
-            };
-          }
+          const { share } = state;
+          if (!share) throw new RequestError(409, NO_VAULT_MESSAGE);
+          const signReq = parseSignRequest(b, { partyIds, self: selfPartyId, minSigners: share.threshold });
+          ceremonyId = signReq.ceremonyId;
+          const r = await leader.sign(signReq);
           return {
             status: 200,
             body: {
-              ceremonyId,
+              ceremonyId: r.ceremonyId,
               status: 'done',
-              scheme: 'frost',
-              signaturesHex: result.signatures.map((s) => toHex(s)),
-              // Present only when the daemon broadcast the tx internally
-              // (opnet-params flow); absent for btc/opnet where the operator
-              // broadcasts externally.
-              ...(result.transactionId !== undefined ? { transactionId: result.transactionId } : {}),
+              txid: r.txid,
+              signedTxHex: r.signedTxHex,
+              signaturesHex: r.signaturesHex,
             },
           };
         }
+        default:
+          return { status: 400, body: { error: `unknown op '${op}'` } };
       }
     } catch (err) {
+      if (err instanceof RequestError) return { status: err.status, body: { error: err.message } };
       if (err instanceof GateRejection) {
-        return { status: 403, body: { error: 'gate rejected', decision: err.decision, ceremonyId } };
+        return { status: 403, body: { error: 'gate rejected', decision: err.decision, ceremonyId: err.ceremonyId } };
       }
-      logger.warn('http handler: ceremony failed', {
-        op,
-        ceremonyId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-      return {
-        status: 500,
-        body: { error: err instanceof Error ? err.message : String(err), ceremonyId },
-      };
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(`api: ${op} ${ceremonyId ?? ''} failed: ${message}`, { op, ceremonyId });
+      return { status: 500, body: { error: message, ceremonyId } };
     }
-    return { status: 400, body: { error: `unknown op '${op}'` } };
   };
-}
-
-function requireString(obj: Record<string, unknown>, key: string): string {
-  const v = obj[key];
-  if (typeof v !== 'string') throw new Error(`'${key}' must be a string`);
-  return v;
-}
-function requireObject(obj: Record<string, unknown>, key: string): Record<string, unknown> {
-  const v = obj[key];
-  if (!v || typeof v !== 'object' || Array.isArray(v))
-    throw new Error(`'${key}' must be an object`);
-  return v as Record<string, unknown>;
-}
-function requireNumber(obj: Record<string, unknown>, key: string): number {
-  const v = obj[key];
-  if (typeof v !== 'number' || !Number.isFinite(v))
-    throw new Error(`'${key}' must be a finite number`);
-  return v;
-}
-function requireNumberArray(obj: Record<string, unknown>, key: string): number[] {
-  const v = obj[key];
-  if (!Array.isArray(v)) throw new Error(`'${key}' must be an array of numbers`);
-  return v.map((item, i) => {
-    if (typeof item !== 'number' || !Number.isFinite(item))
-      throw new Error(`'${key}[${i}]' must be a number`);
-    return item;
-  });
 }

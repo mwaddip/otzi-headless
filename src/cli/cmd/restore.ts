@@ -22,27 +22,30 @@
  *   2. /etc/otzi/daemon.toml must NOT already exist
  *   3. systemctl is-active otzi must NOT report running
  *
+ * Restore runs as root, and an archive can come from a compromised host. So
+ * after decryption the tar members are read in memory and validated before
+ * anything is written: only the fixed paths and the three paths the archived
+ * daemon.toml names are written, each a direct child of /etc/otzi or
+ * /var/lib/otzi (so no directory between those and a target can be swapped for
+ * a symlink while restore runs); `..`, absolute names, links, devices and
+ * FIFOs are refused; other members are skipped with a warning. Restore only
+ * creates files: it refuses when any target exists, never writes through a
+ * symlink, and on a failure removes only the files it created. Names taken
+ * from the archive are shown through `displayText` in every refusal.
+ *
  * Wrong password and tampered ciphertext both surface as the same friendly
  * message — leaking which one happened gives an attacker an oracle.
  */
 
 import { execFile as execFileCb } from 'node:child_process';
 import { createDecipheriv, pbkdf2Sync } from 'node:crypto';
-import {
-  chmod,
-  mkdir,
-  mkdtemp,
-  readFile,
-  rm,
-  stat,
-  writeFile,
-} from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { lstat, mkdir, open, readFile, rm, stat } from 'node:fs/promises';
+import { dirname, join, posix, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
-import { extract as tarExtract } from 'tar';
+import { Parser as TarParser } from 'tar';
 import { parse as parseToml } from 'smol-toml';
+import { displayText } from '../../util/text';
 import {
   BACKUP_HEADER_LEN,
   BACKUP_IV_LEN,
@@ -65,9 +68,8 @@ const execFile = promisify(execFileCb);
  */
 const FIXED_FILE_MODES: Record<string, number> = {
   'etc/otzi/daemon.toml': 0o640,
-  'etc/otzi/manifest.otzi.json': 0o660,
+  'etc/otzi/address-book.otzi.json': 0o640,
   'var/lib/otzi/vault-pubkey.json': 0o644,
-  'var/lib/otzi/bootstrap-secret': 0o660,
 };
 
 /**
@@ -82,6 +84,30 @@ const PUBKEYS_MODE = 0o644;
 
 /** meta.json lives only inside the archive — never written to disk. */
 const META_TAR_PATH = 'meta.json';
+
+/** The only directories restore writes into (under `rootOverride` in tests). */
+const ALLOWED_DIRS = ['etc/otzi', 'var/lib/otzi'] as const;
+
+/** Tar types that are regular files. */
+const REGULAR_TYPES: ReadonlySet<string> = new Set(['File', 'OldFile', 'ContiguousFile']);
+
+/** Tar types never found in a backup, and refused wherever they appear. */
+const REFUSED_TYPES: Readonly<Record<string, string>> = {
+  SymbolicLink: 'symlink',
+  Link: 'hardlink',
+  CharacterDevice: 'character device',
+  BlockDevice: 'block device',
+  FIFO: 'FIFO',
+};
+
+interface ArchiveMember {
+  /** The name as stored in the tar header. */
+  rawName: string;
+  /** Normalized relative name (no trailing slash). */
+  name: string;
+  type: string;
+  data: Buffer;
+}
 
 /**
  * Default daemon-running probe — `systemctl is-active otzi` exit code 0
@@ -154,6 +180,8 @@ export interface RestoreOptions {
 export interface RestoreResult {
   /** Absolute paths after extraction, with the mode each file was chmod'd to. */
   restoredFiles: { path: string; mode: number }[];
+  /** Tar member names that are not part of a backup; skipped, never written. */
+  skippedEntries: string[];
   /**
    * `partyId` from meta.json. Surfaced so the operator can confirm "yes,
    * this archive is for the right host" in the CLI banner.
@@ -207,7 +235,7 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
       root === '/'
         ? '/etc/otzi/daemon.toml'
         : join(root, 'etc/otzi/daemon.toml');
-    throw new Error(`config already present at ${configPath}; remove it first`);
+    throw new Error(`config already present at ${configPath}; move it aside first`);
   }
 
   // --- Pre-flight check 3: refuse if daemon is running.
@@ -251,169 +279,217 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
     throw new Error('wrong password or corrupted archive');
   }
 
-  // --- Untar.
-  // Stage to a tmpdir first so we can:
-  //   (a) inspect the entry list and compute modes BEFORE touching the real
-  //       extraction targets, and
-  //   (b) keep the entire restore atomic-ish: if extract fails midway, the
-  //       real targets are untouched.
-  // The tar package's defaults strip leading '/' from absolute paths in the
-  // archive (warns and continues). We never produce absolute paths in
-  // backup.ts, but the paranoid check at test time confirms this.
-  const stageDir = await mkdtemp(join(tmpdir(), 'otzi-restore-stage-'));
-  let restoredFiles: { path: string; mode: number }[];
+  // --- Read the tar members in memory. Nothing from the archive touches the
+  // disk until every member and every target path has been validated.
+  const members = await readArchiveMembers(plaintext);
+
+  // --- Member names and types.
+  const files = new Map<string, ArchiveMember>();
+  const directories: ArchiveMember[] = [];
+  for (const m of members) {
+    checkMemberName(m.rawName);
+    const refused = REFUSED_TYPES[m.type];
+    if (refused) throw new Error(`archive entry ${displayText(m.rawName)}: ${refused} refused`);
+    if (m.type === 'Directory') {
+      directories.push(m);
+      continue;
+    }
+    if (!REGULAR_TYPES.has(m.type)) throw new Error(`archive entry ${displayText(m.rawName)}: tar type ${displayText(m.type)} refused`);
+    if (files.has(m.name)) throw new Error(`archive entry ${displayText(m.rawName)}: the archive holds this file more than once`);
+    files.set(m.name, m);
+  }
+
+  // --- meta.json (helps the operator confirm host).
   let metaPartyId: number | undefined;
   let metaCreatedAt: string | undefined;
   let metaHostname: string | undefined;
-  try {
-    const entryPaths: string[] = [];
-    await new Promise<void>((resolveExtract, rejectExtract) => {
-      const sink = tarExtract({
-        cwd: stageDir,
-        gzip: true,
-        // Default behavior strips leading slashes safely. `preservePaths` is
-        // explicitly false (the default) — we don't want absolute-path entries
-        // to escape stageDir. Test 9 verifies this.
-        onReadEntry: (entry) => {
-          // entry.path is the in-archive path; record before tar resumes the
-          // stream + writes the file out.
-          entryPaths.push(entry.path);
-        },
-      }) as NodeJS.WritableStream & { on: (e: string, fn: (...args: unknown[]) => void) => void };
-      sink.on('error', (err: unknown) => rejectExtract(err as Error));
-      sink.on('finish', () => resolveExtract());
-      sink.on('end', () => resolveExtract());
-      sink.end(plaintext);
-    });
-
-    // --- Read meta.json (helps the operator confirm host).
-    const metaStaged = join(stageDir, META_TAR_PATH);
+  const metaMember = files.get(META_TAR_PATH);
+  if (metaMember) {
     try {
-      const metaText = await readFile(metaStaged, 'utf8');
-      const meta = JSON.parse(metaText) as MetaShape;
+      const meta = JSON.parse(metaMember.data.toString('utf8')) as MetaShape;
       metaPartyId = meta.partyId;
       metaCreatedAt = meta.createdAt;
       metaHostname = meta.hostname;
     } catch {
-      // meta.json missing or malformed isn't fatal — backups produced by
-      // older / future versions might omit it. Operators just lose the
-      // confirmation banner.
+      // meta.json malformed isn't fatal — operators just lose the banner.
     }
+  }
 
-    // --- Read the staged daemon.toml to learn the operator-configurable
-    // paths (share, identity, pubkeys). These paths in the tar can differ
-    // from the canonical defaults if the operator customized them; backup
-    // wrote them at `stripLeadingSlash(<absolute path>)`, so we recover the
-    // tar path by the same transform.
-    const dynamicModes = new Map<string, number>();
-    try {
-      const tomlText = await readFile(
-        join(stageDir, 'etc/otzi/daemon.toml'),
-        'utf8',
-      );
-      // Loose TOML parse — restore must work even if the backed-up daemon.toml
-      // wouldn't pass full validation (e.g. mid-bootstrap, missing peers).
-      // We only need three string paths.
-      const rawConfig = parseToml(tomlText) as Record<string, unknown>;
-      const shareTable = (rawConfig.share ?? {}) as Record<string, unknown>;
-      const nodeTable = (rawConfig.node ?? {}) as Record<string, unknown>;
-      const sharePath =
-        typeof shareTable.path === 'string'
-          ? shareTable.path
-          : DEFAULT_SHARE_PATH;
-      const identityPath =
-        typeof nodeTable.identity_key_file === 'string'
-          ? nodeTable.identity_key_file
-          : DEFAULT_IDENTITY_PATH;
-      const pubkeyPath =
-        typeof nodeTable.pubkey_book_file === 'string'
-          ? nodeTable.pubkey_book_file
-          : DEFAULT_PUBKEY_BOOK_PATH;
-      const shareTar = stripLeadingSlash(sharePath);
-      const identityTar = stripLeadingSlash(identityPath);
-      const pubkeyTar = stripLeadingSlash(pubkeyPath);
-      dynamicModes.set(shareTar, SHARE_MODE);
-      dynamicModes.set(identityTar, IDENTITY_MODE);
-      dynamicModes.set(pubkeyTar, PUBKEYS_MODE);
-    } catch (err) {
-      // daemon.toml is required by backup.ts, so its absence here means a
-      // malformed archive. Surface as the friendly error.
-      throw new Error(
-        `archive missing or malformed daemon.toml: ${(err as Error).message}`,
-      );
+  // --- The targets: the fixed paths, plus the three paths the archived
+  // daemon.toml names, each a direct child of /etc/otzi or /var/lib/otzi.
+  const targets = targetModes(files.get('etc/otzi/daemon.toml'));
+  for (const d of directories) {
+    if (targets.has(d.name)) {
+      throw new Error(`archive entry ${displayText(d.rawName)}: directory where a regular file is expected refused`);
     }
+  }
 
-    // --- Categorize entries → real path + mode.
-    // Track every real-path file we've placed so we can roll them back if a
-    // later iteration throws. Without this, a partial restore would leave
-    // host paths under /etc/otzi and /var/lib/otzi half-populated — which
-    // contradicts the "atomic-ish" guarantee the operator banner promises.
-    // We deliberately do NOT track or remove parent directories: they may
-    // have existed before restore (postinst sets them up), and mkdir with
-    // recursive:true is idempotent — undoing it can't be done safely.
-    restoredFiles = [];
-    const placedPaths: string[] = [];
-    try {
-      for (const entryPath of entryPaths) {
-        // tar emits both directory and file entries; skip directories (paths
-        // ending in '/').
-        if (entryPath.endsWith('/')) continue;
-        // Normalize the in-archive path: strip any leading '/' (defense in
-        // depth — tar already strips, but the entryPath here might still
-        // have one if preservePaths were ever flipped on).
-        const normalized = stripLeadingSlash(entryPath);
-        if (normalized === META_TAR_PATH) continue; // never write meta.json
+  // --- Everything else is skipped and reported.
+  const placements: { member: ArchiveMember; dest: string; mode: number }[] = [];
+  const skippedEntries: string[] = [];
+  for (const m of members) {
+    if (m.name === META_TAR_PATH && REGULAR_TYPES.has(m.type)) continue;
+    const mode = REGULAR_TYPES.has(m.type) ? targets.get(m.name) : undefined;
+    if (mode === undefined) {
+      skippedEntries.push(m.rawName);
+      continue;
+    }
+    placements.push({ member: m, dest: resolve(root, m.name), mode });
+  }
 
-        // Mode lookup precedence: dynamic (from daemon.toml) → fixed table.
-        // Unknown entries (operator-injected mystery files) fall back to
-        // SHARE_MODE (0o600) — most-restrictive default.
-        const mode =
-          dynamicModes.get(normalized) ?? FIXED_FILE_MODES[normalized] ?? SHARE_MODE;
-        const stagedSrc = join(stageDir, normalized);
-        const realDest = resolve(root, normalized);
+  // --- The host side: no target exists. Every target is a direct child of an
+  // allowed directory, so there is no directory in between that could be swapped
+  // for a symlink between this check and the write below.
+  const existing: string[] = [];
+  for (const p of placements) if (await entryExists(p.dest)) existing.push(displayText(p.dest));
+  if (existing.length > 0) {
+    throw new Error(
+      `restore would replace existing files: ${existing.join(', ')}; move them aside and run restore again`,
+    );
+  }
 
-        // Move staged → real path. Use rename within same FS where possible;
-        // fall back to copy+remove. Since stageDir is in os.tmpdir() and real
-        // dests are in /etc and /var, rename will usually fail (cross-device).
-        // Always copy via readFile/writeFile to avoid that failure mode.
-        const fileBuf = await readFile(stagedSrc);
-        await mkdir(dirname(realDest), { recursive: true });
-        await writeFile(realDest, fileBuf, { mode });
-        placedPaths.push(realDest);
-        // writeFile honors umask; chmod again to set the mode unconditionally.
-        await chmod(realDest, mode);
-
-        restoredFiles.push({ path: realDest, mode });
+  // --- Create each target. Only files this call created are tracked, so a
+  // rollback never touches a file that existed before.
+  // We deliberately do NOT track or remove parent directories: they may
+  // have existed before restore (postinst sets them up), and mkdir with
+  // recursive:true is idempotent — undoing it can't be done safely.
+  const restoredFiles: { path: string; mode: number }[] = [];
+  const created: string[] = [];
+  try {
+    for (const { member, dest, mode } of placements) {
+      await mkdir(dirname(dest), { recursive: true });
+      // 'wx': fails if anything appeared at `dest` meanwhile, and never
+      // follows a symlink there.
+      const handle = await open(dest, 'wx', mode);
+      created.push(dest);
+      try {
+        await handle.writeFile(member.data);
+        // The umask may have narrowed the creation mode.
+        await handle.chmod(mode);
+        await handle.sync();
+      } finally {
+        await handle.close();
       }
-    } catch (err) {
-      // Best-effort rollback: remove every file we placed so the host is
-      // left in the same state it was in before this call. Reverse order is
-      // cosmetic (matches the order we'd have unwound a stack), not
-      // load-bearing — files are independent. Individual rm failures are
-      // swallowed so a transient unlink error can't shadow the original
-      // cause the caller actually needs to see.
-      console.error(
-        `otzi restore: placement failed; rolling back ${placedPaths.length} file(s) already placed`,
-      );
-      for (const p of [...placedPaths].reverse()) {
-        try {
-          await rm(p, { force: true });
-        } catch {
-          // Swallow — the original error is what the caller needs.
-        }
-      }
-      throw err;
+      restoredFiles.push({ path: dest, mode });
     }
-  } finally {
-    await rm(stageDir, { recursive: true, force: true });
+  } catch (err) {
+    // Best-effort rollback of what this call created. Individual rm failures
+    // are swallowed so a transient unlink error can't shadow the original
+    // cause the caller actually needs to see.
+    console.error(
+      `otzi restore: placement failed; removing the ${created.length} file(s) this restore created`,
+    );
+    for (const p of [...created].reverse()) {
+      try {
+        await rm(p, { force: true });
+      } catch {
+        // Swallow — the original error is what the caller needs.
+      }
+    }
+    throw err;
   }
 
   return {
     restoredFiles,
+    skippedEntries,
     ...(metaPartyId !== undefined ? { metaPartyId } : {}),
     ...(metaCreatedAt !== undefined ? { metaCreatedAt } : {}),
     ...(metaHostname !== undefined ? { metaHostname } : {}),
   };
+}
+
+/** Every tar member with its content, read from the gzipped tar in memory. */
+async function readArchiveMembers(tgz: Buffer): Promise<ArchiveMember[]> {
+  const members: ArchiveMember[] = [];
+  const parser = new TarParser({ strict: true });
+  await new Promise<void>((resolveParse, rejectParse) => {
+    parser.on('entry', (entry) => {
+      const chunks: Buffer[] = [];
+      entry.on('data', (chunk: Buffer) => chunks.push(chunk));
+      entry.on('end', () => {
+        const rawName = entry.path;
+        members.push({
+          rawName,
+          name: posix.normalize(rawName).replace(/\/+$/, ''),
+          type: entry.type,
+          data: Buffer.concat(chunks),
+        });
+      });
+    });
+    parser.on('error', (err: Error) => rejectParse(new Error(`archive is not a valid tar: ${displayText(err.message)}`)));
+    parser.on('end', () => resolveParse());
+    parser.end(tgz);
+  });
+  return members;
+}
+
+/** A member name must be relative and must not climb out with `..`. */
+function checkMemberName(rawName: string): void {
+  if (rawName.startsWith('/') || /^[A-Za-z]:/.test(rawName)) {
+    throw new Error(`archive entry ${displayText(rawName)}: absolute path refused`);
+  }
+  if (rawName.split(/[\\/]/).includes('..')) throw new Error(`archive entry ${displayText(rawName)}: '..' refused`);
+  if (rawName === '' || posix.normalize(rawName) === '.') throw new Error(`archive entry '${displayText(rawName)}': empty name refused`);
+}
+
+/**
+ * The tar paths restore writes, with their modes: the fixed ones and the
+ * three the archived daemon.toml names. Throws when daemon.toml is missing or
+ * unreadable, or names a path that is not a direct child of /etc/otzi or
+ * /var/lib/otzi.
+ */
+function targetModes(daemonToml: ArchiveMember | undefined): Map<string, number> {
+  let rawConfig: Record<string, unknown>;
+  try {
+    if (!daemonToml) throw new Error('etc/otzi/daemon.toml is not in the archive');
+    // Loose TOML parse — restore must work even if the backed-up daemon.toml
+    // wouldn't pass full validation (e.g. mid-bootstrap, missing peers).
+    rawConfig = parseToml(daemonToml.data.toString('utf8')) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(`archive missing or malformed daemon.toml: ${displayText((err as Error).message)}`);
+  }
+  const shareTable = (rawConfig.share ?? {}) as Record<string, unknown>;
+  const nodeTable = (rawConfig.node ?? {}) as Record<string, unknown>;
+  const named = (value: unknown, fallback: string): string => (typeof value === 'string' ? value : fallback);
+
+  const targets = new Map<string, number>(Object.entries(FIXED_FILE_MODES));
+  const dynamic: [string, string, number][] = [
+    ['[share].path', named(shareTable.path, DEFAULT_SHARE_PATH), SHARE_MODE],
+    ['[node].identity_key_file', named(nodeTable.identity_key_file, DEFAULT_IDENTITY_PATH), IDENTITY_MODE],
+    ['[node].pubkey_book_file', named(nodeTable.pubkey_book_file, DEFAULT_PUBKEY_BOOK_PATH), PUBKEYS_MODE],
+  ];
+  for (const [key, path, mode] of dynamic) {
+    const tarPath = allowedTarPath(key, path);
+    if (targets.has(tarPath)) {
+      throw new Error(`daemon.toml in the archive: ${key} = ${displayText(path)} names a file another key also names; refused`);
+    }
+    targets.set(tarPath, mode);
+  }
+  return targets;
+}
+
+/** The tar path of an absolute path that is a direct child of an allowed directory. */
+function allowedTarPath(key: string, path: string): string {
+  const refuse = (why: string) =>
+    new Error(`daemon.toml in the archive: ${key} = ${displayText(path)} ${why}; refused`);
+  if (!path.startsWith('/')) throw refuse('is outside /etc/otzi and /var/lib/otzi');
+  const tarPath = stripLeadingSlash(posix.resolve(path));
+  if ((ALLOWED_DIRS as readonly string[]).includes(posix.dirname(tarPath))) return tarPath;
+  if (ALLOWED_DIRS.some(dir => tarPath.startsWith(`${dir}/`))) {
+    throw refuse('is not a direct child of /etc/otzi or /var/lib/otzi');
+  }
+  throw refuse('is outside /etc/otzi and /var/lib/otzi');
+}
+
+/** True iff any file system entry (a dangling symlink included) exists at `p`. */
+async function entryExists(p: string): Promise<boolean> {
+  try {
+    await lstat(p);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
 }
 
 /**

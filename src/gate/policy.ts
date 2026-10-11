@@ -1,135 +1,185 @@
 /**
- * `PolicyGate` — deterministic rule check.
+ * `PolicyGate` — deterministic rule check on Bitcoin ceremony specs (facts/gate.md).
  *
- * Strict-by-default: if the operator sets an allowlist / cap and the spec lacks the
- * corresponding field, the gate rejects. Rationale: the operator explicitly opted in
+ * Strict-by-default: if the operator sets a cap / allowlist and the spec lacks the
+ * corresponding input, the gate rejects. Rationale: the operator explicitly opted in
  * to a constraint; they shouldn't be surprised by a no-field-means-bypass loophole.
  *
- * Rules split into "generic" (apply across protocols) and "protocol-scoped"
- * (only active when the spec's operation matches). A rate limiter applies
- * to every signing ceremony; DKG has its own leader allowlist.
- *
- * TOML shape (under `[gate]`):
+ * TOML shape — flat keys under `[gate]`:
+ *   [gate]
  *   strategy = "policy"
- *   [gate.params]
- *   # Generic signing rules — match any signing spec (BTC or OPNet):
- *   max_amount = 100000                           # u64 or decimal string
- *   destination_allowlist = ["bc1p...", "0x..."]
- *   method_allowlist = ["transfer", "approve"]
  *
- *   # BTC-scoped (active iff operation='btc-transfer'):
- *   max_btc_per_tx = 100000000                    # 1 BTC cap on sum of non-self outputs
- *   allowed_btc_recipients = ["bc1p...", "bc1q..."]
- *                                                 # every non-self output must be in this list
+ *   # Signing rules (never applied to a DKG spec). Caps are non-negative safe
+ *   # integers, given as a TOML integer or a decimal string:
+ *   max_sats_per_tx = 100000              # sum of non-change outputs
+ *   max_sats_per_24h = 1000000            # rolling 24 h, this node's approvals
+ *   allowed_recipients = ["bc1q...", "bc1p..."]
+ *                                         # every non-change output must be listed
+ *   allowed_recipients = "address-book"   # ... or be in this node's address book,
+ *                                         # read at each evaluation
+ *   max_fee_sats = 20000
+ *   max_fee_rate = 25.5                   # sat/vB, may be fractional
+ *   max_ceremonies_per_hour = 10          # rolling hour, this node's approvals
  *
- *   # OPNet-scoped (active iff operation='opnet-call'):
- *   allowed_contracts = ["0xcontract..."]
- *
- *   # Signing rate limit — sliding window, in-memory, resets on restart:
- *   max_ceremonies_per_hour = 10
- *
- *   # DKG-scoped:
+ *   # DKG rule:
  *   dkg_leader_allowlist = ["node-a"]
+ *
+ * Both rolling windows live in memory and count approvals only; they reset on
+ * daemon restart.
  */
 
 import { ConfigError } from '../config/parse';
-import type { ApprovalGate, CeremonySpec, Decision } from './types';
+import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
+import type { ApprovalGate, CeremonySpec, Decision, DkgSpec, SigningSpec } from './types';
 
 export interface PolicyConfig {
-  /** Cap on `spec.amount`. Spec rejected if amount missing or > this. */
-  maxAmount?: bigint;
-  /** Destination must be in this list if set. Spec rejected if destination missing. */
-  destinationAllowlist?: string[];
-  /** Method must be in this list if set. Spec rejected if method missing. */
-  methodAllowlist?: string[];
+  /** Cap on `spec.amount` (sats): the sum of the non-change outputs. */
+  maxSatsPerTx?: number;
+  /** Cap on the 24 h sum of `amount` over this node's approvals plus the spec under test. */
+  maxSatsPer24h?: number;
   /**
-   * BTC-only: cap on sum of non-self output amounts (sats). Active only
-   * when `operation === 'btc-transfer'`. Rejects if outputs missing.
+   * Every non-change output address must be in this list, or in the node's
+   * address book with `'address-book'`. Change outputs are ignored.
    */
-  maxBtcPerTx?: bigint;
-  /**
-   * BTC-only: every non-self output address must be in this list. Rejects
-   * if outputs missing or any output has `address: null` (OP_RETURN etc.).
-   */
-  allowedBtcRecipients?: string[];
-  /**
-   * OPNet-only: spec.destination (the contract address hint) must be in this list.
-   * Active only when `operation === 'opnet-call'`. Rejects if destination missing.
-   */
-  allowedContracts?: string[];
-  /** Max signing ceremonies approved per rolling hour. Rejects when exceeded. */
+  allowedRecipients?: string[] | 'address-book';
+  /** Cap on `spec.fee` (sats). */
+  maxFeeSats?: number;
+  /** Cap on `spec.feeRate` (sat/vB, may be fractional). */
+  maxFeeRate?: number;
+  /** Signing approvals by this node per rolling hour must stay below this. */
   maxCeremoniesPerHour?: number;
   /** DKG leader must be in this list if set. */
   dkgLeaderAllowlist?: string[];
 }
 
+export interface PolicyGateOptions {
+  /** Clock in ms since epoch; defaults to `Date.now`. Injectable for window tests. */
+  now?: () => number;
+  /**
+   * The addresses in this node's address book, for `allowedRecipients === 'address-book'`.
+   * Rejects when the book cannot be loaded, a missing book file included.
+   */
+  loadAddressBook?: () => Promise<string[]>;
+  /** Receives the warning for an address-book rule that rejects for want of a book. Default: none. */
+  logger?: Logger;
+}
+
 const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+interface SatApproval {
+  at: number;
+  amount: number;
+}
+
+function isSats(n: unknown): n is number {
+  return typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
+}
+
+function isFeeRate(n: unknown): n is number {
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0;
+}
 
 export class PolicyGate implements ApprovalGate {
-  /** Approval timestamps for the signing-rate-limit sliding window (ms since epoch). */
-  private readonly signingApprovals: number[] = [];
+  /** Approval timestamps for the signing-rate-limit window (ms since epoch). */
+  private hourly: number[] = [];
+  /** Approved amounts for the rolling 24 h sats window. */
+  private daily: SatApproval[] = [];
+  private readonly now: () => number;
+  private readonly loadAddressBook: (() => Promise<string[]>) | undefined;
+  private readonly log: Logger;
 
-  constructor(private readonly config: PolicyConfig, private readonly now: () => number = Date.now) {}
+  constructor(private readonly config: PolicyConfig, opts: PolicyGateOptions = {}) {
+    this.now = opts.now ?? Date.now;
+    this.loadAddressBook = opts.loadAddressBook;
+    this.log = opts.logger ?? NOOP_LOGGER;
+  }
 
   async approve(spec: CeremonySpec): Promise<Decision> {
-    if (spec.kind === 'dkg') {
-      if (this.config.dkgLeaderAllowlist !== undefined) {
-        if (!this.config.dkgLeaderAllowlist.includes(spec.leader)) return 'reject';
+    try {
+      if (spec.kind === 'dkg') return this.approveDkg(spec);
+      // The address book is read before, never during, the rules: every rule is checked
+      // and the approval recorded in one synchronous section (`approveSigning`), so
+      // concurrent evaluations cannot both pass a cap.
+      const book = this.config.allowedRecipients === 'address-book' ? await this.readBook(spec) : undefined;
+      return this.approveSigning(spec, book);
+    } catch (err) {
+      // A spec the rules cannot evaluate (a null output, a missing field) is a reject, never a throw.
+      this.log.warn(
+        `policy: ${spec?.kind ?? 'unknown'} ${spec?.ceremonyId ?? '?'} rejected: the rules could not be evaluated: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        { ceremonyId: spec?.ceremonyId },
+      );
+      return 'reject';
+    }
+  }
+
+  /** This node's address book addresses, or `null` (with a warning) when there is no usable book. */
+  private async readBook(spec: SigningSpec): Promise<string[] | null> {
+    const why = (cause: string) =>
+      this.log.warn(`policy: signing ${spec.ceremonyId} rejected: allowed_recipients = "address-book" but ${cause}`, {
+        ceremonyId: spec.ceremonyId,
+      });
+    if (!this.loadAddressBook) {
+      why('no address book loader is configured');
+      return null;
+    }
+    try {
+      return await this.loadAddressBook();
+    } catch (err) {
+      why(`the address book cannot be loaded: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
+
+  private approveDkg(spec: DkgSpec): Decision {
+    const allow = this.config.dkgLeaderAllowlist;
+    if (allow !== undefined && !allow.includes(spec.leader)) return 'reject';
+    return 'approve';
+  }
+
+  /** `book` is the loaded address book (`null` when it could not be) when `allowedRecipients` is `'address-book'`. */
+  private approveSigning(spec: SigningSpec, book: string[] | null | undefined): Decision {
+    const c = this.config;
+    const now = this.now();
+    this.hourly = this.hourly.filter((at) => at >= now - HOUR_MS);
+    this.daily = this.daily.filter((e) => e.at >= now - DAY_MS);
+
+    if (c.maxSatsPerTx !== undefined) {
+      if (!isSats(spec.amount) || spec.amount > c.maxSatsPerTx) return 'reject';
+    }
+
+    if (c.maxSatsPer24h !== undefined) {
+      if (!isSats(spec.amount)) return 'reject';
+      const spent = this.daily.reduce((sum, e) => sum + e.amount, 0);
+      if (spent + spec.amount > c.maxSatsPer24h) return 'reject';
+    }
+
+    if (c.allowedRecipients !== undefined) {
+      const allowed = c.allowedRecipients === 'address-book' ? book : c.allowedRecipients;
+      if (!allowed || !Array.isArray(spec.outputs)) return 'reject';
+      for (const out of spec.outputs) {
+        if (out.isChange === true) continue;
+        if (typeof out.address !== 'string' || !allowed.includes(out.address)) return 'reject';
       }
-      return 'approve';
     }
 
-    // Generic rules — apply to any signing spec.
-    if (this.config.maxAmount !== undefined) {
-      if (spec.amount === undefined) return 'reject';
-      if (spec.amount > this.config.maxAmount) return 'reject';
+    if (c.maxFeeSats !== undefined) {
+      if (!isSats(spec.fee) || spec.fee > c.maxFeeSats) return 'reject';
     }
 
-    if (this.config.destinationAllowlist !== undefined) {
-      if (spec.destination === undefined) return 'reject';
-      if (!this.config.destinationAllowlist.includes(spec.destination)) return 'reject';
+    if (c.maxFeeRate !== undefined) {
+      if (!isFeeRate(spec.feeRate) || spec.feeRate > c.maxFeeRate) return 'reject';
     }
 
-    if (this.config.methodAllowlist !== undefined) {
-      if (spec.method === undefined) return 'reject';
-      if (!this.config.methodAllowlist.includes(spec.method)) return 'reject';
+    if (c.maxCeremoniesPerHour !== undefined) {
+      if (this.hourly.length >= c.maxCeremoniesPerHour) return 'reject';
     }
 
-    // BTC-scoped rules.
-    if (spec.operation === 'btc-transfer') {
-      if (this.config.maxBtcPerTx !== undefined) {
-        if (!spec.outputs) return 'reject';
-        const total = spec.outputs.reduce((sum, o) => sum + o.amountSat, 0n);
-        if (total > this.config.maxBtcPerTx) return 'reject';
-      }
-      if (this.config.allowedBtcRecipients !== undefined) {
-        if (!spec.outputs) return 'reject';
-        for (const out of spec.outputs) {
-          if (out.address === null) return 'reject';
-          if (!this.config.allowedBtcRecipients.includes(out.address)) return 'reject';
-        }
-      }
-    }
-
-    // OPNet-scoped rules.
-    if (spec.operation === 'opnet-call') {
-      if (this.config.allowedContracts !== undefined) {
-        if (spec.destination === undefined) return 'reject';
-        if (!this.config.allowedContracts.includes(spec.destination)) return 'reject';
-      }
-    }
-
-    // Rate limit (sliding window). Check + record atomically (no async gap).
-    if (this.config.maxCeremoniesPerHour !== undefined) {
-      const cutoff = this.now() - HOUR_MS;
-      // Prune old entries.
-      while (this.signingApprovals.length > 0 && this.signingApprovals[0]! < cutoff) {
-        this.signingApprovals.shift();
-      }
-      if (this.signingApprovals.length >= this.config.maxCeremoniesPerHour) return 'reject';
-      this.signingApprovals.push(this.now());
-    }
-
+    // Final approval: record it in each active window. A rejected spec records nothing.
+    if (c.maxSatsPer24h !== undefined) this.daily.push({ at: now, amount: spec.amount });
+    if (c.maxCeremoniesPerHour !== undefined) this.hourly.push(now);
     return 'approve';
   }
 }
@@ -139,41 +189,49 @@ export class PolicyGate implements ApprovalGate {
 // ---------------------------------------------------------------------------
 
 const KNOWN_KEYS = new Set([
-  'max_amount',
-  'destination_allowlist',
-  'method_allowlist',
-  'max_btc_per_tx',
-  'allowed_btc_recipients',
-  'allowed_contracts',
+  'max_sats_per_tx',
+  'max_sats_per_24h',
+  'allowed_recipients',
+  'max_fee_sats',
+  'max_fee_rate',
   'max_ceremonies_per_hour',
   'dkg_leader_allowlist',
 ]);
 
+/** Keys of the earlier policy vocabulary, with the message naming the replacement. */
+const LEGACY_KEYS = new Map<string, string>([
+  ['max_amount', 'use max_sats_per_tx'],
+  ['max_btc_per_tx', 'use max_sats_per_tx'],
+  ['allowed_btc_recipients', 'use allowed_recipients'],
+  ['destination_allowlist', 'use allowed_recipients'],
+  ['method_allowlist', 'no longer supported'],
+  ['allowed_contracts', 'no longer supported'],
+]);
+
 export function parsePolicyParams(params: Record<string, unknown>): PolicyConfig {
   for (const key of Object.keys(params)) {
+    const legacy = LEGACY_KEYS.get(key);
+    if (legacy !== undefined) throw new ConfigError(`gate.${key}`, legacy);
     if (!KNOWN_KEYS.has(key))
       throw new ConfigError(`gate.${key}`, `unknown policy field (expected one of ${[...KNOWN_KEYS].join(', ')})`);
   }
 
   const out: PolicyConfig = {};
 
-  if (params.max_amount !== undefined) {
-    out.maxAmount = coerceAmount(params.max_amount, 'gate.max_amount');
+  if (params.max_sats_per_tx !== undefined) {
+    out.maxSatsPerTx = coerceSats(params.max_sats_per_tx, 'gate.max_sats_per_tx');
   }
-  if (params.destination_allowlist !== undefined) {
-    out.destinationAllowlist = coerceStringArray(params.destination_allowlist, 'gate.destination_allowlist');
+  if (params.max_sats_per_24h !== undefined) {
+    out.maxSatsPer24h = coerceSats(params.max_sats_per_24h, 'gate.max_sats_per_24h');
   }
-  if (params.method_allowlist !== undefined) {
-    out.methodAllowlist = coerceStringArray(params.method_allowlist, 'gate.method_allowlist');
+  if (params.allowed_recipients !== undefined) {
+    out.allowedRecipients = coerceRecipients(params.allowed_recipients, 'gate.allowed_recipients');
   }
-  if (params.max_btc_per_tx !== undefined) {
-    out.maxBtcPerTx = coerceAmount(params.max_btc_per_tx, 'gate.max_btc_per_tx');
+  if (params.max_fee_sats !== undefined) {
+    out.maxFeeSats = coerceSats(params.max_fee_sats, 'gate.max_fee_sats');
   }
-  if (params.allowed_btc_recipients !== undefined) {
-    out.allowedBtcRecipients = coerceStringArray(params.allowed_btc_recipients, 'gate.allowed_btc_recipients');
-  }
-  if (params.allowed_contracts !== undefined) {
-    out.allowedContracts = coerceStringArray(params.allowed_contracts, 'gate.allowed_contracts');
+  if (params.max_fee_rate !== undefined) {
+    out.maxFeeRate = coerceFeeRate(params.max_fee_rate, 'gate.max_fee_rate');
   }
   if (params.max_ceremonies_per_hour !== undefined) {
     out.maxCeremoniesPerHour = coercePositiveInt(params.max_ceremonies_per_hour, 'gate.max_ceremonies_per_hour');
@@ -193,21 +251,46 @@ function coercePositiveInt(v: unknown, path: string): number {
   return v;
 }
 
-function coerceAmount(v: unknown, path: string): bigint {
+/** A non-negative safe integer from a TOML integer or a decimal string. */
+function coerceSats(v: unknown, path: string): number {
   if (typeof v === 'bigint') {
     if (v < 0n) throw new ConfigError(path, `must be >= 0 (got ${v})`);
-    return v;
+    if (v > BigInt(Number.MAX_SAFE_INTEGER))
+      throw new ConfigError(path, `must be <= ${Number.MAX_SAFE_INTEGER} (got ${v})`);
+    return Number(v);
   }
   if (typeof v === 'number') {
     if (!Number.isFinite(v) || !Number.isInteger(v))
       throw new ConfigError(path, `must be an integer (got ${v})`);
     if (v < 0) throw new ConfigError(path, `must be >= 0 (got ${v})`);
-    return BigInt(v);
+    if (!Number.isSafeInteger(v))
+      throw new ConfigError(path, `must be <= ${Number.MAX_SAFE_INTEGER} (got ${v})`);
+    return v === 0 ? 0 : v;
   }
   if (typeof v === 'string') {
     if (!/^\d+$/.test(v))
       throw new ConfigError(path, `must be a non-negative decimal string (got '${v}')`);
-    return BigInt(v);
+    if (BigInt(v) > BigInt(Number.MAX_SAFE_INTEGER))
+      throw new ConfigError(path, `must be <= ${Number.MAX_SAFE_INTEGER} (got '${v}')`);
+    return Number(v);
+  }
+  throw new ConfigError(path, `must be an integer or decimal string (got ${describe(v)})`);
+}
+
+/** A finite, non-negative number (fractional allowed) from a TOML number or a decimal string. */
+function coerceFeeRate(v: unknown, path: string): number {
+  if (typeof v === 'bigint') return coerceSats(v, path);
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) throw new ConfigError(path, `must be a finite number (got ${v})`);
+    if (v < 0) throw new ConfigError(path, `must be >= 0 (got ${v})`);
+    return v === 0 ? 0 : v;
+  }
+  if (typeof v === 'string') {
+    if (!/^\d+(\.\d+)?$/.test(v))
+      throw new ConfigError(path, `must be a non-negative decimal string (got '${v}')`);
+    const n = Number(v);
+    if (!Number.isFinite(n)) throw new ConfigError(path, `must be a finite number (got '${v}')`);
+    return n;
   }
   throw new ConfigError(path, `must be a number or decimal string (got ${describe(v)})`);
 }
@@ -218,6 +301,26 @@ function coerceStringArray(v: unknown, path: string): string[] {
   return v.map((item, i) => {
     if (typeof item !== 'string')
       throw new ConfigError(`${path}[${i}]`, `must be a string (got ${describe(item)})`);
+    return item;
+  });
+}
+
+/** An array of addresses, or the string `"address-book"`. */
+function coerceRecipients(v: unknown, path: string): string[] | 'address-book' {
+  if (v === 'address-book') return v;
+  if (typeof v === 'string')
+    throw new ConfigError(path, `must be an array of addresses or the string "address-book" (got '${v}')`);
+  return coerceAddressArray(v, path);
+}
+
+function coerceAddressArray(v: unknown, path: string): string[] {
+  if (!Array.isArray(v))
+    throw new ConfigError(path, `must be an array of addresses or the string "address-book" (got ${describe(v)})`);
+  return v.map((item, i) => {
+    if (typeof item !== 'string')
+      throw new ConfigError(`${path}[${i}]`, `must be a string (got ${describe(item)})`);
+    if (item === '')
+      throw new ConfigError(`${path}[${i}]`, 'must not be empty');
     return item;
   });
 }

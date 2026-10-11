@@ -4,7 +4,7 @@
 # Output: dist/otzi-headless_<version>_<arch>.deb
 #
 # Strategy: esbuild bundles src/daemon/entrypoint.ts into a single ESM file
-# at /usr/lib/otzi/entrypoint.mjs. Vendor/post-quantum (pure JS) is inlined.
+# at /usr/lib/otzi/entrypoint.mjs. Every dependency (pure JS) is inlined.
 # No node_modules, no tsx runtime — just one .mjs + the wrapper at /usr/bin/otzi.
 set -euo pipefail
 
@@ -28,8 +28,8 @@ cp -a packaging/deb/. "$STAGE/"
 sed -i "s/@@VERSION@@/$VERSION/g; s/@@ARCH@@/$ARCH/g" "$STAGE/DEBIAN/control"
 
 # Bundle the daemon entrypoint. Banner installs createRequire so any CJS
-# transitive dep (e.g. @noble/hashes/cryptoNode in bip39) can `require('node:crypto')`
-# at runtime through esbuild's __require shim.
+# transitive dep can `require('node:crypto')` at runtime through esbuild's
+# __require shim.
 APP_DIR="$STAGE/usr/lib/otzi"
 mkdir -p "$APP_DIR"
 echo ">> bundling entrypoint with esbuild"

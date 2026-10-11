@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<!--
+  Operator page for the gate-web-btc-message approver. Served by approver.ts at GET /.
+  Plain static page: no build step, no external scripts, no external requests.
+
+  Every string that comes from a spec (labels come from address books, ceremony
+  ids and addresses from the daemon) is written with textContent or as a text
+  node. There is no innerHTML in this file, so spec data is never parsed as markup.
+
+  Wire protocol with the approver (relative URLs, so a path-prefix proxy works):
+    GET  pending  → { address, pending: [{ nonce, ceremonyId, receivedAt, spec,
+                                           messages: { approve, reject } }] }
+    POST decide   ← { nonce, decision, signature }
+
+  The operator signs messages[decision] in a wallet and pastes the base64 signature.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ötzi Gate Approver</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #656d76; --bg: #f6f8fa; --card: #fff; --border: #d0d7de;
+    --code: #eef1f4; --approve: #1a7f37; --reject: #cf222e; --warn: #9a6700; --warn-bg: #fff8c5;
+    --accent: #0969da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6edf3; --muted: #8b949e; --bg: #0d1117; --card: #161b22; --border: #30363d;
+      --code: #1f242c; --approve: #2ea043; --reject: #f85149; --warn: #d29922; --warn-bg: #3b2e00;
+      --accent: #58a6ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 0 auto; padding: 1.5rem 1rem 3rem;
+         color: var(--fg); background: var(--bg); line-height: 1.45; }
+  h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
+  .muted { color: var(--muted); font-size: 0.9em; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; word-break: break-all; }
+  #status { margin: 0.25rem 0 1rem; }
+  .card { border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin: 1rem 0; background: var(--card); }
+  .card h2 { margin: 0 0 0.25rem; font-size: 1.05rem; word-break: break-all; }
+  .tags { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.75rem; }
+  .tag { font-size: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .tag.change { color: var(--approve); border-color: var(--approve); }
+  .tag.label { color: var(--accent); border-color: var(--accent); }
+  .tag.unlabelled { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0.5rem 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; }
+  .outputs { list-style: none; margin: 0.5rem 0; padding: 0; }
+  .outputs li { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.75rem; margin: 0.4rem 0; }
+  .outputs .amount { font-weight: 600; }
+  details { margin: 0.5rem 0; }
+  summary { cursor: pointer; color: var(--muted); }
+  pre { background: var(--code); padding: 0.6rem; border-radius: 4px; overflow-x: auto; font-size: 0.8em; margin: 0.4rem 0; }
+  fieldset { border: 1px solid var(--border); border-radius: 6px; margin: 0.75rem 0 0; padding: 0.6rem 0.75rem; }
+  legend { color: var(--muted); padding: 0 0.3rem; }
+  label.choice { margin-right: 1rem; cursor: pointer; }
+  input[type=text], textarea { width: 100%; padding: 0.45rem; border: 1px solid var(--border); border-radius: 4px;
+         background: var(--code); color: var(--fg); font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+  textarea { min-height: 4.5rem; resize: vertical; }
+  .row { display: flex; gap: 0.5rem; align-items: center; margin: 0.4rem 0; }
+  .row input { flex: 1; }
+  button { padding: 0.45rem 0.9rem; border: none; border-radius: 4px; color: #fff; font-weight: 600; cursor: pointer; background: var(--accent); }
+  button.approve { background: var(--approve); }
+  button.reject { background: var(--reject); }
+  button.secondary { background: var(--muted); }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  .error { color: var(--reject); margin: 0.5rem 0 0; min-height: 1.2em; }
+</style>
+</head>
+<body>
+  <h1>Ötzi Gate Approver</h1>
+  <div id="status" class="muted">Connecting…</div>
+  <div id="pending"></div>
+
+<script>
+'use strict';
+
+const statusEl = document.getElementById('status');
+const pendingEl = document.getElementById('pending');
+const emptyEl = document.createElement('p');
+emptyEl.className = 'muted';
+emptyEl.textContent = 'No pending ceremonies.';
+
+// nonce → card element. Cards are added and removed, never rebuilt, so a
+// signature the operator is pasting survives the 3 s poll.
+const cards = new Map();
+
+// ── DOM helpers: text only ─────────────────────────────────────────────────
+function el(tag, className, ...children) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  for (const child of children) node.append(child instanceof Node ? child : String(child));
+  return node;
+}
+
+// ── Formatting ─────────────────────────────────────────────────────────────
+function group(digits) { return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function sats(n) {
+  if (!Number.isSafeInteger(n) || n < 0) return String(n);
+  const btc = Math.floor(n / 1e8) + '.' + String(n % 1e8).padStart(8, '0');
+  return group(String(n)) + ' sats (' + btc + ' BTC)';
+}
+function rate(n) { return typeof n === 'number' && Number.isFinite(n) ? String(+n.toFixed(2)) + ' sat/vB' : String(n); }
+function field(dl, name, value, mono) {
+  dl.append(el('dt', '', name), el('dd', mono ? 'mono' : '', value));
+}
+
+// ── Cards ──────────────────────────────────────────────────────────────────
+function signingSummary(spec) {
+  const box = el('div');
+  const dl = el('dl');
+  field(dl, 'Network', spec.network);
+  field(dl, 'Role', spec.role + ' (leader: ' + spec.leader + ')');
+  field(dl, 'Sends', sats(spec.amount));
+  field(dl, 'Fee', sats(spec.fee));
+  field(dl, 'Fee rate', rate(spec.feeRate));
+  field(dl, 'Txid', spec.txid, true);
+  box.append(dl);
+
+  const outputs = Array.isArray(spec.outputs) ? spec.outputs : [];
+  box.append(el('div', 'muted', 'Outputs (' + outputs.length + ')'));
+  const list = el('ul', 'outputs');
+  for (const out of outputs) {
+    const tags = el('div', 'tags');
+    if (out.isChange) tags.append(el('span', 'tag change', 'change to the vault'));
+    else if (out.label) tags.append(el('span', 'tag label', 'label: ' + out.label));
+    else tags.append(el('span', 'tag unlabelled', 'not in this node’s address book'));
+    list.append(el('li', '', el('div', 'amount', sats(out.amount)), el('div', 'mono', out.address), tags));
+  }
+  box.append(list);
+  return box;
+}
+
+function dkgSummary(spec) {
+  const dl = el('dl');
+  field(dl, 'Network', spec.network);
+  field(dl, 'Role', spec.role + ' (leader: ' + spec.leader + ')');
+  field(dl, 'Threshold', spec.threshold + ' of ' + spec.parties);
+  field(dl, 'Ring', Array.isArray(spec.peerIds) ? spec.peerIds.join(', ') : spec.peerIds);
+  return dl;
+}
+
+function buildCard(item) {
+  const spec = item.spec;
+  const card = el('div', 'card');
+  card.append(el('h2', '', item.ceremonyId));
+  card.append(el('div', 'tags',
+    el('span', 'tag', spec.kind === 'dkg' ? 'DKG: creates a new vault key' : 'signing'),
+    el('span', 'tag', 'received ' + item.receivedAt)));
+  card.append(spec.kind === 'dkg' ? dkgSummary(spec) : signingSummary(spec));
+
+  const raw = el('details', '', el('summary', '', 'Raw spec'), el('pre', '', JSON.stringify(spec, null, 2)));
+  card.append(raw);
+
+  // Decision form: pick a decision, sign the shown message, paste the signature.
+  const radioName = 'decision-' + item.nonce;
+  const approveInput = el('input'); approveInput.type = 'radio'; approveInput.name = radioName; approveInput.value = 'approve';
+  const rejectInput = el('input'); rejectInput.type = 'radio'; rejectInput.name = radioName; rejectInput.value = 'reject';
+  const messageInput = el('input'); messageInput.type = 'text'; messageInput.readOnly = true;
+  messageInput.addEventListener('click', () => messageInput.select());
+  const copyBtn = el('button', 'secondary', 'Copy');
+  copyBtn.type = 'button';
+  const signature = el('textarea'); signature.placeholder = 'Paste the base64 signature here';
+  signature.spellcheck = false;
+  const submit = el('button', '', 'Submit'); submit.type = 'button';
+  const message = el('p', 'error');
+  message.setAttribute('role', 'alert');
+
+  const signBox = el('div');
+  signBox.hidden = true;
+  signBox.append(
+    el('div', 'muted', 'Sign exactly this message with the pinned address in your wallet:'),
+    el('div', 'row', messageInput, copyBtn),
+    signature,
+    el('div', 'row', submit),
+  );
+  if (!navigator.clipboard) copyBtn.hidden = true;
+
+  let decision = null;
+  function choose(d) {
+    decision = d;
+    messageInput.value = item.messages[d];
+    submit.textContent = 'Submit ' + d;
+    submit.className = d;
+    signBox.hidden = false;
+    message.textContent = '';
+  }
+  approveInput.addEventListener('change', () => choose('approve'));
+  rejectInput.addEventListener('change', () => choose('reject'));
+  copyBtn.addEventListener('click', () => navigator.clipboard.writeText(messageInput.value).catch(() => messageInput.select()));
+
+  submit.addEventListener('click', async () => {
+    if (!decision) return;
+    submit.disabled = true;
+    message.className = 'error';
+    message.textContent = '';
+    try {
+      const resp = await fetch('decide', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ nonce: item.nonce, decision, signature: signature.value.trim() }),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.error || resp.status + ' ' + resp.statusText);
+      statusEl.textContent = 'Sent ' + decision + ' for ' + item.ceremonyId + '.';
+      card.remove();
+      cards.delete(item.nonce);
+      syncEmpty();
+    } catch (e) {
+      message.textContent = 'Not accepted: ' + e.message;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  card.append(el('fieldset', '',
+    el('legend', '', 'Decision'),
+    el('label', 'choice', approveInput, ' Approve'),
+    el('label', 'choice', rejectInput, ' Reject'),
+    signBox,
+    message));
+  return card;
+}
+
+function syncEmpty() {
+  if (cards.size === 0) pendingEl.append(emptyEl);
+  else emptyEl.remove();
+}
+
+// ── Polling ────────────────────────────────────────────────────────────────
+async function refresh() {
+  try {
+    const r = await fetch('pending', { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+    const data = await r.json();
+    const seen = new Set();
+    for (const item of data.pending) {
+      seen.add(item.nonce);
+      if (!cards.has(item.nonce)) {
+        const card = buildCard(item);
+        cards.set(item.nonce, card);
+        pendingEl.append(card);
+      }
+    }
+    for (const [nonce, card] of cards) {
+      if (!seen.has(nonce)) { card.remove(); cards.delete(nonce); }
+    }
+    syncEmpty();
+    statusEl.textContent = 'Signatures count from ' + data.address + ' only. Polled ' + new Date().toLocaleTimeString() + '.';
+  } catch (e) {
+    statusEl.textContent = 'Failed to poll: ' + e.message;
+  }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

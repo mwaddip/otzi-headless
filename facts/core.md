@@ -10,17 +10,17 @@
 
 **Public surface:**
 - `type PartyId = number`
-  - **Pre:** 0-indexed integer; valid range is ceremony-specific (0 ≤ partyId < parties).
-  - **Post:** Canonical party identifier within the ring.
+  - **Pre:** 0-indexed integer; valid range is `0 ≤ partyId < parties` (ring size).
+  - **Post:** Canonical party identifier within the ring. FROST identifier = `partyId + 1`.
   - **Concurrency:** Immutable type; no concurrency concerns.
 
 - `const BROADCAST = undefined`
   - **Pre:** Singleton marker.
-  - **Post:** Indicates broadcast blob (to field absent on BlobKey).
+  - **Post:** Indicates broadcast blob (`to` field absent on BlobKey).
 
 - `interface BlobKey`
-  - **Pre:** `ceremonyId` must be non-empty string (no constraint on `#` suffix enforced here; upper layers handle retry numbering); `round` is semantic round name; `from` is valid PartyId in active ceremony; `to` is undefined for broadcast or valid target PartyId.
-  - **Post:** Uniquely identifies a ceremony blob; invariant (ceremonyId, round, from, to) is unique per BlobStore.
+  - **Pre:** `ceremonyId` is a non-empty string (ceremony IDs that enter from the API or the wire match `CEREMONY_ID_RE`, see `messages.ts`); `round` is a round key (see § Round keys in INTERFACES.md); `from` is the producing PartyId; `to` is undefined for a broadcast blob or the recipient PartyId for an addressed blob.
+  - **Post:** Uniquely identifies a ceremony blob; the tuple (ceremonyId, round, from, to) is unique per BlobStore.
   - **Concurrency:** Immutable data structure; safe for concurrent reads.
 
 - `type Unsubscribe = () => void`
@@ -33,11 +33,11 @@
   - **Concurrency:** Pure function; safe.
 
 **Invariants:**
-- PartyId is 0-indexed within the ring; conversion to FROST's 1-indexed bigint happens in wire layer.
-- BlobKey tuples are globally unique per ceremony (no collisions across rounds or retries).
+- PartyId is 0-indexed within the ring; conversion to FROST's 1-indexed bigint uses `partyIdToFrostId` / `frostIdToPartyId` from `src/otzi/lib/dkg.ts`.
+- BlobKey tuples are unique per ceremony (no collisions across rounds).
 
 **Cross-component contracts:**
-- Used by: Transport, BlobStore, BlobPuller, CeremonyRunner (exclusively).
+- Used by: Transport, BlobStore, BlobServer, BlobPuller, sessions, ceremonies.
 
 ---
 
@@ -52,30 +52,30 @@
     - **Post:** Same value as provided at Transport creation.
 
   - `readonly peers: readonly PartyId[]`
-    - **Pre:** Complete list of all ring members (including self), sorted (implied by callers).
-    - **Post:** Immutable; stable across daemon lifetime; length is fixed N for all ceremonies on this daemon.
+    - **Pre:** Complete list of all ring members (including self), sorted.
+    - **Post:** Immutable; stable across daemon lifetime; length is the ring size N for all ceremonies on this daemon.
 
   - `broadcast(msg: Uint8Array) → Promise<void>`
     - **Pre:** `msg` is non-empty; caller treats as broadcast to all other peers (sender is implicit).
-    - **Post:** Message is delivered to all other `partyId` on all peers' `onBroadcast` handlers with `from: this.partyId`.
+    - **Post:** Message is delivered to all other peers' `onBroadcast` handlers with `from: this.partyId`. Never delivered to self.
     - **Throws:** On network failure or internal error; caller should treat as retryable or fatal depending on phase.
     - **Concurrency:** Safe to call concurrently; broadcast order is NOT guaranteed.
     - **Cross-component:** The sender's `from` is cryptographically authenticated; implementations MUST NOT forge `from` even in test harnesses (InMemoryTransport respects this).
 
   - `onBroadcast(handler: (from: PartyId, msg: Uint8Array) => void) → Unsubscribe`
     - **Pre:** Handler is a new function; at most one handler per Transport (enforced by InMemoryTransport).
-    - **Post:** Handler fires synchronously on each `broadcast` from any peer; unsubscribe is idempotent.
+    - **Post:** Handler fires on each `broadcast` from any peer; unsubscribe is idempotent.
     - **Throws:** InMemoryTransport throws if a handler is already registered.
 
   - `pull(key: BlobKey) → Promise<Uint8Array | null>`
     - **Pre:** `key.from` is a valid peer in the ring; key identifies a blob expected to be produced by that peer.
-    - **Post:** Returns blob bytes if peer has produced it; returns `null` if peer hasn't produced it yet (caller retries with backoff); throws if `key.from` is not in peers array.
-    - **Throws:** On peer-not-found, network error, or other transport failure (retryable by caller).
+    - **Post:** Returns blob bytes if the peer serves it; returns `null` if the peer hasn't produced it yet, will not serve it to this node, or cannot be reached right now — offline, the request could not be sent, the connection closed while waiting, or no response in time (caller retries with backoff); throws if `key.from` is not in peers array.
+    - **Throws:** Only when `key.from` is not in `peers` (a configuration error; `BlobPuller` treats a throw as fatal for the ceremony). A stopping transport may also reject its pending pulls.
     - **Concurrency:** Safe to call concurrently; null returns are interpreted as "not yet ready" (BlobPuller retries).
 
   - `servePulls(handler: (from: PartyId, key: BlobKey) → Uint8Array | null) → Unsubscribe`
     - **Pre:** Handler is a new function; at most one handler per Transport (enforced).
-    - **Post:** Handler fires on each incoming `pull` request from a peer, returning the blob if this node has produced it (or `null` if not). Unsubscribe returns `null` for all subsequent pulls.
+    - **Post:** Handler fires on each incoming `pull` request from a peer with the requester's authenticated `from`, returning the blob or `null`. Unsubscribe returns `null` for all subsequent pulls.
     - **Throws:** InMemoryTransport throws if a handler is already registered.
     - **Concurrency:** Handler may fire concurrently from multiple peer pull requests; should be thread-safe or use a lock.
 
@@ -85,12 +85,12 @@
 - Peers list is fixed for the daemon's lifetime; ceremonies do not add or remove peers mid-run.
 
 **Cross-component contracts:**
-- Used by: CeremonyRunner (broadcasts announcements, pulls blobs), BlobPuller (pulls blobs), BlobServer (serves stored blobs).
-- Implemented by: InMemoryTransport (test harness), real transports in daemon (not in scope).
+- Used by: ceremonies (broadcast messages), BlobPuller (pulls blobs), BlobServer (serves stored blobs), orchestrator (`onBroadcast`).
+- Implemented by: InMemoryTransport (test harness), `PeerMeshTransport` and `RelayTransport` (see [transport.md](transport.md)).
 
 **Notes / gotchas:**
-- `pull(key)` returning `null` does NOT indicate an error; it means the producer has not yet generated the blob. BlobPuller interprets null as "retry later with backoff."
-- `servePulls` is registered once per daemon at startup; its lifetime is the daemon's, not a ceremony's. This allows a peer to serve blobs from completed ceremonies to lagging peers.
+- `pull(key)` returning `null` does NOT indicate an error; it means the producer has not yet generated the blob (or refuses to serve it). BlobPuller interprets null as "retry later with backoff."
+- `servePulls` is registered once per daemon at startup; its lifetime is the daemon's, not a ceremony's. This allows a peer to serve blobs from completed ceremonies to lagging peers until retention clears them.
 
 ---
 
@@ -107,7 +107,7 @@
 
 - `class InMemoryTransport implements Transport`
   - **Pre:** Constructed via `createInMemoryRing`; partyId and peers provided at construction.
-  - **Post:** Transport methods dispatch synchronously to peer instances in the shared ring Map.
+  - **Post:** Transport methods dispatch synchronously to peer instances in the shared ring Map. `servePulls` handlers receive the puller's real partyId as `from`.
   - **Memory:** Each transport holds references to the entire ring; no cleanup needed per ceremony.
   - **Invariants:**
     - At most one `pullHandler` per transport.
@@ -115,7 +115,7 @@
     - Pull requests go directly to the target peer's `servePull` method (no async wrapping, no null-then-wait).
 
 **Cross-component contracts:**
-- Used by: tests that exercise ceremony mechanics without real networking.
+- Used by: tests that exercise ceremony mechanics without real networking (`src/testing/ring.ts`).
 - Depends on: InMemoryTransport shared ring Map (circular reference; OK for test harness).
 
 **Notes / gotchas:**
@@ -134,10 +134,10 @@
   - **Post:** Owns a Map of (BlobKey.string → {key, blob}) entries; fires observers on put.
 
   - `put(key: BlobKey, blob: Uint8Array) → void`
-    - **Pre:** BlobKey and Uint8Array are fresh; if key already exists, blob MUST be byte-identical (idempotent) or it's a protocol violation.
+    - **Pre:** If key already exists, blob MUST be byte-identical (idempotent) or it's a protocol violation.
     - **Post:** Blob is stored; if byte-equal to existing entry, fires no observer (idempotent no-op); if byte-differ, throws immediately.
-    - **Throws:** `Error("Conflicting blob for ${keyStr}")` if re-putting different bytes under the same key. Caller (CeremonyRunner or BlobPuller) should treat as ceremony-fatal and abort.
-    - **Concurrency:** NOT thread-safe; assumes single-threaded ceremony runner or external serialization.
+    - **Throws:** `Error("Conflicting blob for ${keyStr}")` if re-putting different bytes under the same key. Callers treat this as ceremony-fatal.
+    - **Concurrency:** NOT thread-safe; assumes single-threaded ceremony code or external serialization.
     - **Idempotency:** Putting identical bytes is a no-op (no observer fire, no exception).
 
   - `get(key: BlobKey) → Uint8Array | undefined`
@@ -153,7 +153,7 @@
 
   - `list(ceremonyId: string, round?: string) → Array<{key: BlobKey; blob: Uint8Array}>`
     - **Pre:** ceremonyId is non-empty; optional round filters results.
-    - **Post:** Returns all blobs for the ceremony (optionally filtered to one round); returns copies of the blob references (callers MUST not mutate).
+    - **Post:** Returns all blobs for the ceremony (optionally filtered to one round); callers MUST not mutate the blobs.
     - **Concurrency:** Safe for concurrent reads.
 
   - `onPut(handler: (key: BlobKey) => void) → Unsubscribe`
@@ -164,7 +164,7 @@
   - `clear(ceremonyId: string) → void`
     - **Pre:** ceremonyId identifies an in-flight or completed ceremony.
     - **Post:** Deletes all blobs for that ceremony; does NOT fire observers (cleanup-only).
-    - **Concurrency:** Safe if called once per ceremony at end-of-life.
+    - **Concurrency:** Called by `blob-retention.ts` once per ceremony end.
 
 **Invariants:**
 - Each (ceremonyId, round, from, to) key is unique; re-putting triggers conflict check.
@@ -173,29 +173,32 @@
 
 **Cross-component contracts:**
 - Depends on: BlobKey type (from types.ts).
-- Used by: CeremonyRunner (stores produced blobs, pulls and stores received blobs), BlobPuller (stores pulled blobs), BlobServer (queries get for serving).
-- Wire format: blobs are JSON-encoded round results (wire/threshold.ts, wire/dkg.ts formatters).
+- Used by: sessions' callers in `dkg-ceremony.ts` / `sign-ceremony.ts` (store produced blobs), BlobPuller (stores pulled blobs), BlobServer (serves), `blob-retention.ts` (clears).
+- Blob format: FROST blobs are the UTF-8 bytes of an Ötzi envelope string (`src/otzi/lib/dkg.ts`, `frost-sign.ts`); `dkg-verified` is the raw 64-byte signature.
 
 **Notes / gotchas:**
-- NOT thread-safe; ceremony runner must serialize blob operations or use external locks.
-- Conflict detection is exact byte comparison; different encodings of the same data are treated as conflicts (by design — wire codecs MUST be deterministic).
+- NOT thread-safe; ceremony code must serialize blob operations or use external locks.
+- Conflict detection is exact byte comparison; different encodings of the same data are treated as conflicts (by design — codecs MUST be deterministic). A conflicting own `sign-r1` is what stops a reused `ceremonyId` from producing a second set of commitments while the first is still stored.
 - `onPut` observers fire synchronously during put; blocking or reentering is unsafe.
 
 ---
 
 ### `blob-server.ts`
 
-**Purpose:** Long-lived bridge from Transport.servePulls to BlobStore; decouples blob availability from ceremony lifetime.
+**Purpose:** Long-lived bridge from `Transport.servePulls` to `BlobStore`, with addressed-blob access control. Decouples blob availability from ceremony lifetime.
 
 **Public surface:**
 - `class BlobServer`
   - **Pre:** Constructed at daemon startup with a Transport and BlobStore (both long-lived).
-  - **Post:** Registers a pull handler that serves any blob in the store; lifetime is the daemon's, not a ceremony's.
-  - **Memory:** Holds a reference to the pull-handler unsubscriber (stored as `off`).
+  - **Post:** Registers a pull handler; lifetime is the daemon's, not a ceremony's.
+  - **Memory:** Holds the pull-handler unsubscriber.
 
   - `constructor(transport: Transport, store: BlobStore)`
-    - **Pre:** transport and store are both live; at most one BlobServer per daemon (enforced by Transport.servePulls).
-    - **Post:** Registers the pull handler; handler looks up keys in the store and returns the blob or null.
+    - **Pre:** transport and store are both live; at most one BlobServer per daemon (enforced by `Transport.servePulls`).
+    - **Post:** Registers the pull handler `(from, key)`:
+      - `key.from !== transport.partyId` → `null`: this node serves only blobs it produced (a pull is addressed to the producer), never one it pulled from a peer;
+      - `key.to !== undefined` and `from !== key.to` → `null`, whether or not the blob exists;
+      - otherwise `store.get(key) ?? null`.
     - **Throws:** If transport already has a pull handler registered (InMemoryTransport throws).
 
   - `close() → void`
@@ -204,16 +207,17 @@
     - **Concurrency:** Safe to call once at daemon shutdown.
 
 **Invariants:**
-- The pull handler serves blobs from store.get(key) with fallback to null (key not in store).
-- BlobServer lifetime decouples blob availability from ceremony completion: a peer that finishes can still serve its blobs to lagging peers (important for federation fault tolerance).
+- **Addressed-blob access:** a blob whose key has a `to` is served only to the authenticated requester equal to `to`. Blobs without `to` are served to any ring member (the transport delivers pulls only from ring members). DKG round-2 secret shares (`dkg-r2`) are the addressed blobs, so with `threshold < parties` no peer can collect another party's shares.
+- **Own blobs only:** a blob whose `from` is another party is never served, even though the store holds it (pulled blobs land in the same store).
+- A refused pull is indistinguishable from "not produced yet" (`null`).
+- BlobServer lifetime decouples blob availability from ceremony completion: a peer that finishes keeps serving its blobs to lagging peers until retention clears them.
 
 **Cross-component contracts:**
-- Depends on: Transport.servePulls, BlobStore.get.
-- Used by: daemon lifecycle (created at startup, closed at shutdown).
+- Depends on: Transport.servePulls (authenticated `from`), BlobStore.get.
+- Used by: daemon lifecycle (created at startup, closed at shutdown); `src/testing/ring.ts`.
 
 **Notes / gotchas:**
-- BlobServer is a passive bridge; it does NOT actively push blobs or clean up old ceremonies. The daemon must manually call store.clear(ceremonyId) for memory management.
-- The pull handler is registered once per daemon; it serves all ceremonies that have run on that daemon.
+- BlobServer is a passive bridge; it does NOT push blobs or clean up. Cleanup is `blob-retention.ts`.
 
 ---
 
@@ -228,652 +232,443 @@
     - `initialDelayMs: number` — initial backoff after null-return (doubled each retry up to maxDelayMs).
     - `maxDelayMs: number` — cap on backoff delay.
     - `deadlineMs: number` — wall-clock deadline from `pullAll` start.
-  - **Pre:** All fields must be positive; typically maxAttempts ≥ 10, initialDelayMs = 100, maxDelayMs = 5000, deadlineMs = 30000.
+  - **Pre:** All fields positive.
   - **Post:** Passed to `pullAll`; controls retry behavior and timeout.
+  - **Ceremonies:** the daemon's `CeremonyIo.pullOpts` supplies the backoff (`initialDelayMs`, `maxDelayMs`). Every ceremony — leader (`LeaderDispatcher`) and participant (`Orchestrator`) — runs with `deadlineMs` = the ceremony deadline (`[deadlines].signing_ms` or `dkg_ms`) and `maxAttempts = Number.MAX_SAFE_INTEGER`, so pulls retry with backoff until the ceremony deadline: they are bounded by the deadline, not by an attempt count.
 
 - `class BlobPuller`
   - **Pre:** Constructed with Transport and BlobStore (long-lived).
-  - **Post:** Provides `pullAll` method for parallel blob fetches.
+  - **Post:** Provides `pullAll` for parallel blob fetches.
 
-  - `async pullAll(expected: readonly BlobKey[], opts: PullOpts) → Promise<void>`
-    - **Pre:** `expected` is a non-empty array of BlobKeys (each with a valid producer in transport.peers); opts are well-formed.
-    - **Post:** Resolves when all blobs are in store. Each blob is fetched by a parallel worker (Promise.all).
+  - `async pullAll(expected: readonly BlobKey[], opts: PullOpts, signal?: AbortSignal) → Promise<void>`
+    - **Pre:** Each key in `expected` names a producer in `transport.peers`; opts are well-formed.
+    - **Post:** Resolves when every expected key is in the store. Each key is fetched by a parallel worker (`Promise.all`); a pulled blob is stored under the key it was requested with, so `key.from` is the authenticated producer.
     - **Throws:**
-      - `Error("Failed to fetch ${keyStr} after ${maxAttempts} attempts")` if a key is not found after maxAttempts retries.
-      - `Error("Deadline exceeded while pulling ${keyStr}")` if wall-clock deadline fires before all blobs are fetched.
+      - `Error("Failed to fetch ${keyStr} after ${maxAttempts} attempts")` if a key is not served after maxAttempts retries.
+      - `Error("Deadline exceeded while pulling ${keyStr}")` if the wall-clock deadline fires first.
+      - `Error('aborted')` when `signal` aborts (or is already aborted); every worker stops pulling.
+      - A `BlobStore` conflict or transport throw propagates.
     - **Concurrency:** Parallel per-key workers; safe.
-    - **Abort semantics:** Uses AbortController to cancel all workers when wall-clock deadline fires.
-
-  - `private async pullOne(key: BlobKey, opts: PullOpts, signal: AbortSignal) → Promise<void>`
-    - **Pre:** key is valid; signal is from AbortController.
-    - **Post:** Pulls key from transport.pull(key) with exponential backoff; stores blob if not already in store (double-check avoids race).
-    - **Throws:** On exhausted attempts or deadline.
-    - **Backoff:** delay starts at opts.initialDelayMs, doubles on each null-return (capped at opts.maxDelayMs), does NOT backoff after successful pull or conflict.
-    - **Idempotency check:** If blob lands in store by another path (parallel worker or local production), pullOne short-circuits (store.has check).
 
 **Invariants:**
-- Per-key workers retry independently; a deadline fires for all.
-- Wall-clock deadline is enforced via AbortController; once fired, all pending pulls reject.
-- Blobs stored via pullAll.put are idempotent (store.put checks byte-equality); a conflict is a protocol violation that propagates.
+- Per-key workers retry independently; the deadline and the signal stop all of them.
+- When a `pullAll` call settles (every key present, a key failed, the deadline, or the signal), its remaining workers stop retrying and put nothing further.
+- A worker short-circuits if its key lands in the store by another path (local production, parallel puller).
+- Blobs stored via `pullAll` go through `store.put` (idempotent on equal bytes; a conflict is a protocol violation that propagates).
 
 **Cross-component contracts:**
 - Depends on: Transport.pull, BlobStore.get/put/has.
-- Used by: CeremonyRunner (pulls round results between phases).
-- Error propagation: transport.pull throws are immediately fatal; BlobStore.put conflicts are ceremony-fatal.
+- Used by: `dkg-ceremony.ts`, `sign-ceremony.ts` (through `CeremonyIo`).
 
 **Notes / gotchas:**
-- `maxAttempts` is per-key, not total; if a key takes 10 attempts and deadline fires after attempt 5, the deadline takes precedence.
-- Deadline is wall-clock; sleep delays are interruptible via AbortSignal race.
-- Initial delay should be tuned per deployment (100ms for local tests, 500ms+ for real networks).
+- `maxAttempts` is per-key; the deadline is wall-clock for the whole call and wins when it fires first.
+- Sleep delays are interruptible by the deadline and by the signal.
+- Initial delay should be tuned per deployment (a few ms in tests, 100 ms+ on real networks).
 
 ---
 
-### `ceremony-messages.ts`
+### `blob-retention.ts`
 
-**Purpose:** Wire protocol for ceremony control messages (broadcasts, not blobs); defines message shapes, encoding/parsing, helpers.
+**Purpose:** Delayed cleanup of a ceremony's blobs after it ends on this node.
 
 **Public surface:**
-- `type CeremonyMessage = { v: 1; kind: 'announce' | 'announce-frost' | ... }`
-  - **Pre:** Exhaustive union of all ceremony control message types.
-  - **Post:** Marshals to JSON; `v: 1` is version marker.
-  - **Kinds:**
-    - `announce` — ML-DSA signing attempt with optional `#N` retry suffix.
-    - `announce-frost` — FROST signing with construction data (btc/opnet/opnet-params/keylink protocol).
-    - `announce-dkg`, `announce-frost-dkg`, `announce-combined-dkg` — symmetric DKG initiations.
-    - `signoff-done`, `signoff-frost-done` — leader success signoffs.
-    - `signoff-aborted` — leader abort.
-    - `manifest-push` — control-plane manifest distribution (Phase 9c). Bootstrap-window-only.
+- `const BLOB_RETENTION_MS = { signing: 300_000, dkg: 900_000 } as const`
+  - **Post:** Retention after a ceremony ends: 5 minutes for signing, 15 minutes for DKG — the default ceremony deadlines, so a peer that is behind can still pull until then.
 
-- `function encodeCeremonyMessage(msg: CeremonyMessage) → Uint8Array`
-  - **Pre:** Message is well-formed CeremonyMessage.
-  - **Post:** JSON-stringified + UTF-8 encoded.
-  - **Concurrency:** Pure function; safe.
-
-- `function parseCeremonyMessage(bytes: Uint8Array) → CeremonyMessage | null`
-  - **Pre:** bytes are UTF-8 JSON (may be truncated or malformed).
-  - **Post:** Parses and validates shape; returns null on any parse or validation error (soft error, not thrown — matches federation-trust posture: ignore bad announces).
-  - **Throws:** Never; invalid messages are silently dropped.
-  - **Validation:** v=1, discriminant kind, all required fields present and well-typed.
-
-- **Announce variants:**
-
-  - `announce` (ML-DSA signing)
-    - **Pre:** `messageHex` is even-length hex string (message bytes); `signers` is non-empty array of valid PartyIds.
-    - **Post:** Wire shape with `ceremonyId` (may include `#N` retry suffix), `baseCeremonyId` (stable across retries), `messageHex`, `signers`.
-    - **Factory:** `announceMessage(ceremonyId, baseCeremonyId, message: Uint8Array, signers) → CeremonyMessage`
-
-  - `announce-frost` (FROST signing with protocol)
-    - **Pre:** `sighashes` is array of {hashHex (32B hex), tweaked (bool)}; `signers` is active signer set; `extras: AnnounceFrostExtras` specifies protocol (btc/opnet/opnet-params/keylink).
-    - **Post:** Base message + protocol-specific construction data.
-    - **Protocols:**
-      - `btc` — `btcParams` with to/amount/feeRate/network/frostP2tr/utxos. Participants rebuild tx and verify sighashes.
-      - `opnet` — `unsignedTxHex` + `inputs[]` + optional `hints`. Participants re-extract sighashes from tx bytes.
-      - `opnet-params` — `opnetParams: AnnounceOpnetParams` (full UTXO/challenge/random-seed payload for deterministic `captureOpnetSighashes` rebuild).
-      - `keylink` — `network` (mainnet/testnet). Participants sign the OPNet SDK key-link hash.
-    - **Factory:** `announceFrostMessage(ceremonyId, baseCeremonyId, sighashes[], signers, extras) → CeremonyMessage`
-    - **Dummy for testing:** `makeDummyFrostKeylinkExtras(network) → AnnounceFrostKeylinkExtras`
-
-  - `announce-dkg`, `announce-frost-dkg`, `announce-combined-dkg` (DKG)
-    - **Pre:** `sessionIdHex` is 64-char hex (32 bytes); `threshold ≤ parties`; `level` is ML-DSA security level (44/65/87 for combined-dkg).
-    - **Post:** Initiator broadcasts sessionId; participants extract it and run DKG with matching params.
-    - **Factories:** `announceDkgMessage`, `announceFrostDkgMessage`, `announceCombinedDkgMessage`
-    - **Extractors:** `sessionIdFromAnnounceDkg`, etc., decode sessionIdHex back to Uint8Array.
-
-  - `signoff-done` (ML-DSA success)
-    - **Pre:** `signatureHex` is even-length hex (FIPS 204 signature).
-    - **Post:** Leader broadcasts after combine succeeds; participants release state on receipt.
-    - **Factory:** `signoffDoneMessage(baseCeremonyId, signature: Uint8Array) → CeremonyMessage`
-
-  - `signoff-frost-done` (FROST success)
-    - **Pre:** `signaturesHex[]` is array of hex-encoded 64-byte BIP340 sigs (one per sighash, ceremony order).
-    - **Post:** Leader broadcasts after aggregate; carries all N signatures for audit.
-    - **Factory:** `signoffFrostDoneMessage(baseCeremonyId, signatures: Uint8Array[])`
-
-  - `signoff-aborted` (any failure)
-    - **Pre:** `baseCeremonyId` identifies the ceremony; optional `reason` is human-readable cause.
-    - **Post:** Leader broadcasts on exhausted retries or unrecoverable error; participants release state.
-    - **Factory:** `signoffAbortedMessage(baseCeremonyId, reason?)`
-
-  - `manifest-push` (control-plane — Phase 9c)
-    - **Pre:** Sender has the operator-typed shared `bootstrap-secret` and computed `HMAC-SHA-256(secret, manifestText)`.
-    - **Post:** Carries `{ manifest: string (UTF-8 .otzi.json contents), hmac: string (hex HMAC-SHA-256) }`.
-    - **Factory:** `manifestPushMessage({ manifest, hmac })`
-    - **Lifecycle:** Bootstrap-window-only. Receiver drops at the daemon's control-plane layer if `/var/lib/otzi/bootstrap-secret` is absent. `share-persistence.persistCombinedDkgShare` `unlink()`s the secret on first DKG completion (Phase 9a.5); subsequent `manifest-push` messages are dropped with a `ControlPlaneClosed` log.
-    - **Authentication layering:** The transport's `from` field already authenticates the sender as a peer in the ring. The HMAC is additive — it proves the sender knows the *operator-typed* shared secret, not just any peer in the ring (so a rogue daemon can't push without cooperating with an operator who holds the secret).
-    - **Validation:** Receiver re-computes HMAC + validates manifest against `headless-manifest-v1` schema; mismatch / schema failure → silent drop (logged warn).
-
-- **OPNet params (AnnounceOpnetParams):**
-  - **Fields:**
-    - `contractAddress`, `method` — target contract + 4-byte selector (STRUCTURALLY-verified on SigningSpec, so policy rules can gate).
-    - `params[]` — pre-conversion constructor args (JSON-safe types).
-    - `refundAddress`, `feeRate`, `priorityFeeSat`, `maxSatToSpendSat` — OPNet tx params.
-    - `randomBytesSeedHex` — 32-byte random seed for deterministic `BitcoinUtils.rndBytes()` during sighash capture.
-    - `utxos[]` — `AnnounceOpnetUtxoRaw` (transactionId, outputIndex, value, scriptPubKey) in raw IUTXO form.
-    - `challenge` — `ChallengeSolution.toRaw()` pass-through object.
-    - `mldsaThresholdSignatureHex` — ML-DSA sig over `sha256(calldata)` (outer OPNet tx auth; operator pre-computes via `/sign scheme='mldsa'` ceremony, leader asserts, participants consume during capture).
-    - `hints?` — advisory contractAddress/method/amountTokenAtomic (unlike opnet-params, these are not STRUCTURALLY-verified; legacy compatibility).
-  - **Validation:** Structural validation only (field types); `challenge` is checked at reconstruction time (soft error).
-  - **Parse / encode:** `parseOpnetParams`, `encodeOpnetParams` (internal helpers).
+- `function scheduleClear(store: BlobStore, ceremonyId: string, delayMs: number): void`
+  - **Pre:** The ceremony has ended on this node (either role, any outcome).
+  - **Post:** Starts an unref'd timer (it never keeps the process alive) that calls `store.clear(ceremonyId)` after `delayMs`.
+  - **Throws:** Never.
 
 **Invariants:**
-- Wire messages are JSON-safe (no binary encoding); byte-stability relies on canonical JSON encoding.
-- `ceremonyId` may carry `#N` suffix (leader-driven retries); `baseCeremonyId` is stable across retries (used for aggregate-level bookkeeping).
-- `from` (sender) is implicit in transport callback; message contains only content, not sender.
-- Parse errors silently drop messages (federation-trust posture: assume honest peers, ignore garbage).
-- OPNet params `challenge` is pass-through; malformed challenge is caught at `new ChallengeSolution(raw)` during rebuild (soft drop).
+- Every ceremony end on a node (leader success, leader failure, every participant settle) schedules exactly one clear for its `ceremonyId`.
+- DKG round-2 secret shares and signing blobs do not outlive the retention window.
 
 **Cross-component contracts:**
-- Depends on: types.ts (PartyId), wire/hex.ts (toHex/fromHex).
-- Used by: CeremonyRunner (constructs announcements + signoffs), ceremony trigger layer (parses announcements to decide participation).
-- Wire format: JSON over UTF-8; no compression, no encryption (transport layer handles E2E encryption).
+- Used by: `Orchestrator` (every settle), `LeaderDispatcher` (settle and failure).
 
 **Notes / gotchas:**
-- `ceremonyId` field in announce carries the `#N` suffix for a retry; `baseCeremonyId` is the stable root (participants should listen on base, switch to #N only when announce fires).
-- FROST keylink uses round names `frost-keylink-r1`/`r2` to avoid collision with regular FROST signing rounds (same ceremony can't run both).
-- `opnet-params` protocol is for deterministic rebuild; `opnet` is advisory (legacy); policy rules MUST gate on contractAddress/method from opnet-params, NOT from opnet hints.
-- `mldsaThresholdSignatureHex` in opnet-params is asserted but not verified by orchestrator (operator pre-computed, doS-safe by federation trust).
+- Reusing a `ceremonyId` within the retention window fails: the stored blobs conflict, and the scheduled clear removes the new ceremony's blobs.
 
 ---
 
-### `ceremony-runner.ts`
+### `ceremony-io.ts`
 
-**Purpose:** Drives all ceremony protocols (ML-DSA signing, FROST signing, DKG variants) end-to-end; implements leader/participant asymmetry for signing, symmetric protocols for DKG.
+**Purpose:** The I/O bundle every ceremony runs on.
 
 **Public surface:**
-
-- **Specs (input types):**
-
-  - `interface SigningSpec`
-    - **Fields:**
-      - `ceremonyId: string` — stable ID (may include `#N` for retries in runner state; base ID used for signoff).
-      - `message: Uint8Array` — bytes to sign (e.g., SHA256(data)).
-      - `signers: PartyId[]` — active signer set (size = threshold); MUST include this daemon's partyId.
-      - `share: DecryptedShare` — this daemon's ML-DSA key share (from DKG or dealer).
-    - **Pre:** `signers` is non-empty, sorted, all valid; partyId is in signers.
-    - **Post:** Passed to signAsLeader or participateInSigning.
-
-  - `interface FrostSigningSpec`
-    - **Fields:**
-      - `ceremonyId: string` — unique ceremony ID (no retries; FROST combine is deterministic).
-      - `sighashes: readonly FrostSighash[]` — array of {hash (32B), tweaked (bool)}; canonical input order.
-      - `signers: PartyId[]` — active signer set (size = minSigners); MUST include partyId.
-      - `keyPackage: KeyPackage` — this daemon's FROST signing key (from DKG).
-      - `publicKeyPackage: PublicKeyPackage` — shared group material (identical across all signers).
-      - `rng: Rng` — CSPRNG for nonce generation.
-    - **Pre:** `sighashes` non-empty; `keyPackage` and `publicKeyPackage` DKG-derived and consistent.
-    - **Post:** Passed to signFrostAsLeader or participateInFrostSigning.
-
-  - `interface MldsaDkgSpec`
-    - **Fields:** `ceremonyId`, `threshold`, `parties`, `level` (ML-DSA security level).
-    - **Pre:** `0 < threshold ≤ parties`; `level ∈ {44, 65, 87}`; partyId < parties.
-    - **Post:** Passed to runMldsaDkg or participateInMldsaDkg.
-
-  - `interface FrostDkgSpec`
-    - **Fields:** `ceremonyId`, `threshold`, `parties`, `rng`.
-    - **Pre:** `0 < threshold ≤ parties`; partyId < parties.
-    - **Post:** Passed to runFrostDkg or participateInFrostDkg.
-
-  - `interface CombinedDkgSpec`
-    - **Fields:** `ceremonyId`, `threshold`, `parties`, `level`, `rng`, `network?` (for optional key-link signing).
-    - **Pre:** `0 < threshold ≤ parties`; `level` valid.
-    - **Post:** Runs ML-DSA DKG then FROST DKG under one sessionId; optionally runs n-of-n FROST key-link sign if network is set.
-
-  - `interface CombinedDkgResult`
-    - **Fields:** `mldsa: DKGResult`, `frost: {keyPackage, publicKeyPackage}`, `frostLegacySig?: Uint8Array`.
-    - **Post:** Returned by runCombinedDkg / participateInCombinedDkg; contains both key materials + optional key-link sig.
-
-- **ML-DSA Signing (asymmetric):**
-
-  - `async signAsLeader(spec: SigningSpec, opts: PullOpts, maxCombineAttempts = 50) → Promise<Uint8Array>`
-    - **Pre:** `spec.partyId` (implicit, from transport) is in spec.signers; spec.message non-empty; opts well-formed.
-    - **Post:** Returns FIPS 204 signature on success; broadcasts announce per attempt (base ID + `#N` suffix on retry), drives 3 rounds (R1/R2/R3), runs combine, retries on null (up to maxCombineAttempts), broadcasts signoff-done on success.
-    - **Throws:** `Error("Signing aborted: <reason>")` on exhausted retries or unrecoverable error; broadcasts signoff-aborted before throwing.
-    - **Concurrency:** Single-threaded; leader must not be called concurrently.
-    - **Retry behavior:** After each combine attempt, if result is null (rejection-sampling), ceremony ID gets `#N` suffix (e.g., `base#2`); participants watch `baseCeremonyId` and switch to new announce.
-    - **Blob production:** Leader produces R1/R2/R3 locally via round1/round2/round3; pulls R1 and R2 from active signers; runs combine on R3.
-    - **Signoff:** After combine succeeds, caller broadcasts the tx upstream, then calls `sendSigningDoneSignoff` to release participant state (TTL is safety net).
-
-  - `async participateInSigning(spec: SigningSpec, opts: PullOpts) → Promise<void>`
-    - **Pre:** `spec.partyId` in spec.signers; spec non-empty.
-    - **Post:** Produces R1/R2/R3 blobs locally, pulls R1 and R2 from other active signers, adds them to session, destroys session on return.
-    - **Throws:** On pull timeout or blob rejection.
-    - **Concurrency:** Single-threaded per daemon; participants run reactively (one per announcement).
-    - **Non-operations:** Participant does NOT pull R3 from others, does NOT run combine (leader-only).
-
-  - `async sendSigningDoneSignoff(baseCeremonyId: string, signature: Uint8Array) → Promise<void>`
-    - **Pre:** Called after signAsLeader succeeds and tx is broadcast.
-    - **Post:** Broadcasts signoff-done message with signature; releases participant state immediately.
-    - **Concurrency:** Safe to call from leader context.
-
-- **FROST Signing (asymmetric, no retry):**
-
-  - `async signFrostAsLeader(spec: FrostSigningSpec, opts: PullOpts, announceExtras: AnnounceFrostExtras) → Promise<Uint8Array[]>`
-    - **Pre:** `spec.partyId` in spec.signers; `announceExtras` is valid construction data (btc/opnet/opnet-params/keylink).
-    - **Post:** Broadcasts announce (no retries), drives R1+R2, aggregates N BIP340 sigs (one per sighash), returns sigs array (ceremony order).
-    - **Throws:** `Error("FROST signing aborted: <reason>")` on any failure; broadcasts signoff-aborted.
-    - **Concurrency:** Single-threaded.
-    - **Determinism:** FROST combine always succeeds (no rejection sampling); single attempt guaranteed.
-
-  - `async participateInFrostSigning(spec: FrostSigningSpec, opts: PullOpts) → Promise<void>`
-    - **Pre:** `spec.partyId` in spec.signers.
-    - **Post:** Produces R1+R2, pulls R1+R2 from other signers, does NOT aggregate (leader-only).
-    - **Throws:** On pull timeout or blob rejection.
-
-  - `async sendFrostSigningDoneSignoff(baseCeremonyId: string, signatures: ReadonlyArray<Uint8Array>) → Promise<void>`
-    - **Pre:** Called after signFrostAsLeader succeeds.
-    - **Post:** Broadcasts signoff-frost-done with all sigs; releases participant state.
-
-- **ML-DSA DKG (symmetric, no leader):**
-
-  - `async runMldsaDkg(spec: MldsaDkgSpec, opts: PullOpts) → Promise<DKGResult>`
-    - **Pre:** `spec.partyId` < spec.parties; threshold/parties valid.
-    - **Post:** Generates sessionId, broadcasts announce-dkg, runs 5-phase protocol (P1/P2-pub/P2-priv/P3/P4), returns own DKGResult (share + pubkey).
-    - **Throws:** `Error("MLDSA DKG aborted: <reason>")` on failure.
-    - **Concurrency:** Single-threaded.
-    - **Initiator role:** The peer whose trigger fired generates sessionId; others discover it via announce and call participateInMldsaDkg. No mid-ceremony coordinator.
-
-  - `async participateInMldsaDkg(spec: MldsaDkgSpec, sessionId: Uint8Array, opts: PullOpts) → Promise<DKGResult>`
-    - **Pre:** `sessionId` extracted from received announce-dkg message (must be 32 bytes).
-    - **Post:** Runs the same 5-phase protocol with the asserted sessionId; returns own DKGResult.
-    - **Throws:** Same abort semantics.
-
-- **FROST DKG (symmetric, no leader):**
-
-  - `async runFrostDkg(spec: FrostDkgSpec, opts: PullOpts) → Promise<{keyPackage, publicKeyPackage}>`
-    - **Pre:** spec valid; partyId < parties.
-    - **Post:** Generates sessionId, broadcasts announce-frost-dkg, runs 3-round protocol (R1/R2/finalize), returns local key material.
-    - **Throws:** `Error("FROST DKG aborted: <reason>")`
-
-  - `async participateInFrostDkg(spec: FrostDkgSpec, sessionId: Uint8Array, opts: PullOpts) → Promise<{keyPackage, publicKeyPackage}>`
-    - **Pre:** sessionId from announce-frost-dkg (32 bytes).
-    - **Post:** Runs protocol with asserted sessionId.
-    - **Throws:** Same abort semantics.
-
-- **Combined DKG (symmetric, single sessionId, optional key-link signing):**
-
-  - `async runCombinedDkg(spec: CombinedDkgSpec, opts: PullOpts) → Promise<CombinedDkgResult>`
-    - **Pre:** spec valid; partyId < parties; if spec.network is set, OPNet SDK is available (for key-link hash computation).
-    - **Post:** Generates sessionId, broadcasts announce-combined-dkg, runs ML-DSA DKG then FROST DKG under one sessionId. If spec.network is set, also runs n-of-n FROST sign over `computeKeyLinkHash(...)` and includes `frostLegacySig` in result.
-    - **Throws:** `Error("Combined DKG aborted: <reason>")`
-    - **Key-link signing (phase 2.5c):** All peers participate in n-of-n sign (signers = [0..N-1]); deterministic aggregate produces the same sig everywhere. Sig is what OPNet SDK replays via `withFrostLegacySig` during V3-vault contract calls.
-
-  - `async participateInCombinedDkg(spec: CombinedDkgSpec, sessionId: Uint8Array, opts: PullOpts) → Promise<CombinedDkgResult>`
-    - **Pre:** sessionId from announce-combined-dkg.
-    - **Post:** Runs combined protocol; includes key-link sig if spec.network was set.
-
-**Invariants:**
-
-- **Asymmetry contract (signing):** Leader drives all 3 rounds and runs combine (sole producer of final sig); participants produce R1/R2/R3 but do NOT pull R3 from others or combine.
-- **Symmetry contract (DKG):** All peers run the same phases end-to-end; initiator only names the peer whose trigger fired; no coordinator.
-- **Idempotency:** Blobs stored via store.put are idempotent (store checks byte-equality); pulling the same blob twice is a no-op.
-- **Retry naming:** ML-DSA signing uses `#{N}` suffix on ceremonyId (base ID `foo` becomes `foo#2` on second attempt); participants watch baseCeremonyId and switch rounds on new announce.
-- **Blob round names:** ML-DSA: `mldsa-r1/r2/r3`; FROST: `frost-sign-r1/r2`; FROST DKG: `frost-dkg-r1/r2`; Key-link FROST: `frost-keylink-r1/r2` (distinct from regular FROST to avoid collision).
-- **Session destruction:** Every session (ML-DSA, FROST, DKG) is destroyed in finally block; destruction clears all state and marks destroyed=true to prevent re-entry.
+- `interface CeremonyIo { transport: Transport; store: BlobStore; puller: BlobPuller; pullOpts: PullOpts }`
+  - **Pre:** `store` is the store the daemon's `BlobServer` serves; `puller` wraps the same `transport` and `store`.
+  - **Post:** Passed to `runDkgCeremony`, `leadSigning`, `participateInSigning`. Self is `transport.partyId`; the ring is `transport.peers`.
 
 **Cross-component contracts:**
-
-- Depends on: Transport (broadcast, pull), BlobStore (put, get, has), BlobPuller (pullAll with backoff), ceremony-messages (encode/parse/factories), wire codecs (threshold, dkg, frost-dkg, frost-sign), DKG session modules (dkg-session, frost-dkg-session, frost-sign-session).
-- Used by: daemon trigger layer (listens for announcements, invokes run*/participate* methods), human operators (via CLI).
-- Memory: Sessions are short-lived (per ceremony attempt); store and transport are long-lived (daemon lifetime).
-
-**Notes / gotchas:**
-
-- **Retry loop (ML-DSA signing):** Leader retries up to maxCombineAttempts; each attempt gets a new `#N` suffix (ceremony ID becomes foo#1, foo#2, etc., but baseCeremonyId stays foo). Participants watch baseId and react to new announces; they must pull and process each retry independently.
-- **Keylink phase:** After combined DKG finishes, all peers run n-of-n FROST sign with all N parties as signers (not just threshold). Output is deterministic; all parties get the same sig. This sig is what the OPNet SDK replays.
-- **Pull blocking:** Pulling is reactive; participants block on pullAll until deadline. Leader must poll for R1/R2/R3 as participants produce them.
-- **Blob conflicts:** If a blob re-put with different bytes, store.put throws; runner catches and converts to ceremony abort.
-- **Unrecoverable errors:** Transport throws, blob rejection, or decode errors are caught as strings and broadcast in signoff-aborted before throwing.
+- Built by: `Daemon` (one per daemon), `src/testing/ring.ts` (one per test node).
 
 ---
 
-### `dkg-session.ts`
+### `messages.ts`
 
-**Purpose:** ML-DSA DKG session wrapper; implements 5-phase symmetric protocol (P1/P2/P2-finalize/P3/P4).
+**Purpose:** Ceremony control messages (broadcasts, not blobs): shapes, strict parser, encoder.
 
 **Public surface:**
+```ts
+export const CEREMONY_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+export const MAX_INPUTS = 255;
+export interface AnnounceDkg { v: 2; kind: 'announce-dkg'; ceremonyId: string; sessionIdHex: string; threshold: number; parties: number; network: NetworkName }
+export interface AnnounceSign { v: 2; kind: 'announce-sign'; ceremonyId: string; signers: PartyId[]; proposal: SendProposal }
+export interface SignoffDone { v: 2; kind: 'signoff-done'; ceremonyId: string; signaturesHex: string[] }
+export interface SignoffAborted { v: 2; kind: 'signoff-aborted'; ceremonyId: string; reason?: string }
+export type CeremonyMessage = AnnounceDkg | AnnounceSign | SignoffDone | SignoffAborted;
+```
 
-- `interface MldsaDkgSession`
-  - **Read-only fields:** `partyId`, `sessionId` (32B), `threshold`, `parties`, `level`, `instance` (ThresholdMLDSA), `setup` (DKGSetupResult).
-  - **Mutable fields:** phase state (phase1State, myPhase1Broadcast, collectedPhase1, ..., collectedPhase4, result, destroyed).
-  - **Invariants:** Only one peer produces each broadcast/private blob per phase; destroyed flag blocks re-entry.
+- `isCeremonyId(s: unknown): s is string`
+  - **Post:** `true` iff `s` is a string matching `CEREMONY_ID_RE`.
 
-- `function createSession(input: CreateMldsaDkgSessionInput) → MldsaDkgSession`
-  - **Pre:** `partyId ∈ [0, parties)`; `0 < threshold ≤ parties`; `sessionId.length === 32`; `level ∈ {44, 65, 87}`.
-  - **Post:** Session object initialized; all state maps empty, result/destroyed false.
-  - **Throws:** On invalid range or sessionId length.
+- `isProposalShape(p: unknown): p is SendProposal`
+  - **Post:** `true` iff `p` has exactly the keys `{network, tx, prevouts}`; `network` is one of the three networks; `tx` is non-empty, even-length, lowercase hex; `prevouts` is an array of 1–255 entries, each with exactly the keys `{txid, vout, amount, script}`: `txid` 64 lowercase hex, `vout` a safe integer ≥ 0, `amount` a safe integer ≥ 0, `script` non-empty even-length lowercase hex.
+  - **Notes:** Shape only. Everything else (input/prevout match, vault script, network, fee) is `analyzeProposal`'s job.
 
-- **Phase 1 (commitment broadcast):**
+- `encodeMessage(msg: CeremonyMessage): Uint8Array`
+  - **Pre:** `msg` satisfies the parser rules.
+  - **Post:** UTF-8 JSON. `parseMessage(encodeMessage(m))` deep-equals `m`.
 
-  - `function phase1(session) → string`
-    - **Pre:** Session live (not destroyed); phase1 not already run.
-    - **Post:** Calls `instance.dkgPhase1`, stores state and broadcast, adds own broadcast to collected, returns encoded broadcast string.
-    - **Throws:** On destroyed or re-entry.
-
-- **Phase 2 (public reveal broadcast + private reveals to holder-mates):**
-
-  - `function phase2(session) → string`
-    - **Pre:** phase1 run; all N phase1 broadcasts collected.
-    - **Post:** Calls `instance.dkgPhase2` with sorted P1 list, stores broadcast and per-recipient private map, returns encoded broadcast.
-    - **Throws:** If phase1 not run or missing any phase1 broadcasts.
-
-  - `function phase2PrivateForTarget(session, toPartyId) → string | null`
-    - **Pre:** phase2 run.
-    - **Post:** Returns encoded private reveal for toPartyId (holder-mate) or null if none.
-
-  - `function phase2Recipients(session) → PartyId[]`
-    - **Pre:** phase2 run.
-    - **Post:** Returns parties (excluding self) who should receive phase2 private blobs, sorted.
-
-  - `function phase2ExpectedSenders(session) → PartyId[]`
-    - **Pre:** Session created (setup available).
-    - **Post:** Returns parties (excluding self) from whom phase2 private reveals are expected (symmetric: j sends me iff j and I share ≥1 bitmask). No pulling needed; computable from setup.holdersOf.
-
-  - `function phase2Finalize(session) → void`
-    - **Pre:** phase1 run; all N phase2-pub broadcasts collected; all expected phase2 privates collected.
-    - **Post:** Calls `instance.dkgPhase2Finalize` locally; stores result (used to produce P3 blobs).
-
-- **Phase 3 (targeted masks to every other generator):**
-
-  - `function phase3PrivateForTarget(session, toPartyId) → string | null`
-    - **Pre:** phase2Finalize run.
-    - **Post:** Returns encoded phase3 private for toPartyId (generator assignment) or null if none.
-
-  - `function phase3Recipients(session) → PartyId[]`
-    - **Pre:** phase2Finalize run.
-    - **Post:** Returns parties (excluding self) to send P3 privates to, sorted.
-
-  - `function phase3ExpectedSenders(session) → PartyId[]`
-    - **Pre:** phase2Finalize run.
-    - **Post:** Returns distinct generators (excluding self) from whom P3 privates are expected. May be < N if some generators are repeated.
-
-- **Phase 4 (aggregate broadcast):**
-
-  - `function phase4(session) → string`
-    - **Pre:** All N phase1 broadcasts, all phase2-pub broadcasts, all expected phase3 privates collected; phase2Finalize run.
-    - **Post:** Calls `instance.dkgPhase4` with all inputs, stores broadcast, returns encoded broadcast.
-    - **Throws:** On missing phase3 privates.
-
-- **Finalize (derive own share + public key):**
-
-  - `function finalize(session) → DKGResult`
-    - **Pre:** All N phase4 broadcasts collected; phase2Finalize run.
-    - **Post:** Calls `instance.dkgFinalize`, caches result, returns DKGResult (own ThresholdKeyShare + aggregate pubkey).
-    - **Throws:** On missing phase4 broadcasts or phase2Finalize not run.
-    - **Idempotency:** If called multiple times, returns cached result.
-
-- **Blob ingestion (adds received blobs to state):**
-
-  - `function addBlob(session, blob: string, round: DkgRound) → {ok: boolean; error?: string}`
-    - **Pre:** blob is properly encoded/formatted; round ∈ {p1, p2-pub, p2-priv, p3, p4}.
-    - **Post:** Decodes blob, validates sender partyId, checks for duplicates, stores in appropriate map, returns {ok: true} or {ok: false; error: reason}.
-    - **Soft errors:** Returns {ok: false} on bad format or duplicate (NOT thrown); caller decides whether to abort.
-    - **Validation per round:**
-      - p1: sender ≠ self, partyId in range [0, parties).
-      - p2-pub: sender ≠ self, partyId in range.
-      - p2-priv: sender ≠ self, from/to partyIds in range.
-      - p3: sender (generator) ≠ self, generatorId in range.
-      - p4: sender ≠ self, partyId in range.
-
-- `function destroySession(session) → void`
-  - **Pre:** Session is live.
-  - **Post:** Sets destroyed=true, nullifies all state, clears all maps.
-  - **Concurrency:** Safe to call once per session (idempotent after first call due to destroyed check in all phase functions).
+- `parseMessage(bytes: Uint8Array): CeremonyMessage | null`
+  - **Post:** Returns the message when every rule below holds; `null` otherwise.
+  - **Throws:** Never.
+  - **Rules:**
+    - UTF-8 JSON object with `v === 2` and `kind` one of the four kinds.
+    - Each kind has an exact key set (`reason` optional for `signoff-aborted`); extra keys mean `null`.
+    - `ceremonyId`: `isCeremonyId`.
+    - `sessionIdHex`: 64 lowercase hex characters.
+    - `threshold` and `parties`: integers from 2 to 255, with `threshold ≤ parties`.
+    - `network`: one of `mainnet`, `testnet4`, `signet`.
+    - `signers`: 1–255 integers in `0..254`.
+    - `proposal`: `isProposalShape`.
+    - `signaturesHex`: 1–255 strings of 128 lowercase hex characters.
+    - `reason`: a string of at most 1024 characters.
 
 **Invariants:**
-
-- Session is single-threaded; only one peer calls phase*() on any given session instance.
-- Destroyed flag prevents re-entry after finalize or error.
-- All broadcast blobs are sorted by partyId (0..N-1) before passing to ThresholdMLDSA lib functions.
-- Private reveals are indexed by sender partyId (p2-priv) or by sender generator ID (p3), not recipient.
-- Phase 2 and 3 have optional holders/generators; phase4 is N-of-N broadcast.
+- `from` (sender) is the transport's authenticated `from`; messages carry no sender field.
+- A parse failure is a silent drop at the receiver (logged).
+- Sighashes never appear in a message; every signer derives them from `proposal`.
 
 **Cross-component contracts:**
-
-- Depends on: @btc-vision/post-quantum (ThresholdMLDSA, DKG lib), wire/dkg.ts (encode/decode functions), PartyId type.
-- Used by: CeremonyRunner.runMldsaDkgProtocol / participateInMldsaDkg.
-- Blob wire format: JSON strings from wire/dkg.ts (encodePhase*Broadcast, encodePhase*Private).
-
-**Notes / gotchas:**
-
-- Phase 2 private reveals are sent only to "holder-mates" (parties sharing ≥1 bitmask from setup); other parties get null from phase2PrivateForTarget.
-- Phase 3 private masks are sent to every other party but must be indexed by generator ID; if two parties share the same generator role, only one set of masks is collected.
-- Phase 2 finalize is local (no network); phase2Finalize must be called before phase3 work can start.
-- All broadcast phases require collection of N blobs before next phase; targeted phases require only the subset of expected senders.
+- Depends on: `NetworkName`, `SendProposal` (`src/otzi/`), `PartyId`.
+- Used by: `dkg-ceremony.ts` (`signoff-aborted`), `sign-ceremony.ts` (`announce-sign`), `Orchestrator` (parse), `LeaderDispatcher` (`announce-dkg`, signoffs), `src/daemon/api.ts` (`isCeremonyId`, `isProposalShape`, `MAX_INPUTS`).
 
 ---
 
 ### `frost-dkg-session.ts`
 
-**Purpose:** FROST (secp256k1) DKG session wrapper; implements 3-round symmetric protocol (R1/R2/finalize).
+**Purpose:** FROST (secp256k1) DKG session wrapper around `@mwaddip/frots`; 3-step symmetric protocol (R1 / R2 / finalize) with Ötzi codecs.
 
 **Public surface:**
 
 - `interface FrostDkgSession`
-  - **Read-only fields:** `partyId`, `sessionId`, `threshold`, `parties`, `rng`.
-  - **Mutable fields:** r1Secret, myR1Package, collectedR1, r2Secret, myR2PackagesByRecipient, collectedR2, result, destroyed.
-  - **Invariants:** FROST uses 1-indexed bigint IDs internally; partyId-to-frostId conversion happens in wire codec (partyIdToFrostId / frostIdToPartyId).
+  - **Read-only fields:** `partyId`, `sessionId` (32 B), `threshold`, `parties`, `rng`.
+  - **Mutable fields:** `r1Secret`, `myR1Package`, `collectedR1`, `r2Secret`, `myR2PackagesByRecipient`, `collectedR2`, `result`, `destroyed`.
 
 - `function createSession(input: CreateFrostDkgSessionInput) → FrostDkgSession`
-  - **Pre:** `partyId ∈ [0, parties)`; `0 < threshold ≤ parties`; `sessionId.length === 32`; `rng` is CSPRNG.
-  - **Post:** Session initialized; all state null/empty, destroyed=false.
+  - **Pre:** `partyId ∈ [0, parties)`; `0 < threshold ≤ parties`; `sessionId.length === 32`; `rng` is a CSPRNG.
+  - **Post:** Session initialized; all state null/empty, `destroyed = false`.
   - **Throws:** On invalid range or sessionId length.
 
-- **Round 1 (commitment + proof of knowledge broadcast):**
+- `function round1(session) → string`
+  - **Pre:** Session live; round 1 not yet run.
+  - **Post:** Calls frots `dkgRound1(partyIdToFrostId(partyId), parties, threshold, rng)`, stores secret and package, adds own package to `collectedR1`, returns the `encodeFrostRound1` blob (Ötzi `frost-r1`).
+  - **Throws:** On destroyed or re-entry.
 
-  - `function round1(session) → string`
-    - **Pre:** Session live; round1 not yet run.
-    - **Post:** Calls `libDkgRound1` (converted to FROST's 1-indexed ID), stores secret and package, adds own to collected, returns encoded R1 string.
-    - **Throws:** On destroyed or re-entry.
+- `function round2(session) → void`
+  - **Pre:** Round 1 run; all N round-1 packages collected.
+  - **Post:** Calls frots `dkgRound2` (verifies every proof of knowledge), stores the round-2 secret and one package per recipient.
+  - **Throws:** On missing round-1 packages, round 1 not run, or a frots verification failure (names the offending identifier).
 
-- **Round 2 (targeted signing shares):**
+- `function round2ForTarget(session, toPartyId) → string | null`
+  - **Pre:** Round 2 run.
+  - **Post:** `encodeFrostRound2` blob (Ötzi `frost-r2`, envelope `to` = recipient) for `toPartyId`, or null for self.
 
-  - `function round2(session) → void`
-    - **Pre:** round1 run; all N R1 packages collected.
-    - **Post:** Calls `libDkgRound2` with r1Secret and received R1 packages (excluding self), stores r2Secret and per-recipient packages (converted back to partyId).
-    - **Throws:** On missing R1 packages or round1 not run.
-    - **No return:** void; output is via round2ForTarget.
+- `function round2Recipients(session) → PartyId[]`
+  - **Pre:** Round 2 run.
+  - **Post:** Every other partyId, sorted ascending.
 
-  - `function round2ForTarget(session, toPartyId) → string | null`
-    - **Pre:** round2 run.
-    - **Post:** Returns encoded R2 share for toPartyId or null if lib produced none (e.g., invalid recipient).
+- `function finalize(session) → { keyPackage, publicKeyPackage }`
+  - **Pre:** Round 2 run; all N−1 round-2 packages addressed to self collected.
+  - **Post:** Calls frots `dkgFinalize` (verifies every received share), caches and returns the key material with the BIP341 key-path tweak applied.
+  - **Throws:** On missing packages or a frots verification failure. frots names the sender of a bad share by FROST identifier (`from sender 3`); the error rewrites it to the party id (`from party 2`, cause kept), like every other message.
+  - **Idempotency:** Returns the cached result on repeated calls.
 
-  - `function round2Recipients(session) → PartyId[]`
-    - **Pre:** round2 run.
-    - **Post:** Returns all recipient partyIds (N-1 parties, excluding self), sorted.
-
-- **Finalize (VSS-verify received shares, derive key material):**
-
-  - `function finalize(session) → {keyPackage, publicKeyPackage}`
-    - **Pre:** round2 run; all N-1 R2 packages addressed to self collected.
-    - **Post:** Calls `libDkgFinalize` with r2Secret and all received R1+R2 packages, caches result, returns {keyPackage, publicKeyPackage} with BIP341 tap-tweak applied.
-    - **Throws:** On missing R2 packages or round2 not run.
-    - **Idempotency:** Returns cached result if called multiple times.
-
-- **Blob ingestion:**
-
-  - `function addBlob(session, blob: string, round: FrostDkgRound) → {ok: boolean; error?: string}`
-    - **Pre:** blob properly encoded; round ∈ {r1, r2}.
-    - **Post:** Decodes blob, converts FROST ID to partyId, validates sender and recipient (r2 only), stores in appropriate map, returns {ok} or {ok: false; error}.
-    - **Soft errors:** Bad format, out-of-range ID, duplicate, or wrong recipient returns {ok: false} (NOT thrown).
-    - **Validation per round:**
-      - r1: sender ≠ self, partyId in [0, parties).
-      - r2: sender ≠ self, recipient = self, both partyIds in range.
+- `function addBlob(session, blob: string, round: 'r1' | 'r2', from: PartyId) → { ok: true } | { ok: false; error: string }`
+  - **Pre:** `from` is the authenticated producer the blob was pulled from; session not destroyed.
+  - **Post:** On `ok: true` the decoded package is stored under `from`.
+  - **Rejects (`ok: false`, error names `from`):**
+    - `from === partyId` or `from ∉ [0, parties)`;
+    - the blob does not decode (`decodeFrostRound1` / `decodeFrostRound2` → null);
+    - **sender binding:** the partyId inside the blob ≠ `from` (round 1: `frostIdToPartyId(identifier)`; round 2: `sender`);
+    - **commitment count:** a round-1 package without exactly `threshold` commitments;
+    - round 2: the recipient inside the blob ≠ this node;
+    - a second package from the same `from` for the round.
+  - **Throws:** Never.
 
 - `function destroySession(session) → void`
-  - **Pre:** Session live.
-  - **Post:** Sets destroyed=true, nullifies all state, clears maps.
+  - **Post:** Sets `destroyed = true`, nulls all secrets, clears all maps.
 
 **Invariants:**
-
-- Single-threaded per session instance.
-- Destroyed flag prevents re-entry.
-- FROST library uses 1-indexed bigint; wire codec converts to/from partyId (0-indexed).
-- Round 2 shares are targeted (N-1 per party); each party gets shares from every other party (N-1 incoming).
-- Finalize requires all N-1 R2 shares and all N R1 packages (own + N-1 others).
-- PublicKeyPackage includes BIP341 post-DKG tap-tweak (applied by libDkgFinalize).
+- Single-threaded per session instance; destroyed flag prevents re-entry.
+- Round-2 shares are targeted (N−1 per party); every party receives one share from every other party.
+- Finalize requires all N round-1 packages (own included) and all N−1 round-2 packages.
+- The public key package carries the BIP341 key-path tweak (`verifyingKey` = output key, `untweakedVerifyingKey` = internal key).
 
 **Cross-component contracts:**
-
-- Depends on: @mwaddip/frots (FROST DKG lib), wire/dkg.ts (encode/decode + partyId ↔ frostId conversion).
-- Used by: CeremonyRunner.runFrostDkgProtocol / participateInFrostDkg.
-- Blob wire format: JSON strings from wire/dkg.ts.
+- Depends on: `@mwaddip/frots`; codecs and id conversion from `src/otzi/lib/dkg.ts`.
+- Used by: `dkg-ceremony.ts`.
 
 **Notes / gotchas:**
-
-- FROST DKG is N-to-N (every party sends shares to every other); mirrors ML-DSA's phase 3 (targeted reveals) but not phase 2 (no public broadcast before targeted).
-- partyId-to-frostId conversion is 1-based; frostId = BigInt(partyId + 1). Conversion lives in wire codec, not here.
-- Round 2 shares are keyed by sender partyId in collectedR2; during finalize, they're looked up by FROST bigint via frostIdToPartyId.
+- `encodeFrostRound2`'s envelope `to` matches the blob key's `to`, which is what `BlobServer` uses to refuse other requesters.
 
 ---
 
 ### `frost-sign-session.ts`
 
-**Purpose:** FROST (secp256k1) signing session wrapper; implements 2-round symmetric protocol (R1/R2) + leader-only aggregate.
+**Purpose:** FROST (secp256k1) signing session wrapper around `@mwaddip/frots`; 2-round protocol (R1 / R2) plus leader-only aggregate, with Ötzi codecs, sender binding and the nonce rules.
 
 **Public surface:**
 
 - `interface FrostSighash`
-  - **Fields:** `hash: Uint8Array` (32B), `tweaked: boolean` (key-path vs script-path BIP341 tweak).
-  - **Pre:** hash is SHA256 output (32 bytes); tweaked indicates BIP341 tap-tweak applied.
-  - **Post:** One sighash to sign in the ceremony.
+  - **Fields:** `hash: Uint8Array` (32 B), `tweaked: boolean`.
+  - **Post:** One sighash to sign. Every caller in this repo passes `tweaked: true` (BIP341 key-path).
+
+- `type FrostSignRound = 1 | 2`
 
 - `interface FrostSigningSession`
-  - **Read-only fields:** `partyId`, `keyPackage`, `publicKeyPackage`, `sighashes`, `activeSigners`, `rng`, `sessionId` (32B, derived from ceremonyId via SHA256).
-  - **Mutable fields:** myNonces, myCommitments, collectedR1, myShares, collectedR2, signatures, destroyed.
-  - **Invariants:** N sighashes signed in parallel (one blob per round packs all N items).
+  - **Read-only fields:** `partyId`, `keyPackage`, `publicKeyPackage`, `sighashes`, `activeSigners`, `rng`, `sessionId`.
+  - **Mutable fields:** `myNonces`, `myCommitments`, `collectedR1`, `myShares`, `collectedR2`, `signatures`, `round2Started: boolean`, `destroyed`.
+
+- `interface CreateFrostSessionInput { partyId; keyPackage; publicKeyPackage; sighashes; activeSigners; rng; sessionId: Uint8Array }`
+  - `sessionId` is 32 bytes: the first sighash for proposal signing, the DKG session ID for DKG verification. The Ötzi envelope `sid` (first 16 hex characters) is taken from it.
 
 - `function createSession(input: CreateFrostSessionInput) → FrostSigningSession`
-  - **Pre:** `sighashes.length > 0`; `partyId ∈ activeSigners`; `keyPackage` and `publicKeyPackage` from DKG or dealer.
-  - **Post:** Session initialized; sessionId derived as SHA256(ceremonyId); all state null/empty.
-  - **Throws:** On empty sighashes or partyId not in activeSigners.
-  - **sessionId determinism:** All peers derive same sessionId from same ceremonyId, enabling wire-envelope session tag without random state.
+  - **Pre:** `1 ≤ sighashes.length ≤ 255`; `partyId ∈ activeSigners`; `activeSigners` has no duplicates; `keyPackage` and `publicKeyPackage` are from the same vault.
+  - **Post:** Session initialized; `round2Started = false`; all state null/empty.
+  - **Throws:** On empty sighashes, `partyId` not in `activeSigners`, or `sessionId` not 32 bytes.
 
-- **Round 1 (nonce + commitment generation, broadcast commitments):**
+- `function round1(session) → string`
+  - **Pre:** Session live; round 1 not run.
+  - **Post:** One frots `signRound1(keyPackage, rng)` per sighash (fresh nonces), stores nonces and commitments, adds own commitments to `collectedR1`, returns the `encodeFrostSignR1` blob (Ötzi `frost-sign-r1`).
+  - **Throws:** On destroyed or re-entry.
 
-  - `function round1(session) → string`
-    - **Pre:** Session live; round1 not run.
-    - **Post:** Generates N (nonces, commitments) pairs (one per sighash) via libSignRound1, stores nonces and commitments, adds own commitments to collectedR1, returns encoded R1 blob.
-    - **Throws:** On destroyed or re-entry.
+- `function round2(session) → string`
+  - **Pre:** Round 1 run; `round2Started === false`; one commitment set collected for every signer in `activeSigners`.
+  - **Post:** Sets `round2Started = true` before any work; takes exactly one commitment set per active signer, frozen at that moment; for each sighash calls frots `signRound2(keyPackage, nonces, hash, commitments sorted by identifier, { tweaked })`; sets `myNonces = null`; adds own shares to `collectedR2`; returns the `encodeFrostSignR2` blob (Ötzi `frost-sign-r2`).
+  - **Throws:** If round 2 already started (checked first), round 1 not run, or a commitment set is missing. Past those first two checks `myNonces` is `null` once `round2` exits, by return or by throw; a throw there leaves the session unable to run round 2 again.
 
-- **Round 2 (signature shares, broadcast shares):**
+- `function aggregate(session) → Uint8Array[]`
+  - **Pre:** Round 2 run; one share set collected for every active signer. Leader only (and every node in DKG verification).
+  - **Post:** For each sighash, frots `signAggregate(shares, hash, commitments, publicKeyPackage, { tweaked })` with the full `publicKeyPackage`; returns one 64-byte BIP340 signature per sighash, in sighash order. Cached on repeated calls.
+  - **Throws:** On missing shares, or `Error('signature aggregation for input <i> failed: <frots message>')` where every FROST identifier frots names (`signer(s): 3`, `signer 3`) is rewritten to the party id (`party(ies) 2`, `party 2`): the cheater identification (needs the full `verifyingShares`) reaches errors and `signoff-aborted` reasons in party ids, like every other message.
 
-  - `function round2(session) → string`
-    - **Pre:** round1 run; all activeSigners' R1 commitments collected (via addBlob or manual collection).
-    - **Post:** For each sighash, gathers commitments from all signers (sorted by partyId) and calls libSignRound2 to produce signature share. Stores shares, adds own to collectedR2, returns encoded R2 blob.
-    - **Throws:** On missing R1 commitments or round1 not run.
-    - **Determinism:** Sorted signer order ensures all parties produce identical share arrays.
-
-- **Aggregate (leader-only, produce final signatures):**
-
-  - `function aggregate(session) → Uint8Array[]`
-    - **Pre:** round2 run; all activeSigners' R2 shares collected.
-    - **Post:** For each sighash, gathers shares and commitments from all signers (sorted), calls libSignAggregate, returns array of N BIP340 Schnorr sigs (ceremony order, one per sighash).
-    - **Throws:** On missing R2 shares or R1 commitments.
-    - **Idempotency:** If called multiple times, returns cached signatures.
-    - **Leader-only:** Participants do NOT call this; only leader aggregates.
-
-- **Blob ingestion:**
-
-  - `function addBlob(session, blob: string, expectedRound: FrostSignRound) → {ok: boolean; error?: string}`
-    - **Pre:** blob properly encoded; expectedRound ∈ {1, 2}; session not destroyed.
-    - **Post:** Decodes blob, validates sender partyId, checks sighash count and non-duplicate, stores commitments/shares, returns {ok} or {ok: false; error}.
-    - **Soft errors:** Bad format, out-of-range partyId, not in activeSigners, wrong sighash count, or duplicate returns {ok: false} (NOT thrown).
-    - **Validation per round:**
-      - r1: sender ≠ self, in activeSigners, commitments.length = N sighashes.
-      - r2: sender ≠ self, in activeSigners, shares.length = N sighashes.
+- `function addBlob(session, blob: string, expectedRound: FrostSignRound, from: PartyId) → { ok: true } | { ok: false; error: string }`
+  - **Pre:** `from` is the authenticated producer the blob was pulled from; session not destroyed.
+  - **Post:** On `ok: true` the decoded set is stored under `from`.
+  - **Rejects (`ok: false`, error names `from`):**
+    - `from === partyId` or `from ∉ activeSigners`;
+    - the blob does not decode (`decodeFrostSignR1` / `decodeFrostSignR2` → null, or the decoder throws on a truncated payload);
+    - **sender binding:** the partyId inside the blob ≠ `from`, or any entry's FROST identifier ≠ `from + 1`;
+    - entry count ≠ `sighashes.length`;
+    - round 1: any `hiding` or `binding` that is not a 33-byte compressed secp256k1 point on the curve (a truncated or off-curve point is rejected naming `from`, not left to fail later inside `round2`);
+    - a second set from the same `from` for the round;
+    - round 1 after round 2 has started.
+  - **Throws:** Never.
 
 - `function destroySession(session) → void`
-  - **Pre:** Session live.
-  - **Post:** Sets destroyed=true, nullifies all state, clears maps.
+  - **Post:** Sets `destroyed = true`, nulls nonces, shares and signatures, clears maps.
 
-**Invariants:**
-
-- Single-threaded per session instance.
-- Destroyed flag prevents re-entry.
-- All N sighashes are signed in lockstep (same R1 nonce per sighash across all parties, same R2 share computation, same aggregate).
-- Signature order matches sighash order (canonical input order preserved).
-- activeSigners are sorted by partyId before passing to aggregate (determinism).
-- BIP340 signature is 64 bytes (32B r + 32B s); tweaked flag is metadata (tells aggregate to apply BIP341 context hash).
+**Invariants (nonce rules):**
+- Round 2 runs at most once per session; the `round2Started` guard is set before any work.
+- Round 2 uses exactly one commitment set per active signer, frozen when it starts; later blobs cannot change it.
+- Nonces are fresh per session (`signRound1`) and dropped right after `signRound2`.
+- Signature order matches sighash order (input order).
 
 **Cross-component contracts:**
-
-- Depends on: @mwaddip/frots (FROST sign lib), wire/frost-sign.ts (encode/decode).
-- Used by: CeremonyRunner.signFrostAsLeader / participateInFrostSigning / runKeylinkSignProtocol.
-- Blob wire format: JSON from wire/frost-sign.ts.
-- sessionId derivation: SHA256(ceremonyId) — deterministic across peers, enables sync without pre-shared session secrets.
+- Depends on: `@mwaddip/frots`; codecs from `src/otzi/lib/frost-sign.ts`.
+- Used by: `sign-ceremony.ts` (proposal signing), `dkg-ceremony.ts` (verification signature).
 
 **Notes / gotchas:**
+- The Ötzi sign decoders do not check payload length, the inner partyId, the identifiers or the points; `addBlob` is where those checks live: payload partyId, entry count, identifiers, and in round 1 point validity. A truncated round-2 payload makes the decoder throw, which `addBlob` turns into a rejection.
+- `sessionId` is not a secret; it only tags envelopes.
 
-- sessionId is NOT a secret; it's derived deterministically so peers can embed it in wire envelopes as a non-secret session tag.
-- All N sighashes are signed with the same nonce generation params (partyId + keyPackage); results are N independent BIP340 sigs in ceremony order.
-- Leader aggregate is deterministic (no randomness); all peers who run aggregate locally get the same N sigs (used for key-link protocol where all peers aggregate independently).
-- `tweaked` flag is metadata; it tells the FROST library whether to apply BIP341 context hash during r2 and aggregate (true = key-path, false = script-path).
+---
+
+### `dkg-ceremony.ts`
+
+**Purpose:** The symmetric DKG protocol with verification signature and all-N confirmation (spec §5.3 steps 2–7).
+
+**Public surface:**
+```ts
+export const DKG_ROUNDS = { r1: 'dkg-r1', r2: 'dkg-r2', verifyR1: 'dkg-verify-r1', verifyR2: 'dkg-verify-r2', verified: 'dkg-verified' } as const;
+export interface DkgCeremonyResult { keyPackage: KeyPackage; publicKeyPackage: PublicKeyPackage }
+export interface ShareStager {
+  readonly sharePath: string;   // where commit() puts the share
+  readonly stagedPath: string;  // where stage() writes it (the daemon's `<share path>.pending`)
+  stage(r: DkgCeremonyResult): Promise<void>;
+  commit(): Promise<void>;
+  discard(): Promise<void>;
+}
+export interface DkgCeremonySpec { ceremonyId: string; sessionId: Uint8Array; threshold: number; parties: number; network: NetworkName; rng: Rng }
+export class DkgShareKeptError extends Error { readonly reason: string; readonly keptNote: string; readonly stagedPath: string }
+export function keptShareNote(stager: Pick<ShareStager, 'sharePath' | 'stagedPath'>, address: string): string
+```
+
+- `ShareStager` contract (what `runDkgCeremony` relies on): `stage` resolves only once the share is durable at `stagedPath`; `commit` resolves once the share is at `sharePath` and never replaces a file that exists there; `discard` removes the file this stager's own `stage` wrote in this ceremony, and nothing else: a `discard` before or without a `stage` is a no-op, because any `.pending` already at `stagedPath` may be the share a node kept after publishing its confirmation (ruling R41, no lost share).
+- `keptShareNote(stager, address)` → `this node published its confirmation of vault <address>, so its staged share was kept at <stagedPath>: run 'otzi vault' on the other nodes; if any of them shows <address>, rename <stagedPath> to <sharePath> and restart this daemon, otherwise remove <stagedPath>`.
+- `DkgShareKeptError(reason, keptNote, stagedPath, options?)` — `message` = `DKG aborted: <reason>; <keptNote>`; `name` = `'DkgShareKeptError'`. Thrown by a DKG that failed after this node published its `dkg-verified`; `LeaderDispatcher` rebuilds it with its deadline reason.
+
+- `async runDkgCeremony(io: CeremonyIo, spec: DkgCeremonySpec, stager: ShareStager, signal?: AbortSignal) → Promise<DkgCeremonyResult>`
+  - **Pre:** `announce-dkg` for this ceremony was broadcast (leader) or accepted (participant) — announcing is the caller's job; this node holds no vault; `spec.parties === io.transport.peers.length`; `2 ≤ threshold ≤ parties`; `sessionId` is 32 bytes; `ceremonyId` satisfies `isCeremonyId`.
+  - **Post (success):** Every step below completed in order; returns this node's key material. `stager.commit()` has resolved (the daemon's stager renames `.pending` to the share path and writes `vault-pubkey.json`).
+    1. **Round 1.** `round1`; put `{ceremonyId, round: 'dkg-r1', from: self}`; pull `dkg-r1` from the other N−1 nodes; `addBlob(..., 'r1', from)` each.
+    2. **Round 2.** `round2`; put one `{round: 'dkg-r2', from: self, to: peer}` per peer; pull the N−1 `{round: 'dkg-r2', from: peer, to: self}`; `addBlob(..., 'r2', from)`; `finalize`.
+    3. **Verify.** `M = dkgVerifyMessage(sessionId, network, publicKeyPackage)` from this node's own result. Signing session with `sighashes = [{ hash: M, tweaked: true }]`, `activeSigners` = all parties, `sessionId = spec.sessionId`. Put `dkg-verify-r1`, pull from all others, `addBlob(..., 1, from)`; `round2` (nonces dropped), put `dkg-verify-r2`, pull from all others, `addBlob(..., 2, from)`; `aggregate` with the full `publicKeyPackage`; check `verifySignature(sig, M, publicKeyPackage.verifyingKey)`.
+    4. **Stage.** `stager.stage({ keyPackage, publicKeyPackage })`.
+    5. **Confirm.** Put `dkg-verified` = the raw 64-byte aggregate signature (this node has now *published its confirmation*). Pull `dkg-verified` from all N−1 others; each must be 64 bytes and pass `verifySignature(theirs, M, publicKeyPackage.verifyingKey)`.
+    6. **Complete.** `stager.commit()` — once all N−1 confirmations have verified, the node commits whatever `signal` says.
+  - **Post (failure, any step):**
+    1. Before this node published its confirmation: `await stager.discard()`, which removes only what this ceremony staged (nothing when it failed before `stage`: the committed nodes drop the announce of a later DKG, so a node that kept its share of a committed vault must find it intact after such a failure). No node can have committed, because every commit needs this node's confirmation.
+    2. From the put of its own `dkg-verified` on — a confirmation pull that fails or times out, a confirmation that does not verify, an aborted `signal`, a failed `commit` — `discard` is never called: another node may already have committed this vault, so the staged share stays at `stagedPath`.
+    3. Unless `signal?.aborted`, broadcast `signoff-aborted {ceremonyId, reason}` (in both cases: nodes that have not confirmed must stop).
+    4. Throw `Error('DKG aborted: <reason>')` before the confirmation, and `DkgShareKeptError(reason, keptShareNote(stager, address))` after it, where `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address`. The callers log it at error level (see orchestrator.md, daemon.md `leader.ts`).
+  - **Abort:** `signal` aborting stops every pull (`Error('aborted')`) and takes the failure path without broadcasting. `signal` is checked before each step up to the put of `dkg-verified`, and not after the confirmations verified.
+
+**Invariants:**
+- **Guarantee:** a node completes only when every node has produced a signature under the same vault key over the same transcript and has staged its share durably to disk.
+- **No lost share:** a node that published its confirmation never deletes its staged share — not in that ceremony, and not in a later DKG it leads or joins that fails before staging (`discard` removes only a file its own ceremony staged). A later DKG that does reach `stage` needs all N nodes, so no node holds a vault, and it replaces a leftover `.pending`. Once any node commits, every other node holds the vault's share either at its share path or at its staged path, where the `DkgShareKeptError` (and the startup warning, `warnOnPendingShare`) tells the operator how to put it in place.
+- An equivocating node (different `dkg-r1` per puller) makes the verification signature or a confirmation fail; no node completes.
+- Sessions are destroyed on every exit path.
+
+**Cross-component contracts:**
+- Depends on: `frost-dkg-session.ts`, `frost-sign-session.ts`, `messages.ts` (`encodeMessage`), `dkgVerifyMessage` / `toVaultKey` (`src/otzi/lib/dkg.ts`), `vaultPayment` (`src/otzi/lib/bitcoin.ts`), frots `verifySignature`, `CeremonyIo`.
+- Used by: `LeaderDispatcher.runDkg` (also `DkgShareKeptError`), `Orchestrator` (`announce-dkg`; `DkgShareKeptError`).
+- `ShareStager` implemented by: `createShareStager` (`src/daemon/vault-share.ts`).
+
+---
+
+### `sign-ceremony.ts`
+
+**Purpose:** The proposal signing protocol (spec §5.4), leader and participant halves.
+
+**Public surface:**
+```ts
+export const SIGN_ROUNDS = { r1: 'sign-r1', r2: 'sign-r2' } as const;
+export interface SignCeremonySpec { ceremonyId: string; signers: readonly PartyId[]; sighashes: readonly Uint8Array[]; keyPackage: KeyPackage; publicKeyPackage: PublicKeyPackage; rng: Rng }
+```
+- `SignCeremonySpec.sighashes` are the sighashes this node computed with `analyzeProposal` (input order, 1–255 entries). `keyPackage` / `publicKeyPackage` come from this node's own share.
+
+- `async leadSigning(io: CeremonyIo, spec: SignCeremonySpec, proposal: SendProposal, signal?: AbortSignal) → Promise<Uint8Array[]>`
+  - **Pre:** The caller analysed `proposal` against this node's own key and network and its gate approved; `spec.signers` contains this node, has no duplicates, contains only ring members, and has at least `publicKeyPackage.minSigners` entries.
+  - **Post:** Broadcasts `announce-sign {ceremonyId, signers, proposal}`; signing session with `sessionId = sighashes[0]` and `tweaked: true` for every sighash; puts `sign-r1`, pulls `sign-r1` from every other signer, `addBlob(..., 1, from)`; `round2`, puts `sign-r2`, pulls `sign-r2` from every other signer, `addBlob(..., 2, from)`; `aggregate` with the full `publicKeyPackage`; checks `verifySignature(sig, sighash, publicKeyPackage.verifyingKey)` for every input. Returns one 64-byte signature per input, in input order.
+  - **Throws:** Before announcing or storing anything, on a spec that breaks the checks listed under *Spec validation* below. Later, on any pull failure, rejected blob (`Rejected <round> blob from party <from>: <reason>` names the sender), aggregation failure (frots names the cheating signer), failed verification (`signature for input <i> does not verify`), or `signal` abort (`Error('aborted')`).
+  - **Abort:** `signal` is checked before the announce (an already-aborted signal announces and stores nothing), before round 2 and before aggregating, and it stops every pull (`Error('aborted')`). `LeaderDispatcher` passes its ceremony-deadline signal.
+  - **Notes:** Does not broadcast a signoff; `LeaderDispatcher` broadcasts `signoff-done` / `signoff-aborted`.
+
+- `async participateInSigning(io: CeremonyIo, spec: SignCeremonySpec, signal?: AbortSignal) → Promise<void>`
+  - **Pre:** The `announce-sign` passed the participant checks, `analyzeProposal` against this node's own key, and the gate (see [orchestrator.md](orchestrator.md)).
+  - **Post:** Signing session as above; puts `sign-r1`, pulls `sign-r1` from every other signer, `addBlob(..., 1, from)`; `round2` (nonces dropped), puts `sign-r2`; resolves. Does not pull `sign-r2` and does not aggregate.
+  - **Throws:** Before producing anything, on a spec that breaks the checks listed under *Spec validation* below. Later, on any pull failure, rejected blob (`Rejected <round> blob from party <from>: <reason>`), or `signal` abort (`Error('aborted')`).
+
+- **Spec validation** (both functions, first thing, in this order; the error texts are exact, and nothing is announced, stored or created when one throws). For `leadSigning` this node is the leader, so "this node is not in `signers`" is the leader-missing case.
+  - `sighashes.length` not in 1..255 → `sighashes must have 1 to 255 entries, got <n>`
+  - a sighash not 32 bytes → `sighash <i> is <len> bytes, expected 32`
+  - `signers` empty → `signers must not be empty`
+  - duplicate signer → `signers must be unique`
+  - this node (`transport.partyId`) not in `signers` → `party <id> is not in signers`
+  - a signer not in `transport.peers` → `signer <id> is not in the ring`
+  - fewer signers than `publicKeyPackage.minSigners` → `signers needs at least <minSigners> entries, got <n>`
+
+**Invariants:**
+- Sighashes never leave the node; each signer derives them from the proposal.
+- The nonce rules of `frost-sign-session.ts` hold on both roles; the session is destroyed on every exit path.
+- A conflicting own `sign-r1` (reused `ceremonyId` within retention) throws from `BlobStore.put` before any share is computed.
+
+**Cross-component contracts:**
+- Depends on: `frost-sign-session.ts`, `messages.ts`, frots `verifySignature`, `CeremonyIo`.
+- Used by: `LeaderDispatcher.sign` (`leadSigning`), `Orchestrator` (`participateInSigning`).
+
+---
+
+## src/testing/ (test only)
+
+Test helpers; never imported by runtime code.
+
+### `ring.ts`
+- `interface RingNode { partyId: PartyId; io: CeremonyIo; server: BlobServer }`
+- `makeRing(n: number, pullOpts?: Partial<PullOpts>): RingNode[]`
+  - **Post:** An in-memory ring (`createInMemoryRing`) of `n` nodes, each with its own `BlobStore`, `BlobServer` and `BlobPuller`. Pull defaults: `maxAttempts 50`, `initialDelayMs 5`, `maxDelayMs 20`, `deadlineMs 3000`.
+
+### `proposal.ts`
+- `testVault(t: number, n: number): { keyPackages: KeyPackage[]; publicKeyPackage: PublicKeyPackage; vaultKey: VaultKey }`
+  - **Post:** A real FROST DKG result (via Ötzi `runDkg`); `keyPackages[i]` belongs to partyId `i`; `vaultKey = toVaultKey(publicKeyPackage)`.
+- `makeProposal(vaultKey: VaultKey, network: NetworkName, opts?: { inputs?: Array<{ amount: number; script?: string }>; outputs?: Array<{ address: string; amount: number }>; change?: number }): SendProposal`
+  - **Post:** An unsigned transaction with random prevout txids, every input sequence `0xfffffffd`, lockTime 0. Defaults: one input of 100 000 sats paying the vault script; one external output of 50 000 sats; change of 49 000 sats back to the vault. `inputs[i].script` overrides the prevout script (for foreign-input tests). With defaults, `analyzeProposal(makeProposal(v, net), v, net)` succeeds.
 
 ---
 
 ## Cross-Module Summary
 
 **Data flow:**
-1. Transport broadcasts ceremony announcements; peers listen via onBroadcast.
-2. CeremonyRunner reacts to announcements, drives protocol phases.
-3. Each phase produces a blob (stored locally or received); CeremonyRunner stores own blobs in BlobStore, pulls others' blobs via BlobPuller.
-4. BlobPuller uses Transport.pull with exponential backoff + wall-clock deadline.
-5. BlobServer serves stored blobs to peers pulling via Transport.pull.
-6. Session modules (DkgSession, FrostDkgSession, FrostSignSession) hold transient protocol state; blobs are ingested via addBlob.
+1. A trigger reaches `LeaderDispatcher` (leader) or a broadcast reaches `Orchestrator` (participant); both parse with `messages.ts`.
+2. The ceremony (`runDkgCeremony`, `leadSigning`, `participateInSigning`) drives sessions, puts own blobs in `BlobStore`, pulls peers' blobs with `BlobPuller`.
+3. `BlobServer` serves stored blobs to pulling peers, refusing addressed blobs to anyone but the recipient.
+4. Sessions ingest pulled blobs through `addBlob(..., from)`, which applies sender binding.
+5. When the ceremony ends on a node, `scheduleClear` clears its blobs after the retention period.
 
 **Lifetime:**
-- Transport + BlobStore + BlobServer: daemon lifetime (long-lived).
-- BlobPuller: created per daemon, reused across ceremonies.
-- Sessions: per-ceremony-attempt (destroyed after finalize or error).
-- Blobs: live in store until ceremony.clear(ceremonyId).
-
-**Concurrency:**
-- All modules assume single-threaded ceremony runner (no internal locks).
-- Transport.pull may fire from peer transports (sync in InMemoryTransport, async in real transports).
-- BlobStore.onPut observers fire synchronously during put; should not reenter.
-- BlobPuller parallelizes per-key workers (Promise.all); abort via wall-clock deadline.
+- Transport + BlobStore + BlobServer + BlobPuller: daemon lifetime.
+- Sessions: per ceremony (destroyed on every exit path).
+- Blobs: until `scheduleClear` fires (5 min signing, 15 min DKG after the ceremony ends on this node).
 
 **Error handling:**
-- Transport errors: retryable (BlobPuller retries with backoff).
-- BlobStore conflicts (re-put different bytes): protocol violation, ceremony-fatal.
-- Blob rejection (addBlob returns {ok: false}): soft error, runner logs and continues or aborts depending on phase.
-- Unrecoverable errors: leader broadcasts signoff-aborted before throwing.
+- Transport null: retryable (BlobPuller backoff).
+- BlobStore conflict: protocol violation, ceremony-fatal.
+- `addBlob` → `{ ok: false }`: ceremony-fatal; the abort reason names the sender.
+- DKG failure: `signoff-aborted` from the failing node (unless aborted by signal); the `.pending` this ceremony staged is discarded before this node published its `dkg-verified`, kept after it (`DkgShareKeptError`); an earlier `.pending` a ceremony did not stage is never touched.
+- Signing failure after announce: the leader dispatcher broadcasts `signoff-aborted`.
 
 **Contracts (formal):**
 
 | Contract | Pre | Post | Throws |
 |----------|-----|------|--------|
-| BlobStore.put(key, blob) | key unique or blob byte-equal; not destroyed | Blob stored or conflict error | `Error("Conflicting blob...")` |
-| BlobPuller.pullAll(keys, opts) | keys non-empty; opts valid; deadline > now | All blobs in store | `Error("Failed to fetch...")` or `Error("Deadline exceeded...")` |
+| BlobStore.put(key, blob) | key unique or blob byte-equal | Blob stored or conflict error | `Error("Conflicting blob...")` |
+| BlobServer pull handler(from, key) | `from` authenticated | blob, or `null` (absent, or `key.to` set and ≠ `from`) | Never |
+| BlobPuller.pullAll(keys, opts, signal?) | producers in ring; opts valid | All blobs in store | `Failed to fetch…`, `Deadline exceeded…`, `aborted` |
 | Transport.pull(key) | key.from ∈ peers | blob bytes or null or transport error | Varies (peer-dependent) |
 | Transport.broadcast(msg) | msg non-empty | msg delivered to all other peers with from=partyId | Varies (peer-dependent) |
-| Transport.servePulls(handler) | handler new; at most one per transport | handler fires on incoming pulls | InMemoryTransport throws if duplicate |
-| CeremonyRunner.signAsLeader(spec, opts, maxAttempts) | spec valid, partyId ∈ signers, maxAttempts > 0 | signature returned or aborted with signoff | `Error("Signing aborted...")` |
-| CeremonyRunner.participateInSigning(spec, opts) | spec valid, partyId ∈ signers | R1/R2/R3 produced, others' pulled | `Error("Missing ... blob...")` or pull timeout |
-| MldsaDkgSession.addBlob(session, blob, round) | blob encoded; round valid; session not destroyed | blob decoded and stored (soft error if invalid) | Never (returns {ok: bool; error?}) |
-| FrostDkgSession.finalize(session) | round2 run; all R2 collected | (keyPackage, publicKeyPackage) returned | `Error("round2 not run...")` or `Error("Missing R2...")` |
-| FrostSignSession.aggregate(session) | round2 run; all R2 collected; all R1 collected | N BIP340 sigs returned (ceremony order) | `Error("Missing R2...")` or `Error("Missing R1...")` |
+| parseMessage(bytes) | — | valid `CeremonyMessage` or `null` | Never |
+| FrostDkgSession.addBlob(s, blob, round, from) | `from` authenticated | stored, or `{ok:false}` naming `from` | Never |
+| FrostSignSession.addBlob(s, blob, round, from) | `from` authenticated | stored, or `{ok:false}` naming `from` | Never |
+| FrostSignSession.round2(s) | all commitments collected; not started | shares blob; `myNonces === null` | already started / missing commitments |
+| runDkgCeremony(io, spec, stager, signal?) | announced; no vault | share committed, result returned | `DKG aborted: <reason>`; `DkgShareKeptError` after its confirmation |
+| leadSigning(io, spec, proposal, signal?) | analysed + gated by caller | verified signatures, input order | on any failure / `aborted` |
+| participateInSigning(io, spec, signal?) | participant checks passed | `sign-r1`, `sign-r2` produced | on any failure / `aborted` |
 
 ---
 
 ## Key Gotchas
 
-1. **ceremonyId retry suffix:** ML-DSA signing's `#N` suffix (e.g., `base#2`) is part of ceremonyId in runner state but NOT advertised separately; participants watch `baseCeremonyId` (stable across retries) and react to new announces dynamically.
+1. **Addressed blobs:** `BlobServer` checks `key.to` against the requester. Never add a second serving path that skips this check.
 
-2. **FROST keylink round naming:** Uses `frost-keylink-r1` and `frost-keylink-r2` (NOT `frost-sign-r1/r2`) to avoid collision with regular FROST signing (same ceremony can emit both if missequenced).
+2. **Sender binding lives in `addBlob`:** the Ötzi decoders do not bind blobs to senders (and the sign decoders do not check lengths). Always pass the authenticated `from`.
 
-3. **BlobStore idempotency:** Re-putting IDENTICAL bytes is a silent no-op (no observer fire); re-putting DIFFERENT bytes is a protocol violation (immediate conflict throw). Callers MUST ensure wire codecs are deterministic.
+3. **BlobStore idempotency:** Re-putting IDENTICAL bytes is a silent no-op (no observer fire); re-putting DIFFERENT bytes is a protocol violation (immediate conflict throw). Codecs MUST be deterministic.
 
 4. **Transport authenticated-from:** The `from` field in every broadcast/pull callback is cryptographically authenticated. Test transports (InMemoryTransport) MUST preserve this contract even when bypassing E2E encryption.
 
-5. **DKG sessionId:** Shared across ML-DSA + FROST phases in combined DKG (same 32B value used for both); enables deterministic key binding without out-of-band coordination.
+5. **Nonces:** `round2` sets `round2Started` before computing and leaves `myNonces === null`. Never cache or log nonce objects.
 
-6. **FROST aggregate is deterministic:** All peers with the same R1+R2 collections get the same N signatures (no randomness in aggregate). Key-link protocol exploits this: all peers run aggregate independently and get the same sig.
+6. **FROST aggregate is deterministic:** All nodes with the same commitment and share sets get the same signatures; DKG verification relies on every node aggregating independently.
 
-7. **partyId vs frostId:** ML-DSA and CeremonyRunner use 0-indexed partyId; FROST lib uses 1-indexed bigint frostId. Conversion happens in wire/dkg.ts (partyIdToFrostId / frostIdToPartyId); callers do NOT do the conversion.
+7. **partyId vs frostId:** 0-indexed partyId everywhere in headless; FROST uses 1-indexed bigint (`partyIdToFrostId` / `frostIdToPartyId` from `src/otzi/lib/dkg.ts`). Sign blobs carry the 16-bit identifier, which must equal `from + 1`.
 
-8. **Wall-clock deadline:** BlobPuller deadline is absolute (wall-clock time since pullAll call), NOT relative per key. If maxAttempts = 10 and deadline fires after 5 attempts, deadline wins.
+8. **Wall-clock deadline:** BlobPuller deadline is absolute (since the `pullAll` call), NOT relative per key.
 
-9. **BlobServer lifetime:** NOT ceremony-scoped; lives as long as daemon. Allows peers to serve completed ceremonies' blobs to lagging peers (federation fault tolerance).
+9. **BlobServer lifetime:** NOT ceremony-scoped; lives as long as the daemon. Retention, not the server, bounds how long blobs exist.
 
-10. **Lead-participant asymmetry (signing):** Participants produce R1/R2/R3 but do NOT pull R3 or combine. If they try to combine, they get null (no R3 from themselves or leader). Leader is sole producer of final sig.
+10. **Leader-participant asymmetry (signing):** Participants produce `sign-r1` and `sign-r2` and stop; only the leader pulls `sign-r2` and aggregates.

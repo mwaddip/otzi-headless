@@ -46,7 +46,7 @@
 
 **Invariants:**
 - Trigger sources are stateless; they emit to handler-supplied callbacks.
-- Handlers own all ceremony logic (gate, runner invocation, persistence).
+- Handlers own all ceremony logic (request parsing, gate, ceremony dispatch, share staging).
 - Errors in handlers are NOT propagated back to the trigger (best-effort execution).
 - Trigger sources must be stopped before process exit to avoid resource leaks.
 
@@ -56,7 +56,7 @@
 
 **Notes / gotchas:**
 - Chain-watching is NOT a trigger source (daemon is a signing backend, not autonomous).
-- Triggers are generic; ceremony dispatch logic lives in the handler (phase 5e wires it).
+- Triggers are generic; ceremony dispatch logic lives in the handler (the daemon's `buildDefaultHttpHandler`).
 
 ---
 
@@ -90,7 +90,8 @@
 - **Request handling**
   - **Pre:** HTTP request arrives.
   - **Post:** Body read up to MAX_BODY_BYTES (1MB), parsed as JSON if Content-Type is application/json.
-  - **Auth:** If `authTokenEnv` was configured, request MUST have `Authorization: Bearer <token>` header; 401 if missing/wrong.
+  - **Host header (loopback bind):** when the bind host is loopback (`isLoopbackHost`; always, as the parser allows nothing else), a request whose `Host` header does not name a loopback host (`localhost`, `127.0.0.0/8`, `::1`; not `localhost.`) with the port the server listens on is answered `403 {"error":"forbidden host"}` before auth or body: a web page in the operator's browser cannot reach the API through DNS rebinding.
+  - **Auth:** If `authTokenEnv` was configured, request MUST have `Authorization: Bearer <token>` header; 401 if missing/wrong. The comparison is constant-time (`timingSafeEqual` over the SHA-256 digests of the header and of `Bearer <token>`).
   - **Body parsing:** 400 if JSON parse fails.
   - **Handler:** Invoked with `HttpRequest`; exceptions caught, logged, and returned as 500.
   - **Response:** Handler result is JSON-serialized and sent back.
@@ -114,7 +115,7 @@
 
 **Notes / gotchas:**
 - No HTTPS / mTLS (operator configures reverse proxy or OS-level firewall).
-- Max body is 1MB; OPNet params blobs should fit comfortably.
+- Max body is 1MB; a `sign` request (one `SendProposal` of at most 255 inputs) fits comfortably.
 - Errors in the handler (e.g., ceremony failure) are user-level; HTTP itself doesn't fail (status 500 carries the error message).
 - Port 0 is supported for tests; `address()` returns actual bound port.
 

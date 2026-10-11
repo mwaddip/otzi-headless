@@ -2,21 +2,37 @@
  * `WebhookGate` — operator-in-the-loop strategy backed by an HTTP POST.
  *
  * Daemon POSTs the `CeremonySpec` as JSON to `url` and expects a JSON body
- * `{"decision": "approve" | "reject"}` in response. The request blocks for
- * up to `timeout_sec` — for human-in-the-loop the approver endpoint is
- * expected to hold the connection open until the operator responds.
+ * `{"decision": "approve" | "reject"}` in response. `timeout_sec` is ONE
+ * deadline for the whole exchange — connect, response headers and the full
+ * body read — so an approver that answers early but never finishes cannot
+ * outlast it. For human-in-the-loop the approver endpoint is expected to hold
+ * the connection open until the operator responds.
  *
- * TOML shape (under `[gate]`):
+ * `url` is `https:`, or `http:` to a loopback host only: the decision is this
+ * node's security boundary, and the Bearer token goes out with every request.
+ *
+ * TOML shape (under `[gate]`, parameters sit directly next to `strategy`):
  *   strategy = "webhook"
- *   [gate.params]
  *   url = "https://approver.internal/otzi"
  *   timeout_sec = 86400
  *   bearer_token_env = "APPROVER_TOKEN"   # optional: env var carrying the token
+ *
+ * The request goes through `node:http` / `node:https` rather than `fetch`:
+ * fetch's undici client gives up on a response that is silent for 5 minutes
+ * (headers and body timeouts) whatever `timeout_sec` says, which would cap
+ * every human approval at 5 minutes.
  */
 
+import { request as httpRequest, type ClientRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { ConfigError } from '../config/parse';
+import { isLoopbackHost } from '../util/endpoint';
 import { serializeSpec } from './exec';
+import { parseGateTimeoutSec } from './timeout';
 import type { ApprovalGate, CeremonySpec, Decision } from './types';
+
+/** Response bodies are `{"decision": …}`; anything past this is a misbehaving approver. */
+const MAX_RESPONSE_BYTES = 64 * 1024;
 
 export interface WebhookGateConfig {
   url: string;
@@ -25,13 +41,17 @@ export interface WebhookGateConfig {
   bearerTokenEnv?: string;
 }
 
+interface HttpResult {
+  status: number;
+  statusText: string;
+  body: string;
+}
+
 export class WebhookGate implements ApprovalGate {
   constructor(private readonly config: WebhookGateConfig) {}
 
   async approve(spec: CeremonySpec): Promise<Decision> {
     const { url, timeoutSec, bearerTokenEnv } = this.config;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutSec * 1000);
 
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (bearerTokenEnv) {
@@ -40,30 +60,16 @@ export class WebhookGate implements ApprovalGate {
       headers.authorization = `Bearer ${token}`;
     }
 
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: serializeSpec(spec),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      if ((err as { name?: string }).name === 'AbortError')
-        throw new Error(`WebhookGate: timed out after ${timeoutSec}s`);
-      throw new Error(`WebhookGate: request failed: ${(err as Error).message}`);
-    } finally {
-      clearTimeout(timer);
-    }
+    const res = await postJson(url, headers, serializeSpec(spec), timeoutSec);
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`WebhookGate: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 500)}` : ''}`);
+    if (res.status < 200 || res.status > 299) {
+      const body = res.body.slice(0, 500);
+      throw new Error(`WebhookGate: ${res.status} ${res.statusText}${body ? ` — ${body}` : ''}`);
     }
 
     let parsed: unknown;
     try {
-      parsed = await res.json();
+      parsed = JSON.parse(res.body);
     } catch (err) {
       throw new Error(`WebhookGate: response is not JSON: ${(err as Error).message}`);
     }
@@ -71,6 +77,93 @@ export class WebhookGate implements ApprovalGate {
     if (decision === 'approve' || decision === 'reject') return decision;
     throw new Error(`WebhookGate: unexpected decision ${JSON.stringify(decision)} — expected 'approve' or 'reject'`);
   }
+}
+
+/**
+ * POST `payload` to `url` and collect the response, all within `timeoutSec`.
+ * On expiry the request is destroyed. Redirects are not followed (a 3xx is a
+ * non-2xx result). The body is read up to `MAX_RESPONSE_BYTES`.
+ */
+function postJson(
+  url: string,
+  headers: Record<string, string>,
+  payload: string,
+  timeoutSec: number,
+): Promise<HttpResult> {
+  return new Promise((resolve, reject) => {
+    let target: URL;
+    try {
+      target = new URL(url);
+    } catch (err) {
+      reject(new Error(`WebhookGate: request failed: ${(err as Error).message}`));
+      return;
+    }
+    const send = target.protocol === 'https:' ? httpsRequest : target.protocol === 'http:' ? httpRequest : undefined;
+    if (!send) {
+      reject(new Error(`WebhookGate: request failed: unsupported protocol '${target.protocol}'`));
+      return;
+    }
+
+    // Declared first and assigned below, so `fail` is safe to call at any point: before the
+    // request exists it has nothing to destroy, and before the timer exists nothing to clear.
+    let req: ClientRequest | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    let done = false;
+    const finish = (settle: () => void): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      settle();
+    };
+    const fail = (message: string): void =>
+      finish(() => {
+        req?.destroy();
+        reject(new Error(message));
+      });
+
+    try {
+      // `request` throws at once on a header value Node refuses (a token read from a CRLF env
+      // file, a non-latin1 character). The deadline is armed only after it has succeeded.
+      req = send(
+        target,
+        // A fresh connection per ceremony: no pooled socket to go stale during a long hold.
+        { method: 'POST', agent: false, headers: { ...headers, 'content-length': Buffer.byteLength(payload) } },
+        (res) => {
+          const status = res.statusCode ?? 0;
+          const chunks: Buffer[] = [];
+          let size = 0;
+          res.on('data', (chunk: Buffer) => {
+            size += chunk.length;
+            if (size <= MAX_RESPONSE_BYTES) {
+              chunks.push(chunk);
+              return;
+            }
+            // Too much. An error status still reports itself, truncated; a 2xx body is refused.
+            if (status >= 200 && status <= 299) fail(`WebhookGate: response body exceeds ${MAX_RESPONSE_BYTES} bytes`);
+            else
+              finish(() => {
+                req?.destroy();
+                resolve({ status, statusText: res.statusMessage ?? '', body: Buffer.concat(chunks).toString('utf8') });
+              });
+          });
+          res.on('end', () =>
+            finish(() =>
+              resolve({ status, statusText: res.statusMessage ?? '', body: Buffer.concat(chunks).toString('utf8') }),
+            ),
+          );
+          res.on('error', (err) => fail(`WebhookGate: request failed: ${err.message}`));
+          res.on('close', () => {
+            if (!res.complete) fail('WebhookGate: request failed: connection closed before the response ended');
+          });
+        },
+      );
+      timer = setTimeout(() => fail(`WebhookGate: timed out after ${timeoutSec}s`), timeoutSec * 1000);
+      req.on('error', (err) => fail(`WebhookGate: request failed: ${err.message}`));
+      req.end(payload);
+    } catch (err) {
+      fail(`WebhookGate: request failed: ${(err as Error).message}`);
+    }
+  });
 }
 
 const KNOWN_KEYS = new Set(['url', 'timeout_sec', 'bearer_token_env']);
@@ -83,12 +176,10 @@ export function parseWebhookParams(params: Record<string, unknown>): WebhookGate
 
   if (typeof params.url !== 'string' || params.url.length === 0)
     throw new ConfigError('gate.url', 'must be a non-empty string');
-  if (typeof params.timeout_sec !== 'number' || !Number.isFinite(params.timeout_sec) || params.timeout_sec <= 0)
-    throw new ConfigError('gate.timeout_sec', 'must be a positive number (seconds)');
-
+  checkWebhookUrl(params.url);
   const out: WebhookGateConfig = {
     url: params.url,
-    timeoutSec: params.timeout_sec,
+    timeoutSec: parseGateTimeoutSec(params.timeout_sec),
   };
   if (params.bearer_token_env !== undefined) {
     if (typeof params.bearer_token_env !== 'string')
@@ -96,4 +187,26 @@ export function parseWebhookParams(params: Record<string, unknown>): WebhookGate
     out.bearerTokenEnv = params.bearer_token_env;
   }
   return out;
+}
+
+/**
+ * `https:` anywhere; `http:` only to a loopback host. Plain http across a
+ * network would let anyone on the path read the Bearer token and forge the
+ * decision this node's signature depends on.
+ */
+function checkWebhookUrl(raw: string): void {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new ConfigError('gate.url', `must be a URL (got '${raw}')`);
+  }
+  if (url.hostname === '') throw new ConfigError('gate.url', `must name a host (got '${raw}')`);
+  if (url.protocol === 'https:') return;
+  if (url.protocol === 'http:' && isLoopbackHost(url.hostname)) return;
+  throw new ConfigError(
+    'gate.url',
+    `must be https, or http to a loopback host (localhost, 127.0.0.0/8, ::1) — got '${raw}'. ` +
+      'For a remote approver, put a TLS reverse proxy in front of it and use its https URL.',
+  );
 }

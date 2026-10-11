@@ -61,6 +61,7 @@ export function parseBtcAmount(input: string): ParsedAmount {
 }
 
 export function formatSats(sats: bigint, unit: BtcUnit = 'sats'): string {
+  if (sats < 0n) return `-${formatSats(-sats, unit)}`;
   const factor = UNIT_TO_SATS[unit];
   if (unit === 'sats') return sats.toString();
   const digits = Math.log10(Number(factor));

@@ -1,46 +1,24 @@
 /**
- * `otzi vault [--json]` — print the operator-facing vault metadata.
+ * `otzi vault [--json]` — print the vault metadata (facts/daemon.md,
+ * `vault.ts`).
  *
- * Reads /var/lib/otzi/vault-pubkey.json (written by the daemon at startup
- * post share-decrypt and post-DKG). Two outputs:
- *   - Default: human-readable network + addresses.
- *   - --json:  the raw JSON file contents (for scripts).
+ * Reads `vault-pubkey.json`, which the daemon writes at startup (whenever a
+ * share is loaded) and when a DKG commits. Works without the daemon.
  */
 
-import { readFile } from 'node:fs/promises';
-import { DEFAULT_VAULT_PUBKEY_PATH } from '../../daemon/vault-pubkey';
+import { readVaultPubkeyFile } from '../../daemon/vault-pubkey';
 
 export interface VaultOptions {
   vaultPath?: string;
   json?: boolean;
 }
 
-export interface VaultPubkey {
-  network: string;
-  btcAddress: string;
-  opnetAddress: string;
-  frostUntweakedPubKey: string;
-  frostTweakedPubKey: string;
-  mldsaPubKeyHex: string;
-}
-
 export async function vault(opts: VaultOptions = {}): Promise<string> {
-  const path = opts.vaultPath ?? DEFAULT_VAULT_PUBKEY_PATH;
-  let raw: string;
-  try {
-    raw = await readFile(path, 'utf8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
-      throw new Error(
-        `no vault metadata at ${path}; run \`otzi generate\` to complete DKG, or restart the daemon if DKG already happened.`,
-      );
-    throw err;
-  }
-  const data = JSON.parse(raw) as VaultPubkey;
-  if (opts.json) return JSON.stringify(data, null, 2);
+  const file = await readVaultPubkeyFile(opts.vaultPath);
+  if (opts.json) return JSON.stringify(file, null, 2);
   return [
-    `network:        ${data.network}`,
-    `btc address:    ${data.btcAddress}`,
-    `opnet address:  ${data.opnetAddress}`,
+    `network:   ${file.network}`,
+    `address:   ${file.address}`,
+    `threshold: ${file.threshold}-of-${file.parties}`,
   ].join('\n');
 }

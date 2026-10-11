@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { canonicalizeEndpoint, EndpointParseError } from './endpoint';
+import { canonicalizeEndpoint, EndpointParseError, isLoopbackHost } from './endpoint';
 
 describe('canonicalizeEndpoint — IPv4', () => {
   it('passes through host:port unchanged', () => {
@@ -109,4 +109,15 @@ describe('EndpointParseError', () => {
       expect((err as EndpointParseError).path).toBeTypeOf('string');
     }
   });
+});
+
+describe('isLoopbackHost', () => {
+  it.each(['localhost', 'LOCALHOST', '127.0.0.1', '127.255.3.4', '::1', '[::1]', '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1', '::1%lo'])(
+    'is true for %s',
+    (host) => expect(isLoopbackHost(host)).toBe(true),
+  );
+  it.each(['localhost.', 'LOCALHOST.', 'localhost.evil.example', '127.0.0.1.nip.io', '128.0.0.1', '10.0.0.1', '::2', 'fe80::1', '0.0.0.0', '::', '', 'example.com'])(
+    'is false for %s',
+    (host) => expect(isLoopbackHost(host)).toBe(false),
+  );
 });

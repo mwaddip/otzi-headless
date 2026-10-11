@@ -1,301 +1,290 @@
-# Ötzi — Signing Flow Reference
+# Ceremony flow reference
 
-Visual reference for the two main ceremonies: key generation (DKG) and transaction signing.
+Visual reference for the two ceremonies the daemons run: key generation (DKG) and
+transaction signing. Both are FROST (RFC 9591, secp256k1) over a key-path-only
+Taproot vault. Signatures are standard BIP340 and look like single-key signatures
+on chain.
+
+The ceremonies are **pull-based**. Each node produces its blobs locally and stores
+them; a node that needs round-N inputs pulls them from their producers. There are
+no periodic state broadcasts, no barriers and no heartbeats. Four small control
+messages announce and close ceremonies; everything else is blobs.
 
 ---
 
-## DKG Ceremony (Key Generation)
+## Building blocks
 
-Creates both an ML-DSA threshold signing key (post-quantum, for OPNet contract calls) and a FROST threshold BTC key (secp256k1, for funding transactions). Nine steps, one uninterrupted session.
+### Control messages
+
+Broadcast, UTF-8 JSON with `v: 2`. A parser accepts exactly these four kinds and
+drops anything else.
+
+| Kind | Sent by | Carries |
+|---|---|---|
+| `announce-dkg` | The node whose trigger fired | `ceremonyId`, `sessionIdHex` (32 bytes), `threshold`, `parties`, `network` |
+| `announce-sign` | The leader | `ceremonyId`, `signers`, the whole `proposal` (`network`, `tx`, `prevouts`) |
+| `signoff-done` | The signing leader, after finalizing | `ceremonyId`, `signaturesHex` (64-byte BIP340 signatures, input order) |
+| `signoff-aborted` | Any node that fails a DKG; the signing leader on failure | `ceremonyId`, optional `reason` |
+
+Every `ceremonyId` matches `^[A-Za-z0-9._:-]{1,128}$`. Sighashes never appear in a
+message: each signer computes them from the proposal.
+
+### Blobs
+
+Blobs use the same payload layouts as web Ötzi (`frost-r1`, `frost-r2`,
+`frost-sign-r1`, `frost-sign-r2`).
+
+| Ceremony | Round key | Payload | Addressing |
+|---|---|---|---|
+| DKG | `dkg-r1` | `frost-r1` (commitments + proof of knowledge) | broadcast |
+| DKG | `dkg-r2` | `frost-r2` (a secret share) | addressed to one recipient |
+| DKG | `dkg-verify-r1`, `dkg-verify-r2` | `frost-sign-r1/r2` over the verification message | broadcast |
+| DKG | `dkg-verified` | the raw 64-byte aggregate signature | broadcast |
+| Signing | `sign-r1`, `sign-r2` | `frost-sign-r1/r2` over the transaction sighashes | broadcast |
+
+### Rules every pull obeys
+
+- **Addressed blobs** (`dkg-r2`) are served only to their recipient. Anyone else
+  gets the same answer as for a blob that does not exist yet.
+- **Sender binding.** For every pulled blob, the party ID inside it equals the
+  authenticated node it was pulled from. For signing blobs, every entry's FROST
+  identifier equals that party ID + 1. A mismatch aborts the ceremony with a
+  reason naming the sender.
+- **Pull until the deadline.** A blob that is not available yet is pulled again
+  until it arrives or the ceremony deadline (`[deadlines]`) passes. A blob that is
+  still unavailable at the deadline fails the ceremony.
+- **Retention.** When a ceremony ends on a node (either role, any outcome), the
+  node clears its blobs 5 minutes later for signing, 15 minutes later for DKG, so
+  lagging peers can still pull. DKG secret shares never outlive that window.
+
+---
+
+## DKG (key generation)
+
+Run once, on a set of nodes that hold no vault. The ceremony is **symmetric**:
+every node plays the same role. The node whose trigger fired (`otzi generate`)
+generates the 32-byte session ID and announces; it has no other special role.
+`parties` is the ring size and `threshold = parties`.
+
+The DKG runs under a setup trust assumption: one administrator sets up the
+federation, or a trusted group does it live. The checks below make a faulty or
+inconsistent setup fail loudly. Once a vault exists, no DKG can touch it.
 
 ```
- ┌─────────────────────────────────────────────────────────────────────┐
- │                         DKG CEREMONY                               │
- │                                                                    │
- │  Party A (leader)          Relay           Party B (joiner)        │
- │  ─────────────────         ─────           ──────────────────      │
- │                                                                    │
- │  ① JOIN                                                            │
- │  Create session ──────────────────────────► Join with code         │
- │  Set T, N, level                           Receive session config  │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                     ML-DSA PHASES                                  │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │  ② COMMIT — ML-DSA Phase 1                                        │
- │  Generate random nonces ◄════════════════► Generate random nonces  │
- │  Broadcast commitments                     Broadcast commitments   │
- │  · Each party commits to secret randomness without revealing it    │
- │                                                                    │
- │  ③ REVEAL — ML-DSA Phase 2                                        │
- │  Reveal public blobs   ◄════════════════► Reveal public blobs      │
- │  Send private shares ──── per-party ────► Receive private shares   │
- │  · Polynomial secret sharing: each party gets a unique private     │
- │    share that only they can use                                    │
- │                                                                    │
- │  ④ MASKS — ML-DSA Phase 3                                         │
- │  Compute mask values   ◄════════════════► Compute mask values      │
- │  Broadcast responses                      Broadcast responses      │
- │  · Zero-knowledge proofs that shares are consistent                │
- │  · SHA-256 checksums for blob integrity                            │
- │                                                                    │
- │  ⑤ AGGREGATE — ML-DSA Phase 4                                     │
- │  Aggregate all masks   ◄════════════════► Aggregate all masks      │
- │  ═══ Combined ML-DSA public key derived ═══                       │
- │  · All parties independently verify the same combined public key   │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                     FROST PHASES                                   │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │  ⑥ FROST-COMMIT — FROST DKG Round 1                               │
- │  Generate secp256k1    ◄════════════════► Generate secp256k1       │
- │  nonces + commitments                     nonces + commitments     │
- │  · Verifiable secret sharing over secp256k1 (BIP340-compatible)    │
- │                                                                    │
- │  ⑦ FROST-SHARES — FROST DKG Round 2                               │
- │  Distribute key shares ◄════════════════► Distribute key shares    │
- │  ═══ FROST aggregate key derived (BTC address) ═══                │
- │  · Each party holds a KeyPackage with their signing share          │
- │  · Untweaked + tweaked aggregate keys computed                     │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                     KEY LINK                                       │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │  ⑧ FROST-LINK — Key-Link Signing                                  │
- │  Compute key-link hash ◄════════════════► Compute key-link hash    │
- │  FROST-sign the hash   ◄════════════════► FROST-sign the hash      │
- │  (2-round FROST ceremony over the link message)                    │
- │  · Binds ML-DSA identity to FROST BTC key for OPNet verification   │
- │  · Legacy Schnorr sig stored in config for transaction injection   │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │  ⑨ COMPLETE                                                        │
- │  Download encrypted    ◄════════════════► Download encrypted       │
- │  share file (V3)                          share file (V3)          │
- │  · Share file contains ML-DSA ThresholdKeyShare + FROST KeyPackage │
- │  · Server auto-generates internal wallet for SDK protocol sigs     │
- │  · FROST P2TR address derived as the vault's BTC address           │
- └─────────────────────────────────────────────────────────────────────┘
+ Node A (trigger)             Node B                     Node C
+ ────────────────             ──────                     ──────
+ ① ANNOUNCE
+ announce-dkg ──────────────► checks ──────────────────► checks
+ (session ID, t, n, network)  no vault · network · ring size · 2 ≤ t ≤ n · gate
+
+ ② ROUND 1
+ dkg-r1 ◄════════════ every node pulls from every other node ═══════════►
+ · exactly `threshold` commitments per package
+
+ ③ ROUND 2
+ dkg-r2 ◄════ one blob per recipient, served only to that recipient ════►
+ · finalize → this node's key package + the vault's public key package
+
+ ④ VERIFY
+ M = hash of the session, network and the public key package this node computed
+ dkg-verify-r1 ◄══ all N nodes FROST-sign M ══► dkg-verify-r2
+ · each node aggregates with the full public key package and verifies
+
+ ⑤ STAGE
+ share (Ötzi v4) → <share path>.pending, mode 0600, synced to disk
+
+ ⑥ CONFIRM
+ dkg-verified ◄═══ each node pulls the other N−1 signatures and verifies ═►
+
+ ⑦ COMPLETE
+ link .pending → share path (never replaces) · unlink .pending · write vault-pubkey.json · settle done
 ```
 
-### What each party holds after DKG
+### Steps
+
+1. **Announce.** `announce-dkg {ceremonyId, sessionIdHex, threshold, parties,
+   network}`. A node drops the announce unless it holds no vault (no share
+   loaded, no file at the share path), `network` equals its configured network,
+   `parties` equals its ring size, `2 ≤ threshold ≤ parties`, and its gate
+   approves the DKG spec. The announcing node applies the no-vault rule before it
+   announces (the `dkg` op returns `409`).
+2. **Round 1.** Each node generates its round-1 package and stores it as
+   `dkg-r1`, then pulls `dkg-r1` from the other N−1 nodes. Each package must
+   carry exactly `threshold` commitments.
+3. **Round 2.** Each node derives one `dkg-r2` per peer, addressed to that peer,
+   and pulls the N−1 `dkg-r2` blobs addressed to itself. Finalizing verifies every
+   received share and yields this node's key package.
+4. **Verify.** Each node computes the verification message `M` from its own
+   result: the session ID, the network, the group key, the threshold and every
+   verifying share. All N nodes FROST-sign `M` with the key-path tweak: round 1
+   (`dkg-verify-r1`), then round 2 (`dkg-verify-r2`, nonces dropped right after
+   they are used). Each node aggregates and checks the signature against the vault
+   output key. If any node saw a different session, network, key, threshold or
+   share, the signature fails and no node proceeds.
+5. **Stage.** The node writes its Ötzi v4 share, encrypted with the share
+   password, to `<share path>.pending` (mode 0600), replacing any earlier
+   `.pending`, and syncs the file and its directory to disk.
+6. **Confirm.** Each node publishes the aggregate signature as `dkg-verified`,
+   pulls the other N−1, and checks each against `M` and its own vault key.
+7. **Complete.** Once all N−1 confirmations verify, the node commits even if the
+   ceremony is aborted meanwhile: it links `.pending` to the share path (refused
+   if anything exists there, so a vault is never replaced), syncs the directory,
+   removes `.pending`, syncs the directory again,
+   writes `vault-pubkey.json` (a failed write is only a warning; startup rewrites
+   it), and settles as done.
+
+A node completes only when every node has produced a signature under the same
+vault key over the same transcript and has staged its share durably to disk.
+
+**Failure at any step.** The failing node broadcasts `signoff-aborted
+{ceremonyId, reason}` and settles as aborted. Because the DKG is symmetric, a node
+accepts a DKG `signoff-aborted` from any ring member and stops. A node that had
+not yet published its `dkg-verified` deletes the `.pending` file this ceremony
+staged, if any (a ceremony that staged nothing leaves an existing `.pending`
+alone): no node can have committed without its confirmation. A node that had published it keeps the file,
+because another node may already have committed the vault, and logs an error
+naming the file, the vault address and the recovery: run `otzi vault` on the
+other nodes; if any shows that address, rename `.pending` to the share path and
+restart the daemon, otherwise remove it. A `.pending` file found at startup is
+logged at warn level with the same recovery and never loaded; the next DKG
+overwrites it. If it is the loaded share's own file (a second name left by a
+failed removal after the commit), startup removes it and logs at info level.
+
+**After the DKG.** The new share is on disk but not loaded. Restart every daemon
+so each loads its share; until then `sign` returns `409`. Replacing an existing
+vault is an operator action: move the share file away and restart the daemon.
+
+### What each node holds afterwards
 
 | Data | Where | Purpose |
-|------|-------|---------|
-| Encrypted share file (`.json`) | Downloaded locally | ML-DSA key share + FROST key package |
-| Combined ML-DSA public key | In share file + server config | OPNet contract signing identity |
-| FROST aggregate key (tweaked) | Server config | BTC P2TR address derivation |
-| FROST aggregate key (untweaked) | Server config | Taproot internal key for signing |
-| FROST legacy signature | Server config | Key-link proof for OPNet VM |
-| Auto-generated wallet | Server config only | SDK protocol-level sigs (not user-facing) |
+|---|---|---|
+| Encrypted share file (Ötzi v4) | `[share].path`, mode 0600 | This node's FROST key package and the vault's public key package; opens in web Ötzi |
+| Vault metadata (`vault-pubkey.json`) | `/var/lib/otzi/`, mode 0644 | Public: address, keys, threshold, parties; lets the CLI build transactions |
+| Nothing else | — | No node ever holds another node's share |
 
 ---
 
-## Transaction Signing
+## Transaction signing
 
-Signs and broadcasts an OPNet contract call. Two ceremonies back-to-back: ML-DSA (3 rounds) produces the contract signature, then FROST (2 rounds) signs the Bitcoin transaction inputs. From the user's perspective, this is one continuous flow.
+Signing is **leader-driven and single-attempt**. The leader is the node whose
+trigger fired (`otzi btc send`, `otzi btc sign`, or an operator backend's
+`sign` call): a static role for this ceremony, not an elected one. FROST
+aggregation is deterministic, so there are no retries.
+
+The caller supplies a **proposal**: an unsigned transaction plus the prevouts it
+spends. The daemon never reads the chain; the CLI (or the backend) fetches UTXOs,
+builds the proposal and broadcasts the result.
 
 ```
- ┌─────────────────────────────────────────────────────────────────────┐
- │                     TRANSACTION SIGNING                            │
- │                                                                    │
- │  Leader                   Relay              Joiner(s)             │
- │  ──────                   ─────              ─────────             │
- │                                                                    │
- │  BUILD TRANSACTION                                                 │
- │  Select contract + method                                          │
- │  Enter parameters ────────────────────────►  Receive tx details    │
- │  Load share file + password                  Load share file + pw  │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │             ML-DSA THRESHOLD SIGNING (3 rounds)                    │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                                                                    │
- │  ROUND 1 — Commitments                                            │
- │  Generate random nonces ◄════════════════► Generate random nonces  │
- │  Broadcast commitment                      Broadcast commitment    │
- │  · Each party commits to signing randomness                        │
- │                                                                    │
- │  ROUND 2 — Proofs                                                  │
- │  Compute proof blob    ◄════════════════► Compute proof blob       │
- │  Broadcast proof                          Broadcast proof          │
- │  · Zero-knowledge proofs of correct participation                  │
- │                                                                    │
- │  ROUND 3 — Signature shares                                        │
- │  Compute partial sig   ◄════════════════► Compute partial sig      │
- │  Broadcast response                       Broadcast response       │
- │  · Each party contributes their share of the final signature       │
- │                                                                    │
- │  COMBINE (leader only)                                             │
- │  Aggregate all shares ═══════════════════► Receive COMPLETE msg    │
- │  ═══ ML-DSA signature produced ═══                                │
- │  · FIPS 204 threshold signature over the message hash              │
- │  · If norm check fails, auto-retry from Round 1 (up to 50×)       │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │             TEMPLATE TX CAPTURE (leader's backend)                 │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                                                                    │
- │  POST /api/tx/sighash                                              │
- │  ┌──────────────────────────────────────┐                          │
- │  │ Build OPNet tx with DummySigner      │                          │
- │  │ Capture sighash per input:           │                          │
- │  │   input 0: hash=abc... (script-path) │                          │
- │  │   input 1: hash=def... (key-path)    │                          │
- │  │   input 2: hash=ghi... (key-path)    │                          │
- │  │ Cache template txs + challengeToken  │                          │
- │  └──────────────────────────────────────┘                          │
- │  Broadcast sighashes ════════════════════► Receive sighashes       │
- │  · Template tx has dummy sigs — real FROST sigs injected later     │
- │  · Script-path = OPNet interaction input                           │
- │  · Key-path = BTC funding inputs                                   │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │             FROST BTC SIGNING (2 rounds × N sighashes)             │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                                                                    │
- │  FROST ROUND 1 — Nonces (batched over all sighashes)               │
- │  For each sighash:     ◄════════════════► For each sighash:        │
- │    signRound1() →                           signRound1() →         │
- │    nonces + commitment                      nonces + commitment    │
- │  Broadcast R1 blob                        Broadcast R1 blob        │
- │  · All sighashes handled in one blob exchange round                │
- │                                                                    │
- │  FROST ROUND 2 — Partial signatures (batched)                      │
- │  For each sighash:     ◄════════════════► For each sighash:        │
- │    signRound2() →                           signRound2() →         │
- │    partial BIP340 sig                       partial BIP340 sig     │
- │  Broadcast R2 blob                        Broadcast R2 blob        │
- │  · Each partial sig is a 64-byte Schnorr signature share           │
- │                                                                    │
- │  FROST AGGREGATE (leader only)                                     │
- │  For each sighash:                                                 │
- │    signAggregate() →                                               │
- │    64-byte Schnorr sig ══════════════════► Receive FROST-COMPLETE  │
- │  ═══ BIP340 signatures produced (one per input) ═══               │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │             BROADCAST (leader's backend)                           │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                                                                    │
- │  POST /api/tx/broadcast                                            │
- │  ┌──────────────────────────────────────┐                          │
- │  │ Retrieve cached template txs         │                          │
- │  │ Inject FROST sigs into witness:      │                          │
- │  │   script-path → witness[2]           │                          │
- │  │   key-path    → witness[0]           │                          │
- │  │ Inject key-link legacy sig           │                          │
- │  │ Send to OPNet network                │                          │
- │  └──────────────────────────────────────┘                          │
- │  ═══ Transaction broadcast ═══            See result               │
- │  · Server-side lock prevents double-broadcast                      │
- │  · Other parties polling /broadcast-status get cached result       │
- └─────────────────────────────────────────────────────────────────────┘
+ Leader (trigger)                              Participants
+ ────────────────                              ────────────
+ validate the request           ─ 400
+ analyse proposal, own key      ─ 400
+ own gate                       ─ 403
+ announce-sign {signers, proposal} ──────────► sender is the pinned leader
+                                               ceremonyId new · signers valid
+                                               analyse proposal, own key
+                                               own gate
+
+ sign-r1 ◄═══ every signer pulls sign-r1 from every other signer ═══►
+
+ sign-r2 produce; pull from the others         sign-r2 produce, then stop
+ aggregate per input (full public key package)
+ verify each signature against the output key
+ finalizeSend → signed transaction
+
+ signoff-done {signaturesHex} ───────────────► verify each signature against
+ return {txid, signedTxHex, signaturesHex}     own sighashes + output key → done
 ```
 
-### Signature summary
+### Leader
 
-| Signature | Algorithm | Purpose | Produced by |
-|-----------|-----------|---------|-------------|
-| ML-DSA threshold sig | FIPS 204 (Dilithium) | OPNet contract call authorization | 3-round ceremony, leader combines |
-| FROST Schnorr sigs | BIP340 (secp256k1-SHA256-TR) | Bitcoin transaction input signing | 2-round ceremony, leader aggregates |
-| Key-link legacy sig | BIP340 via FROST | Binds ML-DSA identity → BTC key | Produced once during DKG, stored in config |
+1. **Validate the request**: the `ceremonyId` pattern, the `signers` rules, the
+   proposal shape and the 255-input limit. A violation is a `400`.
+2. **Analyse the proposal** against the public key package in its own share and
+   its own network. A rejection is a `400` and nothing is announced.
+3. **Build the signing spec** from that analysis and evaluate its own gate. A
+   reject is a `403` and nothing is announced.
+4. **Announce.** Broadcast `announce-sign {ceremonyId, signers, proposal}`.
+   Sighashes are not sent.
+5. **Sign.** Run `sign-r1` and `sign-r2`: produce its own blob, pull the other
+   signers' blobs.
+6. **Aggregate** per input with the full public key package, so a cheating signer
+   is named. Check each signature against the vault output key.
+7. **Finalize.** `finalizeSend` places the signatures as key-path witnesses
+   (verifying each under BIP340 again) and yields the signed transaction and its
+   txid.
+8. **Sign off.** Broadcast `signoff-done {ceremonyId, signaturesHex}` and return
+   `{ceremonyId, txid, signedTxHex, signaturesHex}` to the caller.
+9. **On any failure after the announce**, broadcast `signoff-aborted` and return
+   `500`.
 
-### Why two signature schemes?
+### Participant
 
-OPNet transactions require **two layers of authorization**:
+A participant drops the announce silently, with a log line naming the reason,
+unless all of these hold:
 
-1. **Contract layer** (ML-DSA): The OPNet VM verifies that the contract call was authorized by the vault's ML-DSA public key. This is a post-quantum signature — resistant to future quantum attacks.
+- the sender is the leader pinned for this `ceremonyId` (first announce wins);
+- the `ceremonyId` has no live session on this node;
+- this node and the leader are in `signers`; `signers` has no duplicates,
+  contains only ring members, and has at least as many entries as the share's
+  threshold;
+- the proposal has at most 255 inputs;
+- the proposal passes the same analysis against this node's own key package and
+  network;
+- this node's gate approves the spec built from that analysis.
 
-2. **Bitcoin layer** (FROST/Schnorr): The Bitcoin network requires valid Taproot signatures on every transaction input. FROST produces standard BIP340 signatures that are indistinguishable from single-key signatures on-chain.
+It then produces `sign-r1`, pulls `sign-r1` from every other signer, produces
+`sign-r2`, and stops: it pulls no `sign-r2` and never aggregates.
 
-The **key-link** ties them together: a FROST signature over a message binding both public keys, verified by the OPNet VM to confirm that the ML-DSA signer controls the BTC address.
+### Nonce rules
+
+These hold for both roles.
+
+- Round 2 runs at most once per session; the guard is set before any work.
+- The commitment list used in round 2 is exactly one pulled set per signer in
+  `signers`, frozen when round 2 starts.
+- The nonces are dropped immediately after round 2.
+- A second announce for a `ceremonyId` with a live session is dropped. A reused
+  `ceremonyId` cannot reuse nonces: each session draws fresh ones, and the blob
+  store rejects a conflicting `sign-r1`.
+
+### Sign-off
+
+A participant stays live until the leader's sign-off or its signing deadline.
+
+| Event | Local outcome |
+|---|---|
+| `signoff-done` from the pinned leader; every signature is valid against the sighashes this node computed and its own output key | `done` |
+| `signoff-done` with any invalid signature | `invalid-signoff` (error log) |
+| `signoff-aborted` from the pinned leader | `aborted` |
+| Analysis failed or this node's gate did not approve | `rejected` |
+| The signing deadline passes first | `timeout` |
 
 ---
 
-## BTC Vault Send
+## Where each check happens
 
-Sends BTC from the FROST P2TR address to any Bitcoin address. FROST-only — no ML-DSA, no OPNet SDK. Simpler and faster than contract signing.
+| Check | Where | On failure |
+|---|---|---|
+| Request shape: unknown fields, `ceremonyId` pattern, `signers` rules, proposal shape, at most 255 inputs | Daemon API (leader) | `400`, nothing announced |
+| Proposal analysis against the node's **own** key and network | Leader before the announce; every participant on the announce | Leader `400`; participant silent drop |
+| Gate on a spec built from that analysis | Leader before the announce; every participant on the announce | Leader `403`; participant silent drop |
+| Announce comes from the pinned leader; `ceremonyId` is new | Participant | Dropped, logged |
+| `signers` valid: contains self and leader, unique, ring members, at least the threshold | Participant | Dropped, logged |
+| DKG announce: no vault, matching network, `parties` = ring size, `2 ≤ threshold ≤ parties`, gate | Each node | Dropped; the `dkg` op returns `409` when the receiving node holds a vault |
+| Sender binding on every pulled blob | Every node, both ceremonies | Ceremony aborts, reason names the sender |
+| DKG round 1 carries exactly `threshold` commitments | Every node | Ceremony aborts |
+| Addressed blobs go only to their recipient | Every node's blob server | The puller gets "not available" |
+| Round 2 runs once; frozen commitment set; nonces dropped | Every signer | Session error |
+| FROST aggregation with the full public key package (names a cheating signer) | Leader (signing); every node (DKG verification) | Ceremony aborts naming the signer |
+| Each signature verified against the vault output key | Leader per input; `finalizeSend` again under BIP340 | Leader `500` |
+| `signoff-done` signatures against own sighashes and output key | Participant | `invalid-signoff` |
+| Sign-offs accepted only from the pinned leader (signing); aborts from any ring member (DKG) | Participant | Ignored |
+| DKG verification signature, then all-N confirmation | Every node | `signoff-aborted`; `.pending` deleted on a node that had not confirmed, kept (with the recovery logged) on one that had |
+| Startup: the share decrypts, its network matches `[network].name`, `partyId` and `parties` match the pubkey book | Each daemon | Refuses to start |
+| Input count, confirmed UTXOs, recipient resolution | `otzi btc send` | Error before any daemon call |
+| Prevout amounts and scripts | Bitcoin consensus: sighashes commit to every input amount and script | Signatures from false prevout data are invalid on chain |
 
-```
- ┌─────────────────────────────────────────────────────────────────────┐
- │                       BTC VAULT SEND                               │
- │                                                                    │
- │  Leader                   Relay              Joiner(s)             │
- │  ──────                   ─────              ─────────             │
- │                                                                    │
- │  PREPARE TRANSACTION                                               │
- │  Enter destination addr                                            │
- │  Enter amount + fee rate                                           │
- │  Click "Initiate"                                                  │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │             TX CONSTRUCTION (leader's backend)                     │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                                                                    │
- │  POST /api/btc/prepare                                             │
- │  ┌──────────────────────────────────────┐                          │
- │  │ Fetch UTXOs for FROST P2TR address   │                          │
- │  │ Coin selection (largest first)       │                          │
- │  │ Build Transaction (key-path only):   │                          │
- │  │   inputs: selected UTXOs             │                          │
- │  │   output 1: destination (amount)     │                          │
- │  │   output 2: change → FROST P2TR     │                          │
- │  │ Compute sighash per input (0x00)     │                          │
- │  │ Cache tx + challengeToken (5 min)    │                          │
- │  └──────────────────────────────────────┘                          │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │             RELAY SESSION                                          │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                                                                    │
- │  Load share file + pw                    Load share file + pw      │
- │  Create relay session ──────────────────► Join with code           │
- │  Broadcast sighashes  ══════════════════► Receive sighashes        │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │             FROST BTC SIGNING (2 rounds)                           │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                                                                    │
- │  FROST ROUND 1 — Nonces                                           │
- │  For each sighash:     ◄════════════════► For each sighash:        │
- │    signRound1() →                           signRound1() →         │
- │    nonces + commitment                      nonces + commitment    │
- │  · All inputs are key-path (tweaked: true)                         │
- │                                                                    │
- │  FROST ROUND 2 — Partial signatures                                │
- │  For each sighash:     ◄════════════════► For each sighash:        │
- │    signRound2() →                           signRound2() →         │
- │    partial Schnorr sig                      partial Schnorr sig    │
- │                                                                    │
- │  FROST AGGREGATE (leader only)                                     │
- │  For each sighash:                                                 │
- │    signAggregate() →                                               │
- │    64-byte Schnorr sig ══════════════════► Receive FROST-COMPLETE  │
- │  ═══ BIP340 signatures produced ═══                               │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │             BROADCAST (leader's backend)                           │
- │  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
- │                                                                    │
- │  POST /api/btc/broadcast                                           │
- │  ┌──────────────────────────────────────┐                          │
- │  │ Retrieve cached tx                   │                          │
- │  │ Inject FROST sigs as key-path        │                          │
- │  │   witness = [64-byte Schnorr sig]    │                          │
- │  │ Broadcast to network                 │                          │
- │  └──────────────────────────────────────┘                          │
- │  ═══ Transaction broadcast ═══            See result               │
- └─────────────────────────────────────────────────────────────────────┘
-```
-
-### Key differences from contract signing
-
-| Aspect | Contract signing | BTC vault send |
-|--------|-----------------|---------------|
-| ML-DSA ceremony | Required (3 rounds) | Skipped |
-| FROST ceremony | 2 rounds | 2 rounds |
-| Input types | Mixed (script-path + key-path) | Key-path only |
-| TX construction | OPNet SDK capture pattern | Direct Transaction build |
-| Broadcast target | OPNet provider | OPNet provider (testnet) / mempool.space (mainnet) |
-
----
-
-### Template transaction approach
-
-Rather than having the SDK re-derive transactions (which involves non-deterministic UTXO selection and fee estimation), Ötzi uses a **capture-and-inject** pattern:
-
-1. **Capture**: Build the full transaction with a dummy signer that records every sighash the SDK requests, producing template transactions with placeholder signatures.
-2. **Sign**: Run the FROST ceremony over the captured sighashes.
-3. **Inject**: Replace the placeholder signatures in the template transactions with real FROST signatures.
-4. **Broadcast**: Send the final transactions to the network.
-
-This avoids the problem of the SDK producing a different transaction on rebuild (different UTXOs, different fees), which would invalidate the FROST signatures.
+A node that fails a check on an announce stays silent. To its peers it is
+indistinguishable from an offline node, and the leader's ceremony fails.

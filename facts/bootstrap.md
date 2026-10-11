@@ -40,7 +40,7 @@
 
 - `computeFingerprint(book: PubkeyBook): Promise<string>`
   - **Pre:** book is valid `PubkeyBook`.
-  - **Post:** Returns 8-character lowercase hex string = first 32 bits (4 bytes) of SHA-256 hash over concatenated raw pubkey bytes (65B each) in sorted order.
+  - **Post:** Returns the 96-bit fingerprint: the first 12 bytes of SHA-256 over the concatenated raw pubkey bytes (65B each) in book order (ascending `partyId` = ascending raw pubkey bytes), as lowercase hex in six groups of 4 joined by `-` — `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` (29 characters).
   - **Throws:** Never (crypto operation assumed to succeed).
   - **Concurrency:** Async; safe to call in parallel.
 
@@ -49,7 +49,7 @@
 - Every `publicKeyHex` is exactly 130 chars (65 bytes), lowercase, starts with `04`.
 - `partyId` values are unique and non-negative integers, derived during bootstrap from sorted-pubkey-bytes order (every peer assigns identical mapping).
 - `advertisedEndpoint` is in canonical form (lowercase host, default port 8800 filled in, RFC 5952 IPv6, no wildcards) — caller must apply `canonicalizeEndpoint` before construction.
-- Fingerprint is computed over the sorted raw pubkey bytes (no metadata), so all nodes derive the same 8-char hex.
+- Fingerprint is computed over the sorted raw pubkey bytes (no metadata), so all nodes derive the same `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` string.
 - JSON serialization is stable (JSON.stringify with fixed 2-space indent); re-parsing the same book yields the same sorted order.
 
 **Cross-component contracts:**
@@ -60,7 +60,7 @@
 **Notes / gotchas:**
 - `buildBook` sorts entries *in-place* after copying (not lazy); ensures canonical order immediately.
 - `computeFingerprint` hashes raw P-256 bytes (0x04 || X || Y), not compressed or any other format.
-- Operators must visually compare 8-char fingerprints across all daemons before proceeding; mismatch = abort + redo bootstrap.
+- Operators compare the 96-bit fingerprint out of band across all daemons before any DKG; mismatch = abort + redo bootstrap.
 - Legacy `nodeId` field: dropped in Phase F. `parseBook` strict-rejects entries containing it; cross-node identity is by raw pubkey, local labels live only in `config.node.id`.
 
 ---
@@ -75,7 +75,7 @@
 
 - `MasterBootstrapResult`
   - **Pre:** none
-  - **Post:** Contains final `book` and 8-char `fingerprint`.
+  - **Post:** Contains final `book` and the 96-bit `fingerprint` (`computeFingerprint` format).
 
 - `runMasterBootstrap(input: MasterBootstrapInputs): Promise<MasterBootstrapResult>`
   - **Pre:** `input.bind` is valid `"host:port"` string. `input.self.identity` has 65-byte `publicKeyRaw`. `input.self.advertisedEndpoint` is canonical (caller already applied `canonicalizeEndpoint`). `input.expectedPeers[*].advertisedEndpoint` are all canonical and do not include self.
@@ -122,7 +122,7 @@
   - **Post:** Configuration specifying self identity + advertisedEndpoint, leader URL, optional timeout and logger.
 
 - `MemberRegisterResult`
-  - **Post:** Contains final `book` and 8-char `fingerprint`.
+  - **Post:** Contains final `book` and the 96-bit `fingerprint` (`computeFingerprint` format).
 
 - `runMemberRegister(input: MemberRegisterInputs): Promise<MemberRegisterResult>`
   - **Pre:** `input.masterUrl` is valid URL. `input.self.identity.publicKeyRaw` is 65-byte P-256 public key. `input.self.advertisedEndpoint` is canonical (caller applied `canonicalizeEndpoint`).
@@ -144,7 +144,7 @@
 
 **Notes / gotchas:**
 - Member self-check by pubkey catches a compromised leader substituting the member's pubkey for a different one.
-- Fingerprint check across all nodes is the last-line defense; must be done by operators eyeball-comparing the 8-char string.
+- Fingerprint check across all nodes is the last-line defense; operators compare the `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` string out of band.
 - Timeout applies to the entire POST + wait loop, not individual network operations.
 - `connection: close` header is set by leader, so member's cleanup is automatic.
 

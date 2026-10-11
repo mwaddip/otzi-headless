@@ -89,6 +89,16 @@ isn't emitting drops in the queried window (normal when no scanners are
 hitting the listen port); zero-matched-from-non-zero-lines means the regex
 is wrong against the deployed daemon's logger format — file an issue.
 
+## Why the filter is anchored
+
+Some daemon log lines carry text that comes from peers (a `signoff-aborted`
+reason, for one). The daemon's logger writes every entry as exactly one line —
+it escapes newlines and every other control character — and the filter only
+matches a line that *starts* with `WARN peer-allowlist: dropped connection from
+non-peer source {"ip":…` (after journald's `<host> <ident>[<pid>]: ` prefix).
+Together these keep a peer from writing a fake drop line that would get an
+honest peer's IP banned. Keep the anchor if you adapt the regex.
+
 ## Files
 
 - `otzi.conf` — fail2ban filter (the regex that captures the offending IP).

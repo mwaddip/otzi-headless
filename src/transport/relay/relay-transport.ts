@@ -15,6 +15,14 @@
  * with an `ack { roster }` listing currently-connected peers. Subsequent
  * `peer-joined` / `peer-left` events push roster changes. Initiators start
  * their handshake when the roster learns of a higher-partyId peer.
+ *
+ * Ordering: every frame to a peer (hs1, hs2, records) takes its turn in that
+ * peer's send chain, sealing and reaching the relay socket in counter order.
+ *
+ * Re-handshake: a broken session is replaced by a fresh handshake, always
+ * started by the initiator — on its own record failure, on the next send or
+ * pull, or on a re-handshake request (an empty frame) from the responder. A
+ * responder accepts a fresh hs1 in any state.
  */
 
 import { WebSocket } from 'ws';
@@ -30,6 +38,7 @@ import {
 import { RecordSession } from '../record';
 import {
   broadcastBytes,
+  MAX_FRAME_BYTES,
   encodeBroadcast,
   encodePullRequest,
   encodePullResponse,
@@ -39,7 +48,7 @@ import {
   type AppMessage,
 } from '../peer-mesh/wire';
 import { NOOP_LOGGER, type Logger } from '../../orchestrator/types';
-import { fromHex, toHex } from '../../wire/hex';
+import { fromHex, toHex } from '../../otzi/lib/hex';
 import {
   encodeClientMsg,
   parseServerMsg,
@@ -72,6 +81,13 @@ interface PeerState {
   status: PeerStatus;
   session: RecordSession | null;
   initiatorState: InitiatorState | null;
+  /** On the relay roster (ack / peer-joined, until peer-left or relay close). */
+  online: boolean;
+  /** Initiator: when the current handshake started, and which one it is. */
+  handshakeStartedAt: number;
+  handshakeAttempt: number;
+  /** Serialises every frame to this peer (handshake and records): the relay sees them in counter order. */
+  sendChain: Promise<void>;
   /**
    * Per-peer FIFO queue of raw payloads awaiting dispatch. `processing` guards
    * against interleaving state transitions — if a second message arrives while
@@ -86,9 +102,16 @@ interface PendingPull {
   resolve: (blob: Uint8Array | null) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+  /** The producer asked; the end of its session resolves the pull with null. */
+  peer: PartyId;
 }
 
 const DEFAULT_PULL_TIMEOUT_MS = 30_000;
+/** An initiator handshake without hs2 for this long may be restarted. */
+const HANDSHAKE_TIMEOUT_MS = 10_000;
+/** Handshake messages are raw uncompressed P-256 points. */
+const HANDSHAKE_FRAME_BYTES = 65;
+const EMPTY = new Uint8Array(0);
 
 export class RelayTransport implements Transport {
   readonly partyId: PartyId;
@@ -110,7 +133,8 @@ export class RelayTransport implements Transport {
   constructor(options: RelayTransportOptions) {
     this.self = options.self;
     this.partyId = options.self.partyId;
-    this.peers = options.peers.map((p) => p.partyId);
+    // Every ring member, self included (the Transport contract); `options.peers` lists the others.
+    this.peers = [this.partyId, ...options.peers.map((p) => p.partyId)].sort((a, b) => a - b);
     this.relayUrl = options.relayUrl;
     this.ringId = options.ringId;
     this.wsCtor = options.wsCtor ?? WebSocket;
@@ -127,6 +151,10 @@ export class RelayTransport implements Transport {
         status: 'disconnected',
         session: null,
         initiatorState: null,
+        online: false,
+        handshakeStartedAt: 0,
+        handshakeAttempt: 0,
+        sendChain: Promise.resolve(),
         pending: [],
         processing: false,
       });
@@ -135,7 +163,7 @@ export class RelayTransport implements Transport {
 
   async start(): Promise<void> {
     if (this.ws) return;
-    const ws = new this.wsCtor(this.relayUrl);
+    const ws = new this.wsCtor(this.relayUrl, { maxPayload: MAX_FRAME_BYTES });
     this.ws = ws;
 
     await new Promise<void>((resolve, reject) => {
@@ -184,9 +212,8 @@ export class RelayTransport implements Transport {
       }
     }
     for (const peer of this.peerStates.values()) {
-      peer.status = 'disconnected';
-      peer.session = null;
-      peer.initiatorState = null;
+      peer.online = false;
+      this.endSession(peer, 'disconnected');
     }
     this.log.info('relay-transport: stopped');
   }
@@ -197,13 +224,15 @@ export class RelayTransport implements Transport {
 
   async broadcast(msg: Uint8Array): Promise<void> {
     // Fan-out: each peer gets its own AES-GCM seal (each session has distinct keys).
+    const appMessage = encodeBroadcast(msg);
     await Promise.all(
       [...this.peerStates.values()].map(async (peer) => {
-        if (peer.status !== 'connected' || !peer.session) return;
+        if (peer.status !== 'connected' || !peer.session) {
+          this.maybeStartHandshake(peer);
+          return;
+        }
         try {
-          const appMessage = encodeBroadcast(msg);
-          const ct = await peer.session.seal(appMessage);
-          await this.sendFrame(peer.partyId, ct);
+          await this.sendAppMessage(peer, appMessage);
         } catch (err) {
           this.log.warn('relay-transport: broadcast seal/send failed', {
             peerPartyId: peer.partyId,
@@ -224,7 +253,10 @@ export class RelayTransport implements Transport {
   async pull(key: BlobKey): Promise<Uint8Array | null> {
     const peer = this.peerStates.get(key.from);
     if (!peer) throw new Error(`relay-transport: pull target partyId=${key.from} is not in the ring`);
-    if (peer.status !== 'connected' || !peer.session) return null;
+    if (peer.status !== 'connected' || !peer.session) {
+      this.maybeStartHandshake(peer);
+      return null;
+    }
 
     const requestId = randomId();
     const result = new Promise<Uint8Array | null>((resolve, reject) => {
@@ -233,20 +265,15 @@ export class RelayTransport implements Transport {
         // Timeout is transient — BlobPuller's retry loop handles it.
         resolve(null);
       }, this.pullTimeoutMs);
-      this.pendingPulls.set(requestId, { resolve, reject, timer });
+      this.pendingPulls.set(requestId, { resolve, reject, timer, peer: peer.partyId });
     });
 
     try {
-      const appMessage = encodePullRequest(requestId, key);
-      const ct = await peer.session.seal(appMessage);
-      await this.sendFrame(peer.partyId, ct);
+      await this.sendAppMessage(peer, encodePullRequest(requestId, key));
     } catch (err) {
-      const pending = this.pendingPulls.get(requestId);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pendingPulls.delete(requestId);
-      }
-      throw new Error(`relay-transport: pull send failed: ${errMsg(err)}`);
+      // Transient as well: the session is gone or being replaced; the caller retries.
+      this.log.warn('relay-transport: pull request send failed', { peerPartyId: peer.partyId, err: errMsg(err) });
+      this.settlePull(requestId, null);
     }
 
     return result;
@@ -294,6 +321,7 @@ export class RelayTransport implements Transport {
     for (const partyId of roster) {
       const peer = this.peerStates.get(partyId);
       if (!peer) continue;
+      peer.online = true;
       if (peer.role === 'initiator') void this.startInitiatorHandshake(peer);
       else peer.status = 'waiting-for-hs1';
     }
@@ -302,16 +330,17 @@ export class RelayTransport implements Transport {
   private async onPeerJoined(partyId: PartyId): Promise<void> {
     const peer = this.peerStates.get(partyId);
     if (!peer) return;
-    if (peer.role === 'initiator') void this.startInitiatorHandshake(peer);
-    else peer.status = 'waiting-for-hs1';
+    peer.online = true;
+    // A (re)joined peer holds no session: any handshake in flight went to its previous connection.
+    if (peer.role === 'initiator') void this.startInitiatorHandshake(peer, { restart: true });
+    else this.endSession(peer, 'waiting-for-hs1');
   }
 
   private onPeerLeft(partyId: PartyId): void {
     const peer = this.peerStates.get(partyId);
     if (!peer) return;
-    peer.status = 'disconnected';
-    peer.session = null;
-    peer.initiatorState = null;
+    peer.online = false;
+    this.endSession(peer, 'disconnected');
     peer.pending.length = 0;
     this.log.info('relay-transport: peer left', { partyId });
   }
@@ -322,6 +351,8 @@ export class RelayTransport implements Transport {
       this.log.warn('relay-transport: incoming from unknown partyId', { from });
       return;
     }
+    // The relay forwards only from connected ring members.
+    peer.online = true;
     peer.pending.push(payload);
     if (peer.processing) return;
     peer.processing = true;
@@ -336,64 +367,124 @@ export class RelayTransport implements Transport {
   }
 
   private async dispatchIncoming(peer: PeerState, payload: Uint8Array): Promise<void> {
-    if (peer.status === 'waiting-for-hs1') {
-      await this.completeResponderHandshake(peer, payload);
+    if (payload.length === 0) {
+      // A re-handshake request: the responder lost the session.
+      if (peer.role === 'initiator') this.onRehandshakeRequest(peer);
       return;
     }
+    if (peer.role === 'responder') {
+      if (peer.status === 'connected' && peer.session) {
+        if (await this.handleConnectedIncoming(peer, payload)) return;
+        // Not a record of this session: a fresh hs1 from the initiator, or a broken session.
+        if (isHandshakeFrame(payload)) {
+          await this.completeResponderHandshake(peer, payload);
+          return;
+        }
+        this.log.warn('relay-transport: record auth failed; asking the initiator to re-handshake', {
+          peerPartyId: peer.partyId,
+        });
+        this.endSession(peer, 'waiting-for-hs1');
+        this.requestRehandshake(peer);
+        return;
+      }
+      if (isHandshakeFrame(payload)) {
+        await this.completeResponderHandshake(peer, payload);
+        return;
+      }
+      // A record while this node holds no session: the initiator still holds one.
+      this.requestRehandshake(peer);
+      return;
+    }
+
+    // Initiator.
     if (peer.status === 'waiting-for-hs2') {
-      await this.completeInitiatorHandshake(peer, payload);
+      if (isHandshakeFrame(payload) && peer.initiatorState) await this.completeInitiatorHandshake(peer, payload);
+      // Anything else is a record the responder sealed under the old session: dropped.
       return;
     }
     if (peer.status === 'connected' && peer.session) {
-      await this.handleConnectedIncoming(peer, payload);
+      if (await this.handleConnectedIncoming(peer, payload)) return;
+      this.log.warn('relay-transport: record auth failed; re-handshaking', { peerPartyId: peer.partyId });
+      void this.startInitiatorHandshake(peer, { restart: true });
       return;
     }
-    this.log.warn('relay-transport: incoming in unexpected state', {
-      from: peer.partyId,
-      status: peer.status,
-    });
+    // A record while this node holds no session: the responder still holds one.
+    this.maybeStartHandshake(peer);
   }
 
   // ─────────────────────────────────────────────────────────────────────
   // Handshake
   // ─────────────────────────────────────────────────────────────────────
 
-  private async startInitiatorHandshake(peer: PeerState): Promise<void> {
-    if (peer.status !== 'disconnected') return;
+  /** Initiator: start a handshake to an online peer that has none, or whose handshake went stale. */
+  private maybeStartHandshake(peer: PeerState): void {
+    if (peer.role !== 'initiator' || !peer.online) return;
+    const stale =
+      peer.status === 'waiting-for-hs2' && Date.now() - peer.handshakeStartedAt > HANDSHAKE_TIMEOUT_MS;
+    if (peer.status === 'disconnected' || stale) void this.startInitiatorHandshake(peer, { restart: true });
+  }
+
+  private onRehandshakeRequest(peer: PeerState): void {
+    if (peer.status === 'waiting-for-hs2') {
+      this.maybeStartHandshake(peer); // only when stale: a handshake is already under way
+      return;
+    }
+    this.log.info('relay-transport: re-handshake requested', { peerPartyId: peer.partyId });
+    void this.startInitiatorHandshake(peer, { restart: true });
+  }
+
+  /** Responder: ask the initiator for a fresh handshake (an empty frame). */
+  private requestRehandshake(peer: PeerState): void {
+    this.enqueueFrame(peer, async () => EMPTY).catch((err) =>
+      this.log.warn('relay-transport: re-handshake request send failed', {
+        peerPartyId: peer.partyId,
+        err: errMsg(err),
+      }),
+    );
+  }
+
+  private async startInitiatorHandshake(peer: PeerState, opts: { restart?: boolean } = {}): Promise<void> {
+    if (this.stopped || !this.ws || peer.role !== 'initiator') return;
+    if (peer.status !== 'disconnected' && !opts.restart) return;
+    // Synchronously: the old session ends (its pulls resolve null) and later triggers see a handshake under way.
+    this.endSession(peer, 'waiting-for-hs2');
+    peer.handshakeStartedAt = Date.now();
+    const attempt = ++peer.handshakeAttempt;
     try {
       const { state, message1 } = await initiatorBegin(this.self.identity);
+      if (peer.handshakeAttempt !== attempt || peer.status !== 'waiting-for-hs2') return; // superseded
       peer.initiatorState = state;
-      peer.status = 'waiting-for-hs2';
-      await this.sendFrame(peer.partyId, message1);
+      await this.enqueueFrame(peer, async () => message1);
       this.log.info('relay-transport: sent hs1', { peerPartyId: peer.partyId });
     } catch (err) {
+      if (peer.handshakeAttempt !== attempt) return;
       this.log.warn('relay-transport: initiator handshake start failed', {
         peerPartyId: peer.partyId,
         err: errMsg(err),
       });
-      peer.status = 'disconnected';
-      peer.initiatorState = null;
+      this.endSession(peer, 'disconnected');
     }
   }
 
   private async completeInitiatorHandshake(peer: PeerState, message2: Uint8Array): Promise<void> {
-    if (!peer.initiatorState) {
-      peer.status = 'disconnected';
-      return;
-    }
+    const state = peer.initiatorState;
+    if (!state) return;
+    const attempt = peer.handshakeAttempt;
     try {
-      const secrets = await initiatorFinish(peer.initiatorState, message2, peer.publicKey);
-      peer.session = await RecordSession.create(secrets);
+      const secrets = await initiatorFinish(state, message2, peer.publicKey);
+      const session = await RecordSession.create(secrets);
+      if (peer.handshakeAttempt !== attempt || peer.initiatorState !== state) return; // superseded
+      peer.session = session;
       peer.status = 'connected';
       peer.initiatorState = null;
       this.log.info('relay-transport: handshake complete (initiator)', { peerPartyId: peer.partyId });
     } catch (err) {
+      if (peer.handshakeAttempt !== attempt) return;
       this.log.warn('relay-transport: initiator finish failed', {
         peerPartyId: peer.partyId,
         err: errMsg(err),
       });
-      peer.status = 'disconnected';
-      peer.initiatorState = null;
+      this.endSession(peer, 'disconnected');
     }
   }
 
@@ -404,16 +495,41 @@ export class RelayTransport implements Transport {
         message1,
         peer.publicKey,
       );
-      peer.session = await RecordSession.create(secrets);
-      peer.status = 'connected';
-      await this.sendFrame(peer.partyId, message2);
+      const session = await RecordSession.create(secrets);
+      // One synchronous step: the old session ends, the new one is usable, and hs2
+      // takes its place in the send chain ahead of every record sealed under it.
+      this.endSession(peer, 'connected');
+      peer.session = session;
+      const sent = this.enqueueFrame(peer, async () => message2);
+      await sent;
       this.log.info('relay-transport: handshake complete (responder)', { peerPartyId: peer.partyId });
     } catch (err) {
       this.log.warn('relay-transport: responder handshake failed', {
         peerPartyId: peer.partyId,
         err: errMsg(err),
       });
-      peer.status = 'disconnected';
+      this.endSession(peer, 'waiting-for-hs1');
+    }
+  }
+
+  /** Drop the peer's session and handshake state; its pending pulls resolve null. */
+  private endSession(peer: PeerState, status: PeerStatus): void {
+    peer.status = status;
+    peer.session = null;
+    peer.initiatorState = null;
+    for (const [requestId, pending] of this.pendingPulls) {
+      if (pending.peer === peer.partyId) this.settlePull(requestId, null);
+    }
+  }
+
+  /** A sealed record never reached the peer: the counters diverged, so the session is useless. */
+  private sessionBroken(peer: PeerState, reason: string): void {
+    this.log.warn('relay-transport: session broken', { peerPartyId: peer.partyId, reason });
+    if (peer.role === 'initiator') {
+      void this.startInitiatorHandshake(peer, { restart: true });
+    } else {
+      this.endSession(peer, 'waiting-for-hs1');
+      this.requestRehandshake(peer);
     }
   }
 
@@ -421,25 +537,23 @@ export class RelayTransport implements Transport {
   // Connected traffic
   // ─────────────────────────────────────────────────────────────────────
 
-  private async handleConnectedIncoming(peer: PeerState, ciphertext: Uint8Array): Promise<void> {
-    if (!peer.session) return;
+  /** False when the frame does not open under the current session (nothing is dispatched). */
+  private async handleConnectedIncoming(peer: PeerState, ciphertext: Uint8Array): Promise<boolean> {
+    const session = peer.session;
+    if (!session) return false;
     let plaintext: Uint8Array;
     try {
-      plaintext = await peer.session.open(ciphertext);
+      plaintext = await session.open(ciphertext);
     } catch {
-      this.log.warn('relay-transport: record auth failed; tearing down peer', {
-        peerPartyId: peer.partyId,
-      });
-      peer.status = 'disconnected';
-      peer.session = null;
-      return;
+      return false;
     }
     const msg = parseAppMessage(plaintext);
     if (!msg) {
       this.log.warn('relay-transport: malformed app message', { peerPartyId: peer.partyId });
-      return;
+      return true;
     }
     this.dispatchAppMessage(peer, msg);
+    return true;
   }
 
   private dispatchAppMessage(peer: PeerState, msg: AppMessage): void {
@@ -463,33 +577,76 @@ export class RelayTransport implements Transport {
       case 'pull-resp': {
         const pending = this.pendingPulls.get(msg.requestId);
         if (!pending) return;
-        clearTimeout(pending.timer);
-        this.pendingPulls.delete(msg.requestId);
-        pending.resolve(pullResponseBlob(msg));
+        // Only the peer that was asked may answer.
+        if (pending.peer !== peer.partyId) {
+          this.log.warn('relay-transport: dropped a pull response from a peer the pull was not sent to', {
+            peerPartyId: peer.partyId,
+          });
+          return;
+        }
+        this.settlePull(msg.requestId, pullResponseBlob(msg));
         return;
       }
     }
   }
 
+  /** Resolve a pending pull (idempotent). */
+  private settlePull(requestId: string, blob: Uint8Array | null): void {
+    const pending = this.pendingPulls.get(requestId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingPulls.delete(requestId);
+    pending.resolve(blob);
+  }
+
+  /** Seal under the current session and send, in this peer's send chain. */
   private async sendAppMessage(peer: PeerState, appBytes: Uint8Array): Promise<void> {
-    if (!peer.session || peer.status !== 'connected')
+    const session = peer.session;
+    if (!session || peer.status !== 'connected')
       throw new Error(`relay-transport: peer ${peer.partyId} not connected`);
-    const ct = await peer.session.seal(appBytes);
-    await this.sendFrame(peer.partyId, ct);
+    let sealed = false;
+    try {
+      await this.enqueueFrame(peer, async () => {
+        // Queued behind a re-handshake: a record of the old session would only fail at the peer.
+        if (peer.session !== session) throw new Error(`relay-transport: session with peer ${peer.partyId} was replaced`);
+        const ct = await session.seal(appBytes);
+        sealed = true;
+        return ct;
+      });
+    } catch (err) {
+      if (sealed && peer.session === session) this.sessionBroken(peer, `send failed: ${errMsg(err)}`);
+      throw err;
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────
   // Relay-level IO
   // ─────────────────────────────────────────────────────────────────────
 
-  private async sendFrame(to: PartyId, payload: Uint8Array): Promise<void> {
-    await this.sendToRelay({ kind: 'frame', to, payloadHex: toHex(payload) });
+  /**
+   * Take this frame's turn in the peer's send chain: produce it (seal, or a
+   * handshake message) and hand it to the relay socket before the next frame
+   * may produce. Resolves when the write completes.
+   */
+  private enqueueFrame(peer: PeerState, produce: () => Promise<Uint8Array>): Promise<void> {
+    let written: Promise<void> | undefined;
+    const turn = peer.sendChain.then(async () => {
+      const payload = await produce();
+      written = this.sendFrame(peer.partyId, payload);
+    });
+    peer.sendChain = turn.catch(() => {});
+    return turn.then(() => written);
   }
 
-  private async sendToRelay(msg: RelayClientMsg): Promise<void> {
+  /** Calls `ws.send` synchronously (frame order = call order); resolves on write completion. */
+  private sendFrame(to: PartyId, payload: Uint8Array): Promise<void> {
+    return this.sendToRelay({ kind: 'frame', to, payloadHex: toHex(payload) });
+  }
+
+  private sendToRelay(msg: RelayClientMsg): Promise<void> {
     const ws = this.ws;
-    if (!ws) throw new Error('relay-transport: not started');
-    await new Promise<void>((resolve, reject) => {
+    if (!ws) return Promise.reject(new Error('relay-transport: not connected to the relay'));
+    return new Promise<void>((resolve, reject) => {
       ws.send(encodeClientMsg(msg), (err) => (err ? reject(err) : resolve()));
     });
   }
@@ -498,9 +655,8 @@ export class RelayTransport implements Transport {
     if (this.stopped) return;
     this.log.warn('relay-transport: relay connection closed');
     for (const peer of this.peerStates.values()) {
-      peer.status = 'disconnected';
-      peer.session = null;
-      peer.initiatorState = null;
+      peer.online = false;
+      this.endSession(peer, 'disconnected');
     }
     this.ws = null;
     // Reconnection to the relay is not implemented in phase 3e — operator
@@ -511,6 +667,15 @@ export class RelayTransport implements Transport {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * The shape of hs1 / hs2: a raw uncompressed P-256 point. It is only consulted
+ * for frames that do not open under a session; a stray frame of this shape
+ * fails the handshake step (not a valid point), and the initiator retries.
+ */
+function isHandshakeFrame(payload: Uint8Array): boolean {
+  return payload.length === HANDSHAKE_FRAME_BYTES && payload[0] === 0x04;
 }
 
 function randomId(): string {

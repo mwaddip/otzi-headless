@@ -21,23 +21,21 @@ import {
   BACKUP_HEADER_LEN,
   BACKUP_PBKDF2_ITERATIONS,
 } from './backup';
+import * as backupModule from './backup';
 
 interface Fixture {
   configPath: string;
-  manifestPath: string;
   sharePath: string;
   identityPath: string;
   pubkeyBookPath: string;
   vaultPubkeyPath: string;
-  bootstrapSecretPath: string;
+  addressBookPath: string;
   expectedShareTar: string;
   expectedIdTar: string;
   expectedPubTar: string;
 }
 
 interface FixtureOpts {
-  /** Skip writing the manifest file (test optional skip). */
-  skipManifest?: boolean;
   /** Skip writing the share file (test required-file failure). */
   skipShare?: boolean;
   /** Skip writing the identity file (test required-file failure). */
@@ -46,16 +44,16 @@ interface FixtureOpts {
   skipPubkeys?: boolean;
   /** Skip writing the vault-pubkey cache (test optional skip). */
   skipVaultPubkey?: boolean;
-  /** Skip writing the bootstrap-secret (test optional skip). */
-  skipBootstrapSecret?: boolean;
+  /** Skip writing the address book (test optional skip). */
+  skipAddressBook?: boolean;
 }
 
 /**
  * Materialize a fake daemon install layout under `root`. The share / identity
  * / pubkey-book paths are encoded into the daemon.toml so backup discovers
- * them via the real config-parsing path. The "fixed" paths (manifest,
- * vault-pubkey, bootstrap-secret) are tmpdir-rooted and have to be passed via
- * `pathOverrides` to runBackup — those paths aren't in the config.
+ * them via the real config-parsing path. The "fixed" paths (vault-pubkey,
+ * address book) are tmpdir-rooted and have to be passed via `pathOverrides` to
+ * runBackup — they aren't in the config.
  */
 async function buildFixture(root: string, opts: FixtureOpts = {}): Promise<Fixture> {
   const etcDir = join(root, 'etc', 'otzi');
@@ -67,8 +65,7 @@ async function buildFixture(root: string, opts: FixtureOpts = {}): Promise<Fixtu
   const identityPath = join(varDir, 'identity.json');
   const pubkeyBookPath = join(varDir, 'pubkeys.json');
   const vaultPubkeyPath = join(varDir, 'vault-pubkey.json');
-  const bootstrapSecretPath = join(varDir, 'bootstrap-secret');
-  const manifestPath = join(etcDir, 'manifest.otzi.json');
+  const addressBookPath = join(etcDir, 'address-book.otzi.json');
 
   const tomlText = `
 [share]
@@ -81,8 +78,7 @@ identity_key_file = "${identityPath}"
 pubkey_book_file = "${pubkeyBookPath}"
 
 [network]
-name = "regtest"
-opnet_rpc = "https://example/rpc"
+name = "testnet4"
 
 [transport]
 kind = "peer-mesh"
@@ -97,12 +93,6 @@ strategy = "auto"
   const configPath = join(etcDir, 'daemon.toml');
   await writeFile(configPath, tomlText);
 
-  if (!opts.skipManifest) {
-    await writeFile(
-      manifestPath,
-      JSON.stringify({ version: 1, name: 'fixture', contracts: [] }),
-    );
-  }
   if (!opts.skipShare) {
     await writeFile(sharePath, JSON.stringify({ version: 3, partyId: 7 }), {
       mode: 0o600,
@@ -117,25 +107,30 @@ strategy = "auto"
   if (!opts.skipVaultPubkey) {
     await writeFile(vaultPubkeyPath, JSON.stringify({ p2tr: 'bc1p...' }));
   }
-  if (!opts.skipBootstrapSecret) {
-    await writeFile(bootstrapSecretPath, 'super-secret-bootstrap-token\n', {
-      mode: 0o660,
-    });
+  if (!opts.skipAddressBook) {
+    await writeFile(addressBookPath, ADDRESS_BOOK_JSON, { mode: 0o640 });
   }
 
   return {
     configPath,
-    manifestPath,
     sharePath,
     identityPath,
     pubkeyBookPath,
     vaultPubkeyPath,
-    bootstrapSecretPath,
+    addressBookPath,
     expectedShareTar: stripLead(sharePath),
     expectedIdTar: stripLead(identityPath),
     expectedPubTar: stripLead(pubkeyBookPath),
   };
 }
+
+const ADDRESS_BOOK_TAR = 'etc/otzi/address-book.otzi.json';
+const ADDRESS_BOOK_JSON = JSON.stringify({
+  kind: 'otzi-address-book',
+  version: 1,
+  network: 'testnet4',
+  entries: [{ label: 'treasury', address: 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx' }],
+});
 
 function stripLead(p: string): string {
   return p.startsWith('/') ? p.slice(1) : p;
@@ -176,11 +171,7 @@ function decryptBackup(buf: Buffer, password: string): Buffer {
 
 /** Build the `pathOverrides` block from a fixture. */
 function overridesFrom(f: Fixture) {
-  return {
-    manifest: f.manifestPath,
-    vaultPubkey: f.vaultPubkeyPath,
-    bootstrapSecret: f.bootstrapSecretPath,
-  };
+  return { vaultPubkey: f.vaultPubkeyPath, addressBook: f.addressBookPath };
 }
 
 describe('runBackup', () => {
@@ -217,12 +208,11 @@ describe('runBackup', () => {
     expect(new Set(result.filesIncluded)).toEqual(
       new Set([
         'etc/otzi/daemon.toml',
-        'etc/otzi/manifest.otzi.json',
         f.expectedShareTar,
         f.expectedPubTar,
         f.expectedIdTar,
         'var/lib/otzi/vault-pubkey.json',
-        'var/lib/otzi/bootstrap-secret',
+        ADDRESS_BOOK_TAR,
         'meta.json',
       ]),
     );
@@ -233,11 +223,7 @@ describe('runBackup', () => {
   });
 
   it('skips missing optional files silently', async () => {
-    const f = await buildFixture(tmp, {
-      skipManifest: true,
-      skipVaultPubkey: true,
-      skipBootstrapSecret: true,
-    });
+    const f = await buildFixture(tmp, { skipVaultPubkey: true });
     const out = join(tmp, 'out');
     const result = await runBackup({
       configPath: f.configPath,
@@ -251,9 +237,47 @@ describe('runBackup', () => {
     expect(result.filesIncluded).toContain(f.expectedPubTar);
     expect(result.filesIncluded).toContain('meta.json');
 
-    expect(result.filesIncluded).not.toContain('etc/otzi/manifest.otzi.json');
     expect(result.filesIncluded).not.toContain('var/lib/otzi/vault-pubkey.json');
-    expect(result.filesIncluded).not.toContain('var/lib/otzi/bootstrap-secret');
+    expect(result.filesIncluded).toContain(ADDRESS_BOOK_TAR);
+  });
+
+  it('includes the address book at etc/otzi/address-book.otzi.json when present, and skips it when absent', async () => {
+    const f = await buildFixture(tmp);
+    const withBook = await runBackup({
+      configPath: f.configPath,
+      outputDir: join(tmp, 'out'),
+      pathOverrides: overridesFrom(f),
+    });
+    expect(withBook.filesIncluded).toContain(ADDRESS_BOOK_TAR);
+
+    const none = await buildFixture(join(tmp, 'bare'), { skipAddressBook: true });
+    const withoutBook = await runBackup({
+      configPath: none.configPath,
+      outputDir: join(tmp, 'out'),
+      pathOverrides: overridesFrom(none),
+    });
+    expect(withoutBook.filesIncluded).not.toContain(ADDRESS_BOOK_TAR);
+    expect(withoutBook.filesIncluded).toContain('etc/otzi/daemon.toml');
+  });
+
+  it('exports default paths only for the files the vault actually has', () => {
+    // facts/daemon.md "Backup file set": neither a manifest nor a
+    // bootstrap-window token is in the file set, so no default path constant
+    // for them exists for `runBackup` or `runRestore` to reference. The
+    // address book is in the file set, and its constant is the store's.
+    expect(backupModule.DEFAULT_ADDRESS_BOOK_PATH).toBe('/etc/otzi/address-book.otzi.json');
+    const pathConstants = Object.keys(backupModule).filter((k) =>
+      k.startsWith('DEFAULT_'),
+    );
+    expect(pathConstants.filter((k) => /MANIFEST|BOOTSTRAP/.test(k))).toEqual([]);
+    expect(pathConstants.sort()).toEqual([
+      'DEFAULT_ADDRESS_BOOK_PATH',
+      'DEFAULT_DAEMON_CONFIG_PATH',
+      'DEFAULT_IDENTITY_PATH',
+      'DEFAULT_PUBKEY_BOOK_PATH',
+      'DEFAULT_SHARE_PATH',
+      'DEFAULT_VAULT_PUBKEY_PATH',
+    ]);
   });
 
   it('fails clearly when a required file (share) is missing', async () => {

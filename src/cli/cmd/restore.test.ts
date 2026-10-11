@@ -4,35 +4,81 @@
  * coverage to make sure the friendly messages survive refactors.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
+  chmod,
+  lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from 'node:fs/promises';
+import { gzipSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
-import { runBackup, BACKUP_HEADER_LEN, BACKUP_MAGIC_LEN } from './backup';
+import { createCipheriv, pbkdf2Sync, randomBytes } from 'node:crypto';
+import { create as tarCreate } from 'tar';
+import {
+  runBackup,
+  BACKUP_HEADER_LEN,
+  BACKUP_IV_LEN,
+  BACKUP_MAGIC,
+  BACKUP_MAGIC_LEN,
+  BACKUP_PBKDF2_ITERATIONS,
+  BACKUP_SALT_LEN,
+} from './backup';
 import { runRestore } from './restore';
 
+// A test can make `open` fail for one file name, to break a restore part-way.
+const failOpen = vi.hoisted(() => ({ suffix: undefined as string | undefined }));
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    open: async (...args: Parameters<typeof actual.open>) => {
+      if (failOpen.suffix !== undefined && String(args[0]).endsWith(failOpen.suffix)) {
+        throw Object.assign(new Error('EIO: simulated write failure'), { code: 'EIO' });
+      }
+      return actual.open(...args);
+    },
+  };
+});
+
 interface Fixture {
+  /** The install root the fixture lives under (backup's `rootOverride`). */
+  root: string;
   configPath: string;
-  manifestPath: string;
   sharePath: string;
   identityPath: string;
   pubkeyBookPath: string;
   vaultPubkeyPath: string;
-  bootstrapSecretPath: string;
+  addressBookPath: string;
 }
 
+/** The fixed paths backup reads that daemon.toml does not name. */
+function overridesFrom(f: Fixture) {
+  return { vaultPubkey: f.vaultPubkeyPath, addressBook: f.addressBookPath };
+}
+
+const ADDRESS_BOOK_TAR = 'etc/otzi/address-book.otzi.json';
+const SHARE_TAR = 'var/lib/otzi/share.json';
+const IDENTITY_TAR = 'var/lib/otzi/identity.json';
+const PUBKEYS_TAR = 'var/lib/otzi/pubkeys.json';
+const ADDRESS_BOOK_JSON = JSON.stringify({
+  kind: 'otzi-address-book',
+  version: 1,
+  network: 'testnet4',
+  entries: [{ label: 'treasury', address: 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx' }],
+});
+
 interface FixtureOpts {
-  skipManifest?: boolean;
   skipVaultPubkey?: boolean;
-  skipBootstrapSecret?: boolean;
+  skipAddressBook?: boolean;
   /**
    * If set, encode the share/identity/pubkeys at relative paths under this
    * tar-encoded prefix. The fixture writes the actual files under the root
@@ -54,22 +100,22 @@ async function buildBackupFixture(
   const identityPath = join(varDir, 'identity.json');
   const pubkeyBookPath = join(varDir, 'pubkeys.json');
   const vaultPubkeyPath = join(varDir, 'vault-pubkey.json');
-  const bootstrapSecretPath = join(varDir, 'bootstrap-secret');
-  const manifestPath = join(etcDir, 'manifest.otzi.json');
+  const addressBookPath = join(etcDir, 'address-book.otzi.json');
 
+  // daemon.toml names the production paths, as on a real install; backup reads
+  // them under `root` (its rootOverride seam).
   const tomlText = `
 [share]
-path = "${sharePath}"
+path = "/${SHARE_TAR}"
 password_env = "OTZI_SHARE_PASSWORD"
 
 [node]
 id = "node-a"
-identity_key_file = "${identityPath}"
-pubkey_book_file = "${pubkeyBookPath}"
+identity_key_file = "/${IDENTITY_TAR}"
+pubkey_book_file = "/${PUBKEYS_TAR}"
 
 [network]
-name = "regtest"
-opnet_rpc = "https://example/rpc"
+name = "testnet4"
 
 [transport]
 kind = "peer-mesh"
@@ -84,13 +130,6 @@ strategy = "auto"
   const configPath = join(etcDir, 'daemon.toml');
   await writeFile(configPath, tomlText, { mode: 0o640 });
 
-  if (!opts.skipManifest) {
-    await writeFile(
-      manifestPath,
-      JSON.stringify({ version: 1, name: 'fixture', contracts: [] }),
-      { mode: 0o660 },
-    );
-  }
   await writeFile(sharePath, JSON.stringify({ version: 3, partyId: 7 }), {
     mode: 0o600,
   });
@@ -103,18 +142,20 @@ strategy = "auto"
       mode: 0o644,
     });
   }
-  if (!opts.skipBootstrapSecret) {
-    await writeFile(bootstrapSecretPath, 'bootstrap-token\n', { mode: 0o660 });
+  if (!opts.skipAddressBook) {
+    // Looser than the restored mode, to show restore sets the mode itself.
+    await writeFile(addressBookPath, ADDRESS_BOOK_JSON);
+    await chmod(addressBookPath, 0o666);
   }
 
   return {
+    root,
     configPath,
-    manifestPath,
     sharePath,
     identityPath,
     pubkeyBookPath,
     vaultPubkeyPath,
-    bootstrapSecretPath,
+    addressBookPath,
   };
 }
 
@@ -132,6 +173,42 @@ async function pathExists(p: string): Promise<boolean> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw err;
   }
+}
+
+/**
+ * Build a valid encrypted archive from an explicit entry table, bypassing
+ * `runBackup`. Lets a test hand `runRestore` an archive whose entries differ
+ * from what the current `runBackup` writes (e.g. one from an older daemon).
+ * Same wire format as backup.ts: magic | salt | iv | tag | AES-256-GCM(tgz).
+ */
+async function craftArchive(
+  dir: string,
+  entries: Record<string, string>,
+): Promise<{ path: string; password: string }> {
+  const staging = await mkdtemp(join(dir, 'craft-stage-'));
+  const names = Object.keys(entries);
+  for (const name of names) {
+    const dest = join(staging, name);
+    await mkdir(join(dest, '..'), { recursive: true });
+    await writeFile(dest, entries[name]!);
+  }
+  const chunks: Buffer[] = [];
+  const tarStream = tarCreate({ cwd: staging, gzip: true, portable: true }, names);
+  for await (const chunk of tarStream as AsyncIterable<Buffer>) chunks.push(chunk);
+
+  const password = 'crafted-archive-password';
+  const salt = randomBytes(BACKUP_SALT_LEN);
+  const iv = randomBytes(BACKUP_IV_LEN);
+  const key = pbkdf2Sync(password, salt, BACKUP_PBKDF2_ITERATIONS, 32, 'sha256');
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(Buffer.concat(chunks)), cipher.final()]);
+  const magic = Buffer.alloc(BACKUP_MAGIC_LEN, 0);
+  magic.write(BACKUP_MAGIC, 0, 'ascii');
+
+  const path = join(dir, 'crafted.otzi-backup');
+  await writeFile(path, Buffer.concat([magic, salt, iv, cipher.getAuthTag(), ciphertext]));
+  await rm(staging, { recursive: true, force: true });
+  return { path, password };
 }
 
 /**
@@ -160,11 +237,8 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: outDir,
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     // Restore into a fresh root.
@@ -184,20 +258,19 @@ describe('runRestore', () => {
     // the runRestore output paths.
     const restored = (rel: string): string => resolve(restoreRoot, rel);
     expect(restoredPaths.has(restored('etc/otzi/daemon.toml'))).toBe(true);
-    expect(restoredPaths.has(restored('etc/otzi/manifest.otzi.json'))).toBe(true);
     // Share file lives at the same relative path the backup recorded.
-    const shareRel = f.sharePath.startsWith('/') ? f.sharePath.slice(1) : f.sharePath;
+    const shareRel = SHARE_TAR;
     expect(restoredPaths.has(restored(shareRel))).toBe(true);
-    const identityRel = f.identityPath.startsWith('/')
-      ? f.identityPath.slice(1)
-      : f.identityPath;
+    const identityRel = IDENTITY_TAR;
     expect(restoredPaths.has(restored(identityRel))).toBe(true);
-    const pubkeysRel = f.pubkeyBookPath.startsWith('/')
-      ? f.pubkeyBookPath.slice(1)
-      : f.pubkeyBookPath;
+    const pubkeysRel = PUBKEYS_TAR;
     expect(restoredPaths.has(restored(pubkeysRel))).toBe(true);
     expect(restoredPaths.has(restored('var/lib/otzi/vault-pubkey.json'))).toBe(true);
-    expect(restoredPaths.has(restored('var/lib/otzi/bootstrap-secret'))).toBe(true);
+
+    expect(restoredPaths.has(restored(ADDRESS_BOOK_TAR))).toBe(true);
+
+    // Exactly the vault's file set, nothing else.
+    expect(restoredPaths.size).toBe(6);
 
     // meta.json is NOT restored to disk.
     expect(restoredPaths.has(restored('meta.json'))).toBe(false);
@@ -227,11 +300,8 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: outDir,
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const restoreRoot = join(tmp, 'dst');
@@ -251,24 +321,69 @@ describe('runRestore', () => {
     // so we catch bugs where we report one mode but write another).
     const restored = (rel: string): string => resolve(restoreRoot, rel);
     expect(await modeOf(restored('etc/otzi/daemon.toml'))).toBe(0o640);
-    expect(await modeOf(restored('etc/otzi/manifest.otzi.json'))).toBe(0o660);
 
-    const shareRel = f.sharePath.startsWith('/') ? f.sharePath.slice(1) : f.sharePath;
+    const shareRel = SHARE_TAR;
     expect(await modeOf(restored(shareRel))).toBe(0o600); // share — by elimination
-    const identityRel = f.identityPath.startsWith('/')
-      ? f.identityPath.slice(1)
-      : f.identityPath;
+    const identityRel = IDENTITY_TAR;
     expect(await modeOf(restored(identityRel))).toBe(0o660);
-    const pubkeysRel = f.pubkeyBookPath.startsWith('/')
-      ? f.pubkeyBookPath.slice(1)
-      : f.pubkeyBookPath;
+    const pubkeysRel = PUBKEYS_TAR;
     expect(await modeOf(restored(pubkeysRel))).toBe(0o644);
     expect(await modeOf(restored('var/lib/otzi/vault-pubkey.json'))).toBe(0o644);
-    expect(await modeOf(restored('var/lib/otzi/bootstrap-secret'))).toBe(0o660);
+    expect(await modeOf(restored(ADDRESS_BOOK_TAR))).toBe(0o640);
 
     // Result-reported modes match on-disk modes.
     expect(got.get(restored('etc/otzi/daemon.toml'))).toBe(0o640);
     expect(got.get(restored(shareRel))).toBe(0o600);
+    expect(got.get(restored(ADDRESS_BOOK_TAR))).toBe(0o640);
+  });
+
+  it('backup includes the address book and restore sets 0640', async () => {
+    const f = await buildBackupFixture(join(tmp, 'src'));
+    expect(await modeOf(f.addressBookPath)).toBe(0o666);
+
+    const backup = await runBackup({
+      configPath: f.configPath,
+      outputDir: join(tmp, 'archive'),
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
+    });
+    expect(backup.filesIncluded).toContain(ADDRESS_BOOK_TAR);
+
+    const restoreRoot = join(tmp, 'dst');
+    const result = await runRestore({
+      archivePath: backup.path,
+      password: backup.password,
+      rootOverride: restoreRoot,
+      configExistsCheck: NEVER_EXISTS,
+      daemonStatusCheck: NEVER_RUNNING,
+    });
+
+    const restoredBook = resolve(restoreRoot, ADDRESS_BOOK_TAR);
+    expect(result.restoredFiles).toContainEqual({ path: restoredBook, mode: 0o640 });
+    expect(await modeOf(restoredBook)).toBe(0o640);
+    expect(await readFile(restoredBook, 'utf8')).toBe(ADDRESS_BOOK_JSON);
+  });
+
+  it('restores a backup that holds no address book without one', async () => {
+    const f = await buildBackupFixture(join(tmp, 'src'), { skipAddressBook: true });
+    const backup = await runBackup({
+      configPath: f.configPath,
+      outputDir: join(tmp, 'archive'),
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
+    });
+    expect(backup.filesIncluded).not.toContain(ADDRESS_BOOK_TAR);
+
+    const restoreRoot = join(tmp, 'dst');
+    const result = await runRestore({
+      archivePath: backup.path,
+      password: backup.password,
+      rootOverride: restoreRoot,
+      configExistsCheck: NEVER_EXISTS,
+      daemonStatusCheck: NEVER_RUNNING,
+    });
+    expect(result.restoredFiles).toHaveLength(5);
+    expect(await pathExists(resolve(restoreRoot, ADDRESS_BOOK_TAR))).toBe(false);
   });
 
   it('wrong password → friendly error', async () => {
@@ -277,11 +392,8 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     await expect(
@@ -301,11 +413,8 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     // Flip 1 byte mid-ciphertext (well after the magic + header).
@@ -365,11 +474,8 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const dstRoot = join(tmp, 'dst');
@@ -383,7 +489,7 @@ describe('runRestore', () => {
         daemonStatusCheck: NEVER_RUNNING,
       }),
     ).rejects.toThrow(
-      `config already present at ${expectedConfigPath}; remove it first`,
+      `config already present at ${expectedConfigPath}; move it aside first`,
     );
   });
 
@@ -406,7 +512,7 @@ describe('runRestore', () => {
         daemonStatusCheck: NEVER_RUNNING,
       }),
     ).rejects.toThrow(
-      'config already present at /etc/otzi/daemon.toml; remove it first',
+      'config already present at /etc/otzi/daemon.toml; move it aside first',
     );
   });
 
@@ -416,11 +522,8 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     await expect(
@@ -442,11 +545,8 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const result = await runRestore({
@@ -460,17 +560,14 @@ describe('runRestore', () => {
     expect(result.restoredFiles.length).toBeGreaterThan(0);
   });
 
-  it('skips optional bootstrap-secret cleanly when archive omits it', async () => {
+  it('restores an archive built without the optional vault-pubkey file', async () => {
     const backupRoot = join(tmp, 'src');
-    const f = await buildBackupFixture(backupRoot, { skipBootstrapSecret: true });
+    const f = await buildBackupFixture(backupRoot, { skipVaultPubkey: true, skipAddressBook: true });
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const restoreRoot = join(tmp, 'dst');
@@ -482,40 +579,44 @@ describe('runRestore', () => {
       daemonStatusCheck: NEVER_RUNNING,
     });
 
-    // bootstrap-secret should NOT be in the restored set (wasn't in the archive).
+    // vault-pubkey.json was not in the archive, so it is not in the restored set.
     const restoredPaths = new Set(result.restoredFiles.map((r) => r.path));
     expect(
-      restoredPaths.has(resolve(restoreRoot, 'var/lib/otzi/bootstrap-secret')),
+      restoredPaths.has(resolve(restoreRoot, 'var/lib/otzi/vault-pubkey.json')),
     ).toBe(false);
     // But required files are still there.
     expect(restoredPaths.has(resolve(restoreRoot, 'etc/otzi/daemon.toml'))).toBe(true);
+    expect(restoredPaths.size).toBe(4);
   });
 
-  it('skips optional manifest cleanly when archive omits it', async () => {
-    const backupRoot = join(tmp, 'src');
-    const f = await buildBackupFixture(backupRoot, { skipManifest: true });
-    const backup = await runBackup({
-      configPath: f.configPath,
-      outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+  it('skips an entry outside the file set, with a warning, and writes nothing for it', async () => {
+    // Only the fixed paths and the three paths daemon.toml names are restored;
+    // anything else in an archive (an older daemon's leftovers, or planted
+    // entries) is skipped and reported.
+    const archive = await craftArchive(tmp, {
+      'etc/otzi/daemon.toml': '[share]\npath = "/var/lib/otzi/share.json"\n',
+      'var/lib/otzi/share.json': '{}',
+      'var/lib/otzi/extra-entry': 'leftover\n',
+      'etc/cron.d/evil': '* * * * * root sh -c id\n',
+      'root/.ssh/authorized_keys': 'ssh-ed25519 AAAA attacker\n',
     });
 
     const restoreRoot = join(tmp, 'dst');
     const result = await runRestore({
-      archivePath: backup.path,
-      password: backup.password,
+      archivePath: archive.path,
+      password: archive.password,
       rootOverride: restoreRoot,
       configExistsCheck: NEVER_EXISTS,
       daemonStatusCheck: NEVER_RUNNING,
     });
 
-    const restoredPaths = new Set(result.restoredFiles.map((r) => r.path));
-    expect(restoredPaths.has(resolve(restoreRoot, 'etc/otzi/manifest.otzi.json'))).toBe(false);
-    expect(restoredPaths.has(resolve(restoreRoot, 'etc/otzi/daemon.toml'))).toBe(true);
+    expect(result.restoredFiles.map((r) => r.path).sort()).toEqual(
+      [resolve(restoreRoot, 'etc/otzi/daemon.toml'), resolve(restoreRoot, SHARE_TAR)].sort(),
+    );
+    expect(result.skippedEntries).toEqual(['var/lib/otzi/extra-entry', 'etc/cron.d/evil', 'root/.ssh/authorized_keys']);
+    for (const planted of ['var/lib/otzi/extra-entry', 'etc/cron.d/evil', 'root/.ssh/authorized_keys']) {
+      expect(await pathExists(resolve(restoreRoot, planted)), planted).toBe(false);
+    }
   });
 
   it('extraction never escapes rootOverride even if a tar entry has a leading slash (paranoid check)', async () => {
@@ -529,11 +630,8 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const restoreRoot = join(tmp, 'dst');
@@ -557,11 +655,8 @@ describe('runRestore', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const result = await runRestore({
@@ -576,33 +671,33 @@ describe('runRestore', () => {
     expect(result.metaPartyId).toBe(7);
   });
 
-  it('atomicity (I-1): a placement failure mid-loop rolls back files placed before the failure', async () => {
+  it('atomicity (I-1, superseded by R47): an existing target, even a directory, refuses before anything is written', async () => {
     // Build a real archive, then arrange for a mid-loop placement to throw
     // by pre-creating one of the destination paths as a DIRECTORY. writeFile
     // against an existing directory yields EISDIR, which propagates out of
     // the placement loop and triggers the rollback path.
     //
-    // The first file the loop tries to place is `etc/otzi/daemon.toml`
-    // (by tar entry order — see backup.ts fileSet). The second is
-    // `etc/otzi/manifest.otzi.json`. Sabotage the second to fail; assert
-    // that the first was rolled back (no file at `<restoreRoot>/etc/otzi/
-    // daemon.toml`) and that NO files anywhere under restoreRoot survive.
+    // The loop places files in tar entry order (see backup.ts fileSet):
+    // `etc/otzi/daemon.toml` first, then the share, pubkeys and identity,
+    // `var/lib/otzi/vault-pubkey.json`, the address book, and the generated
+    // meta.json last (never written). Sabotage vault-pubkey.json; assert that
+    // everything placed before it was rolled back (no file at
+    // `<restoreRoot>/etc/otzi/daemon.toml`, share, identity or pubkeys) and
+    // that nothing after it was placed, so NO files anywhere under
+    // restoreRoot survive.
     const backupRoot = join(tmp, 'src');
     const f = await buildBackupFixture(backupRoot);
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const restoreRoot = join(tmp, 'dst-rollback');
-    // Pre-create the manifest *path* as a directory so writeFile() will
+    // Pre-create the vault-pubkey *path* as a directory so writeFile() will
     // throw EISDIR when the loop reaches it.
-    const sabotagePath = join(restoreRoot, 'etc/otzi/manifest.otzi.json');
+    const sabotagePath = join(restoreRoot, 'var/lib/otzi/vault-pubkey.json');
     await mkdir(sabotagePath, { recursive: true });
 
     const daemonTomlDest = join(restoreRoot, 'etc/otzi/daemon.toml');
@@ -615,11 +710,9 @@ describe('runRestore', () => {
         configExistsCheck: NEVER_EXISTS,
         daemonStatusCheck: NEVER_RUNNING,
       }),
-    ).rejects.toThrow(/EISDIR|illegal operation on a directory/);
+    ).rejects.toThrow(`restore would replace existing files: ${sabotagePath}`);
 
-    // The file placed BEFORE the failure (daemon.toml) must NOT exist after
-    // rollback. This is the load-bearing assertion: if rollback is broken,
-    // daemon.toml will still be on disk.
+    // Nothing was written: the refusal comes before placement.
     expect(await pathExists(daemonTomlDest)).toBe(false);
 
     // The sabotage directory itself should remain (it predates the call —
@@ -628,22 +721,13 @@ describe('runRestore', () => {
 
     // No other restored files should survive either. Walk the var-tree
     // dest paths the fixture would have produced.
-    const shareRel = f.sharePath.startsWith('/') ? f.sharePath.slice(1) : f.sharePath;
-    const identityRel = f.identityPath.startsWith('/')
-      ? f.identityPath.slice(1)
-      : f.identityPath;
-    const pubkeysRel = f.pubkeyBookPath.startsWith('/')
-      ? f.pubkeyBookPath.slice(1)
-      : f.pubkeyBookPath;
+    const shareRel = SHARE_TAR;
+    const identityRel = IDENTITY_TAR;
+    const pubkeysRel = PUBKEYS_TAR;
     expect(await pathExists(resolve(restoreRoot, shareRel))).toBe(false);
     expect(await pathExists(resolve(restoreRoot, identityRel))).toBe(false);
     expect(await pathExists(resolve(restoreRoot, pubkeysRel))).toBe(false);
-    expect(
-      await pathExists(resolve(restoreRoot, 'var/lib/otzi/vault-pubkey.json')),
-    ).toBe(false);
-    expect(
-      await pathExists(resolve(restoreRoot, 'var/lib/otzi/bootstrap-secret')),
-    ).toBe(false);
+    expect(await pathExists(resolve(restoreRoot, ADDRESS_BOOK_TAR))).toBe(false);
   });
 
   it('magic mismatch error fires before pre-flight checks against existing config (cheap precheck order)', async () => {
@@ -766,11 +850,8 @@ describe('passwordStdin', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     // Use the stdinStream seam so we don't have to monkey-patch
@@ -799,11 +880,8 @@ describe('passwordStdin', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const fakeStdin = Readable.from([
@@ -826,11 +904,8 @@ describe('passwordStdin', () => {
     const backup = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'archive'),
-      pathOverrides: {
-        manifest: f.manifestPath,
-        vaultPubkey: f.vaultPubkeyPath,
-        bootstrapSecret: f.bootstrapSecretPath,
-      },
+      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const half = Math.floor(backup.password.length / 2);
@@ -849,5 +924,272 @@ describe('passwordStdin', () => {
       daemonStatusCheck: NEVER_RUNNING,
     });
     expect(result.restoredFiles.length).toBeGreaterThan(0);
+  });
+});
+
+// ─── Archive entry and path safety (R46, R47) ─────────────────────────────
+
+/** One tar member for `rawArchive`: any name, any type flag. */
+interface RawEntry {
+  name: string;
+  /** Tar typeflag: '0' file, '1' hardlink, '2' symlink, '3' char dev, '4' block dev, '5' dir, '6' FIFO. */
+  type: '0' | '1' | '2' | '3' | '4' | '5' | '6';
+  data?: string;
+  linkname?: string;
+}
+
+/** A ustar header, written by hand so a test can produce names and types tar tools refuse to write. */
+function tarHeader(e: RawEntry, size: number): Buffer {
+  const h = Buffer.alloc(512, 0);
+  const field = (value: string, offset: number, length: number) => h.write(value, offset, length, 'utf8');
+  const octal = (n: number, length: number) => n.toString(8).padStart(length - 1, '0') + '\0';
+  field(e.name, 0, 100);
+  field(octal(e.type === '5' ? 0o755 : 0o644, 8), 100, 8);
+  field(octal(0, 8), 108, 8);
+  field(octal(0, 8), 116, 8);
+  field(octal(size, 12), 124, 12);
+  field(octal(0, 12), 136, 12);
+  field('        ', 148, 8);
+  field(e.type, 156, 1);
+  field(e.linkname ?? '', 157, 100);
+  field('ustar\0', 257, 6);
+  field('00', 263, 2);
+  let sum = 0;
+  for (const b of h) sum += b;
+  field(sum.toString(8).padStart(6, '0') + '\0 ', 148, 8);
+  return h;
+}
+
+/** An encrypted archive whose tar members are written byte by byte from `entries`. */
+async function rawArchive(dir: string, entries: RawEntry[]): Promise<{ path: string; password: string }> {
+  const parts: Buffer[] = [];
+  for (const e of entries) {
+    const data = Buffer.from(e.data ?? '', 'utf8');
+    parts.push(tarHeader(e, e.type === '0' ? data.length : 0));
+    if (e.type === '0' && data.length > 0) {
+      parts.push(data, Buffer.alloc((512 - (data.length % 512)) % 512, 0));
+    }
+  }
+  parts.push(Buffer.alloc(1024, 0));
+  const tgz = gzipSync(Buffer.concat(parts));
+
+  const password = 'raw-archive-password';
+  const salt = randomBytes(BACKUP_SALT_LEN);
+  const iv = randomBytes(BACKUP_IV_LEN);
+  const key = pbkdf2Sync(password, salt, BACKUP_PBKDF2_ITERATIONS, 32, 'sha256');
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(tgz), cipher.final()]);
+  const magic = Buffer.alloc(BACKUP_MAGIC_LEN, 0);
+  magic.write(BACKUP_MAGIC, 0, 'ascii');
+  const path = join(dir, `raw-${randomBytes(4).toString('hex')}.otzi-backup`);
+  await writeFile(path, Buffer.concat([magic, salt, iv, cipher.getAuthTag(), ciphertext]));
+  return { path, password };
+}
+
+/** Every regular file under `dir`, as paths relative to it. */
+async function filesUnder(dir: string): Promise<string[]> {
+  if (!(await pathExists(dir))) return [];
+  const out: string[] = [];
+  for (const name of await readdir(dir, { recursive: true })) {
+    if ((await lstat(join(dir, name))).isFile()) out.push(name);
+  }
+  return out.sort();
+}
+
+describe('runRestore — entry and path safety', () => {
+  let tmp: string;
+  let root: string;
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), 'otzi-restore-safety-'));
+    root = join(tmp, 'dst');
+  });
+
+  afterEach(async () => {
+    await rm(tmp, { recursive: true, force: true });
+  });
+
+  const TOML = '[share]\npath = "/var/lib/otzi/share.json"\n';
+  const restore = (archive: { path: string; password: string }) =>
+    runRestore({
+      archivePath: archive.path,
+      password: archive.password,
+      rootOverride: root,
+      configExistsCheck: NEVER_EXISTS,
+      daemonStatusCheck: NEVER_RUNNING,
+    });
+
+  it.each<[string, RawEntry, RegExp]>([
+    ['a .. entry', { name: 'var/lib/otzi/../../../etc/cron.d/evil', type: '0', data: 'x' }, /'\.\.'/],
+    ['an absolute entry', { name: '/etc/cron.d/evil', type: '0', data: 'x' }, /absolute/],
+    ['a symlink', { name: 'var/lib/otzi/link', type: '2', linkname: '/etc/shadow' }, /symlink/],
+    ['a symlink at a target path', { name: 'var/lib/otzi/identity.json', type: '2', linkname: '/etc/shadow' }, /symlink/],
+    ['a hardlink', { name: 'var/lib/otzi/pubkeys.json', type: '1', linkname: 'etc/otzi/daemon.toml' }, /hardlink/],
+    ['a character device', { name: 'var/lib/otzi/tty', type: '3' }, /device/],
+    ['a block device', { name: 'var/lib/otzi/sda', type: '4' }, /device/],
+    ['a FIFO', { name: 'var/lib/otzi/fifo', type: '6' }, /FIFO/],
+    ['a directory where a file is expected', { name: 'var/lib/otzi/vault-pubkey.json/', type: '5' }, /directory/],
+  ])('refuses an archive with %s and writes nothing', async (_name, bad, message) => {
+    const archive = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: TOML },
+      { name: 'var/lib/otzi/share.json', type: '0', data: '{}' },
+      bad,
+    ]);
+    const err = await restore(archive).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).toMatch(message);
+    expect(err!.message).toContain(bad.name);
+    expect(await filesUnder(root)).toEqual([]);
+    expect(await pathExists(join(tmp, 'etc'))).toBe(false);
+  });
+
+  it.each([
+    ['[share].path', '[share]\npath = "/etc/cron.d/evil"\n', 'etc/cron.d/evil'],
+    ['[node].identity_key_file', '[node]\nidentity_key_file = "/root/.ssh/authorized_keys"\n', 'root/.ssh/authorized_keys'],
+    ['[node].pubkey_book_file', '[node]\npubkey_book_file = "/var/lib/otzi/../../../etc/passwd"\n', 'etc/passwd'],
+    ['[share].path (the data dir itself)', '[share]\npath = "/var/lib/otzi"\n', 'var/lib/otzi'],
+    ['[share].path (relative)', '[share]\npath = "var/lib/otzi/share.json"\n', 'var/lib/otzi/share.json'],
+    ['[share].path (nested)', '[share]\npath = "/var/lib/otzi/keys/share.json"\n', 'var/lib/otzi/keys/share.json'],
+    ['[node].identity_key_file (nested)', '[node]\nidentity_key_file = "/etc/otzi/keys/identity.json"\n', 'etc/otzi/keys/identity.json'],
+  ])('refuses a daemon.toml whose %s is not a direct child of /etc/otzi or /var/lib/otzi', async (key, toml, tarPath) => {
+    const archive = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: toml },
+      { name: tarPath, type: '0', data: 'payload' },
+    ]);
+    const err = await restore(archive).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).toContain(key.split(' ')[0]!);
+    expect(err!.message).toMatch(/\/etc\/otzi.*\/var\/lib\/otzi/);
+    expect(await filesUnder(root)).toEqual([]);
+  });
+
+  it('refuses a target below a subdirectory of the data dir, so no symlinked directory can redirect a write', async () => {
+    const outside = join(tmp, 'outside');
+    await mkdir(outside, { recursive: true });
+    await mkdir(join(root, 'var/lib/otzi'), { recursive: true });
+    await symlink(outside, join(root, 'var/lib/otzi/sub'));
+    const archive = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: '[share]\npath = "/var/lib/otzi/sub/share.json"\n' },
+      { name: 'var/lib/otzi/sub/share.json', type: '0', data: 'payload' },
+    ]);
+    await expect(restore(archive)).rejects.toThrow(
+      /\[share\]\.path = \/var\/lib\/otzi\/sub\/share\.json is not a direct child of \/etc\/otzi or \/var\/lib\/otzi; refused/,
+    );
+    expect(await filesUnder(outside)).toEqual([]);
+    expect(await pathExists(join(root, 'etc/otzi/daemon.toml'))).toBe(false);
+  });
+
+  it('places the share, identity and pubkey book as direct children of either allowed directory', async () => {
+    const toml =
+      '[share]\npath = "/var/lib/otzi/share.json"\n[node]\nidentity_key_file = "/etc/otzi/identity.json"\npubkey_book_file = "/var/lib/otzi/./pubkeys.json"\n';
+    const archive = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: toml },
+      { name: 'var/lib/otzi/share.json', type: '0', data: 'share' },
+      { name: 'etc/otzi/identity.json', type: '0', data: 'identity' },
+      { name: 'var/lib/otzi/pubkeys.json', type: '0', data: 'book' },
+    ]);
+    const result = await restore(archive);
+    expect(result.restoredFiles.map(f => f.path).sort()).toEqual(
+      ['etc/otzi/daemon.toml', 'etc/otzi/identity.json', 'var/lib/otzi/pubkeys.json', 'var/lib/otzi/share.json'].map(p =>
+        join(root, p),
+      ),
+    );
+    expect(await filesUnder(root)).toEqual([
+      'etc/otzi/daemon.toml',
+      'etc/otzi/identity.json',
+      'var/lib/otzi/pubkeys.json',
+      'var/lib/otzi/share.json',
+    ]);
+  });
+
+  it('shows archive-derived names without control characters in its refusals', async () => {
+    const hostile = 'var/lib/otzi/evil\u001b[2J\nfake line';
+    const entry = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: TOML },
+      { name: hostile, type: '2', linkname: '/etc/shadow' },
+    ]);
+    const err1 = await restore(entry).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err1!.message).toBe('archive entry var/lib/otzi/evil[2J fake line: symlink refused');
+
+    // The same for a path the archived daemon.toml names (TOML escapes carry the control characters).
+    const path = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: '[share]\npath = "/etc/evil\\u001b[2J\\nfake line"\n' },
+    ]);
+    const err2 = await restore(path).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err2!.message).toBe(
+      'daemon.toml in the archive: [share].path = /etc/evil[2J fake line is outside /etc/otzi and /var/lib/otzi; refused',
+    );
+    expect(await filesUnder(root)).toEqual([]);
+  });
+
+  it('refuses an archive that names the same file twice', async () => {
+    const archive = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: TOML },
+      { name: 'var/lib/otzi/share.json', type: '0', data: 'one' },
+      { name: 'var/lib/otzi/share.json', type: '0', data: 'two' },
+    ]);
+    await expect(restore(archive)).rejects.toThrow(/var\/lib\/otzi\/share\.json: the archive holds this file more than once/);
+    expect(await filesUnder(root)).toEqual([]);
+  });
+
+  it('refuses when any target already exists, lists them, and leaves every file untouched', async () => {
+    await mkdir(join(root, 'var/lib/otzi'), { recursive: true });
+    await mkdir(join(root, 'etc/otzi'), { recursive: true });
+    await writeFile(join(root, 'var/lib/otzi/share.json'), 'EXISTING SHARE', { mode: 0o600 });
+    await symlink(join(tmp, 'nowhere'), join(root, 'etc/otzi/address-book.otzi.json'));
+    const archive = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: TOML },
+      { name: 'var/lib/otzi/share.json', type: '0', data: 'BACKED-UP SHARE' },
+      { name: 'etc/otzi/address-book.otzi.json', type: '0', data: '{}' },
+    ]);
+
+    const err = await restore(archive).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).toContain(join(root, 'var/lib/otzi/share.json'));
+    expect(err!.message).toContain(join(root, 'etc/otzi/address-book.otzi.json'));
+    expect(err!.message).toMatch(/move them aside/);
+    expect(await readFile(join(root, 'var/lib/otzi/share.json'), 'utf8')).toBe('EXISTING SHARE');
+    expect(await pathExists(join(root, 'etc/otzi/daemon.toml'))).toBe(false);
+    expect((await lstat(join(root, 'etc/otzi/address-book.otzi.json'))).isSymbolicLink()).toBe(true);
+  });
+
+  it('a failure in the middle removes only the files restore created; pre-existing files stay', async () => {
+    await mkdir(join(root, 'var/lib/otzi'), { recursive: true });
+    await mkdir(join(root, 'etc/otzi'), { recursive: true });
+    await writeFile(join(root, 'var/lib/otzi/keep.txt'), 'keep me');
+    await writeFile(join(root, 'etc/otzi/otzi.env'), 'OTZI_SHARE_PASSWORD=x');
+    const toml =
+      '[share]\npath = "/var/lib/otzi/share.json"\n[node]\nidentity_key_file = "/var/lib/otzi/id"\npubkey_book_file = "/var/lib/otzi/book.json"\n';
+    const archive = await rawArchive(tmp, [
+      { name: 'etc/otzi/daemon.toml', type: '0', data: toml },
+      { name: 'var/lib/otzi/share.json', type: '0', data: 'share' },
+      { name: 'var/lib/otzi/id', type: '0', data: 'identity' },
+      { name: 'var/lib/otzi/book.json', type: '0', data: 'book' },
+    ]);
+
+    // The last file cannot be written: the three before it must go, the two that were there stay.
+    failOpen.suffix = 'var/lib/otzi/book.json';
+    try {
+      await expect(restore(archive)).rejects.toThrow(/EIO: simulated write failure/);
+    } finally {
+      failOpen.suffix = undefined;
+    }
+    expect(await filesUnder(root)).toEqual(['etc/otzi/otzi.env', 'var/lib/otzi/keep.txt']);
+    expect(await readFile(join(root, 'var/lib/otzi/keep.txt'), 'utf8')).toBe('keep me');
   });
 });

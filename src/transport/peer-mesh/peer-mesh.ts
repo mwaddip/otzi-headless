@@ -11,9 +11,10 @@
  * to reconnect — responder has no way to initiate.
  *
  * Pull: correlates request/response by `requestId`. If the target peer
- * isn't currently connected, `pull` returns `null` (treated as "blob not
- * yet available" — caller's retry + deadline takes over). `pull` throws
- * only when `key.from` isn't in the peer list (config-level error).
+ * isn't currently connected, the request cannot be sent, or the connection
+ * it went out on closes, `pull` returns `null` (treated as "blob not yet
+ * available" — caller's retry + deadline takes over). `pull` throws only
+ * when `key.from` isn't in the peer list (config-level error).
  */
 
 import type { IncomingMessage } from 'node:http';
@@ -25,6 +26,7 @@ import { PeerAllowlist } from './allowlist';
 import { PeerConnection } from './connection';
 import {
   broadcastBytes,
+  MAX_FRAME_BYTES,
   encodeBroadcast,
   encodePullRequest,
   encodePullResponse,
@@ -68,6 +70,8 @@ interface PendingPull {
   resolve: (blob: Uint8Array | null) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+  /** The connection the request went out on; its close resolves the pull with null. */
+  conn: PeerConnection;
 }
 
 const RECONNECT_INITIAL_MS = 1_000;
@@ -95,7 +99,8 @@ export class PeerMeshTransport implements Transport {
   constructor(options: PeerMeshOptions) {
     this.self = options.self;
     this.partyId = options.self.partyId;
-    this.peers = options.peers.map((p) => p.partyId);
+    // Every ring member, self included (the Transport contract); `options.peers` lists the others.
+    this.peers = [this.partyId, ...options.peers.map((p) => p.partyId)].sort((a, b) => a - b);
     this.wsCtor = options.wsCtor ?? WebSocket;
     this.log = options.logger ?? NOOP_LOGGER;
     this.pullTimeoutMs = options.pullTimeoutMs ?? DEFAULT_PULL_TIMEOUT_MS;
@@ -136,6 +141,7 @@ export class PeerMeshTransport implements Transport {
     const server = new WebSocketServer({
       host: this.listenHost,
       port: this.listenPort,
+      maxPayload: MAX_FRAME_BYTES,
       // Synchronous verifyClient runs BEFORE ws writes the HTTP 101 upgrade
       // response. Returning false makes ws abort with 401 — but we destroy
       // the socket first so the response never reaches the wire (truly
@@ -183,6 +189,12 @@ export class PeerMeshTransport implements Transport {
     if (this.stopped) return;
     this.stopped = true;
 
+    // Before the connections close (a close resolves its pulls with null): stopping is not transient.
+    for (const pending of this.pendingPulls.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('peer-mesh: transport stopping'));
+    }
+    this.pendingPulls.clear();
     for (const peer of this.peerStates.values()) {
       if (peer.reconnectTimer) {
         clearTimeout(peer.reconnectTimer);
@@ -193,11 +205,6 @@ export class PeerMeshTransport implements Transport {
         peer.connection = null;
       }
     }
-    for (const pending of this.pendingPulls.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error('peer-mesh: transport stopping'));
-    }
-    this.pendingPulls.clear();
     if (this.server) {
       const server = this.server;
       this.server = null;
@@ -248,7 +255,8 @@ export class PeerMeshTransport implements Transport {
   async pull(key: BlobKey): Promise<Uint8Array | null> {
     const peer = this.peerStates.get(key.from);
     if (!peer) throw new Error(`peer-mesh: pull target partyId=${key.from} is not in the ring`);
-    if (!peer.connection) return null; // peer offline — treat as "not yet available"
+    const conn = peer.connection;
+    if (!conn) return null; // peer offline — treat as "not yet available"
 
     const requestId = randomId();
     const result = new Promise<Uint8Array | null>((resolve, reject) => {
@@ -258,11 +266,11 @@ export class PeerMeshTransport implements Transport {
         // throw; that would abort the whole ceremony on one unlucky pull.
         resolve(null);
       }, this.pullTimeoutMs);
-      this.pendingPulls.set(requestId, { resolve, reject, timer });
+      this.pendingPulls.set(requestId, { resolve, reject, timer, conn });
     });
 
     try {
-      await peer.connection.send({
+      await conn.send({
         kind: 'pull-req',
         requestId,
         ceremonyId: key.ceremonyId,
@@ -271,12 +279,9 @@ export class PeerMeshTransport implements Transport {
         to: key.to,
       });
     } catch (err) {
-      const pending = this.pendingPulls.get(requestId);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pendingPulls.delete(requestId);
-      }
-      throw new Error(`peer-mesh: pull send failed: ${errMsg(err)}`);
+      // Transient as well: the connection is gone or going; the caller retries.
+      this.log.warn('peer-mesh: pull request send failed', { peerPartyId: key.from, err: errMsg(err) });
+      this.settlePull(requestId, null);
     }
 
     return result;
@@ -361,9 +366,13 @@ export class PeerMeshTransport implements Transport {
     }
 
     conn.onMessage((msg) => {
-      this.handleAppMessage(peer, msg);
+      this.handleAppMessage(peer, msg, conn);
     });
     conn.onClose(() => {
+      // No response can arrive on a closed connection: its pulls end now, not at their timeout.
+      for (const [requestId, pending] of this.pendingPulls) {
+        if (pending.conn === conn) this.settlePull(requestId, null);
+      }
       if (peer.connection === conn) {
         this.log.warn('peer-mesh: peer connection closed', { peerPartyId: peer.partyId });
         peer.connection = null;
@@ -394,7 +403,8 @@ export class PeerMeshTransport implements Transport {
   // Internal — message dispatch
   // ─────────────────────────────────────────────────────────────────────
 
-  private handleAppMessage(peer: PeerState, msg: AppMessage): void {
+  /** `conn` is the connection `msg` arrived on (authenticated as `peer`). */
+  private handleAppMessage(peer: PeerState, msg: AppMessage, conn: PeerConnection): void {
     switch (msg.kind) {
       case 'broadcast': {
         const payload = broadcastBytes(msg);
@@ -423,12 +433,26 @@ export class PeerMeshTransport implements Transport {
       case 'pull-resp': {
         const pending = this.pendingPulls.get(msg.requestId);
         if (!pending) return;
-        clearTimeout(pending.timer);
-        this.pendingPulls.delete(msg.requestId);
-        pending.resolve(pullResponseBlob(msg));
+        // Only the peer that was asked may answer.
+        if (pending.conn !== conn) {
+          this.log.warn('peer-mesh: dropped a pull response from a peer the pull was not sent to', {
+            peerPartyId: peer.partyId,
+          });
+          return;
+        }
+        this.settlePull(msg.requestId, pullResponseBlob(msg));
         return;
       }
     }
+  }
+
+  /** Resolve a pending pull (idempotent). */
+  private settlePull(requestId: string, blob: Uint8Array | null): void {
+    const pending = this.pendingPulls.get(requestId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingPulls.delete(requestId);
+    pending.resolve(blob);
   }
 }
 

@@ -8,7 +8,7 @@
  */
 
 import type { IdentityKeyPair } from '../transport/identity';
-import { toHex } from '../wire/hex';
+import { toHex } from '../otzi/lib/hex';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 import {
   computeFingerprint,

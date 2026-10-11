@@ -129,7 +129,7 @@ describe('PeerMeshTransport — IP allowlist', () => {
   it('writes zero bytes to the wire when verifyClient rejects (no 401 leak)', async () => {
     // The previous test asserts the WS *client* never sees `open`, but a
     // destroyed-pre-write socket and a destroyed-after-401-write socket both
-    // manifest the same way to a `WebSocket` client. The information-leak claim
+    // look the same to a `WebSocket` client. The information-leak claim
     // — that scanners see nothing — only holds if `verifyClient` truly aborts
     // before any HTTP response bytes hit the kernel buffer. Verify that
     // directly with a raw TCP socket and assert zero bytes received.

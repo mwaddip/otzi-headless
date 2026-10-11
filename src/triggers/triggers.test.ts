@@ -385,3 +385,41 @@ describe('UdsTrigger', () => {
     await trigger.stop();
   });
 });
+
+describe('HttpTrigger — Host header on a loopback bind', () => {
+  let cleanup: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    await Promise.all(cleanup.map((f) => f()));
+    cleanup = [];
+  });
+
+  function requestWithHost(port: number, host: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/', headers: { host, 'content-type': 'application/json' } }, (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode ?? 0));
+      });
+      req.on('error', reject);
+      req.end('{}');
+    });
+  }
+
+  it('answers only requests whose Host is a loopback name for its port', async () => {
+    let calls = 0;
+    const { trigger } = await startServer(async () => {
+      calls++;
+      return { status: 200, body: { ok: true } };
+    });
+    cleanup.push(() => trigger.stop());
+    const port = trigger.address()!.port;
+
+    for (const ok of [`127.0.0.1:${port}`, `localhost:${port}`, `LOCALHOST:${port}`, `[::1]:${port}`]) {
+      expect(await requestWithHost(port, ok), ok).toBe(200);
+    }
+    expect(calls).toBe(4);
+    for (const bad of ['evil.example', `localhost.:${port}`, `evil.example:${port}`, `127.0.0.1:${port + 1}`, '127.0.0.1', `rebind.attacker.example:${port}`]) {
+      expect(await requestWithHost(port, bad), bad).toBe(403);
+    }
+    expect(calls).toBe(4);
+  });
+});

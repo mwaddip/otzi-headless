@@ -155,3 +155,95 @@ describe('BlobPuller', () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+describe('BlobPuller abort signal', () => {
+  const slowOpts = { maxAttempts: 1000, initialDelayMs: 1, maxDelayMs: 5, deadlineMs: 5000 };
+
+  it('rejects with "aborted" when the signal fires, and every worker stops pulling', async () => {
+    const store = new BlobStore();
+    const { transport, calls } = stubTransport(); // never serves
+    const keys: BlobKey[] = [
+      { ceremonyId: 'c', round: 'r1', from: 1 },
+      { ceremonyId: 'c', round: 'r1', from: 2 },
+    ];
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 20);
+
+    await expect(
+      new BlobPuller(transport, store).pullAll(keys, slowOpts, ac.signal),
+    ).rejects.toThrow(/^aborted$/);
+
+    const after = calls.length;
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(calls.length).toBe(after);
+  });
+
+  it('rejects with "aborted" without pulling when the signal is already aborted', async () => {
+    const store = new BlobStore();
+    const { transport, calls } = stubTransport(async () => new Uint8Array([1]));
+    const key: BlobKey = { ceremonyId: 'c', round: 'r1', from: 1 };
+    const ac = new AbortController();
+    ac.abort();
+
+    await expect(
+      new BlobPuller(transport, store).pullAll([key], slowOpts, ac.signal),
+    ).rejects.toThrow(/^aborted$/);
+    expect(calls).toHaveLength(0);
+    expect(store.has(key)).toBe(false);
+  });
+
+  it('rejects with "aborted" while a transport pull is still in flight', async () => {
+    const store = new BlobStore();
+    const { transport } = stubTransport(() => new Promise(() => {})); // never resolves
+    const key: BlobKey = { ceremonyId: 'c', round: 'r1', from: 1 };
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 10);
+
+    await expect(
+      new BlobPuller(transport, store).pullAll([key], slowOpts, ac.signal),
+    ).rejects.toThrow(/^aborted$/);
+  });
+
+  it('still reports the deadline, not "aborted", when the deadline fires first', async () => {
+    const store = new BlobStore();
+    const { transport } = stubTransport();
+    const key: BlobKey = { ceremonyId: 'c', round: 'r1', from: 1 };
+    const ac = new AbortController();
+
+    await expect(
+      new BlobPuller(transport, store).pullAll([key], { ...slowOpts, deadlineMs: 20 }, ac.signal),
+    ).rejects.toThrow(/Deadline exceeded/);
+  });
+
+  it('once the call settles on a failed key, the other workers stop and put nothing', async () => {
+    const store = new BlobStore();
+    const failing: BlobKey = { ceremonyId: 'c', round: 'r1', from: 1 };
+    const late: BlobKey = { ceremonyId: 'c', round: 'r1', from: 2 };
+    const start = Date.now();
+    const { transport, calls } = stubTransport(async key => {
+      if (key.from === 1) throw new Error('peer 1 refused');
+      return Date.now() - start > 30 ? new Uint8Array([2]) : null; // late arrives after the failure
+    });
+
+    await expect(
+      new BlobPuller(transport, store).pullAll([failing, late], slowOpts),
+    ).rejects.toThrow(/peer 1 refused/);
+
+    const after = calls.length;
+    await new Promise(resolve => setTimeout(resolve, 60));
+    expect(calls.length).toBe(after);
+    expect(store.has(late)).toBe(false);
+  });
+
+  it('resolves normally when the signal never fires', async () => {
+    const store = new BlobStore();
+    const blob = new Uint8Array([9]);
+    const { transport } = stubTransport(async () => blob);
+    const key: BlobKey = { ceremonyId: 'c', round: 'r1', from: 1 };
+    const ac = new AbortController();
+
+    await new BlobPuller(transport, store).pullAll([key], fastOpts, ac.signal);
+    expect(store.get(key)).toEqual(blob);
+    ac.abort(); // aborting after settle is harmless
+  });
+});

@@ -1,6 +1,6 @@
 /**
  * `otzi backup` — produce a single password-protected archive of full daemon
- * state (config + manifest + share + identity + pubkey-book + bootstrap-secret
+ * state (config + share + identity + pubkey-book + vault-pubkey + address book
  * + meta) so an operator who loses their host can recover into a fresh `.deb`
  * install via `otzi restore`.
  *
@@ -37,14 +37,14 @@ import { hostname, homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { create as tarCreate } from 'tar';
 import { parse as parseToml } from 'smol-toml';
+import { DEFAULT_ADDRESS_BOOK_PATH } from '../../address-book/store';
 
+export { DEFAULT_ADDRESS_BOOK_PATH };
 export const DEFAULT_DAEMON_CONFIG_PATH = '/etc/otzi/daemon.toml';
-export const DEFAULT_MANIFEST_PATH = '/etc/otzi/manifest.otzi.json';
 export const DEFAULT_SHARE_PATH = '/var/lib/otzi/share.json';
 export const DEFAULT_IDENTITY_PATH = '/var/lib/otzi/identity.json';
 export const DEFAULT_PUBKEY_BOOK_PATH = '/var/lib/otzi/pubkeys.json';
 export const DEFAULT_VAULT_PUBKEY_PATH = '/var/lib/otzi/vault-pubkey.json';
-export const DEFAULT_BOOTSTRAP_SECRET_PATH = '/var/lib/otzi/bootstrap-secret';
 
 export const BACKUP_MAGIC = 'OTZI-BACKUP-V1';
 export const BACKUP_MAGIC_LEN = 32;
@@ -113,10 +113,16 @@ export interface BackupOptions {
    * tmpdir-rooted layout so we don't read /etc/otzi/* during a unit test.
    */
   pathOverrides?: {
-    manifest?: string;
     vaultPubkey?: string;
-    bootstrapSecret?: string;
+    addressBook?: string;
   };
+  /**
+   * Test seam, the counterpart of `RestoreOptions.rootOverride`: every
+   * absolute path backup reads — `configPath`'s default, the paths daemon.toml
+   * names and the fixed defaults — is read under this directory. Tar paths are
+   * unchanged (`stripLeadingSlash` of the path daemon.toml names).
+   */
+  rootOverride?: string;
 }
 
 export interface BackupResult {
@@ -129,7 +135,8 @@ export interface BackupResult {
 }
 
 export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult> {
-  const configPath = opts.configPath ?? DEFAULT_DAEMON_CONFIG_PATH;
+  const onHost = (p: string): string => (opts.rootOverride ? join(opts.rootOverride, p) : p);
+  const configPath = opts.configPath ?? onHost(DEFAULT_DAEMON_CONFIG_PATH);
   const outputDir = opts.outputDir ?? homedir();
   const now = (opts.now ?? (() => new Date()))();
 
@@ -164,31 +171,25 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
       ? nodeTable.pubkey_book_file
       : DEFAULT_PUBKEY_BOOK_PATH;
 
-  const manifestSource = opts.pathOverrides?.manifest ?? DEFAULT_MANIFEST_PATH;
   const vaultPubkeySource =
-    opts.pathOverrides?.vaultPubkey ?? DEFAULT_VAULT_PUBKEY_PATH;
-  const bootstrapSecretSource =
-    opts.pathOverrides?.bootstrapSecret ?? DEFAULT_BOOTSTRAP_SECRET_PATH;
+    opts.pathOverrides?.vaultPubkey ?? onHost(DEFAULT_VAULT_PUBKEY_PATH);
+  const addressBookSource =
+    opts.pathOverrides?.addressBook ?? onHost(DEFAULT_ADDRESS_BOOK_PATH);
 
   // --- Step 2: assemble the file table. Tar paths are RELATIVE (no leading
   // slash) so restore can `chroot`-style place them back at the corresponding
   // absolute paths.
   const fileSet: FileEntry[] = [
     { tarPath: 'etc/otzi/daemon.toml', sourcePath: configPath, required: true },
-    {
-      tarPath: 'etc/otzi/manifest.otzi.json',
-      sourcePath: manifestSource,
-      required: false,
-    },
-    { tarPath: stripLeadingSlash(sharePath), sourcePath: sharePath, required: true },
+    { tarPath: stripLeadingSlash(sharePath), sourcePath: onHost(sharePath), required: true },
     {
       tarPath: stripLeadingSlash(pubkeyBookPath),
-      sourcePath: pubkeyBookPath,
+      sourcePath: onHost(pubkeyBookPath),
       required: true,
     },
     {
       tarPath: stripLeadingSlash(identityPath),
-      sourcePath: identityPath,
+      sourcePath: onHost(identityPath),
       required: true,
     },
     {
@@ -197,8 +198,8 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
       required: false,
     },
     {
-      tarPath: 'var/lib/otzi/bootstrap-secret',
-      sourcePath: bootstrapSecretSource,
+      tarPath: stripLeadingSlash(DEFAULT_ADDRESS_BOOK_PATH),
+      sourcePath: addressBookSource,
       required: false,
     },
   ];
@@ -222,7 +223,7 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
   // at restore time. Falls back to undefined on malformed share.
   let partyId: number | undefined;
   try {
-    const shareRaw = JSON.parse(await readFile(sharePath, 'utf8')) as {
+    const shareRaw = JSON.parse(await readFile(onHost(sharePath), 'utf8')) as {
       partyId?: unknown;
     };
     if (typeof shareRaw.partyId === 'number') partyId = shareRaw.partyId;

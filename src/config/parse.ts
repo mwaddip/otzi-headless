@@ -26,6 +26,7 @@ import {
   TRIGGER_KINDS,
   DEFAULT_DKG_DEADLINE_MS,
   DEFAULT_SIGNING_DEADLINE_MS,
+  MAX_DEADLINE_MS,
 } from './types';
 
 export class ConfigError extends Error {
@@ -87,6 +88,17 @@ function asEnum<T extends string>(v: unknown, path: string, choices: readonly T[
   return s as T;
 }
 
+/**
+ * Every key of table `o` (at `path`; `''` for the root) must be in `allowed`.
+ * A misspelt key would otherwise be ignored and its setting silently absent.
+ */
+function rejectUnknownKeys(o: Record<string, unknown>, path: string, allowed: readonly string[]): void {
+  for (const key of Object.keys(o)) {
+    if (allowed.includes(key)) continue;
+    throw new ConfigError(path ? `${path}.${key}` : key, `unknown key (expected one of ${allowed.join(', ')})`);
+  }
+}
+
 function describe(v: unknown): string {
   if (v === null) return 'null';
   if (Array.isArray(v)) return 'array';
@@ -99,6 +111,7 @@ function describe(v: unknown): string {
 
 function parseShare(raw: unknown): ShareConfig {
   const o = asObject(raw, 'share');
+  rejectUnknownKeys(o, 'share', ['path', 'password_env']);
   return {
     path: asString(o.path, 'share.path'),
     passwordEnv: asString(o.password_env, 'share.password_env'),
@@ -112,6 +125,7 @@ function parseNode(raw: unknown): NodeConfig {
       'node.party_id',
       'no longer supported — partyId is derived from the pubkey book at startup',
     );
+  rejectUnknownKeys(o, 'node', ['id', 'identity_key_file', 'pubkey_book_file']);
   const out: NodeConfig = {
     id: asString(o.id, 'node.id'),
   };
@@ -122,18 +136,41 @@ function parseNode(raw: unknown): NodeConfig {
   return out;
 }
 
+function parseEsploraUrl(raw: unknown): string {
+  const s = asString(raw, 'network.esplora_url');
+  let url: URL | undefined;
+  try {
+    url = new URL(s);
+  } catch {
+    url = undefined;
+  }
+  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:') || url.hostname === '')
+    throw new ConfigError('network.esplora_url', `must be an http:// or https:// URL (got '${s}')`);
+  return s;
+}
+
 function parseNetwork(raw: unknown): NetworkConfig {
   const o = asObject(raw, 'network');
-  return {
-    name: asEnum(o.name, 'network.name', NETWORK_NAMES),
-    opnetRpc: asString(o.opnet_rpc, 'network.opnet_rpc'),
-  };
+  if ('opnet_rpc' in o)
+    throw new ConfigError(
+      'network.opnet_rpc',
+      'no longer supported — remove it; the CLI reaches the chain through network.esplora_url',
+    );
+  // Reject the retired names explicitly before the enum check so the operator
+  // gets a migration hint instead of the generic "must be one of" message.
+  if (o.name === 'testnet') throw new ConfigError('network.name', 'use testnet4 or signet');
+  if (o.name === 'regtest') throw new ConfigError('network.name', 'not supported');
+  rejectUnknownKeys(o, 'network', ['name', 'esplora_url']);
+  const out: NetworkConfig = { name: asEnum(o.name, 'network.name', NETWORK_NAMES) };
+  if (o.esplora_url !== undefined) out.esploraUrl = parseEsploraUrl(o.esplora_url);
+  return out;
 }
 
 function parseTransport(raw: unknown): TransportConfig {
   const o = asObject(raw, 'transport');
   const kind = asEnum(o.kind, 'transport.kind', TRANSPORT_KINDS);
   if (kind === 'relay') {
+    rejectUnknownKeys(o, 'transport', ['kind', 'url']);
     if (o.url === undefined)
       throw new ConfigError('transport.url', 'required when transport.kind = "relay"');
     return { kind, url: asString(o.url, 'transport.url') };
@@ -143,6 +180,7 @@ function parseTransport(raw: unknown): TransportConfig {
       'transport.listen',
       'no longer supported — use transport.advertised_endpoint',
     );
+  rejectUnknownKeys(o, 'transport', ['kind', 'advertised_endpoint']);
   const out: TransportConfig = { kind };
   if (o.advertised_endpoint !== undefined) {
     const rawStr = asString(o.advertised_endpoint, 'transport.advertised_endpoint');
@@ -168,6 +206,7 @@ function parsePeer(raw: unknown, i: number): PeerEntry {
         'no longer supported — peers carry only `endpoint` post-cleanup',
       );
   }
+  rejectUnknownKeys(o, path, ['endpoint']);
   if (o.endpoint === undefined)
     throw new ConfigError(`${path}.endpoint`, 'required');
   const rawStr = asString(o.endpoint, `${path}.endpoint`);
@@ -194,6 +233,11 @@ function parseGate(raw: unknown): GateConfig {
   const o = asObject(raw, 'gate');
   const strategy = asEnum(o.strategy, 'gate.strategy', GATE_STRATEGIES);
   const { strategy: _, ...rest } = o;
+  if (strategy === 'auto') {
+    // A leftover rule under "auto" would read as enforced while nothing checks it.
+    const [key] = Object.keys(rest);
+    if (key !== undefined) throw new ConfigError(`gate.${key}`, 'not used by strategy auto');
+  }
   return {
     strategy,
     params: Object.keys(rest).length > 0 ? rest : undefined,
@@ -205,16 +249,29 @@ function parseDeadlines(raw: unknown): DeadlineConfig {
     return { signingMs: DEFAULT_SIGNING_DEADLINE_MS, dkgMs: DEFAULT_DKG_DEADLINE_MS };
   }
   const o = asObject(raw, 'deadlines');
+  rejectUnknownKeys(o, 'deadlines', ['signing_ms', 'dkg_ms']);
   return {
     signingMs:
       o.signing_ms === undefined
         ? DEFAULT_SIGNING_DEADLINE_MS
-        : asInteger(o.signing_ms, 'deadlines.signing_ms', 1),
+        : asDeadline(o.signing_ms, 'deadlines.signing_ms'),
     dkgMs:
       o.dkg_ms === undefined
         ? DEFAULT_DKG_DEADLINE_MS
-        : asInteger(o.dkg_ms, 'deadlines.dkg_ms', 1),
+        : asDeadline(o.dkg_ms, 'deadlines.dkg_ms'),
   };
+}
+
+/** A deadline every timer can hold: a longer `setTimeout` delay fires at once. */
+function asDeadline(v: unknown, path: string): number {
+  if (typeof v === 'bigint' && v > BigInt(MAX_DEADLINE_MS)) {
+    throw new ConfigError(path, `must be <= ${MAX_DEADLINE_MS} (the longest Node.js timer; got ${v})`);
+  }
+  const ms = asInteger(v, path, 1);
+  if (ms > MAX_DEADLINE_MS) {
+    throw new ConfigError(path, `must be <= ${MAX_DEADLINE_MS} (the longest Node.js timer; got ${ms})`);
+  }
+  return ms;
 }
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -249,6 +306,7 @@ function parseTrigger(raw: unknown, i: number): TriggerEntry {
   const path = `triggers[${i}]`;
   const o = asObject(raw, path);
   const kind = asEnum(o.kind, `${path}.kind`, TRIGGER_KINDS);
+  rejectUnknownKeys(o, path, ['kind', ...TRIGGER_KEYS[kind]]);
   const { kind: _, ...rest } = o;
   const params = Object.keys(rest).length > 0 ? rest : undefined;
   if (params) {
@@ -257,6 +315,13 @@ function parseTrigger(raw: unknown, i: number): TriggerEntry {
   }
   return { kind, params };
 }
+
+/** The keys each trigger kind takes beside `kind` (read by the daemon's trigger builder). */
+const TRIGGER_KEYS: Record<TriggerEntry['kind'], readonly string[]> = {
+  http: ['bind', 'auth_token_env'],
+  uds: ['path'],
+  cron: ['schedule', 'job_name', 'timezone'],
+};
 
 function parseTriggers(raw: unknown): TriggerEntry[] {
   if (raw === undefined) return [];
@@ -268,6 +333,7 @@ function parseBootstrap(raw: unknown): BootstrapConfig | undefined {
   if (raw === undefined) return undefined;
   const o = asObject(raw, 'bootstrap');
   const role = asEnum(o.role, 'bootstrap.role', BOOTSTRAP_ROLES);
+  rejectUnknownKeys(o, 'bootstrap', ['role', role === 'leader' ? 'bind' : 'leader_url']);
   if (role === 'leader') {
     if (o.bind === undefined)
       throw new ConfigError('bootstrap.bind', 'required when bootstrap.role = "leader"');
@@ -297,6 +363,7 @@ function validateCoherence(cfg: DaemonConfig): void {
 /** Validate a parsed-from-TOML raw value and shape it into a `DaemonConfig`. */
 export function parseDaemonConfig(raw: unknown): DaemonConfig {
   const o = asObject(raw, '<root>');
+  rejectUnknownKeys(o, '', ['share', 'node', 'network', 'transport', 'peers', 'gate', 'deadlines', 'triggers', 'bootstrap']);
   const bootstrap = parseBootstrap(o.bootstrap);
   const cfg: DaemonConfig = {
     share: parseShare(o.share),

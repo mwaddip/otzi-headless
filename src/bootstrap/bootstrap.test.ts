@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import * as net from 'node:net';
+import { createHash } from 'node:crypto';
 import { generateIdentity, type IdentityKeyPair } from '../transport/identity';
-import { toHex } from '../wire/hex';
+import { toHex } from '../otzi/lib/hex';
 import {
   buildBook,
   computeFingerprint,
@@ -96,18 +97,26 @@ describe('pubkey-book — serialize + parse round-trip', () => {
     ).toThrow(/0x04/);
   });
 
-  it('fingerprint is 8 hex chars', async () => {
-    const a = await makePeer('a', 18800);
-    const book = buildBook([
-      {
-        partyId: 0,
-        publicKeyHex: toHex(a.identity.publicKeyRaw),
-        advertisedEndpoint: a.advertisedEndpoint,
-      },
+  it('fingerprint is 96 bits in six groups', async () => {
+    const [a, b, c] = await Promise.all([
+      makePeer('a', 18800),
+      makePeer('b', 18801),
+      makePeer('c', 18802),
     ]);
+    const book = buildBook(
+      [a, b, c].map((p, i) => ({
+        partyId: i,
+        publicKeyHex: toHex(p.identity.publicKeyRaw),
+        advertisedEndpoint: p.advertisedEndpoint,
+      })),
+    );
     const fp = await computeFingerprint(book);
-    expect(fp).toHaveLength(8);
-    expect(/^[0-9a-f]{8}$/.test(fp)).toBe(true);
+    expect(fp).toMatch(/^[0-9a-f]{4}(-[0-9a-f]{4}){5}$/);
+    const raw = createHash('sha256')
+      .update(Buffer.concat(book.entries.map((e) => Buffer.from(e.publicKeyHex, 'hex'))))
+      .digest('hex')
+      .slice(0, 24);
+    expect(fp.replaceAll('-', '')).toBe(raw);
   });
 
   it('fingerprint changes if any pubkey is substituted', async () => {
@@ -267,7 +276,7 @@ describe('bootstrap — 3-peer end-to-end', () => {
       toHex(master.identity.publicKeyRaw).toLowerCase(),
     );
     expect(book.entries[0]!.advertisedEndpoint).toBe(master.advertisedEndpoint);
-    expect(fingerprint).toHaveLength(8);
+    expect(fingerprint).toMatch(/^[0-9a-f]{4}(-[0-9a-f]{4}){5}$/);
   }, 10_000);
 
   it('partyId assigned by sorted-pubkey-bytes — registration timing does NOT affect partyIds', async () => {

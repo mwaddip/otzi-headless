@@ -14,8 +14,7 @@ password_env = "OTZI_SHARE_PASSWORD"
 id = "node-a"
 
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 
 [transport]
 kind = "peer-mesh"
@@ -39,10 +38,7 @@ describe('parseDaemonConfigToml — happy paths', () => {
       passwordEnv: 'OTZI_SHARE_PASSWORD',
     });
     expect(cfg.node).toEqual({ id: 'node-a' });
-    expect(cfg.network).toEqual({
-      name: 'testnet',
-      opnetRpc: 'https://testnet.opnet.org',
-    });
+    expect(cfg.network).toEqual({ name: 'testnet4' });
     expect(cfg.transport).toEqual({
       kind: 'peer-mesh',
       advertisedEndpoint: '127.0.0.1:8800',
@@ -70,7 +66,6 @@ id = "alpha"
 
 [network]
 name = "mainnet"
-opnet_rpc = "https://api.opnet.org"
 
 [transport]
 kind = "relay"
@@ -121,6 +116,76 @@ schedule = "0 */6 * * *"
   });
 });
 
+describe('parseDaemonConfigToml — [network]', () => {
+  const NETWORK_SECTION = '[network]\nname = "testnet4"\n';
+
+  it.each(['mainnet', 'testnet4', 'signet'] as const)('accepts network.name = %s', (name) => {
+    const toml = MINIMAL_TOML.replace('name = "testnet4"', `name = "${name}"`);
+    expect(parseDaemonConfigToml(toml).network).toEqual({ name });
+  });
+
+  it('accepts an optional esplora_url', () => {
+    for (const url of ['https://mempool.example/api', 'http://127.0.0.1:3002']) {
+      const toml = MINIMAL_TOML.replace(NETWORK_SECTION, `${NETWORK_SECTION}esplora_url = "${url}"\n`);
+      expect(parseDaemonConfigToml(toml).network).toEqual({ name: 'testnet4', esploraUrl: url });
+    }
+  });
+
+  it('leaves esploraUrl absent when esplora_url is not set', () => {
+    expect('esploraUrl' in parseDaemonConfigToml(MINIMAL_TOML).network).toBe(false);
+  });
+
+  it('rejects an esplora_url that is not an http(s) URL', () => {
+    for (const bad of ['mempool.example/api', 'ftp://mempool.example', 'ws://mempool.example', 'https://', 'not a url']) {
+      const toml = MINIMAL_TOML.replace(NETWORK_SECTION, `${NETWORK_SECTION}esplora_url = "${bad}"\n`);
+      expect(() => parseDaemonConfigToml(toml), bad).toThrow(/network\.esplora_url.*http:\/\/ or https:\/\/ URL/);
+    }
+  });
+
+  it('rejects a non-string esplora_url', () => {
+    const toml = MINIMAL_TOML.replace(NETWORK_SECTION, `${NETWORK_SECTION}esplora_url = 42\n`);
+    expect(() => parseDaemonConfigToml(toml)).toThrow(/network\.esplora_url.*must be a string/);
+  });
+
+  it('rejects network.opnet_rpc, testnet and regtest with explicit messages', () => {
+    const withRpc = MINIMAL_TOML.replace(
+      NETWORK_SECTION,
+      `${NETWORK_SECTION}opnet_rpc = "https://testnet.opnet.org"\n`,
+    );
+    expect(() => parseDaemonConfigToml(withRpc)).toThrow(
+      new ConfigError(
+        'network.opnet_rpc',
+        'no longer supported — remove it; the CLI reaches the chain through network.esplora_url',
+      ),
+    );
+    const testnet = MINIMAL_TOML.replace('name = "testnet4"', 'name = "testnet"');
+    expect(() => parseDaemonConfigToml(testnet)).toThrow(
+      new ConfigError('network.name', 'use testnet4 or signet'),
+    );
+    const regtest = MINIMAL_TOML.replace('name = "testnet4"', 'name = "regtest"');
+    expect(() => parseDaemonConfigToml(regtest)).toThrow(
+      new ConfigError('network.name', 'not supported'),
+    );
+  });
+
+  it('reports opnet_rpc before a bad network name', () => {
+    const toml = MINIMAL_TOML.replace(
+      NETWORK_SECTION,
+      '[network]\nname = "regtest"\nopnet_rpc = "http://x"\n',
+    );
+    expect(() => parseDaemonConfigToml(toml)).toThrow(/network\.opnet_rpc/);
+  });
+
+  it('carries the offending key path on the ConfigError', () => {
+    try {
+      parseDaemonConfigToml(MINIMAL_TOML.replace('name = "testnet4"', 'name = "regtest"'));
+      expect.fail('should have thrown');
+    } catch (err) {
+      expect((err as ConfigError).path).toBe('network.name');
+    }
+  });
+});
+
 describe('parseDaemonConfigToml — missing required tables', () => {
   it('rejects missing [share]', () => {
     const toml = MINIMAL_TOML.replace(/\[share\][\s\S]*?(?=\n\[node\])/, '');
@@ -162,9 +227,9 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
   });
 
   it('rejects unknown network.name', () => {
-    const toml = MINIMAL_TOML.replace('name = "testnet"', 'name = "moonnet"');
+    const toml = MINIMAL_TOML.replace('name = "testnet4"', 'name = "moonnet"');
     expect(() => parseDaemonConfigToml(toml)).toThrow(
-      /network\.name.*must be one of mainnet \| testnet \| regtest/,
+      /network\.name.*must be one of mainnet \| testnet4 \| signet/,
     );
   });
 
@@ -184,12 +249,43 @@ describe('parseDaemonConfigToml — type & enum validation', () => {
     );
   });
 
+  it.each(['max_sats_per_tx = 100000', 'allowed_recipients = "address-book"', 'command = ["/bin/true"]', 'url = "https://x"'])(
+    'rejects a [gate] key the auto strategy does not use: %s',
+    (line) => {
+      const toml = MINIMAL_TOML.replace('strategy = "auto"', `strategy = "auto"\n${line}`);
+      const key = line.split(' ')[0]!;
+      let err: unknown;
+      try {
+        parseDaemonConfigToml(toml);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).path).toBe(`gate.${key}`);
+      expect((err as Error).message).toBe(`config gate.${key}: not used by strategy auto`);
+    },
+  );
+
   it('rejects negative deadlines', () => {
     const toml =
       MINIMAL_TOML + '\n[deadlines]\nsigning_ms = -1\ndkg_ms = 900000\n';
     expect(() => parseDaemonConfigToml(toml)).toThrow(
       /deadlines\.signing_ms.*must be >= 1/,
     );
+  });
+
+  it('accepts deadlines up to the setTimeout maximum and rejects larger ones', () => {
+    const max = 2_147_483_647;
+    const at = (signing: number, dkg: number) =>
+      parseDaemonConfigToml(MINIMAL_TOML + `\n[deadlines]\nsigning_ms = ${signing}\ndkg_ms = ${dkg}\n`);
+    expect(at(max, max).deadlines).toEqual({ signingMs: max, dkgMs: max });
+    expect(() => at(max + 1, 900_000)).toThrow(
+      /deadlines\.signing_ms.*must be <= 2147483647 \(the longest Node\.js timer; got 2147483648\)/,
+    );
+    expect(() => at(300_000, max + 1)).toThrow(
+      /deadlines\.dkg_ms.*must be <= 2147483647 \(the longest Node\.js timer; got 2147483648\)/,
+    );
+    expect(() => at(300_000, 10_000_000_000_000)).toThrow(/deadlines\.dkg_ms.*must be <= 2147483647/);
   });
 
   it('rejects unknown trigger.kind', () => {
@@ -213,8 +309,7 @@ password_env = "P"
 id = "a"
 
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 
 [transport]
 kind = "peer-mesh"
@@ -408,8 +503,7 @@ password_env = "P"
 [node]
 id = "a"
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "127.0.0.1:8800"
@@ -430,8 +524,7 @@ password_env = "P"
 [node]
 id = "a"
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "192.168.1.5"
@@ -452,8 +545,7 @@ password_env = "P"
 [node]
 id = "a"
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "0.0.0.0:8800"
@@ -473,8 +565,7 @@ password_env = "P"
 [node]
 id = "a"
 [network]
-name = "testnet"
-opnet_rpc = "https://testnet.opnet.org"
+name = "testnet4"
 [transport]
 kind = "peer-mesh"
 advertised_endpoint = "127.0.0.1:8800"
@@ -486,3 +577,80 @@ strategy = "auto"
     expect(() => parseDaemonConfigToml(text)).toThrow(/wildcard/);
   });
 });
+
+describe('parseDaemonConfigToml — unknown keys', () => {
+  const RELAY = MINIMAL_TOML.replace('kind = "peer-mesh"\nadvertised_endpoint = "127.0.0.1:8800"', 'kind = "relay"\nurl = "ws://relay.example:9000"');
+  const WITH_ALL = `${MINIMAL_TOML}
+[deadlines]
+signing_ms = 1000
+
+[[triggers]]
+kind = "http"
+bind = "127.0.0.1:7080"
+
+[[triggers]]
+kind = "uds"
+path = "/var/run/otzi/otzi.sock"
+
+[[triggers]]
+kind = "cron"
+schedule = "0 * * * *"
+job_name = "hourly"
+
+[bootstrap]
+role = "leader"
+bind = "0.0.0.0:7090"
+`;
+
+  it.each<[string, string, string]>([
+    ['share.pasword_env', WITH_ALL, 'password_env = "OTZI_SHARE_PASSWORD"'],
+    ['node.identity_file', WITH_ALL, 'id = "node-a"'],
+    ['network.esplora_uri', WITH_ALL, 'name = "testnet4"'],
+    ['transport.url', WITH_ALL, 'advertised_endpoint = "127.0.0.1:8800"'],
+    ['peers[0].port', WITH_ALL, 'endpoint = "127.0.0.1:8801"'],
+    ['deadlines.signing', WITH_ALL, 'signing_ms = 1000'],
+    ['triggers[0].auth_token', WITH_ALL, 'bind = "127.0.0.1:7080"'],
+    ['triggers[1].mode', WITH_ALL, 'path = "/var/run/otzi/otzi.sock"'],
+    ['triggers[2].tz', WITH_ALL, 'job_name = "hourly"'],
+    ['bootstrap.leader_url', WITH_ALL, 'bind = "0.0.0.0:7090"'],
+  ])('rejects %s', (dotted, base, anchor) => {
+    const key = dotted.split('.').at(-1)!;
+    const value = key === 'port' || key === 'signing' ? '1' : '"x"';
+    const toml = base.replace(anchor, `${anchor}\n${key} = ${value}`);
+    let err: unknown;
+    try {
+      parseDaemonConfigToml(toml);
+    } catch (e) {
+      err = e;
+    }
+    expect(err, dotted).toBeInstanceOf(ConfigError);
+    expect((err as ConfigError).path).toBe(dotted);
+    expect((err as Error).message).toMatch(/unknown key/);
+  });
+
+  it('rejects advertised_endpoint under a relay transport', () => {
+    const toml = RELAY.replace('url = "ws://relay.example:9000"', 'url = "ws://relay.example:9000"\nadvertised_endpoint = "127.0.0.1:8800"');
+    expect(() => parseDaemonConfigToml(toml)).toThrow(/config transport\.advertised_endpoint: unknown key/);
+  });
+
+  it('rejects an unknown top-level table or key', () => {
+    expect(() => parseDaemonConfigToml(`${MINIMAL_TOML}\n[logging]\nlevel = "debug"\n`)).toThrow(/config logging: unknown key/);
+    expect(() => parseDaemonConfigToml(`stray = 1\n${MINIMAL_TOML}`)).toThrow(/config stray: unknown key/);
+  });
+
+  it('keeps the specific messages for retired keys', () => {
+    expect(() => parseDaemonConfigToml(MINIMAL_TOML.replace('id = "node-a"', 'id = "node-a"\nparty_id = 1'))).toThrow(/node\.party_id: no longer supported/);
+    expect(() => parseDaemonConfigToml(MINIMAL_TOML.replace('name = "testnet4"', 'name = "testnet4"\nopnet_rpc = "x"'))).toThrow(/network\.opnet_rpc: no longer supported/);
+  });
+
+  it('accepts every documented key', () => {
+    const toml = WITH_ALL.replace('name = "testnet4"', 'name = "testnet4"\nesplora_url = "https://mempool.space/testnet4/api"')
+      .replace('id = "node-a"', 'id = "node-a"\nidentity_key_file = "/var/lib/otzi/identity.json"\npubkey_book_file = "/var/lib/otzi/pubkeys.json"')
+      .replace('signing_ms = 1000', 'signing_ms = 1000\ndkg_ms = 2000')
+      .replace('bind = "127.0.0.1:7080"', 'bind = "127.0.0.1:7080"\nauth_token_env = "OTZI_API_TOKEN"')
+      .replace('job_name = "hourly"', 'job_name = "hourly"\ntimezone = "UTC"');
+    expect(() => parseDaemonConfigToml(toml)).not.toThrow();
+    expect(() => parseDaemonConfigToml(RELAY)).not.toThrow();
+  });
+});
+

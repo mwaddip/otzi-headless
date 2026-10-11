@@ -1,1021 +1,962 @@
-import { ThresholdMLDSA } from '@btc-vision/post-quantum/threshold-ml-dsa.js';
-import {
-  Transaction,
-  networks,
-  payments,
-  toXOnly,
-  initEccLib,
-} from '@btc-vision/bitcoin';
-import { createNobleBackend } from '@btc-vision/ecpair';
-import { schnorr } from '@noble/curves/secp256k1.js';
-import {
-  dkgFinalize,
-  dkgRound1,
-  dkgRound2,
-  type KeyPackage,
-  type PublicKeyPackage,
-  type Rng,
-  type Round1Package,
-  type Round1SecretPackage,
-  type Round2Package,
-  type Round2SecretPackage,
-} from '@mwaddip/frots';
-import { describe, expect, it } from 'vitest';
-import { buildBtcTxFromParams } from '../broadcast/btc-vault';
-import { BlobPuller, type PullOpts } from '../core/blob-puller';
-import { BlobServer } from '../core/blob-server';
-import { BlobStore } from '../core/blob-store';
-import {
-  announceFrostMessage,
-  encodeCeremonyMessage,
-  makeDummyFrostKeylinkExtras,
-} from '../core/ceremony-messages';
-import { CeremonyRunner } from '../core/ceremony-runner';
-import { createInMemoryRing } from '../core/in-memory-transport';
-import type { Transport } from '../core/transport';
-import type { PartyId } from '../core/types';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { runDkgCeremony, type ShareStager } from '../core/dkg-ceremony';
+import { encodeMessage, parseMessage, type AnnounceDkg, type CeremonyMessage } from '../core/messages';
+import { leadSigning, type SignCeremonySpec } from '../core/sign-ceremony';
+import type { BlobKey, PartyId } from '../core/types';
+import { createShareStager, pendingPath, vaultFileExists } from '../daemon/vault-share';
 import { AutoGate } from '../gate/factory';
 import { PolicyGate } from '../gate/policy';
-import type { ApprovalGate, CeremonySpec, Decision } from '../gate/types';
-import { getKL } from '../wire/dkg';
-import { toHex } from '../wire/hex';
-import type { DecryptedShare } from '../wire/share-crypto';
+import type { ApprovalGate, CeremonySpec, Decision, SigningSpec } from '../gate/types';
+import { analyzeProposal, vaultPayment } from '../otzi/lib/bitcoin';
+import { toVaultKey } from '../otzi/lib/dkg';
+import { rng } from '../otzi/lib/dkg.fixture';
+import { fromHex, toHex } from '../otzi/lib/hex';
+import type { DecryptedShare } from '../otzi/lib/share-file';
+import type { NetworkName, SendProposal } from '../otzi/lib/vault-types';
+import { makeProposal, testVault, type TestVault } from '../testing/proposal';
+import { makeRing, type RingNode } from '../testing/ring';
 import { Orchestrator } from './orchestrator';
 import type { CeremonyOutcome, Logger, OrchestratorDeps } from './types';
 
-// Taproot address derivation uses secp256k1 ECC — init once (idempotent).
-initEccLib(createNobleBackend());
+const NET: NetworkName = 'testnet4';
+const peersById: ReadonlyMap<PartyId, string> = new Map([
+  [0, 'node-0'],
+  [1, 'node-1'],
+  [2, 'node-2'],
+]);
+/** Leader pulls in these tests: generous, so only the participant side is under test. */
+const LEADER_PULLS = { maxAttempts: 1_000, deadlineMs: 8_000 };
+const WAIT_MS = 10_000;
 
-// ─────────────────────────────────────────────────────────────────────────
-// Test fixtures
-// ─────────────────────────────────────────────────────────────────────────
+// ─── Fakes ─────────────────────────────────────────────────────────────────
 
-const FAST_PULL_OPTS: PullOpts = {
-  maxAttempts: 50,
-  initialDelayMs: 2,
-  maxDelayMs: 20,
-  deadlineMs: 30_000,
-};
-
-const DKG_PULL_OPTS: PullOpts = {
-  maxAttempts: 200,
-  initialDelayMs: 5,
-  maxDelayMs: 50,
-  deadlineMs: 120_000,
-};
-
-const SYSTEM_RNG: Rng = {
-  fillBytes(dest) {
-    crypto.getRandomValues(dest);
-  },
-};
-
-const TEST_DEADLINES = { signingMs: 60_000, dkgMs: 180_000 };
-
-interface NodeCtx {
-  id: string;
-  partyId: PartyId;
-  transport: Transport;
-  store: BlobStore;
-  server: BlobServer;
-  puller: BlobPuller;
-  runner: CeremonyRunner;
+interface LogLine {
+  level: 'debug' | 'info' | 'warn' | 'error';
+  msg: string;
 }
 
-function buildRing(peerIds: PartyId[]): { ctx: Map<PartyId, NodeCtx>; close: () => void; peersById: Map<PartyId, string> } {
-  const ring = createInMemoryRing(peerIds);
-  const ctx = new Map<PartyId, NodeCtx>();
-  const peersById = new Map<PartyId, string>();
-  for (const pid of peerIds) {
-    const id = `node-${String.fromCharCode(97 + pid)}`;
-    peersById.set(pid, id);
-    const transport = ring.get(pid)!;
-    const store = new BlobStore();
-    const server = new BlobServer(transport, store);
-    const puller = new BlobPuller(transport, store);
-    const runner = new CeremonyRunner(transport, store, puller);
-    ctx.set(pid, { id, partyId: pid, transport, store, server, puller, runner });
-  }
-  const close = () => {
-    for (const c of ctx.values()) c.server.close();
+interface RecordingLogger extends Logger {
+  lines: LogLine[];
+  /** Lines that mention `text` (a ceremonyId, usually). */
+  about(text: string): LogLine[];
+}
+
+function recordingLogger(): RecordingLogger {
+  const lines: LogLine[] = [];
+  const at = (level: LogLine['level']) => (msg: string) => {
+    lines.push({ level, msg });
   };
-  return { ctx, close, peersById };
+  return {
+    lines,
+    about: text => lines.filter(l => l.msg.includes(text)),
+    debug: at('debug'),
+    info: at('info'),
+    warn: at('warn'),
+    error: at('error'),
+  };
 }
 
-function dealerKeygen(t: number, n: number, level = 44): {
-  publicKeyHex: string;
-  shares: DecryptedShare[];
-} {
-  const tm = ThresholdMLDSA.create(level, t, n);
-  const { publicKey, shares } = tm.keygen();
-  const publicKeyHex = toHex(publicKey);
-  const { K, L } = getKL(level);
-  const wrapped: DecryptedShare[] = shares.map((ks) => ({
-    publicKey: publicKeyHex,
-    partyId: ks.id,
-    threshold: t,
-    parties: n,
-    level,
-    shareBytes: new Uint8Array(0),
-    keyShare: ks,
-    K,
-    L,
-  }));
-  return { publicKeyHex, shares: wrapped };
+interface RecordingStager extends ShareStager {
+  calls: string[];
 }
 
-function frostDkgInMemory(
-  minSigners: number,
-  maxSigners: number,
-): { keyPackages: KeyPackage[]; publicKeyPackage: PublicKeyPackage } {
-  const round1Secrets: Round1SecretPackage[] = [];
-  const round1Packages: Round1Package[] = [];
-  for (let i = 0; i < maxSigners; i++) {
-    const out = dkgRound1(BigInt(i + 1), maxSigners, minSigners, SYSTEM_RNG);
-    round1Secrets.push(out.secretPackage);
-    round1Packages.push(out.package);
-  }
-  const receivedRound1PerParty: Map<bigint, Round1Package>[] = [];
-  for (let i = 0; i < maxSigners; i++) {
-    const m = new Map<bigint, Round1Package>();
-    for (let j = 0; j < maxSigners; j++) {
-      if (i !== j) m.set(BigInt(j + 1), round1Packages[j]!);
-    }
-    receivedRound1PerParty.push(m);
-  }
-  const round2Secrets: Round2SecretPackage[] = [];
-  const round2PackagesPerSender: ReadonlyMap<bigint, Round2Package>[] = [];
-  for (let i = 0; i < maxSigners; i++) {
-    const out = dkgRound2(round1Secrets[i]!, receivedRound1PerParty[i]!);
-    round2Secrets.push(out.secretPackage);
-    round2PackagesPerSender.push(out.packages);
-  }
-  const receivedRound2PerParty: Map<bigint, Round2Package>[] = [];
-  for (let recipient = 0; recipient < maxSigners; recipient++) {
-    const m = new Map<bigint, Round2Package>();
-    for (let sender = 0; sender < maxSigners; sender++) {
-      if (sender === recipient) continue;
-      const pkg = round2PackagesPerSender[sender]!.get(BigInt(recipient + 1));
-      if (!pkg) throw new Error(`DKG: missing R2 from ${sender + 1} to ${recipient + 1}`);
-      m.set(BigInt(sender + 1), pkg);
-    }
-    receivedRound2PerParty.push(m);
-  }
-  let publicKeyPackage: PublicKeyPackage | null = null;
-  const keyPackages: KeyPackage[] = [];
-  for (let i = 0; i < maxSigners; i++) {
-    const out = dkgFinalize(
-      round2Secrets[i]!,
-      receivedRound1PerParty[i]!,
-      receivedRound2PerParty[i]!,
-    );
-    keyPackages.push(out.keyPackage);
-    if (!publicKeyPackage) publicKeyPackage = out.publicKeyPackage;
-  }
-  return { keyPackages, publicKeyPackage: publicKeyPackage! };
+function recordingStager(failStage?: string): RecordingStager {
+  const s: RecordingStager = {
+    sharePath: '/test/share.json',
+    stagedPath: '/test/share.json.pending',
+    calls: [],
+    async stage() {
+      s.calls.push('stage');
+      if (failStage) throw new Error(failStage);
+    },
+    async commit() {
+      s.calls.push('commit');
+    },
+    async discard() {
+      s.calls.push('discard');
+    },
+  };
+  return s;
 }
 
-function buildOrchestrator(
-  nctx: NodeCtx,
-  peersById: Map<PartyId, string>,
-  extras: {
-    gate?: ApprovalGate;
-    share?: DecryptedShare;
-    frostKeyPackage?: KeyPackage;
-    frostPublicKeyPackage?: PublicKeyPackage;
-    logger?: Logger;
-  },
-): Orchestrator {
-  const gate = extras.gate ?? new AutoGate();
-  const share = extras.share ?? ({} as DecryptedShare);
-  const deps: OrchestratorDeps = {
-    transport: nctx.transport,
-    runner: nctx.runner,
-    gate,
-    node: { id: nctx.id, partyId: nctx.partyId },
+/** Records every spec, then defers to `inner`. */
+class SpyGate implements ApprovalGate {
+  readonly specs: CeremonySpec[] = [];
+  constructor(private readonly inner: ApprovalGate) {}
+  approve(spec: CeremonySpec): Promise<Decision> {
+    this.specs.push(spec);
+    return this.inner.approve(spec);
+  }
+}
+
+function shareOf(tv: TestVault, partyId: PartyId): DecryptedShare {
+  return {
+    network: NET,
+    internalKey: tv.vaultKey.untweakedVerifyingKey,
+    partyId,
+    threshold: tv.publicKeyPackage.minSigners,
+    parties: peersById.size,
+    keyPackage: tv.keyPackages[partyId]!,
+    publicKeyPackage: tv.publicKeyPackage,
+  };
+}
+
+// ─── Harness ───────────────────────────────────────────────────────────────
+
+interface Participant {
+  orch: Orchestrator;
+  log: RecordingLogger;
+  gate: SpyGate;
+  stagers: RecordingStager[];
+  createStager: ReturnType<typeof vi.fn<() => ShareStager>>;
+}
+
+type ParticipantOptions = Partial<Omit<OrchestratorDeps, 'createStager'>> & {
+  createStager?: () => ShareStager;
+};
+
+const started: Orchestrator[] = [];
+
+function participant(node: RingNode, over: ParticipantOptions = {}): Participant {
+  const log = recordingLogger();
+  const gate = new SpyGate(over.gate ?? new AutoGate());
+  const stagers: RecordingStager[] = [];
+  const createStager = vi.fn(
+    over.createStager ??
+      (() => {
+        const s = recordingStager();
+        stagers.push(s);
+        return s;
+      }),
+  );
+  const orch = new Orchestrator({
+    io: node.io,
+    node: { id: peersById.get(node.partyId)!, partyId: node.partyId },
     peersById,
-    share,
-    frostKeyPackage: extras.frostKeyPackage,
-    frostPublicKeyPackage: extras.frostPublicKeyPackage,
-    rng: SYSTEM_RNG,
-    pullOpts: FAST_PULL_OPTS,
-    ceremonyDeadlines: TEST_DEADLINES,
-    logger: extras.logger,
-  };
-  return new Orchestrator(deps);
+    network: NET,
+    vaultExists: async () => false,
+    rng,
+    ceremonyDeadlines: { signingMs: 5_000, dkgMs: 8_000 },
+    logger: log,
+    ...over,
+    gate,
+    createStager,
+  });
+  orch.start();
+  started.push(orch);
+  return { orch, log, gate, stagers, createStager };
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// ML-DSA signing
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('Orchestrator — ML-DSA signing', () => {
-  it('participant joins via orchestrator; settles on signoff-done with the leader sig', async () => {
-    const { shares } = dealerKeygen(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'mldsa-sig-1';
-    const message = new TextEncoder().encode('hello orchestrator');
-    const signers: PartyId[] = [0, 1];
-
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, { share: shares[1]! });
-    orch.start();
-
-    try {
-      const pending = orch.waitFor(baseId, 60_000);
-      const sig = await ctx.get(0)!.runner.signAsLeader(
-        { ceremonyId: baseId, message, signers, share: shares[0]! },
-        FAST_PULL_OPTS,
-      );
-      await ctx.get(0)!.runner.sendSigningDoneSignoff(baseId, sig);
-
-      const outcome = await pending;
-      expect(outcome.kind).toBe('signing-mldsa');
-      expect(outcome.status).toBe('done');
-      if (outcome.kind === 'signing-mldsa') {
-        expect(outcome.signatureHex).toBe(toHex(sig));
-      }
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 60_000);
-
-  it('aborted signoff settles as aborted', async () => {
-    const { shares } = dealerKeygen(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'mldsa-sig-aborted';
-
-    // Party 2 is a passive listener — not in the signer set, just observing.
-    const orch = buildOrchestrator(ctx.get(2)!, peersById, { share: shares[2]! });
-    orch.start();
-
-    try {
-      const pending = orch.waitFor(baseId, 10_000);
-      // Leader with signers [0,1]; party 1 never participates → abort.
-      await expect(
-        ctx.get(0)!.runner.signAsLeader(
-          {
-            ceremonyId: baseId,
-            message: new TextEncoder().encode('won\'t sign'),
-            signers: [0, 1],
-            share: shares[0]!,
-          },
-          { maxAttempts: 2, initialDelayMs: 2, maxDelayMs: 5, deadlineMs: 30 },
-        ),
-      ).rejects.toThrow();
-
-      const outcome = await pending;
-      expect(outcome.status).toBe('aborted');
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 20_000);
+afterEach(() => {
+  for (const o of started.splice(0)) o.stop();
 });
 
-// ─────────────────────────────────────────────────────────────────────────
-// FROST signing
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('Orchestrator — FROST signing', () => {
-  it('participant joins via orchestrator; settles on signoff-frost-done', async () => {
-    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'frost-sig-1';
-    const sighash = new Uint8Array(32);
-    crypto.getRandomValues(sighash);
-
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {
-      frostKeyPackage: keyPackages[1]!,
-      frostPublicKeyPackage: publicKeyPackage,
-    });
-    orch.start();
-
-    try {
-      const pending = orch.waitFor(baseId, 60_000);
-      const sigs = await ctx.get(0)!.runner.signFrostAsLeader(
-        {
-          ceremonyId: baseId,
-          sighashes: [{ hash: sighash, tweaked: true }],
-          signers: [0, 1],
-          keyPackage: keyPackages[0]!,
-          publicKeyPackage,
-          rng: SYSTEM_RNG,
-        },
-        FAST_PULL_OPTS,
-        makeDummyFrostKeylinkExtras(),
-      );
-      await ctx.get(0)!.runner.sendFrostSigningDoneSignoff(baseId, sigs);
-
-      const outcome = await pending;
-      expect(outcome.kind).toBe('signing-frost');
-      expect(outcome.status).toBe('done');
-      if (outcome.kind === 'signing-frost') {
-        expect(outcome.signaturesHex).toEqual(sigs.map((s) => toHex(s)));
-      }
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 60_000);
-
-  it('FROST signing refused when unsignedTx/sighash mismatch (byzantine leader)', async () => {
-    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'frost-sig-mismatch';
-
-    const errLogs: string[] = [];
-    const logger: Logger = {
-      debug: () => {},
-      info: () => {},
-      warn: () => {},
-      error: (msg) => errLogs.push(msg),
-    };
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {
-      frostKeyPackage: keyPackages[1]!,
-      frostPublicKeyPackage: publicKeyPackage,
-      logger,
-    });
-    orch.start();
-
-    try {
-      // Build an unsigned tx spending the frost-tweaked key — makes the inputs
-      // look plausible. The assertion is that the leader's sighash does NOT
-      // match what extractBtcSighashes produces, so participant refuses.
-      const xOnly = publicKeyPackage.verifyingKey.slice(1);
-      const p2trScript = new Uint8Array(34);
-      p2trScript[0] = 0x51;
-      p2trScript[1] = 0x20;
-      p2trScript.set(xOnly, 2);
-
-      const tx = new Transaction();
-      tx.version = 2;
-      tx.addInput(Buffer.alloc(32, 0xaa) as never, 0);
-      tx.addOutput(Buffer.from(p2trScript) as never, 1000n as never);
-      const unsignedTxHex = tx.toHex();
-
-      // All-zero sighash — not what any real tx extraction produces.
-      const wrongSighash = new Uint8Array(32);
-
-      const announce = announceFrostMessage(
-        baseId,
-        baseId,
-        [{ hash: wrongSighash, tweaked: true }],
-        [0, 1],
-        {
-          protocol: 'opnet',
-          unsignedTxHex,
-          inputs: [
-            {
-              scriptHex: Buffer.from(p2trScript).toString('hex'),
-              valueSat: '1000',
-              tweaked: true,
-            },
-          ],
-        },
-      );
-      await ctx.get(0)!.transport.broadcast(encodeCeremonyMessage(announce));
-
-      const deadline = Date.now() + 1000;
-      while (Date.now() < deadline) {
-        if (errLogs.some((m) => m.includes('sighash mismatch'))) break;
-        await new Promise((r) => setTimeout(r, 10));
-      }
-      expect(errLogs.some((m) => m.includes('sighash mismatch'))).toBe(true);
-
-      // Belt-and-suspenders: participant produced no R1 blob.
-      const r1Blob = ctx.get(1)!.store.get({
-        ceremonyId: baseId,
-        round: 'frost-sign-r1',
-        from: 1,
-      });
-      expect(r1Blob).toBeUndefined();
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 10_000);
-
-  it('BTC construction-params: participant rebuilds, verifies, spec carries decoded outputs + amount + destination', async () => {
-    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'frost-sig-btc-rebuild';
-
-    // Vault internal key = FROST untweaked aggregate pubkey. Its P2TR is the
-    // vault address — the source of UTXOs and change destination.
-    const frostUntweakedPubKey = publicKeyPackage.untweakedVerifyingKey;
-    const internalXOnly = toXOnly(Buffer.from(frostUntweakedPubKey) as never);
-    const frostP2tr = payments.p2tr({
-      internalPubkey: internalXOnly as never,
-      network: networks.opnetTestnet,
-    }).address!;
-
-    // Destination = a different P2TR. Use a real keypair so the x-only is
-    // a valid secp256k1 curve point.
-    const destSk = new Uint8Array(Array.from({ length: 32 }, (_, i) => i + 17));
-    const destXOnly = new Uint8Array(schnorr.getPublicKey(destSk));
-    const destP2tr = payments.p2tr({
-      internalPubkey: destXOnly as never,
-      network: networks.opnetTestnet,
-    }).address!;
-
-    const btcParamsLeader = {
-      to: destP2tr,
-      amountSat: 100_000n,
-      feeRate: 5,
-      network: 'testnet' as const,
-      frostP2tr,
-      frostUntweakedPubKey,
-      utxos: [
-        { transactionId: '11'.repeat(32), outputIndex: 0, value: 200_000n },
-      ],
-    };
-
-    // Leader builds locally to get the real sighashes that both sides will sign.
-    const built = buildBtcTxFromParams(btcParamsLeader);
-
-    // Capture the spec the gate sees (post-verify).
-    const specs: CeremonySpec[] = [];
-    const recordingGate: ApprovalGate = {
-      async approve(spec: CeremonySpec): Promise<Decision> {
-        specs.push(spec);
-        return 'approve';
-      },
-    };
-
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {
-      gate: recordingGate,
-      frostKeyPackage: keyPackages[1]!,
-      frostPublicKeyPackage: publicKeyPackage,
-    });
-    orch.start();
-
-    try {
-      const pending = orch.waitFor(baseId, 60_000);
-
-      const sigs = await ctx.get(0)!.runner.signFrostAsLeader(
-        {
-          ceremonyId: baseId,
-          sighashes: built.sighashes.map((s) => ({ hash: s.hash, tweaked: s.tweaked })),
-          signers: [0, 1],
-          keyPackage: keyPackages[0]!,
-          publicKeyPackage,
-          rng: SYSTEM_RNG,
-        },
-        FAST_PULL_OPTS,
-        {
-          protocol: 'btc',
-          btcParams: {
-            to: btcParamsLeader.to,
-            amountSat: btcParamsLeader.amountSat.toString(),
-            feeRate: btcParamsLeader.feeRate,
-            network: btcParamsLeader.network,
-            frostP2tr: btcParamsLeader.frostP2tr,
-            frostUntweakedPubKeyHex: toHex(btcParamsLeader.frostUntweakedPubKey),
-            utxos: btcParamsLeader.utxos.map((u) => ({
-              transactionId: u.transactionId,
-              outputIndex: u.outputIndex,
-              valueSat: u.value.toString(),
-            })),
-          },
-        },
-      );
-      await ctx.get(0)!.runner.sendFrostSigningDoneSignoff(baseId, sigs);
-
-      const outcome = await pending;
-      expect(outcome.kind).toBe('signing-frost');
-      expect(outcome.status).toBe('done');
-
-      expect(specs.length).toBe(1);
-      const spec = specs[0]!;
-      expect(spec.kind).toBe('signing');
-      if (spec.kind === 'signing') {
-        expect(spec.operation).toBe('btc-transfer');
-        expect(spec.destination).toBe(destP2tr);
-        expect(spec.amount).toBe(100_000n);
-        // outputs[] is non-self only — change output (vault P2TR) excluded.
-        expect(spec.outputs).toHaveLength(1);
-        expect(spec.outputs?.[0]?.address).toBe(destP2tr);
-        expect(spec.outputs?.[0]?.amountSat).toBe(100_000n);
-      }
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 60_000);
-
-  it('BTC construction-params: participant silent-drops when leader asserts sighashes inconsistent with btcParams (byzantine)', async () => {
-    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'frost-sig-btc-byz';
-
-    const frostUntweakedPubKey = publicKeyPackage.untweakedVerifyingKey;
-    const internalXOnly = toXOnly(Buffer.from(frostUntweakedPubKey) as never);
-    const frostP2tr = payments.p2tr({
-      internalPubkey: internalXOnly as never,
-      network: networks.opnetTestnet,
-    }).address!;
-    const destSk = new Uint8Array(Array.from({ length: 32 }, (_, i) => i + 33));
-    const destXOnly = new Uint8Array(schnorr.getPublicKey(destSk));
-    const destP2tr = payments.p2tr({
-      internalPubkey: destXOnly as never,
-      network: networks.opnetTestnet,
-    }).address!;
-
-    const errLogs: string[] = [];
-    const logger: Logger = {
-      debug: () => {},
-      info: () => {},
-      warn: () => {},
-      error: (msg) => errLogs.push(msg),
-    };
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {
-      frostKeyPackage: keyPackages[1]!,
-      frostPublicKeyPackage: publicKeyPackage,
-      logger,
-    });
-    orch.start();
-
-    try {
-      // Announce real btcParams but assert a bogus (all-zero) sighash that
-      // won't match what participants rebuild.
-      const announce = announceFrostMessage(
-        baseId,
-        baseId,
-        [{ hash: new Uint8Array(32), tweaked: true }],
-        [0, 1],
-        {
-          protocol: 'btc',
-          btcParams: {
-            to: destP2tr,
-            amountSat: '100000',
-            feeRate: 5,
-            network: 'testnet',
-            frostP2tr,
-            frostUntweakedPubKeyHex: toHex(frostUntweakedPubKey),
-            utxos: [
-              { transactionId: '22'.repeat(32), outputIndex: 0, valueSat: '200000' },
-            ],
-          },
-        },
-      );
-      await ctx.get(0)!.transport.broadcast(encodeCeremonyMessage(announce));
-
-      const deadline = Date.now() + 1000;
-      while (Date.now() < deadline) {
-        if (errLogs.some((m) => m.includes('btc sighash') && m.includes('mismatch'))) break;
-        await new Promise((r) => setTimeout(r, 10));
-      }
-      expect(errLogs.some((m) => m.includes('btc sighash') && m.includes('mismatch'))).toBe(true);
-
-      const r1Blob = ctx.get(1)!.store.get({
-        ceremonyId: baseId,
-        round: 'frost-sign-r1',
-        from: 1,
-      });
-      expect(r1Blob).toBeUndefined();
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 10_000);
-
-  it('BTC ceremony aborts when a participant gate rejects (not enough signers → leader timeout)', async () => {
-    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'frost-sig-policy-reject';
-
-    const frostUntweakedPubKey = publicKeyPackage.untweakedVerifyingKey;
-    const internalXOnly = toXOnly(Buffer.from(frostUntweakedPubKey) as never);
-    const frostP2tr = payments.p2tr({
-      internalPubkey: internalXOnly as never,
-      network: networks.opnetTestnet,
-    }).address!;
-
-    // Destination NOT on party-1's allowlist → their PolicyGate rejects.
-    const destSk = new Uint8Array(Array.from({ length: 32 }, (_, i) => i + 91));
-    const destXOnly = new Uint8Array(schnorr.getPublicKey(destSk));
-    const destP2tr = payments.p2tr({
-      internalPubkey: destXOnly as never,
-      network: networks.opnetTestnet,
-    }).address!;
-
-    // Party 1's gate only allows `bc1pOTHER`; the ceremony targets destP2tr → reject.
-    const rejectingGate = new PolicyGate({ allowedBtcRecipients: ['bc1pOTHER'] });
-    const orch1 = buildOrchestrator(ctx.get(1)!, peersById, {
-      gate: rejectingGate,
-      frostKeyPackage: keyPackages[1]!,
-      frostPublicKeyPackage: publicKeyPackage,
-    });
-    orch1.start();
-
-    try {
-      const btcParams = {
-        to: destP2tr,
-        amountSat: 50_000n,
-        feeRate: 5,
-        network: 'testnet' as const,
-        frostP2tr,
-        frostUntweakedPubKey,
-        utxos: [{ transactionId: '44'.repeat(32), outputIndex: 0, value: 200_000n }],
-      };
-      const built = buildBtcTxFromParams(btcParams);
-
-      // signers=[0, 1]; leader (0) depends on party 1's blobs to combine.
-      // Party 1 rejects → silent → leader's pull exhausts retries → throw.
-      await expect(
-        ctx.get(0)!.runner.signFrostAsLeader(
-          {
-            ceremonyId: baseId,
-            sighashes: built.sighashes.map((s) => ({ hash: s.hash, tweaked: s.tweaked })),
-            signers: [0, 1],
-            keyPackage: keyPackages[0]!,
-            publicKeyPackage,
-            rng: SYSTEM_RNG,
-          },
-          { maxAttempts: 3, initialDelayMs: 2, maxDelayMs: 10, deadlineMs: 300 },
-          {
-            protocol: 'btc',
-            btcParams: {
-              to: btcParams.to,
-              amountSat: btcParams.amountSat.toString(),
-              feeRate: btcParams.feeRate,
-              network: btcParams.network,
-              frostP2tr: btcParams.frostP2tr,
-              frostUntweakedPubKeyHex: toHex(btcParams.frostUntweakedPubKey),
-              utxos: btcParams.utxos.map((u) => ({
-                transactionId: u.transactionId,
-                outputIndex: u.outputIndex,
-                valueSat: u.value.toString(),
-              })),
-            },
-          },
-        ),
-      ).rejects.toThrow();
-
-      // Party 1 rejected → no R1 blob produced.
-      const r1Blob1 = ctx.get(1)!.store.get({
-        ceremonyId: baseId,
-        round: 'frost-sign-r1',
-        from: 1,
-      });
-      expect(r1Blob1).toBeUndefined();
-    } finally {
-      orch1.stop();
-      close();
-    }
-  }, 15_000);
-
-  it('FROST signing rejected when no frostKeyPackage is loaded (misconfigured daemon)', async () => {
-    const { keyPackages, publicKeyPackage } = frostDkgInMemory(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'frost-sig-missing-key';
-
-    // Party 1's orchestrator missing FROST key material — should not participate.
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {});
-    orch.start();
-
-    try {
-      // Leader will time out on pulls since participant never produces blobs.
-      await expect(
-        ctx.get(0)!.runner.signFrostAsLeader(
-          {
-            ceremonyId: baseId,
-            sighashes: [{ hash: new Uint8Array(32), tweaked: true }],
-            signers: [0, 1],
-            keyPackage: keyPackages[0]!,
-            publicKeyPackage,
-            rng: SYSTEM_RNG,
-          },
-          { maxAttempts: 2, initialDelayMs: 2, maxDelayMs: 5, deadlineMs: 30 },
-          makeDummyFrostKeylinkExtras(),
-        ),
-      ).rejects.toThrow();
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 20_000);
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// DKG — all three flavors
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('Orchestrator — ML-DSA DKG', () => {
-  it('two participants join via orchestrator; each settles with matching DKG result', async () => {
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'mldsa-dkg-1';
-    const orchs = [1, 2].map((id) => buildOrchestrator(ctx.get(id)!, peersById, {}));
-    orchs.forEach((o) => o.start());
-
-    try {
-      const pendings = orchs.map((o) => o.waitFor(baseId, 120_000));
-      const leaderResult = await ctx.get(0)!.runner.runMldsaDkg(
-        { ceremonyId: baseId, threshold: 2, parties: 3, level: 44 },
-        DKG_PULL_OPTS,
-      );
-
-      const outcomes = await Promise.all(pendings);
-      for (let i = 0; i < 2; i++) {
-        const o = outcomes[i]!;
-        expect(o.kind).toBe('dkg-mldsa');
-        expect(o.status).toBe('done');
-        if (o.kind === 'dkg-mldsa') {
-          expect(o.result!.share.id).toBe(i + 1);
-          expect(toHex(o.result!.publicKey)).toBe(toHex(leaderResult.publicKey));
-        }
-      }
-    } finally {
-      orchs.forEach((o) => o.stop());
-      close();
-    }
-  }, 180_000);
-});
-
-describe('Orchestrator — FROST DKG', () => {
-  it('participants join via orchestrator; verifyingKey agrees across peers', async () => {
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'frost-dkg-1';
-    const orchs = [1, 2].map((id) => buildOrchestrator(ctx.get(id)!, peersById, {}));
-    orchs.forEach((o) => o.start());
-
-    try {
-      const pendings = orchs.map((o) => o.waitFor(baseId, 60_000));
-      const leaderResult = await ctx.get(0)!.runner.runFrostDkg(
-        { ceremonyId: baseId, threshold: 2, parties: 3, rng: SYSTEM_RNG },
-        FAST_PULL_OPTS,
-      );
-      const outcomes = await Promise.all(pendings);
-      for (let i = 0; i < 2; i++) {
-        const o = outcomes[i]!;
-        expect(o.kind).toBe('dkg-frost');
-        expect(o.status).toBe('done');
-        if (o.kind === 'dkg-frost') {
-          expect(o.keyPackage!.identifier).toBe(BigInt(i + 2));
-          expect(toHex(o.publicKeyPackage!.verifyingKey)).toBe(
-            toHex(leaderResult.publicKeyPackage.verifyingKey),
-          );
-        }
-      }
-    } finally {
-      orchs.forEach((o) => o.stop());
-      close();
-    }
-  }, 120_000);
-});
-
-describe('Orchestrator — Combined DKG', () => {
-  it('participants settle with matching ML-DSA + FROST outputs', async () => {
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'combined-dkg-1';
-    const orchs = [1, 2].map((id) => buildOrchestrator(ctx.get(id)!, peersById, {}));
-    orchs.forEach((o) => o.start());
-
-    try {
-      const pendings = orchs.map((o) => o.waitFor(baseId, 120_000));
-      const leaderResult = await ctx.get(0)!.runner.runCombinedDkg(
-        { ceremonyId: baseId, threshold: 2, parties: 3, level: 44, rng: SYSTEM_RNG },
-        DKG_PULL_OPTS,
-      );
-      const outcomes = await Promise.all(pendings);
-      for (let i = 0; i < 2; i++) {
-        const o = outcomes[i]!;
-        expect(o.kind).toBe('dkg-combined');
-        expect(o.status).toBe('done');
-        if (o.kind === 'dkg-combined') {
-          expect(toHex(o.result!.mldsa.publicKey)).toBe(toHex(leaderResult.mldsa.publicKey));
-          expect(toHex(o.result!.frost.publicKeyPackage.verifyingKey)).toBe(
-            toHex(leaderResult.frost.publicKeyPackage.verifyingKey),
-          );
-        }
-      }
-    } finally {
-      orchs.forEach((o) => o.stop());
-      close();
-    }
-  }, 180_000);
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// Leader auth + gate integration
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('Orchestrator — leader authentication', () => {
-  it('ignores announces from a peer that is not the established leader', async () => {
-    const { shares } = dealerKeygen(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'mldsa-auth-1';
-    const message = new TextEncoder().encode('leader auth');
-
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, { share: shares[1]! });
-    orch.start();
-
-    try {
-      const outcomes: CeremonyOutcome[] = [];
-      orch.onCompleted((o) => outcomes.push(o));
-
-      // Leader = party 0. Leader announces the ceremony first.
-      const pending = orch.waitFor(baseId, 30_000);
-      // Parallel: party 2 tries to inject a rogue announce with the same baseId.
-      const rogueAnnounce = new TextEncoder().encode(
-        JSON.stringify({
-          v: 1,
-          kind: 'announce',
-          ceremonyId: baseId,
-          baseCeremonyId: baseId,
-          messageHex: '00',
-          signers: [0, 1],
-        }),
-      );
-      // Broadcast from party 0 first (establishes leader), then rogue.
-      const sig = await ctx.get(0)!.runner.signAsLeader(
-        { ceremonyId: baseId, message, signers: [0, 1], share: shares[0]! },
-        FAST_PULL_OPTS,
-      );
-      // Rogue broadcast from party 2 (after leader is pinned).
-      await ctx.get(2)!.transport.broadcast(rogueAnnounce);
-      await ctx.get(0)!.runner.sendSigningDoneSignoff(baseId, sig);
-
-      const outcome = await pending;
-      expect(outcome.status).toBe('done');
-      // Only the real leader's sig was settled; rogue announce produced no additional outcomes.
-      expect(outcomes.filter((o) => o.baseCeremonyId === baseId)).toHaveLength(1);
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 60_000);
-
-  it('ignores signoffs from a peer that is not the established leader', async () => {
-    const { shares } = dealerKeygen(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'mldsa-auth-2';
-
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, { share: shares[1]! });
-    orch.start();
-
-    try {
-      const pending = orch.waitFor(baseId, 30_000);
-      // Party 0 legitimately announces.
-      const p = ctx.get(0)!.runner.signAsLeader(
-        { ceremonyId: baseId, message: new TextEncoder().encode('x'), signers: [0, 1], share: shares[0]! },
-        FAST_PULL_OPTS,
-      );
-      // Party 2 tries to send a rogue signoff-done BEFORE the real one.
-      const fakeSig = new Uint8Array(64);
-      const rogueSignoff = new TextEncoder().encode(
-        JSON.stringify({
-          v: 1,
-          kind: 'signoff-done',
-          baseCeremonyId: baseId,
-          signatureHex: toHex(fakeSig),
-        }),
-      );
-      await ctx.get(2)!.transport.broadcast(rogueSignoff);
-
-      const sig = await p;
-      await ctx.get(0)!.runner.sendSigningDoneSignoff(baseId, sig);
-
-      const outcome = await pending;
-      expect(outcome.status).toBe('done');
-      if (outcome.kind === 'signing-mldsa') {
-        expect(outcome.signatureHex).toBe(toHex(sig));
-        expect(outcome.signatureHex).not.toBe(toHex(fakeSig));
-      }
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 60_000);
-});
-
-describe('Orchestrator — gate integration', () => {
-  it('silent drop when gate rejects — leader sees no participation and aborts', async () => {
-    const { shares } = dealerKeygen(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'gate-reject-1';
-
-    // PolicyGate with maxAmount set but spec.amount will be undefined (announce has no amount)
-    // → strict-by-default rejects the generic signing.
-    const policyGate = new PolicyGate({ maxAmount: 1_000n });
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, { share: shares[1]!, gate: policyGate });
-    orch.start();
-
-    try {
-      await expect(
-        ctx.get(0)!.runner.signAsLeader(
-          {
-            ceremonyId: baseId,
-            message: new TextEncoder().encode('rejected'),
-            signers: [0, 1],
-            share: shares[0]!,
-          },
-          { maxAttempts: 2, initialDelayMs: 2, maxDelayMs: 5, deadlineMs: 30 },
-        ),
-      ).rejects.toThrow();
-      // The orchestrator's participant task was never dispatched; leader gave up.
-      // We can't assert "no participation" directly other than the leader aborting.
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 20_000);
-
-  it('AutoGate passes through — ceremony completes', async () => {
-    const { shares } = dealerKeygen(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'gate-auto-1';
-
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {
-      share: shares[1]!,
-      gate: new AutoGate(),
-    });
-    orch.start();
-
-    try {
-      const pending = orch.waitFor(baseId, 60_000);
-      const sig = await ctx.get(0)!.runner.signAsLeader(
-        { ceremonyId: baseId, message: new TextEncoder().encode('auto'), signers: [0, 1], share: shares[0]! },
-        FAST_PULL_OPTS,
-      );
-      await ctx.get(0)!.runner.sendSigningDoneSignoff(baseId, sig);
-      const outcome = await pending;
-      expect(outcome.status).toBe('done');
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 60_000);
-
-  it('caches gate decision across ML-DSA retries (gate called once per baseId)', async () => {
-    const { shares } = dealerKeygen(2, 3);
-    const { ctx, close, peersById } = buildRing([0, 1, 2]);
-    const baseId = 'gate-cache-1';
-
-    let gateCalls = 0;
-    const countingGate: ApprovalGate = {
-      async approve() {
-        gateCalls++;
-        return 'approve';
-      },
-    };
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {
-      share: shares[1]!,
-      gate: countingGate,
-    });
-    orch.start();
-
-    try {
-      const pending = orch.waitFor(baseId, 60_000);
-      const sig = await ctx.get(0)!.runner.signAsLeader(
-        { ceremonyId: baseId, message: new TextEncoder().encode('cache'), signers: [0, 1], share: shares[0]! },
-        FAST_PULL_OPTS,
-      );
-      await ctx.get(0)!.runner.sendSigningDoneSignoff(baseId, sig);
-      await pending;
-      // Regardless of retries (there may be 0+ #N attempts), the gate runs once per baseId.
-      expect(gateCalls).toBe(1);
-    } finally {
-      orch.stop();
-      close();
-    }
-  }, 60_000);
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// Lifecycle
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('Orchestrator — lifecycle', () => {
-  it('stop() rejects pending waitFor with "stopped" error', async () => {
-    const { ctx, close, peersById } = buildRing([0, 1]);
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {});
-    orch.start();
-
-    const pending = orch.waitFor('never-fires', 10_000);
-    orch.stop();
-    await expect(pending).rejects.toThrow(/stopped before/);
-    close();
+function broadcastFrom(ring: RingNode[], p: PartyId, msg: CeremonyMessage): Promise<void> {
+  return ring[p]!.io.transport.broadcast(encodeMessage(msg));
+}
+
+function announceDkg(ceremonyId: string, sessionId: Uint8Array, over: Partial<AnnounceDkg> = {}): AnnounceDkg {
+  return {
+    v: 2,
+    kind: 'announce-dkg',
+    ceremonyId,
+    sessionIdHex: toHex(sessionId),
+    threshold: 3,
+    parties: 3,
+    network: NET,
+    ...over,
+  };
+}
+
+/** Node `p` leads a DKG directly: announce, then the symmetric ceremony. */
+async function leadDkg(ring: RingNode[], p: PartyId, ceremonyId: string, signal?: AbortSignal) {
+  const sessionId = crypto.getRandomValues(new Uint8Array(32));
+  await broadcastFrom(ring, p, announceDkg(ceremonyId, sessionId));
+  return runDkgCeremony(
+    ring[p]!.io,
+    { ceremonyId, sessionId, threshold: 3, parties: 3, network: NET, rng },
+    recordingStager(),
+    signal,
+  );
+}
+
+/** Wait until `fn` stops throwing. */
+const eventually = (fn: () => void) => vi.waitFor(fn, { timeout: 3_000, interval: 5 });
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>(r => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+// ─── DKG ───────────────────────────────────────────────────────────────────
+
+describe('Orchestrator: DKG participation', () => {
+  let ring: RingNode[];
+
+  beforeEach(() => {
+    ring = makeRing(3, LEADER_PULLS);
   });
 
-  it('waitFor times out when no matching outcome arrives', async () => {
-    const { ctx, close, peersById } = buildRing([0, 1]);
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {});
-    orch.start();
+  it('participates in a DKG and settles done with the vault address', async () => {
+    const id = 'dkg-done';
+    const p1 = participant(ring[1]!);
+    const p2 = participant(ring[2]!);
+    const outcomes: CeremonyOutcome[] = [];
+    p1.orch.onCompleted(o => outcomes.push(o));
 
-    await expect(orch.waitFor('no-such-ceremony', 50)).rejects.toThrow(/timed out/);
-    orch.stop();
-    close();
+    const result = await leadDkg(ring, 0, id);
+    const address = vaultPayment(toVaultKey(result.publicKeyPackage), NET).address;
+
+    for (const p of [p1, p2]) {
+      expect(await p.orch.waitFor(id, WAIT_MS)).toEqual({ ceremonyId: id, kind: 'dkg', status: 'done', address });
+      expect(p.createStager).toHaveBeenCalledTimes(1);
+      expect(p.stagers[0]!.calls).toEqual(['stage', 'commit']);
+      expect(p.gate.specs).toEqual([
+        {
+          kind: 'dkg',
+          ceremonyId: id,
+          leader: 'node-0',
+          role: 'participant',
+          threshold: 3,
+          parties: 3,
+          network: NET,
+          peerIds: ['node-0', 'node-1', 'node-2'],
+        },
+      ]);
+    }
+    expect(outcomes).toHaveLength(1);
   });
 
-  it('double-start is idempotent; double-stop is idempotent', () => {
-    const { ctx, close, peersById } = buildRing([0, 1]);
-    const orch = buildOrchestrator(ctx.get(1)!, peersById, {});
-    orch.start();
-    orch.start();
+  it('drops announce-dkg when a vault exists and never creates a stager', async () => {
+    const id = 'dkg-vault';
+    const tv = testVault(3, 3);
+    const p1 = participant(ring[1]!, { vaultExists: async () => true });
+    const vaultExists2 = vi.fn(async () => false);
+    const p2 = participant(ring[2]!, { vault: shareOf(tv, 2), vaultExists: vaultExists2 });
+
+    await broadcastFrom(ring, 0, announceDkg(id, new Uint8Array(32).fill(7)));
+
+    // A share file at the share path (node 1) and a loaded share (node 2) both refuse.
+    await eventually(() => expect(p1.log.about(id)).toHaveLength(1));
+    expect(p1.log.about(id)[0]).toMatchObject({ level: 'warn' });
+    expect(p1.log.about(id)[0]!.msg).toMatch(/share file exists/);
+    expect(p2.log.about(id)).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p2.log.about(id)[0]!.msg).toMatch(/already holds a vault/);
+    expect(vaultExists2).not.toHaveBeenCalled();
+
+    for (const [p, node] of [[p1, ring[1]!], [p2, ring[2]!]] as const) {
+      expect(p.createStager).not.toHaveBeenCalled();
+      expect(p.gate.specs).toEqual([]);
+      expect(node.io.store.list(id)).toEqual([]);
+      await expect(p.orch.waitFor(id, 50)).rejects.toThrow(/timed out/);
+    }
+  });
+
+  it('drops announce-dkg for another network or party count', async () => {
+    const p1 = participant(ring[1]!);
+    const sessionId = new Uint8Array(32).fill(1);
+
+    await broadcastFrom(ring, 0, announceDkg('dkg-net', sessionId, { network: 'signet' }));
+    await broadcastFrom(ring, 0, announceDkg('dkg-parties', sessionId, { threshold: 2, parties: 2 }));
+
+    expect(p1.log.about('dkg-net')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about('dkg-net')[0]!.msg).toMatch(/network signet/);
+    expect(p1.log.about('dkg-parties')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about('dkg-parties')[0]!.msg).toMatch(/parties 2/);
+    expect(p1.createStager).not.toHaveBeenCalled();
+    expect(p1.gate.specs).toEqual([]);
+    await expect(p1.orch.waitFor('dkg-net', 50)).rejects.toThrow(/timed out/);
+    await expect(p1.orch.waitFor('dkg-parties', 50)).rejects.toThrow(/timed out/);
+  });
+
+  it('settles rejected when the gate refuses a DKG, and never creates a stager', async () => {
+    const thrower: ApprovalGate = { approve: () => Promise.reject(new Error('approver unreachable')) };
+    const p1 = participant(ring[1]!, { gate: new PolicyGate({ dkgLeaderAllowlist: ['node-2'] }) });
+    const p2 = participant(ring[2]!, { gate: thrower });
+
+    await broadcastFrom(ring, 0, announceDkg('dkg-gate', new Uint8Array(32).fill(2)));
+
+    const o1 = await p1.orch.waitFor('dkg-gate', WAIT_MS);
+    expect(o1).toEqual({ ceremonyId: 'dkg-gate', kind: 'dkg', status: 'rejected', reason: 'gate decision: reject' });
+    expect(p1.log.about('dkg-gate')).toEqual([expect.objectContaining({ level: 'info' })]);
+    const o2 = await p2.orch.waitFor('dkg-gate', WAIT_MS);
+    expect(o2).toMatchObject({ status: 'rejected', reason: 'gate error: approver unreachable' });
+    expect(p2.log.about('dkg-gate')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    for (const [p, node] of [[p1, ring[1]!], [p2, ring[2]!]] as const) {
+      expect(p.gate.specs).toHaveLength(1);
+      expect(p.createStager).not.toHaveBeenCalled();
+      expect(node.io.store.list('dkg-gate')).toEqual([]);
+    }
+  });
+
+  it('stops a DKG when any ring member aborts', async () => {
+    const id = 'dkg-abort';
+    const p1 = participant(ring[1]!);
+    // Node 2 is not the leader; its disk fails, so it aborts the ceremony for everyone.
+    const failing = recordingStager('disk full');
+    const p2 = participant(ring[2]!, { createStager: () => failing });
+    const leaderAbort = new AbortController();
+    ring[0]!.io.transport.onBroadcast((_from, bytes) => {
+      const msg = parseMessage(bytes);
+      if (msg?.kind === 'signoff-aborted' && msg.ceremonyId === id) leaderAbort.abort();
+    });
+
+    await expect(leadDkg(ring, 0, id, leaderAbort.signal)).rejects.toThrow(/DKG aborted/);
+
+    const o1 = await p1.orch.waitFor(id, WAIT_MS);
+    expect(o1).toMatchObject({ ceremonyId: id, kind: 'dkg', status: 'aborted' });
+    expect(o1.reason).toContain('disk full');
+    const o2 = await p2.orch.waitFor(id, WAIT_MS);
+    expect(o2).toMatchObject({ ceremonyId: id, kind: 'dkg', status: 'aborted' });
+    expect(o2.reason).toContain('disk full');
+
+    // Node 1 discards its staged share unless it had already published its confirmation.
+    const confirmed = ring[1]!.io.store.has({ ceremonyId: id, round: 'dkg-verified', from: 1 });
+    if (confirmed) {
+      await eventually(() => expect(p1.log.lines.some(l => l.level === 'error' && l.msg.includes(id))).toBe(true));
+      expect(p1.stagers[0]!.calls).toEqual(['stage']);
+    } else {
+      await eventually(() => expect(p1.stagers[0]!.calls).toContain('discard'));
+    }
+    expect(p1.stagers[0]!.calls).not.toContain('commit');
+    expect(failing.calls).toEqual(['stage', 'discard']);
+  });
+
+  it('keeps the staged share and logs an error when a ring member aborts after its confirmation', async () => {
+    const id = 'dkg-kept';
+    const p1 = participant(ring[1]!);
+    participant(ring[2]!);
+    // Node 1 never gets node 2's confirmation.
+    const pull = ring[1]!.io.transport.pull.bind(ring[1]!.io.transport);
+    ring[1]!.io.transport.pull = async key => (key.round === 'dkg-verified' && key.from === 2 ? null : pull(key));
+
+    const led = leadDkg(ring, 0, id).catch(() => undefined);
+    await vi.waitFor(() => expect(ring[1]!.io.store.has({ ceremonyId: id, round: 'dkg-verified', from: 1 })).toBe(true), {
+      timeout: WAIT_MS,
+      interval: 5,
+    });
+    await broadcastFrom(ring, 2, { v: 2, kind: 'signoff-aborted', ceremonyId: id, reason: 'operator abort' });
+
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'aborted', reason: 'operator abort' });
+    await eventually(() => expect(p1.log.about(id).filter(l => l.level === 'error')).toHaveLength(1));
+    const line = p1.log.about(id).find(l => l.level === 'error')!;
+    expect(line.msg).toMatch(/so its staged share was kept at \/test\/share\.json\.pending/);
+    expect(line.msg).toMatch(/run 'otzi vault' on the other nodes/);
+    expect(p1.stagers[0]!.calls).toEqual(['stage']);
+    await led;
+  });
+
+  it('settles timeout when the DKG deadline passes', async () => {
+    const id = 'dkg-timeout';
+    const p1 = participant(ring[1]!, { ceremonyDeadlines: { signingMs: 5_000, dkgMs: 150 } });
+
+    // The announcing node never takes part.
+    await broadcastFrom(ring, 0, announceDkg(id, new Uint8Array(32).fill(3)));
+
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ ceremonyId: id, kind: 'dkg', status: 'timeout' });
+    await eventually(() => expect(p1.stagers[0]!.calls).toEqual(['discard']));
+  });
+
+  it('drops announce-dkg from a sender outside the ring', async () => {
+    const big = makeRing(4, LEADER_PULLS);
+    // Node 1's ring is parties 0..2: party 3 is not a member.
+    const p1 = participant(big[1]!);
+
+    await broadcastFrom(big, 3, announceDkg('dkg-stranger', new Uint8Array(32).fill(1)));
+
+    expect(p1.log.about('dkg-stranger')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about('dkg-stranger')[0]!.msg).toMatch(/party 3 is not a ring member/);
+    expect(p1.createStager).not.toHaveBeenCalled();
+    expect(p1.gate.specs).toEqual([]);
+    await expect(p1.orch.waitFor('dkg-stranger', 50)).rejects.toThrow(/timed out/);
+  });
+
+  it('stop() schedules the clear of a live ceremony\'s blobs', async () => {
+    const id = 'dkg-stopped';
+    const p1 = participant(ring[1]!, { blobRetentionMs: { signing: 50, dkg: 50 } });
+
+    // The announcing node never takes part: node 1 produces its round-1 blob and waits.
+    await broadcastFrom(ring, 0, announceDkg(id, new Uint8Array(32).fill(11)));
+    await eventually(() => expect(ring[1]!.io.store.list(id).length).toBeGreaterThan(0));
+    p1.orch.stop();
+
+    await eventually(() => expect(ring[1]!.io.store.list(id)).toEqual([]));
+  });
+
+  it('accepts a fresh DKG after a leftover pending file', async () => {
+    const id = 'dkg-pending';
+    const dir = await mkdtemp(join(tmpdir(), 'otzi-orchestrator-'));
+    try {
+      const path = join(dir, 'share.json');
+      await writeFile(pendingPath(path), '{"left":"over"}', { mode: 0o600 });
+      const p1 = participant(ring[1]!, {
+        vaultExists: () => vaultFileExists(path),
+        createStager: () =>
+          createShareStager({ path, password: 'pw', network: NET, partyId: 1, vaultPubkeyPath: join(dir, 'vault-pubkey.json') }),
+      });
+      participant(ring[2]!);
+
+      const result = await leadDkg(ring, 0, id);
+
+      const address = vaultPayment(toVaultKey(result.publicKeyPackage), NET).address;
+      expect(await p1.orch.waitFor(id, WAIT_MS)).toEqual({ ceremonyId: id, kind: 'dkg', status: 'done', address });
+      expect(await vaultFileExists(path)).toBe(true);
+      expect(await vaultFileExists(pendingPath(path))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Local slots ───────────────────────────────────────────────────────────
+
+describe('Orchestrator: local ceremony slots', () => {
+  let ring: RingNode[];
+
+  beforeEach(() => {
+    ring = makeRing(3, LEADER_PULLS);
+  });
+
+  it('refuses a second DKG while the first slot is live', () => {
+    const { orch } = participant(ring[1]!);
+
+    const first = orch.beginLocalDkg('local-a');
+    expect(first).not.toBeNull();
+    expect(orch.beginLocalDkg('local-b')).toBeNull();
+
+    first!.end();
+    first!.end(); // idempotent
+    const second = orch.beginLocalDkg('local-c');
+    expect(second).not.toBeNull();
+
+    first!.end(); // a stale end() never releases a later slot
+    expect(orch.beginLocalDkg('local-d')).toBeNull();
+    second!.end();
+    expect(orch.beginLocalDkg('local-e')).not.toBeNull();
+  });
+
+  it('refuses while a participant DKG is live, and refuses its id after it ended', async () => {
+    const id = 'dkg-joined';
+    const p1 = participant(ring[1]!, { ceremonyDeadlines: { signingMs: 5_000, dkgMs: 150 } });
+
+    await broadcastFrom(ring, 0, announceDkg(id, new Uint8Array(32).fill(4)));
+    expect(p1.orch.beginLocalDkg('local-a')).toBeNull();
+
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'timeout' });
+    let slot: ReturnType<Orchestrator['beginLocalDkg']> = null;
+    await eventually(() => {
+      slot = p1.orch.beginLocalDkg('local-a');
+      expect(slot).not.toBeNull();
+    });
+    slot!.end();
+    // The ended ceremony's id stays taken for its retention period.
+    expect(p1.orch.beginLocalDkg(id)).toBeNull();
+    expect(p1.orch.beginLocalSigning(id)).toBeNull();
+  });
+
+  it('holds the DKG slot until a joined DKG finishes unwinding', async () => {
+    const id = 'dkg-unwinding';
+    const release = deferred();
+    const stager = recordingStager();
+    stager.discard = async () => {
+      stager.calls.push('discard');
+      await release.promise;
+    };
+    const p1 = participant(ring[1]!, { createStager: () => stager });
+
+    // Node 0 announces but never takes part; node 2 then aborts the ceremony.
+    await broadcastFrom(ring, 0, announceDkg(id, new Uint8Array(32).fill(6)));
+    await eventually(() => expect(p1.createStager).toHaveBeenCalledTimes(1));
+    await broadcastFrom(ring, 2, { v: 2, kind: 'signoff-aborted', ceremonyId: id, reason: 'operator abort' });
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'aborted', reason: 'operator abort' });
+    await eventually(() => expect(stager.calls).toEqual(['discard']));
+
+    // The tracker is gone, but the ceremony is still inside discard(): no second DKG.
+    expect(p1.orch.beginLocalDkg('local-a')).toBeNull();
+    await broadcastFrom(ring, 0, announceDkg('dkg-next', new Uint8Array(32).fill(7)));
+    expect(p1.log.about('dkg-next')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about('dkg-next')[0]!.msg).toMatch(/a DKG is already running/);
+    expect(p1.createStager).toHaveBeenCalledTimes(1);
+
+    release.resolve();
+    let slot: ReturnType<Orchestrator['beginLocalDkg']> = null;
+    await eventually(() => {
+      slot = p1.orch.beginLocalDkg('local-a');
+      expect(slot).not.toBeNull();
+    });
+    slot!.end();
+  });
+
+  it('drops announce-dkg while a local DKG is live', async () => {
+    const p1 = participant(ring[1]!);
+    const slot = p1.orch.beginLocalDkg('local-a')!;
+
+    await broadcastFrom(ring, 0, announceDkg('remote-b', new Uint8Array(32).fill(5)));
+
+    expect(p1.log.about('remote-b')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about('remote-b')[0]!.msg).toMatch(/a DKG is already running/);
+    expect(p1.createStager).not.toHaveBeenCalled();
+    expect(p1.gate.specs).toEqual([]);
+    await expect(p1.orch.waitFor('remote-b', 50)).rejects.toThrow(/timed out/);
+    slot.end();
+  });
+
+  it('aborts the local DKG when any ring member aborts it', async () => {
+    const id = 'dkg-local';
+    const p1 = participant(ring[1]!);
+    participant(ring[0]!);
+    participant(ring[2]!, { createStager: () => recordingStager('disk full') });
+
+    const slot = p1.orch.beginLocalDkg(id)!;
+    // An abort for another ceremony does not touch the slot.
+    await broadcastFrom(ring, 2, { v: 2, kind: 'signoff-aborted', ceremonyId: 'unrelated' });
+    expect(slot.signal.aborted).toBe(false);
+
+    try {
+      // Node 1 leads through its slot; node 2 fails and broadcasts signoff-aborted.
+      // Without the slot signal node 1 would wait for its pull deadline instead.
+      await expect(leadDkg(ring, 1, id, slot.signal)).rejects.toThrow('DKG aborted: aborted');
+      expect(slot.signal.aborted).toBe(true);
+    } finally {
+      slot.end();
+    }
+  });
+
+  it('reserves signing ids this node leads', async () => {
+    const retention = { signing: 60, dkg: 60 };
+    const { orch } = participant(ring[1]!, { blobRetentionMs: retention });
+
+    const a = orch.beginLocalSigning('sign-a');
+    expect(a).not.toBeNull();
+    expect(orch.ceremonyIdInUse('sign-a')).toBe(true);
+    expect(orch.beginLocalSigning('sign-a')).toBeNull();
+    expect(orch.beginLocalDkg('sign-a')).toBeNull();
+    const b = orch.beginLocalSigning('sign-b'); // distinct ids run side by side
+    expect(b).not.toBeNull();
+    b!.end();
+
+    a!.end();
+    a!.end(); // idempotent
+    // Ended here: the id stays taken for the signing retention period.
+    expect(orch.ceremonyIdInUse('sign-a')).toBe(true);
+    expect(orch.beginLocalSigning('sign-a')).toBeNull();
+    expect(orch.beginLocalDkg('sign-a')).toBeNull();
+    await eventually(() => expect(orch.ceremonyIdInUse('sign-a')).toBe(false));
+    const again = orch.beginLocalSigning('sign-a');
+    expect(again).not.toBeNull();
+    a!.end(); // a stale end() never releases a later reservation
+    expect(orch.beginLocalSigning('sign-a')).toBeNull();
+    again!.end();
+
+    const dkg = orch.beginLocalDkg('dkg-a')!;
+    expect(orch.beginLocalSigning('dkg-a')).toBeNull();
+    dkg.end();
+    expect(orch.beginLocalSigning('dkg-a')).toBeNull();
+    const other = orch.beginLocalDkg('dkg-b'); // the DKG slot itself is free again
+    expect(other).not.toBeNull();
+    other!.end();
+    await eventually(() => expect(orch.beginLocalDkg('dkg-a')).not.toBeNull());
+  });
+
+  it('keeps an ended local id for its own kind\'s retention period', async () => {
+    const { orch } = participant(ring[1]!, { blobRetentionMs: { signing: 40, dkg: 400 } });
+    orch.beginLocalSigning('led-sign')!.end();
+    orch.beginLocalDkg('led-dkg')!.end();
+    const ended = Date.now();
+
+    await eventually(() => expect(orch.ceremonyIdInUse('led-sign')).toBe(false));
+    expect(orch.ceremonyIdInUse('led-dkg')).toBe(true);
+    await eventually(() => expect(orch.ceremonyIdInUse('led-dkg')).toBe(false));
+    expect(Date.now() - ended).toBeGreaterThanOrEqual(390);
+  });
+
+  it('forgets ended local ids on stop', () => {
+    const { orch } = participant(ring[1]!);
+    orch.beginLocalSigning('led-stop')!.end();
+    expect(orch.ceremonyIdInUse('led-stop')).toBe(true);
     orch.stop();
-    orch.stop();
-    close();
+    expect(orch.ceremonyIdInUse('led-stop')).toBe(false);
+  });
+
+  it('drops an announce whose id this node led within retention', async () => {
+    const p1 = participant(ring[1]!);
+    p1.orch.beginLocalDkg('led-before')!.end();
+
+    await broadcastFrom(ring, 0, announceDkg('led-before', new Uint8Array(32).fill(9)));
+
+    expect(p1.log.about('led-before')).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about('led-before')[0]!.msg).toMatch(/this node led a ceremony with this id/);
+    expect(p1.createStager).not.toHaveBeenCalled();
+    expect(p1.gate.specs).toEqual([]);
+    await expect(p1.orch.waitFor('led-before', 50)).rejects.toThrow(/timed out/);
+  });
+
+  it.each([
+    ['a DKG that completes (promise path)', false],
+    ['a DKG deadline (timer path)', true],
+  ])('isolates a throwing onCompleted handler: %s', async (_name, timesOut) => {
+    const id = 'dkg-handler';
+    const escaped: unknown[] = [];
+    const onEscape = (err: unknown) => escaped.push(err);
+    process.on('unhandledRejection', onEscape);
+    process.on('uncaughtException', onEscape);
+    try {
+      const p1 = participant(ring[1]!, timesOut ? { ceremonyDeadlines: { signingMs: 5_000, dkgMs: 150 } } : {});
+      if (!timesOut) participant(ring[2]!);
+      const seen: CeremonyOutcome[] = [];
+      p1.orch.onCompleted(() => {
+        throw new Error('handler boom');
+      });
+      p1.orch.onCompleted(o => seen.push(o));
+      const waiting = p1.orch.waitFor(id, WAIT_MS);
+
+      if (timesOut) await broadcastFrom(ring, 0, announceDkg(id, new Uint8Array(32).fill(8)));
+      else await leadDkg(ring, 0, id);
+
+      expect(await waiting).toMatchObject({ ceremonyId: id, status: timesOut ? 'timeout' : 'done' });
+      expect(seen).toHaveLength(1);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(escaped).toEqual([]);
+      expect(p1.log.lines.filter(l => l.level === 'error' && l.msg.includes('handler boom'))).toHaveLength(1);
+    } finally {
+      process.off('unhandledRejection', onEscape);
+      process.off('uncaughtException', onEscape);
+    }
+  });
+});
+
+// ─── Signing ───────────────────────────────────────────────────────────────
+
+describe('Orchestrator: proposal signing', () => {
+  let tv: TestVault;
+  let foreign: TestVault;
+  let ring: RingNode[];
+
+  beforeAll(() => {
+    tv = testVault(3, 3);
+    foreign = testVault(3, 3);
+  });
+
+  beforeEach(() => {
+    ring = makeRing(3, LEADER_PULLS);
+  });
+
+  function analyse(proposal: SendProposal) {
+    const analysis = analyzeProposal(proposal, tv.vaultKey, NET);
+    return { analysis, sighashes: analysis.sighashes.map(s => fromHex(s.hash)) };
+  }
+
+  const leaderSpec = (ceremonyId: string, sighashes: Uint8Array[]): SignCeremonySpec => ({
+    ceremonyId,
+    signers: [0, 1, 2],
+    sighashes,
+    keyPackage: tv.keyPackages[0]!,
+    publicKeyPackage: tv.publicKeyPackage,
+    rng,
+  });
+
+  /** Nodes 1 and 2 run orchestrators with the vault loaded. */
+  function participants(over: [ParticipantOptions?, ParticipantOptions?] = []): [Participant, Participant] {
+    return [
+      participant(ring[1]!, { vault: shareOf(tv, 1), ...over[0] }),
+      participant(ring[2]!, { vault: shareOf(tv, 2), ...over[1] }),
+    ];
+  }
+
+  /** Node 0 leads the signing ceremony directly; resolves with the signatures. */
+  async function lead(ceremonyId: string, proposal: SendProposal, nodes: RingNode[] = ring): Promise<string[]> {
+    const { sighashes } = analyse(proposal);
+    const sigs = await leadSigning(nodes[0]!.io, leaderSpec(ceremonyId, sighashes), proposal);
+    return sigs.map(toHex);
+  }
+
+  const signoffDone = (ceremonyId: string, signaturesHex: string[]): CeremonyMessage => ({
+    v: 2,
+    kind: 'signoff-done',
+    ceremonyId,
+    signaturesHex,
+  });
+
+  const announceSign = (ceremonyId: string, proposal: SendProposal): CeremonyMessage => ({
+    v: 2,
+    kind: 'announce-sign',
+    ceremonyId,
+    signers: [0, 1, 2],
+    proposal,
+  });
+
+  it('signs an approved proposal and settles done on a valid signoff', async () => {
+    const id = 'sign-done';
+    const [p1, p2] = participants();
+    const proposal = makeProposal(tv.vaultKey, NET);
+    const { analysis } = analyse(proposal);
+
+    const signaturesHex = await lead(id, proposal);
+    await broadcastFrom(ring, 0, signoffDone(id, signaturesHex));
+
+    for (const p of [p1, p2]) {
+      expect(await p.orch.waitFor(id, WAIT_MS)).toEqual({ ceremonyId: id, kind: 'signing', status: 'done', signaturesHex });
+      expect(p.gate.specs).toHaveLength(1);
+      expect(p.gate.specs[0]).toMatchObject({
+        kind: 'signing',
+        ceremonyId: id,
+        leader: 'node-0',
+        role: 'participant',
+        network: NET,
+        txid: analysis.txid,
+        amount: 50_000,
+        fee: 1_000,
+      });
+    }
+  });
+
+  it('stays silent on a proposal spending a foreign input', async () => {
+    const id = 'sign-foreign';
+    const [p1] = participants();
+    const sent = vi.spyOn(ring[1]!.io.transport, 'broadcast');
+    const foreignScript = toHex(vaultPayment(foreign.vaultKey, NET).script);
+    const proposal = makeProposal(tv.vaultKey, NET, { inputs: [{ amount: 100_000, script: foreignScript }] });
+
+    await broadcastFrom(ring, 0, announceSign(id, proposal));
+
+    const o = await p1.orch.waitFor(id, WAIT_MS);
+    expect(o).toMatchObject({ ceremonyId: id, kind: 'signing', status: 'rejected' });
+    expect(o.reason).toMatch(/does not spend a coin of this vault/);
+    expect(p1.log.about(id)).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.gate.specs).toEqual([]);
+    expect(ring[1]!.io.store.list(id)).toEqual([]);
+    expect(sent).not.toHaveBeenCalled();
+  });
+
+  it('stays silent on a proposal for another network', async () => {
+    const id = 'sign-network';
+    const [p1] = participants();
+    const sent = vi.spyOn(ring[1]!.io.transport, 'broadcast');
+    const proposal = makeProposal(tv.vaultKey, 'signet');
+
+    await broadcastFrom(ring, 0, announceSign(id, proposal));
+
+    const o = await p1.orch.waitFor(id, WAIT_MS);
+    expect(o).toMatchObject({ ceremonyId: id, kind: 'signing', status: 'rejected' });
+    expect(o.reason).toMatch(/Proposal is for signet/);
+    expect(p1.gate.specs).toEqual([]);
+    expect(ring[1]!.io.store.list(id)).toEqual([]);
+    expect(sent).not.toHaveBeenCalled();
+  });
+
+  it('stays silent when the policy gate rejects a fee burn', async () => {
+    const id = 'sign-fee';
+    const [p1] = participants([{ gate: new PolicyGate({ maxFeeSats: 1_000 }) }]);
+    const sent = vi.spyOn(ring[1]!.io.transport, 'broadcast');
+    const proposal = makeProposal(tv.vaultKey, NET, { change: 0 }); // 100 000 in, 50 000 out
+
+    await broadcastFrom(ring, 0, announceSign(id, proposal));
+
+    const o = await p1.orch.waitFor(id, WAIT_MS);
+    expect(o).toMatchObject({ ceremonyId: id, kind: 'signing', status: 'rejected' });
+    expect(o.reason).toMatch(/reject/);
+    expect(p1.gate.specs).toEqual([expect.objectContaining({ kind: 'signing', fee: 50_000 })]);
+    expect(p1.log.about(id)).toEqual([expect.objectContaining({ level: 'info' })]);
+    expect(ring[1]!.io.store.list(id)).toEqual([]);
+    expect(sent).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['this node is not in signers', { signers: [0, 2] }, 'info', /party 1 is not in signers/],
+    ['the leader is not in signers', { signers: [1, 2] }, 'warn', /leader party 0 is not in signers/],
+    ['signers has duplicates', { signers: [0, 1, 1, 2] }, 'warn', /signers has duplicates/],
+    ['a signer is outside the ring', { signers: [0, 1, 2, 7] }, 'warn', /signer 7 is not in the ring/],
+    ['signers is below the threshold', { signers: [0, 1] }, 'warn', /signers has 2 entries, the vault needs 3/],
+    ['no vault is loaded', { signers: [0, 1, 2], noVault: true }, 'warn', /no vault loaded/],
+  ] as const)('drops announce-sign when %s', async (_name, c, level, reason) => {
+    const id = 'sign-structural';
+    const p1 = participant(ring[1]!, 'noVault' in c ? {} : { vault: shareOf(tv, 1) });
+    const sent = vi.spyOn(ring[1]!.io.transport, 'broadcast');
+
+    await broadcastFrom(ring, 0, {
+      v: 2,
+      kind: 'announce-sign',
+      ceremonyId: id,
+      signers: [...c.signers],
+      proposal: makeProposal(tv.vaultKey, NET),
+    });
+
+    const lines = p1.log.about(id);
+    expect(lines).toEqual([expect.objectContaining({ level })]);
+    expect(lines[0]!.msg).toMatch(reason);
+    expect(p1.gate.specs).toEqual([]);
+    expect(ring[1]!.io.store.list(id)).toEqual([]);
+    expect(sent).not.toHaveBeenCalled();
+    await expect(p1.orch.waitFor(id, 50)).rejects.toThrow(/timed out/);
+  });
+
+  it('refuses to lead a ceremony whose id is live or ended here', async () => {
+    const id = 'sign-taken';
+    const [p1] = participants();
+
+    const signaturesHex = await lead(id, makeProposal(tv.vaultKey, NET));
+    // Live tracker (awaiting the signoff).
+    expect(p1.orch.beginLocalSigning(id)).toBeNull();
+    expect(p1.orch.beginLocalDkg(id)).toBeNull();
+    const free = p1.orch.beginLocalDkg('dkg-free'); // the refusal above is about the id
+    expect(free).not.toBeNull();
+    free!.end();
+
+    await broadcastFrom(ring, 0, signoffDone(id, signaturesHex));
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'done' });
+    // Ended record, within retention.
+    expect(p1.orch.beginLocalSigning(id)).toBeNull();
+    expect(p1.orch.beginLocalDkg(id)).toBeNull();
+  });
+
+  it('drops an announce-sign whose id this node leads', async () => {
+    const id = 'sign-local';
+    const [p1] = participants();
+    const slot = p1.orch.beginLocalSigning(id)!;
+
+    await broadcastFrom(ring, 0, announceSign(id, makeProposal(tv.vaultKey, NET)));
+
+    expect(p1.log.about(id)).toEqual([expect.objectContaining({ level: 'warn' })]);
+    expect(p1.log.about(id)[0]!.msg).toMatch(/this node leads a ceremony with this id/);
+    expect(p1.gate.specs).toEqual([]);
+    expect(ring[1]!.io.store.list(id)).toEqual([]);
+    await expect(p1.orch.waitFor(id, 50)).rejects.toThrow(/timed out/);
+    slot.end();
+  });
+
+  it('drops announce-sign from a non-leader for a pinned ceremony', async () => {
+    const id = 'sign-pinned';
+    const [p1] = participants();
+    const proposal = makeProposal(tv.vaultKey, NET);
+
+    const signaturesHex = await lead(id, proposal);
+    const mark = p1.log.about(id).length;
+
+    // Node 2 is a co-signer, not the leader: it cannot re-announce, sign off or abort.
+    await broadcastFrom(ring, 2, announceSign(id, makeProposal(tv.vaultKey, NET)));
+    await broadcastFrom(ring, 2, signoffDone(id, signaturesHex));
+    await broadcastFrom(ring, 2, { v: 2, kind: 'signoff-aborted', ceremonyId: id, reason: 'hijack' });
+    // The leader's own duplicate announce is benign.
+    await broadcastFrom(ring, 0, announceSign(id, proposal));
+
+    const lines = p1.log.about(id).slice(mark);
+    expect(lines.map(l => l.level)).toEqual(['warn', 'warn', 'warn', 'info']);
+    expect(lines[0]!.msg).toMatch(/not the pinned leader/);
+    expect(p1.gate.specs).toHaveLength(1);
+
+    await broadcastFrom(ring, 0, signoffDone(id, signaturesHex));
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'done', signaturesHex });
+  });
+
+  it.each([
+    ['a tampered signature', (sigs: string[]) => sigs.map(s => s.slice(0, -2) + (s.endsWith('00') ? '01' : '00'))],
+    ['a missing signature', (sigs: string[]) => sigs.slice(1)],
+  ])('settles invalid-signoff on a forged signoff-done (%s)', async (_name, forge) => {
+    const id = 'sign-forged';
+    const [p1] = participants();
+    const proposal = makeProposal(tv.vaultKey, NET, { inputs: [{ amount: 60_000 }, { amount: 40_000 }] });
+
+    const signaturesHex = await lead(id, proposal);
+    await broadcastFrom(ring, 0, signoffDone(id, forge(signaturesHex)));
+
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ ceremonyId: id, status: 'invalid-signoff' });
+    expect(p1.log.about(id).filter(l => l.level === 'error')).toHaveLength(1);
+  });
+
+  it('settles timeout when no signoff arrives', async () => {
+    const id = 'sign-timeout';
+    const [p1] = participants([{ ceremonyDeadlines: { signingMs: 1_500, dkgMs: 8_000 } }]);
+
+    await lead(id, makeProposal(tv.vaultKey, NET));
+
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ ceremonyId: id, kind: 'signing', status: 'timeout' });
+  });
+
+  it('settles aborted on the leader signoff-aborted', async () => {
+    const id = 'sign-aborted';
+    const [p1] = participants();
+
+    await lead(id, makeProposal(tv.vaultKey, NET));
+    await broadcastFrom(ring, 0, { v: 2, kind: 'signoff-aborted', ceremonyId: id, reason: 'broadcast failed' });
+
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toEqual({
+      ceremonyId: id,
+      kind: 'signing',
+      status: 'aborted',
+      reason: 'broadcast failed',
+    });
+  });
+
+  it('clears ceremony blobs after the retention period', async () => {
+    const id = 'sign-retention';
+    const [p1] = participants([{ blobRetentionMs: { signing: 50, dkg: 50 } }]);
+
+    const signaturesHex = await lead(id, makeProposal(tv.vaultKey, NET));
+    await broadcastFrom(ring, 0, signoffDone(id, signaturesHex));
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'done' });
+
+    expect(ring[1]!.io.store.list(id).length).toBeGreaterThan(0);
+    await eventually(() => expect(ring[1]!.io.store.list(id)).toEqual([]));
+  });
+
+  it('labels outputs from the address book, and signs without labels when the book cannot be read', async () => {
+    const id = 'sign-labels';
+    const recipient = vaultPayment(foreign.vaultKey, NET).address;
+    const [p1, p2] = participants([
+      { addressBook: async () => [{ label: 'cold storage', address: recipient }] },
+      { addressBook: async () => Promise.reject(new Error('EACCES')) },
+    ]);
+    const proposal = makeProposal(tv.vaultKey, NET, { outputs: [{ address: recipient, amount: 50_000 }] });
+
+    const signaturesHex = await lead(id, proposal);
+    await broadcastFrom(ring, 0, signoffDone(id, signaturesHex));
+
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'done' });
+    expect(await p2.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'done' });
+    const outputs = (spec: CeremonySpec | undefined) => (spec as SigningSpec).outputs;
+    expect(outputs(p1.gate.specs[0])).toEqual([
+      { address: recipient, amount: 50_000, isChange: false, label: 'cold storage' },
+      { address: vaultPayment(tv.vaultKey, NET).address, amount: 49_000, isChange: true },
+    ]);
+    expect(outputs(p2.gate.specs[0]).some(o => 'label' in o)).toBe(false);
+    const bookLines = p2.log.lines.filter(l => /address book/.test(l.msg));
+    expect(bookLines).toEqual([expect.objectContaining({ level: 'warn' })]);
+  });
+
+  it('pulls until the ceremony deadline, not the configured pull budget', async () => {
+    const id = 'sign-slow-peer';
+    // A pull budget far below the ceremony deadline: 3 attempts within 100 ms.
+    const tight = makeRing(3, { maxAttempts: 3, deadlineMs: 100 });
+    const ringPullOpts = { ...tight[1]!.io.pullOpts };
+    const leaderIo = { ...tight[0]!.io, pullOpts: { ...tight[0]!.io.pullOpts, ...LEADER_PULLS } };
+    const p1 = participant(tight[1]!, { vault: shareOf(tv, 1), ceremonyDeadlines: { signingMs: 4_000, dkgMs: 8_000 } });
+    participant(tight[2]!, { vault: shareOf(tv, 2), ceremonyDeadlines: { signingMs: 4_000, dkgMs: 8_000 } });
+    const pullAll = vi.spyOn(tight[1]!.io.puller, 'pullAll');
+
+    // The leader serves nothing for its first 400 ms.
+    tight[0]!.server.close();
+    const since = Date.now();
+    tight[0]!.io.transport.servePulls((from: PartyId, key: BlobKey) => {
+      if (Date.now() - since < 400) return null;
+      if (key.to !== undefined && key.to !== from) return null;
+      return tight[0]!.io.store.get(key) ?? null;
+    });
+
+    const proposal = makeProposal(tv.vaultKey, NET);
+    const { sighashes } = analyse(proposal);
+    const sigs = await leadSigning(leaderIo, leaderSpec(id, sighashes), proposal);
+    await broadcastFrom(tight, 0, signoffDone(id, sigs.map(toHex)));
+
+    expect(await p1.orch.waitFor(id, WAIT_MS)).toMatchObject({ status: 'done' });
+    expect(pullAll).toHaveBeenCalled();
+    for (const call of pullAll.mock.calls) {
+      expect(call[1]).toEqual({ ...ringPullOpts, deadlineMs: 4_000, maxAttempts: Number.MAX_SAFE_INTEGER });
+    }
   });
 });
