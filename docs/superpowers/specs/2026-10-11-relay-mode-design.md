@@ -103,7 +103,7 @@ After this change, a federation can be installed, bootstrapped, key-generated an
 | Condition | Behaviour |
 |---|---|
 | Relay unreachable at start or after a drop | Warn on each failed attempt (with backoff), keep retrying until `stop()`. Ceremonies time out by their deadline. |
-| Relay-mode leader without `[bootstrap] parties` | `otzi setup` fails: `config bootstrap.parties: required when transport.kind = "relay"`. |
+| Relay-mode leader without `[bootstrap] parties` | `otzi setup` (and daemon start) fail: `config bootstrap.parties: required when transport.kind = "relay" and bootstrap.role = "leader"`. |
 | Registration with an endpoint in relay mode | 400 `'advertised_endpoint' not used in relay mode`. |
 | Registration after the count is reached | 409 `bootstrap is full`; the member exits non-zero with a message to abort and redo setup. |
 | Peer-mesh book entry without an endpoint | Daemon start fails, naming the party. |
