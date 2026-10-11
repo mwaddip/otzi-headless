@@ -95,7 +95,7 @@ After this change, a federation can be installed, bootstrapped, key-generated an
 - **Responder.** `completeResponderHandshake`'s catch sends the re-handshake request (the empty frame) after ending the session.
 - **Initiator.**
   - `onRehandshakeRequest` restarts the handshake even in `waiting-for-hs2`. Because the responder discarded our hs1, waiting for hs2 cannot succeed.
-  - Restarts are rate-limited to one per second per peer (every initiator restart counts toward the window). A request inside the window is deferred, not dropped: one per-peer timer restarts the handshake when the window ends, merging repeated requests, and is cleared on `stop()`, a relay drop and `peer-left`.
+  - Every initiator restart (request, record failure, send failure, stale check, roster change) is rate-limited to one per second per peer; a peer's first handshake is immediate. A trigger inside the window is deferred, not dropped: one per-peer timer restarts the handshake when the window ends, merging repeated requests, and is cleared on `stop()`, a relay drop and `peer-left`.
 - **Stray record.** An initiator in `waiting-for-hs2` that receives a non-handshake record runs `maybeStartHandshake`, which applies the stale check instead of a silent drop.
 
 ## 4. Errors
