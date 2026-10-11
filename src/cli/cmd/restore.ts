@@ -49,6 +49,7 @@ import { promisify } from 'node:util';
 import { Parser as TarParser } from 'tar';
 import { parse as parseToml } from 'smol-toml';
 import { displayText } from '../../util/text';
+import { resolveStatePaths } from '../state-paths';
 import {
   BACKUP_HEADER_LEN,
   BACKUP_IV_LEN,
@@ -59,7 +60,6 @@ import {
   DEFAULT_IDENTITY_PATH,
   DEFAULT_PUBKEY_BOOK_PATH,
   DEFAULT_SHARE_PATH,
-  stripLeadingSlash,
 } from './backup';
 
 const execFile = promisify(execFileCb);
@@ -87,9 +87,6 @@ const PUBKEYS_MODE = 0o644;
 
 /** meta.json lives only inside the archive — never written to disk. */
 const META_TAR_PATH = 'meta.json';
-
-/** The only directories restore writes into (under `rootOverride` in tests). */
-const ALLOWED_DIRS = ['etc/otzi', 'var/lib/otzi'] as const;
 
 /** The directory whose files belong to the daemon's user (the share is read there). */
 const STATE_DIR = 'var/lib/otzi';
@@ -542,27 +539,13 @@ function targetModes(daemonToml: ArchiveMember | undefined): Map<string, number>
     ['[node].identity_key_file', named(nodeTable.identity_key_file, DEFAULT_IDENTITY_PATH), IDENTITY_MODE],
     ['[node].pubkey_book_file', named(nodeTable.pubkey_book_file, DEFAULT_PUBKEY_BOOK_PATH), PUBKEYS_MODE],
   ];
-  for (const [key, path, mode] of dynamic) {
-    const tarPath = allowedTarPath(key, path);
-    if (targets.has(tarPath)) {
-      throw new Error(`daemon.toml in the archive: ${key} = ${displayText(path)} names a file another key also names; refused`);
-    }
-    targets.set(tarPath, mode);
-  }
+  const tarPaths = resolveStatePaths(
+    dynamic.map(([key, path]) => ({ key, path })),
+    [...targets.keys()],
+    (key, path, why) => new Error(`daemon.toml in the archive: ${key} = ${displayText(path)} ${why}; refused`),
+  );
+  dynamic.forEach(([, , mode], i) => targets.set(tarPaths[i]!, mode));
   return targets;
-}
-
-/** The tar path of an absolute path that is a direct child of an allowed directory. */
-function allowedTarPath(key: string, path: string): string {
-  const refuse = (why: string) =>
-    new Error(`daemon.toml in the archive: ${key} = ${displayText(path)} ${why}; refused`);
-  if (!path.startsWith('/')) throw refuse('is outside /etc/otzi and /var/lib/otzi');
-  const tarPath = stripLeadingSlash(posix.resolve(path));
-  if ((ALLOWED_DIRS as readonly string[]).includes(posix.dirname(tarPath))) return tarPath;
-  if (ALLOWED_DIRS.some(dir => tarPath.startsWith(`${dir}/`))) {
-    throw refuse('is not a direct child of /etc/otzi or /var/lib/otzi');
-  }
-  throw refuse('is outside /etc/otzi and /var/lib/otzi');
 }
 
 /** True iff any file system entry (a dangling symlink included) exists at `p`. */

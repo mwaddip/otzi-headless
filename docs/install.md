@@ -254,6 +254,12 @@ The archive contains:
 
 (Inside the archive, paths are stored without the leading slash.)
 
+The share, identity and pubkey book must sit directly inside `/etc/otzi` or
+`/var/lib/otzi`, as the `.deb` configures them: `otzi backup` refuses a
+`daemon.toml` that puts one in a subdirectory or elsewhere, or names one file
+twice, because `otzi restore` would refuse that archive (see
+[`cli.md`](./cli.md) § Backup + restore).
+
 The password is auto-generated (32 chars from `[A-Za-z0-9]`, ~190 bits
 entropy) and printed once to stdout:
 

@@ -24,6 +24,8 @@ import {
 import * as backupModule from './backup';
 
 interface Fixture {
+  /** The install root the fixture lives under (`runBackup`'s `rootOverride`). */
+  root: string;
   configPath: string;
   sharePath: string;
   identityPath: string;
@@ -34,6 +36,10 @@ interface Fixture {
   expectedIdTar: string;
   expectedPubTar: string;
 }
+
+const SHARE_TAR = 'var/lib/otzi/share.json';
+const IDENTITY_TAR = 'var/lib/otzi/identity.json';
+const PUBKEYS_TAR = 'var/lib/otzi/pubkeys.json';
 
 interface FixtureOpts {
   /** Skip writing the share file (test required-file failure). */
@@ -49,11 +55,10 @@ interface FixtureOpts {
 }
 
 /**
- * Materialize a fake daemon install layout under `root`. The share / identity
- * / pubkey-book paths are encoded into the daemon.toml so backup discovers
- * them via the real config-parsing path. The "fixed" paths (vault-pubkey,
- * address book) are tmpdir-rooted and have to be passed via `pathOverrides` to
- * runBackup — they aren't in the config.
+ * Materialize a fake daemon install layout under `root`. daemon.toml names the
+ * production paths, as on a real install (backup refuses any other), so backup
+ * discovers them via the real config-parsing path and reads them under `root`
+ * (its `rootOverride` seam, as do the fixed paths: vault-pubkey, address book).
  */
 async function buildFixture(root: string, opts: FixtureOpts = {}): Promise<Fixture> {
   const etcDir = join(root, 'etc', 'otzi');
@@ -69,13 +74,13 @@ async function buildFixture(root: string, opts: FixtureOpts = {}): Promise<Fixtu
 
   const tomlText = `
 [share]
-path = "${sharePath}"
+path = "/${SHARE_TAR}"
 password_env = "OTZI_SHARE_PASSWORD"
 
 [node]
 id = "node-a"
-identity_key_file = "${identityPath}"
-pubkey_book_file = "${pubkeyBookPath}"
+identity_key_file = "/${IDENTITY_TAR}"
+pubkey_book_file = "/${PUBKEYS_TAR}"
 
 [network]
 name = "testnet4"
@@ -112,15 +117,16 @@ strategy = "auto"
   }
 
   return {
+    root,
     configPath,
     sharePath,
     identityPath,
     pubkeyBookPath,
     vaultPubkeyPath,
     addressBookPath,
-    expectedShareTar: stripLead(sharePath),
-    expectedIdTar: stripLead(identityPath),
-    expectedPubTar: stripLead(pubkeyBookPath),
+    expectedShareTar: SHARE_TAR,
+    expectedIdTar: IDENTITY_TAR,
+    expectedPubTar: PUBKEYS_TAR,
   };
 }
 
@@ -131,10 +137,6 @@ const ADDRESS_BOOK_JSON = JSON.stringify({
   network: 'testnet4',
   entries: [{ label: 'treasury', address: 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx' }],
 });
-
-function stripLead(p: string): string {
-  return p.startsWith('/') ? p.slice(1) : p;
-}
 
 /**
  * Decrypt the given backup buffer with the given password and return the
@@ -169,11 +171,6 @@ function decryptBackup(buf: Buffer, password: string): Buffer {
   return gunzipSync(gz);
 }
 
-/** Build the `pathOverrides` block from a fixture. */
-function overridesFrom(f: Fixture) {
-  return { vaultPubkey: f.vaultPubkeyPath, addressBook: f.addressBookPath };
-}
-
 describe('runBackup', () => {
   let tmp: string;
 
@@ -191,7 +188,7 @@ describe('runBackup', () => {
     const result = await runBackup({
       configPath: f.configPath,
       outputDir: out,
-      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     // Archive file exists.
@@ -202,9 +199,8 @@ describe('runBackup', () => {
     expect(result.password).toMatch(/^[A-Za-z0-9]{32}$/);
 
     // filesIncluded: the FIXED entries keep their canonical relative tar
-    // paths regardless of the override source. The dynamic entries (share,
-    // identity, pubkey-book) take their tar paths from the source path with
-    // the leading slash stripped.
+    // paths. The dynamic entries (share, identity, pubkey-book) take their tar
+    // paths from the paths daemon.toml names, with the leading slash stripped.
     expect(new Set(result.filesIncluded)).toEqual(
       new Set([
         'etc/otzi/daemon.toml',
@@ -228,7 +224,7 @@ describe('runBackup', () => {
     const result = await runBackup({
       configPath: f.configPath,
       outputDir: out,
-      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     expect(result.filesIncluded).toContain('etc/otzi/daemon.toml');
@@ -246,7 +242,7 @@ describe('runBackup', () => {
     const withBook = await runBackup({
       configPath: f.configPath,
       outputDir: join(tmp, 'out'),
-      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
     expect(withBook.filesIncluded).toContain(ADDRESS_BOOK_TAR);
 
@@ -254,7 +250,7 @@ describe('runBackup', () => {
     const withoutBook = await runBackup({
       configPath: none.configPath,
       outputDir: join(tmp, 'out'),
-      pathOverrides: overridesFrom(none),
+      rootOverride: none.root,
     });
     expect(withoutBook.filesIncluded).not.toContain(ADDRESS_BOOK_TAR);
     expect(withoutBook.filesIncluded).toContain('etc/otzi/daemon.toml');
@@ -286,7 +282,7 @@ describe('runBackup', () => {
       runBackup({
         configPath: f.configPath,
         outputDir: join(tmp, 'out'),
-        pathOverrides: overridesFrom(f),
+        rootOverride: f.root,
       }),
     ).rejects.toThrow(
       /share\.json.*This looks like a fresh \/ pre-bootstrap install; nothing meaningful to back up yet\.$/s,
@@ -299,7 +295,7 @@ describe('runBackup', () => {
       runBackup({
         configPath: f.configPath,
         outputDir: join(tmp, 'out'),
-        pathOverrides: overridesFrom(f),
+        rootOverride: f.root,
       }),
     ).rejects.toThrow(
       /identity\.json.*This looks like a fresh \/ pre-bootstrap install; nothing meaningful to back up yet\.$/s,
@@ -312,7 +308,7 @@ describe('runBackup', () => {
       runBackup({
         configPath: f.configPath,
         outputDir: join(tmp, 'out'),
-        pathOverrides: overridesFrom(f),
+        rootOverride: f.root,
       }),
     ).rejects.toThrow(
       /pubkeys\.json.*This looks like a fresh \/ pre-bootstrap install; nothing meaningful to back up yet\.$/s,
@@ -326,7 +322,7 @@ describe('runBackup', () => {
       runBackup({
         configPath: f.configPath,
         outputDir: join(tmp, 'out'),
-        pathOverrides: overridesFrom(f),
+        rootOverride: f.root,
       }),
     ).rejects.toThrow(
       /daemon\.toml.*This looks like a fresh \/ pre-bootstrap install; nothing meaningful to back up yet\.$/s,
@@ -342,7 +338,7 @@ describe('runBackup', () => {
     try {
       result = await runBackup({
         configPath: f.configPath,
-        pathOverrides: overridesFrom(f),
+        rootOverride: f.root,
       });
       expect(result.path.startsWith(homedir() + '/')).toBe(true);
       const after = new Set(await safeReaddir(homedir()));
@@ -359,7 +355,7 @@ describe('runBackup', () => {
     const result = await runBackup({
       configPath: f.configPath,
       outputDir: out,
-      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
 
     const buf = await readFile(result.path);
@@ -379,7 +375,7 @@ describe('runBackup', () => {
     const result = await runBackup({
       configPath: f.configPath,
       outputDir: out,
-      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
       now: () => fixed,
     });
 
@@ -397,7 +393,7 @@ describe('runBackup', () => {
     const result = await runBackup({
       configPath: f.configPath,
       outputDir: out,
-      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
       passwordOverride: 'OperatorChosenPassword12345!@#$',
     });
     expect(result.password).toBe('OperatorChosenPassword12345!@#$');
@@ -413,7 +409,7 @@ describe('runBackup', () => {
     const result = await runBackup({
       configPath: f.configPath,
       outputDir: out,
-      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
     const buf = await readFile(result.path);
     const magicBytes = buf.subarray(0, BACKUP_MAGIC_LEN);
@@ -431,10 +427,149 @@ describe('runBackup', () => {
     const result = await runBackup({
       configPath: f.configPath,
       outputDir: out,
-      pathOverrides: overridesFrom(f),
+      rootOverride: f.root,
     });
     const st = await stat(result.path);
     expect(st.mode & 0o777).toBe(0o600);
+  });
+});
+
+// ─── Paths restore would refuse (follow-up item 9) ───────────────────────
+
+describe('runBackup — share, identity and pubkey paths', () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), 'otzi-backup-paths-'));
+  });
+
+  afterEach(async () => {
+    await rm(tmp, { recursive: true, force: true });
+  });
+
+  /** A daemon.toml that names the given paths for the three configurable files. */
+  function tomlNaming(paths: { share?: string; identity?: string; pubkeys?: string }): string {
+    return [
+      '[share]',
+      `path = "${paths.share ?? '/var/lib/otzi/share.json'}"`,
+      '[node]',
+      'id = "node-a"',
+      `identity_key_file = "${paths.identity ?? '/var/lib/otzi/identity.json'}"`,
+      `pubkey_book_file = "${paths.pubkeys ?? '/var/lib/otzi/pubkeys.json'}"`,
+      '',
+    ].join('\n');
+  }
+
+  /** The standard fixture, its daemon.toml replaced, and `extra` files (relative to the root) created. */
+  async function fixtureWith(toml: string, extra: string[] = []): Promise<Fixture> {
+    const f = await buildFixture(tmp);
+    await writeFile(f.configPath, toml);
+    for (const rel of extra) {
+      await mkdir(join(f.root, rel, '..'), { recursive: true });
+      await writeFile(join(f.root, rel), 'state');
+    }
+    return f;
+  }
+
+  it.each<[string, { share?: string; identity?: string; pubkeys?: string }, string[], RegExp]>([
+    [
+      'a share below a subdirectory of /var/lib/otzi',
+      { share: '/var/lib/otzi/keys/share.json' },
+      ['var/lib/otzi/keys/share.json'],
+      /\[share\]\.path = \/var\/lib\/otzi\/keys\/share\.json is not a direct child of \/etc\/otzi or \/var\/lib\/otzi/,
+    ],
+    [
+      'an identity below a subdirectory of /etc/otzi',
+      { identity: '/etc/otzi/keys/identity.json' },
+      ['etc/otzi/keys/identity.json'],
+      /\[node\]\.identity_key_file = \/etc\/otzi\/keys\/identity\.json is not a direct child of \/etc\/otzi or \/var\/lib\/otzi/,
+    ],
+    [
+      'a relative pubkey book path',
+      { pubkeys: 'pubkeys.json' },
+      ['pubkeys.json'],
+      /\[node\]\.pubkey_book_file = pubkeys\.json is outside \/etc\/otzi and \/var\/lib\/otzi/,
+    ],
+    [
+      'a share that climbs out with ..',
+      { share: '/var/lib/otzi/../../../srv/share.json' },
+      ['srv/share.json'],
+      /\[share\]\.path = \/var\/lib\/otzi\/\.\.\/\.\.\/\.\.\/srv\/share\.json is outside \/etc\/otzi and \/var\/lib\/otzi/,
+    ],
+    [
+      'an identity outside both directories',
+      { identity: '/srv/otzi/identity.json' },
+      ['srv/otzi/identity.json'],
+      /\[node\]\.identity_key_file = \/srv\/otzi\/identity\.json is outside \/etc\/otzi and \/var\/lib\/otzi/,
+    ],
+    [
+      'a share that is a directory',
+      { share: '/var/lib/otzi' },
+      [],
+      /\[share\]\.path = \/var\/lib\/otzi is outside \/etc\/otzi and \/var\/lib\/otzi/,
+    ],
+    [
+      'an identity and a share naming the same file',
+      { identity: '/var/lib/otzi/./share.json' },
+      [],
+      /\[node\]\.identity_key_file = \/var\/lib\/otzi\/\.\/share\.json names a file another key also names/,
+    ],
+    [
+      'a share naming daemon.toml',
+      { share: '/etc/otzi/daemon.toml' },
+      [],
+      /\[share\]\.path = \/etc\/otzi\/daemon\.toml names a file another key also names/,
+    ],
+  ])('refuses %s, before writing anything', async (_name, paths, extra, message) => {
+    const f = await fixtureWith(tomlNaming(paths), extra);
+    const out = join(tmp, 'out');
+
+    const err = await runBackup({ configPath: f.configPath, outputDir: out, rootOverride: f.root }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).toMatch(/^cannot back up: /);
+    expect(err!.message).toMatch(message);
+    expect(err!.message).toMatch(/; otzi restore would refuse the archive$/);
+    // Nothing was written: no output directory, no archive.
+    expect(await safeReaddir(out)).toEqual([]);
+    await expect(stat(out)).rejects.toThrow(/ENOENT/);
+  });
+
+  it('shows a refused path without control characters', async () => {
+    const f = await fixtureWith('[share]\npath = "/srv/evil\\u001b[2J\\nfake line"\n');
+    await expect(
+      runBackup({ configPath: f.configPath, outputDir: join(tmp, 'out'), rootOverride: f.root }),
+    ).rejects.toThrow(
+      'cannot back up: [share].path = /srv/evil[2J fake line is outside /etc/otzi and /var/lib/otzi; otzi restore would refuse the archive',
+    );
+  });
+
+  it('archives a share, identity and pubkey book directly in either directory, under their resolved paths', async () => {
+    const f = await fixtureWith(
+      tomlNaming({ share: '/var/lib/otzi/./share.json', identity: '/etc/otzi/identity.json', pubkeys: '/var/lib/otzi/../otzi/pubkeys.json' }),
+      ['etc/otzi/identity.json'],
+    );
+    const result = await runBackup({ configPath: f.configPath, outputDir: join(tmp, 'out'), rootOverride: f.root });
+    expect(new Set(result.filesIncluded)).toEqual(
+      new Set([
+        'etc/otzi/daemon.toml',
+        'var/lib/otzi/share.json',
+        'etc/otzi/identity.json',
+        'var/lib/otzi/pubkeys.json',
+        'var/lib/otzi/vault-pubkey.json',
+        ADDRESS_BOOK_TAR,
+        'meta.json',
+      ]),
+    );
+  });
+
+  it('applies the same rule to the defaults when daemon.toml names no paths', async () => {
+    const f = await fixtureWith('[node]\nid = "node-a"\n');
+    const result = await runBackup({ configPath: f.configPath, outputDir: join(tmp, 'out'), rootOverride: f.root });
+    expect(result.filesIncluded).toEqual(expect.arrayContaining([SHARE_TAR, IDENTITY_TAR, PUBKEYS_TAR]));
   });
 });
 

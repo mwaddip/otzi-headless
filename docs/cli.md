@@ -86,6 +86,8 @@ Entry rules: trimmed label of 1 to 64 characters, an address valid for the confi
 
   It needs root: the share file is readable only by its owner. Under plain `sudo` the archive lands in root's home directory (`/root`, as in the banner below); copy it off the host.
 
+  Backup refuses (exit 1, nothing written) a `daemon.toml` that `otzi restore` could not restore: the share (`[share].path`), identity (`[node].identity_key_file`) and pubkey book (`[node].pubkey_book_file`) must each be an absolute path directly inside `/etc/otzi` or `/var/lib/otzi` (not in a subdirectory such as `/var/lib/otzi/keys/`), no two of them may name the same file, and none may name `daemon.toml`, `vault-pubkey.json` or the address book. The error names the key and the path, e.g. `cannot back up: [share].path = /var/lib/otzi/keys/share.json is not a direct child of /etc/otzi or /var/lib/otzi; otzi restore would refuse the archive`. Move the file, fix the path in `daemon.toml`, restart the daemon, and back up again.
+
   Output:
   ```
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
