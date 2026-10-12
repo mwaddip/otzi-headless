@@ -309,8 +309,11 @@ path = "/var/run/otzi/otzi.sock"
 ```
 
 Permission model: filesystem ACL on the socket file gates access. The
-deb's postinst sets `/var/run/otzi/` to `chmod 3770 root:otzi` (setgid and
-sticky), so the socket lands at `chmod 660 root:otzi`. Any user in the `otzi`
+packaged unit's `RuntimeDirectory=` creates `/var/run/otzi/` as `3770 otzi:otzi`
+(setgid and sticky) when the daemon starts and removes it when it stops, so the
+socket lands owned by `otzi:otzi` and group-writable. Nothing creates the
+directory while the daemon is down; the CLI then finds no socket and reports the
+daemon unreachable. Any user in the `otzi`
 group can connect; nobody else. The sticky bit keeps a group member from
 unlinking or renaming the daemon's socket and binding a look-alike, which the
 CLI would trust (`otzi vault` and `otzi btc` check what they print against the

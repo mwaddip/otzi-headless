@@ -192,7 +192,11 @@ Under `[transport] kind = "relay"` the daemons do not dial each other: every nod
 connects to one relay server, which routes opaque encrypted frames between them.
 Run that server on a **coordinator host**, once for the whole ring. The host can
 be one of the ring nodes or a separate machine. The `.deb` ships the server as
-`otzi-relay.service`, installed **disabled**: nothing starts it until you do.
+`otzi-relay.service`, installed **disabled**: nothing starts it until you do. On
+a ring node the relay does not run as the daemon's `otzi` user: systemd gives it
+a transient user of its own (`DynamicUser=yes`) and hides every other process
+from it (`ProtectProc=invisible`), so a compromised relay cannot read the share,
+the identity key or the daemon's environment (see [Service sandbox](#service-sandbox)).
 
 1. **Install the package on the coordinator host.** On a ring node it is already
    there. On a separate host the debconf prompts can take any answer: the relay
@@ -270,7 +274,8 @@ transports. Two differences matter during setup:
 
 ## Operator API
 
-Default: UDS at `/var/run/otzi/otzi.sock` (mode 660, owned otzi:otzi).
+Default: UDS at `/var/run/otzi/otzi.sock` (mode 660, owned otzi:otzi; it and its
+directory exist only while the daemon runs).
 Anyone in the `otzi` group can connect via the CLI.
 The directory is sticky, so a group member cannot remove the daemon's socket. `otzi vault`
 and `otzi btc` trust what the daemon behind that socket says about the vault.
@@ -306,8 +311,8 @@ sudo dpkg-reconfigure otzi-headless
 | `/var/lib/otzi/share.json` | encrypted Ötzi v4 share | otzi:otzi 600 |
 | `/var/lib/otzi/share.json.pending` | DKG staging file; exists while a DKG runs, or after a DKG that failed once this node had confirmed | otzi:otzi 600 |
 | `/var/lib/otzi/vault-pubkey.json` | public vault metadata | otzi:otzi 644 |
-| `/var/run/otzi/` | runtime dir for the socket (setgid and sticky: a group member cannot unlink or rename the daemon's socket and bind a look-alike; the unit's `RuntimeDirectory=` creates it with the same mode) | root:otzi 3770 (postinst, tmpfiles) before the service starts; otzi:otzi 3770 while it runs (the unit's `RuntimeDirectory=` hands it to `User=otzi`) |
-| `/var/run/otzi/otzi.sock` | UDS socket for operator CLI | otzi:otzi 660 |
+| `/var/run/otzi/` | runtime dir for the socket (setgid and sticky: a group member cannot unlink or rename the daemon's socket and bind a look-alike). Exists only while `otzi.service` runs: the unit's `RuntimeDirectory=` creates it at start and removes it at stop, and nothing else creates it (only root can create entries in `/run`), so there is no directory to plant a socket in while the daemon is down | otzi:otzi 3770, while the daemon runs |
+| `/var/run/otzi/otzi.sock` | UDS socket for operator CLI; while the daemon is down the CLI finds no socket and reports the daemon unreachable | otzi:otzi 660, while the daemon runs |
 
 ## Operations
 
@@ -385,7 +390,14 @@ Deliberately not set:
 
 `otzi-relay.service` carries the same restrictions, except that it has no
 `ReadWritePaths=` and no `RuntimeDirectory=`: the relay holds no key, reads no vault
-file and writes nothing, so its whole file system is read-only.
+file and writes nothing, so its whole file system is read-only. It also runs as a
+**transient user**, not as `otzi`: `DynamicUser=yes` allocates a fresh uid and gid for
+each run, separate from the daemon's `otzi` uid, and `ProtectProc=invisible` hides
+every process it does not own. A coordinator that is also a ring node therefore
+keeps the share, the identity key and the daemon's environment out of the relay's
+reach. The relay's logs show that transient uid. It gets its listen address only
+through the environment: systemd reads `/etc/otzi/relay.env` as root before it
+switches users.
 
 `exec` gate commands therefore see no `/dev` beyond the basics and have no setuid
 helper to call; see [`gates.md`](./gates.md) § `exec`. To loosen any of this for
@@ -610,6 +622,8 @@ round-trip it runs relay variants: a relay leader (`parties` 3) and a relay leaf
 each of which must render a `daemon.toml` without `[[peers]]` that parses, and leaders
 with a bad ring size or a relay URL that is not `ws://` or `wss://`, which must be
 warned about and left out. It also
-checks that `otzi-relay.service` is installed with its sandbox directives, not
-enabled, and that `/etc/otzi/relay.env` exists with the loopback default and
-survives a reconfigure. It needs docker. Useful before tagging a release.
+checks that `otzi-relay.service` is installed with its sandbox directives
+(`DynamicUser=yes`, `ProtectProc=invisible`, no `User=` or `Group=`), not
+enabled, that `/etc/otzi/relay.env` exists with the loopback default and
+survives a reconfigure, and that nothing creates `/run/otzi` before the daemon
+starts. It needs docker. Useful before tagging a release.

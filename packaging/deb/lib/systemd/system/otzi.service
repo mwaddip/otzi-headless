@@ -23,10 +23,13 @@ Restart=on-failure
 RestartSec=5
 
 # /var/run/otzi must exist before bind; RuntimeDirectory creates it on unit
-# start with the unit's User/Group + RuntimeDirectoryMode. 3770 = setgid (the
-# socket gets group otzi) + sticky: the CLI trusts the daemon behind this socket,
-# so a member of group otzi, who may create files here, must not be able to
-# unlink or rename the daemon's socket and bind a look-alike in its place.
+# start with the unit's User/Group + RuntimeDirectoryMode, and removes it when
+# the unit stops. Nothing else creates it (only root can create entries in /run),
+# so while the daemon is down there is no directory in which a group member could
+# plant a socket. 3770 = setgid (the socket gets group otzi) + sticky: the CLI
+# trusts the daemon behind this socket, so a member of group otzi, who may create
+# files here, must not be able to unlink or rename the daemon's socket and bind a
+# look-alike in its place.
 RuntimeDirectory=otzi
 RuntimeDirectoryMode=3770
 
@@ -49,7 +52,7 @@ ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
 # The daemon creates no setuid or setgid files. (The setgid bit on /var/lib/otzi
-# and /run/otzi is set by the postinst and by RuntimeDirectoryMode=, not by the
+# is set by the postinst, and on /run/otzi by RuntimeDirectoryMode=, not by the
 # daemon.)
 RestrictSUIDSGID=true
 # AF_NETLINK: glibc's getaddrinfo (AI_ADDRCONFIG) asks the kernel over netlink

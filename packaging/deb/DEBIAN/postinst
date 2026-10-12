@@ -31,13 +31,10 @@ case "$1" in
     chown root:otzi /var/lib/otzi
     chmod 2770 /var/lib/otzi
 
-    # /var/run/otzi: holds the UDS socket. Created here for safety, but
-    # systemd-tmpfiles also recreates it on boot (in case /var/run is tmpfs).
-    # 3770: setgid, plus sticky so a group member cannot unlink or rename the
-    # daemon's socket and bind a look-alike that the CLI would trust.
-    [ -d /var/run/otzi ] || mkdir -p /var/run/otzi
-    chown root:otzi /var/run/otzi
-    chmod 3770 /var/run/otzi
+    # /var/run/otzi (the UDS socket's directory) is not created here: the unit's
+    # RuntimeDirectory= creates it (otzi:otzi 3770) when the daemon starts and
+    # removes it when it stops. A directory that outlived the daemon would let a
+    # group member plant a socket there for the CLI to trust.
 
     # Leftovers of earlier releases; nothing reads these files any more.
     rm -f /var/lib/otzi/bootstrap-secret /etc/otzi/manifest.otzi.json
@@ -443,7 +440,7 @@ Config: /etc/otzi/daemon.toml         (mode 640, owned root:otzi)
                                        only root writes, group otzi reads)
 Secret: /etc/otzi/otzi.env            (you create it: mode 600, owned root:root)
 Data:   /var/lib/otzi/                (mode 2770, owned root:otzi setgid)
-UDS:    /var/run/otzi/otzi.sock       (mode 660, owned otzi:otzi)
+UDS:    /var/run/otzi/otzi.sock       (owned otzi:otzi; exists while the daemon runs)
 Logs:   journalctl -u otzi
 EOF
     fi

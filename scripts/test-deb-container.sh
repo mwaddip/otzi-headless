@@ -14,8 +14,11 @@
 #     init and errors on the missing OTZI_SHARE_PASSWORD env var (proves the
 #     bundle loads + the parser accepts the rendered TOML end-to-end).
 #   - the relay server unit (otzi-relay.service) is installed with its sandbox
-#     directives and left disabled, and /etc/otzi/relay.env holds the loopback
-#     listen address and survives a reconfigure
+#     directives (a transient DynamicUser, never the otzi user) and left disabled,
+#     and /etc/otzi/relay.env holds the loopback listen address and survives a
+#     reconfigure
+#   - nothing creates /run/otzi before the daemon starts (no tmpfiles entry, no
+#     postinst mkdir): the unit's RuntimeDirectory= owns it
 #   - relay-transport installs (leader with `parties` 3, leaf) render a
 #     daemon.toml with no [[peers]] that parses; a bad `parties` or a relay URL
 #     without ws:// or wss:// is left out with a warning; peer-mesh never gets
@@ -129,8 +132,8 @@ echo ">> verifying the relay server unit and relay.env"
 docker exec "$CONTAINER" bash -euo pipefail -c '
 UNIT=/lib/systemd/system/otzi-relay.service
 test -f "$UNIT" || { echo "missing $UNIT"; exit 1; }
-# The listen address comes from relay.env, the user is otzi, and the command is the relay verb.
-for LINE in User=otzi Group=otzi EnvironmentFile=/etc/otzi/relay.env \
+# The listen address comes from relay.env, the user is a transient one, and the command is the relay verb.
+for LINE in DynamicUser=yes ProtectProc=invisible EnvironmentFile=/etc/otzi/relay.env \
             "ExecStart=/usr/bin/otzi relay --listen \${OTZI_RELAY_LISTEN}" Restart=on-failure \
             ProtectSystem=strict ProtectHome=true PrivateTmp=true PrivateDevices=true NoNewPrivileges=true \
             ProtectKernelTunables=true ProtectKernelModules=true ProtectKernelLogs=true \
@@ -139,8 +142,9 @@ for LINE in User=otzi Group=otzi EnvironmentFile=/etc/otzi/relay.env \
             RestrictNamespaces=true RestrictRealtime=true LockPersonality=true SystemCallArchitectures=native; do
   grep -qxF "$LINE" "$UNIT" || { echo "relay unit lacks $LINE"; exit 1; }
 done
-# The relay writes nothing and keeps no socket directory.
-for KEY in ReadWritePaths RuntimeDirectory RuntimeDirectoryMode; do
+# The relay writes nothing and keeps no socket directory, and it never runs as a named user:
+# on a coordinator that is also a ring node, that user would be otzi, which owns the share.
+for KEY in ReadWritePaths RuntimeDirectory RuntimeDirectoryMode User Group; do
   ! grep -q "^$KEY=" "$UNIT" || { echo "relay unit sets $KEY"; exit 1; }
 done
 # Installed, never enabled: nothing under /etc/systemd/system links to it.
@@ -157,9 +161,13 @@ docker exec "$CONTAINER" bash -euo pipefail -c '
 stat -c "%a %U:%G" /etc/otzi      | grep -q "^2750 root:otzi$"     || { echo "FAIL: /etc/otzi mode/owner";       exit 1; }
 stat -c "%a %U:%G" /etc/otzi/daemon.toml | grep -q "^640 root:otzi$" || { echo "FAIL: daemon.toml mode/owner";    exit 1; }
 stat -c "%a %U:%G" /var/lib/otzi  | grep -q "^2770 root:otzi$"     || { echo "FAIL: /var/lib/otzi mode/owner";   exit 1; }
-test -d /var/run/otzi             || { echo "FAIL: /var/run/otzi missing"; exit 1; }
-stat -c "%a %U:%G" /var/run/otzi  | grep -q "^3770 root:otzi$"     || { echo "FAIL: /var/run/otzi mode/owner (want setgid + sticky)"; exit 1; }
-echo "OK: phase 9a perms"
+# The socket directory belongs to the unit: RuntimeDirectory=otzi with RuntimeDirectoryMode=3770
+# (asserted with the layout) creates it when the daemon starts and removes it when it stops. The
+# daemon has not started here, so it must not exist: a directory nobody owns would let a group
+# member plant a socket for the CLI to trust.
+! test -e /run/otzi               || { echo "FAIL: /run/otzi exists before the daemon started ($(stat -c "%a %U:%G" /run/otzi))"; exit 1; }
+! test -e /usr/lib/tmpfiles.d/otzi.conf || { echo "FAIL: the package ships a tmpfiles.d entry for /run/otzi"; exit 1; }
+echo "OK: phase 9a perms, no /run/otzi before the daemon starts"
 '
 
 echo ">> verifying postinst removes files earlier releases left behind"

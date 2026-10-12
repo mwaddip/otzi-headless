@@ -180,7 +180,8 @@ Notes on the prompts:
   address and no peer list; every node asks for the **Relay URL**, and the
   bootstrap leader also asks **Number of nodes in the ring** (2 to 255, itself
   included). One host runs the relay server (`otzi-relay.service`, installed
-  disabled) behind a TLS proxy; see
+  disabled, under a transient systemd user of its own, so it can share a ring
+  node without reaching the daemon's files) behind a TLS proxy; see
   [`docs/install.md`](docs/install.md#relay-coordinator).
 
 postinst auto-adds every operator listed at the debconf prompt to the
