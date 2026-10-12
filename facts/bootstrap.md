@@ -46,7 +46,7 @@
 
 - `keyId(publicKeyHex: string): string`
   - **Pre:** `publicKeyHex` is 130 hex characters (65 bytes; either case).
-  - **Post:** Returns the first 8 lowercase hex characters of SHA-256 over the raw 65 pubkey bytes. The same key gives the same id on every node. The fingerprint proves every node holds the same book; key ids let an operator check that the book holds only their own nodes' keys.
+  - **Post:** Returns the first 16 lowercase hex characters (64 bits) of SHA-256 over the raw 65 pubkey bytes (Ruling P15: 8 characters, 32 bits, could be ground to match an operator's id). The same key gives the same id on every node. The fingerprint proves every node holds the same book; key ids let an operator check that the book holds only their own nodes' keys. Pinned vector: `keyId('04' + '11'.repeat(64)) = 'f0b9315a0459dab7'`.
   - **Throws:** `Error` if the input is not 130 hex characters.
   - **Concurrency:** None (pure, synchronous).
 
@@ -68,7 +68,7 @@
 - `computeFingerprint` hashes raw P-256 bytes (0x04 || X || Y), not compressed or any other format.
 - `keyId` hashes the same raw bytes, not the hex text; uppercase and lowercase hex of one key give one id.
 - Operators compare the 96-bit fingerprint out of band across all daemons before any DKG; mismatch = abort + redo bootstrap.
-- Key-id rule: every node's setup banner (`src/daemon/setup.ts`) prints this node's key id and the key id of every book entry. Operators confirm that each listed id belongs to one of their own nodes; an unknown id means someone else registered, so they delete the pubkey book on every node and redo setup. The fingerprint cannot show such an intruder, since every node receives the same book.
+- Key-id rule: every node's setup banner (`src/daemon/setup.ts`) prints this node's key id, `ring size: <N>` and the key id of every book entry, warns `⚠ duplicate key id <id>` for an id two entries share, and tells the operator to count the party lines (exactly one per node they set up). Operators confirm that each listed id belongs to one of their own nodes; an unknown id means someone else registered, so they delete the pubkey book on every node and redo setup. The fingerprint cannot show such an intruder, since every node receives the same book. The leader's banner also reports the registrations it refused (see `MasterBootstrapResult.refused`).
 - Legacy `nodeId` field: dropped in Phase F. `parseBook` strict-rejects entries containing it; cross-node identity is by raw pubkey, local labels live only in `config.node.id`.
 
 ---
@@ -88,9 +88,11 @@
   - **Pre:** none
   - **Post:** `{ self: { identity }, admission: MasterAdmission, bind, timeoutMs?, logger? }`.
 
+- `MasterRefusals` — `{ full: number; duplicate: number; endpointPresent: number; notAllowed: number }`: registrations the leader refused, one per refused request, by reason. `full`: count admission, 409 `bootstrap is full`. `duplicate`: 409 for a pubkey already registered or the leader's own (both modes), or an endpoint already registered (endpoints admission). `endpointPresent`: count admission, 400 for a body with an endpoint key. `notAllowed`: endpoints admission, 404 off the allowlist or 400 for a missing or invalid endpoint. Requests refused before admission (wrong path or method, invalid JSON, a legacy `node_id`, a malformed `public_key_hex`) are not registrations and are not counted.
+
 - `MasterBootstrapResult`
   - **Pre:** none
-  - **Post:** Contains final `book` and the 96-bit `fingerprint` (`computeFingerprint` format).
+  - **Post:** Contains final `book`, the 96-bit `fingerprint` (`computeFingerprint` format) and `refused: MasterRefusals`. `refused` is taken after the server has closed, so it includes a refusal answered while in-flight connections drained (a late `bootstrap is full`).
 
 - `runMasterBootstrap(input: MasterBootstrapInputs): Promise<MasterBootstrapResult>`
   - **Pre:** `input.bind` is valid `"host:port"` string. `input.self.identity` has 65-byte `publicKeyRaw`. Endpoints admission: `selfEndpoint` and every `expectedPeers[*].advertisedEndpoint` are canonical (caller applied `canonicalizeEndpoint`), and `expectedPeers` excludes self. Count admission: `parties` is an integer ≥ 2 (the config parser further bounds it to 255).
@@ -113,7 +115,8 @@
 - HTTP status codes, count admission (relay), checked in this order after the shared checks:
   1. 400 `'advertised_endpoint' not used in relay mode` when the body has an `advertised_endpoint` (or `advertisedEndpoint`) key at all, whatever its value.
   2. 409 `publicKey already registered` for a pubkey already registered, and 409 `publicKey already registered (it is the leader's own key)` for the leader's pubkey. Checked before the count, so a member that registers twice is told it is already in, not that the bootstrap is full.
-  3. 409 `bootstrap is full` once `parties` registrations (self included) are in.
+  3. 409 `bootstrap is full` once `parties` registrations (self included) are in. A `bootstrap is full` refusal is also logged at warn (`master bootstrap: refused a registration, the ring is full`, with the refused key id).
+- Every refused registration is counted in `refused` (see `MasterRefusals`); `setup.ts` prints the counts in the leader's banner.
 - Every registration response includes the complete book and fingerprint (computed at the moment gate resolves).
 - Response header `connection: close` forces each client to disconnect, preventing idle keep-alive sockets from blocking server shutdown.
 - Server uses graceful shutdown (`server.close()`) to allow in-flight response writers to flush before closure; `closeAllConnections()` is NOT used.
@@ -155,7 +158,7 @@
   - **Leader errors mapped to operator messages:**
     - relay member, 400 whose error starts `'advertised_endpoint' missing` (an endpoints-mode leader) → `setup: the leader expects peer-mesh registrations (an advertised endpoint); this node is configured for relay — use the same transport on every node`.
     - peer-mesh member, 400 `'advertised_endpoint' not used in relay mode` (a count-mode leader) → `setup: the leader expects relay registrations (no advertised endpoint); this node is configured for peer-mesh — use the same transport on every node`.
-    - 409 `bootstrap is full` → `setup: bootstrap is full — another party registered in this node's place; abort, delete pubkeys.json on every node and redo setup with the bootstrap port reachable only by the members`.
+    - 409 `bootstrap is full` → `setup: bootstrap is full — another party registered in this node's place, or the leader's [bootstrap] parties is lower than the number of nodes; abort, delete pubkeys.json on every node, check the leader's parties, and redo setup with the bootstrap port reachable only by the members`.
     - Any other non-200 → `register: master responded <status>[: <error>]`.
     - Matching is by equality with the constants exported from `master.ts` (`ENDPOINT_MISSING_ERROR`, `ENDPOINT_IN_RELAY_ERROR`, `BOOTSTRAP_FULL_ERROR`).
   - **Connection errors:** when the POST fails and the error's `cause.code` is `ECONNREFUSED`, `ECONNRESET` or `UND_ERR_SOCKET` (fetch hides the code in `cause`), the message names the code and adds a hint: `register: POST failed: <message> (<code>); the leader is not accepting registrations — it may not be started yet, or setup already completed without this node; if the leader has finished, compare key ids with the other operators, and if one is unknown delete pubkeys.json on every node and redo setup`. Any other failure stays `register: POST failed: <message>`.

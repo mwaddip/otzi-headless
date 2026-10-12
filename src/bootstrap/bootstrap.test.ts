@@ -219,30 +219,30 @@ describe('pubkey-book — advertisedEndpoint', () => {
 });
 
 describe('pubkey-book — key ids', () => {
-  it('keyId is the first 8 hex chars of sha256(raw pubkey)', async () => {
+  it('keyId is the first 16 hex chars (64 bits) of sha256(raw pubkey)', async () => {
     const identity = await generateIdentity();
     const hex = toHex(identity.publicKeyRaw);
-    const expected = createHash('sha256').update(Buffer.from(hex, 'hex')).digest('hex').slice(0, 8);
+    const expected = createHash('sha256').update(Buffer.from(hex, 'hex')).digest('hex').slice(0, 16);
     expect(keyId(hex)).toBe(expected);
-    expect(keyId(hex)).toMatch(/^[0-9a-f]{8}$/);
+    expect(keyId(hex)).toMatch(/^[0-9a-f]{16}$/);
     // Fixed vector: sha256 of 04 || 64 x 0x11.
     const fixed = '04' + '11'.repeat(64);
     expect(keyId(fixed)).toBe(
-      createHash('sha256').update(Buffer.from(fixed, 'hex')).digest('hex').slice(0, 8),
+      createHash('sha256').update(Buffer.from(fixed, 'hex')).digest('hex').slice(0, 16),
     );
   });
 
-  it('keyId known answer: 04 || 64 x 0x11 gives f0b9315a', () => {
-    // Pinned literal (sha256 = f0b9315a0459dab7…, computed once with sha256sum
-    // and Python's hashlib). Operators compare key ids by eye across nodes, so
-    // the printed format must never drift.
-    expect(keyId('04' + '11'.repeat(64))).toBe('f0b9315a');
+  it('keyId known answer: 04 || 64 x 0x11 gives f0b9315a0459dab7', () => {
+    // Pinned literal (sha256 = f0b9315a0459dab7ab5fa690…, computed with
+    // sha256sum, openssl dgst and Python's hashlib). Operators compare key ids
+    // by eye across nodes, so the printed format must never drift.
+    expect(keyId('04' + '11'.repeat(64))).toBe('f0b9315a0459dab7');
   });
 
   it('keyId is lowercase whatever the case of the input hex', () => {
     const lower = '04' + 'ab'.repeat(64);
     expect(keyId(lower.toUpperCase())).toBe(keyId(lower));
-    expect(keyId(lower)).toMatch(/^[0-9a-f]{8}$/);
+    expect(keyId(lower)).toMatch(/^[0-9a-f]{16}$/);
   });
 
   it('keyId rejects input that is not a 65-byte hex pubkey', () => {
@@ -795,6 +795,68 @@ describe('bootstrap — count admission (relay)', () => {
     expect(m.book.entries.map((e) => e.publicKeyHex)).not.toContain(pubHex(late));
   }, 10_000);
 
+  it('count admission: the result counts the refused registrations by reason', async () => {
+    const [master, b, c, late] = await Promise.all([generateIdentity(), generateIdentity(), generateIdentity(), generateIdentity()]);
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}`;
+    const masterDone = runMasterBootstrap({
+      self: { identity: master },
+      admission: { kind: 'count', parties: 3 },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    await sleep(50);
+
+    expect((await postRegister(port, { public_key_hex: pubHex(c), advertised_endpoint: '127.0.0.1:1' })).status).toBe(400);
+    expect((await postRegister(port, { public_key_hex: pubHex(master) })).status).toBe(409);
+    const bDone = runMemberRegister({ self: { identity: b }, masterUrl: url, timeoutMs: 5_000 });
+    await sleep(100);
+    expect((await postRegister(port, { public_key_hex: pubHex(b) })).status).toBe(409);
+    // Malformed requests are not registrations and are not counted.
+    expect((await postRegister(port, { public_key_hex: 'zz' })).status).toBe(400);
+    const held = await openHeldRegistration(port);
+    const cDone = runMemberRegister({ self: { identity: c }, masterUrl: url, timeoutMs: 5_000 });
+    await Promise.all([bDone, cDone]);
+    expect((await held.send({ public_key_hex: pubHex(late) })).status).toBe(409);
+
+    const m = await masterDone;
+    expect(m.refused).toEqual({ full: 1, duplicate: 2, endpointPresent: 1, notAllowed: 0 });
+  }, 10_000);
+
+  it('endpoints admission: the result counts duplicates and registrations off the allowlist', async () => {
+    const master = await makePeer('node-a', 18800);
+    const memberB = await makePeer('node-b', 18801);
+    const port = await freePort();
+    const masterDone = runMasterBootstrap({
+      self: { identity: master.identity },
+      admission: {
+        kind: 'endpoints',
+        selfEndpoint: master.advertisedEndpoint,
+        expectedPeers: [{ advertisedEndpoint: memberB.advertisedEndpoint }, { advertisedEndpoint: '127.0.0.1:18802' }],
+      },
+      bind: `127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    await sleep(50);
+    const stranger = pubHex(await generateIdentity());
+    expect((await postRegister(port, { public_key_hex: stranger, advertised_endpoint: '127.0.0.1:19999' })).status).toBe(404);
+    expect((await postRegister(port, { public_key_hex: stranger })).status).toBe(400);
+    // An allowlisted, free endpoint with the leader's own key.
+    expect((await postRegister(port, { public_key_hex: pubHex(master.identity), advertised_endpoint: '127.0.0.1:18802' })).status).toBe(409);
+    const bDone = runMemberRegister({ self: memberB, masterUrl: `http://127.0.0.1:${port}`, timeoutMs: 5_000 });
+    await sleep(100);
+    expect((await postRegister(port, { public_key_hex: stranger, advertised_endpoint: memberB.advertisedEndpoint })).status).toBe(409);
+    const c = await generateIdentity();
+    await runMemberRegister({
+      self: { identity: c, advertisedEndpoint: '127.0.0.1:18802' },
+      masterUrl: `http://127.0.0.1:${port}`,
+      timeoutMs: 5_000,
+    });
+    await bDone;
+    const m = await masterDone;
+    expect(m.refused).toEqual({ full: 0, duplicate: 2, endpointPresent: 0, notAllowed: 2 });
+  }, 10_000);
+
   it('count admission: four concurrent registrations for one free slot admit exactly one', async () => {
     const master = await generateIdentity();
     const racers = await Promise.all([0, 1, 2, 3].map(() => generateIdentity()));
@@ -1006,7 +1068,7 @@ describe('bootstrap — member checks by transport', () => {
       await expect(
         runMemberRegister({ self: { identity: b }, masterUrl: stub.url, timeoutMs: 5_000 }),
       ).rejects.toThrow(
-        "setup: bootstrap is full — another party registered in this node's place; abort, delete pubkeys.json on every node and redo setup with the bootstrap port reachable only by the members",
+        "setup: bootstrap is full — another party registered in this node's place, or the leader's [bootstrap] parties is lower than the number of nodes; abort, delete pubkeys.json on every node, check the leader's parties, and redo setup with the bootstrap port reachable only by the members",
       );
     } finally {
       await stub.close();

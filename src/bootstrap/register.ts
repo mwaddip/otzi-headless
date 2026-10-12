@@ -52,7 +52,7 @@ const RELAY_MEMBER_PEER_MESH_LEADER =
 const PEER_MESH_MEMBER_RELAY_LEADER =
   'setup: the leader expects relay registrations (no advertised endpoint); this node is configured for peer-mesh — use the same transport on every node';
 const BOOTSTRAP_FULL =
-  "setup: bootstrap is full — another party registered in this node's place; abort, delete pubkeys.json on every node and redo setup with the bootstrap port reachable only by the members";
+  "setup: bootstrap is full — another party registered in this node's place, or the leader's [bootstrap] parties is lower than the number of nodes; abort, delete pubkeys.json on every node, check the leader's parties, and redo setup with the bootstrap port reachable only by the members";
 /** Connection-level failures that mean nothing is accepting registrations at the leader URL. */
 const NOT_LISTENING_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET']);
 const NOT_LISTENING_HINT =

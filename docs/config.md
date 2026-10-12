@@ -386,14 +386,32 @@ role = "leader"
 bind = "0.0.0.0:7090"
 ```
 
-Example (relay leader, a ring of 3):
+Example (relay leader, a ring of 3, bound to its VPN address so only the
+members reach it):
 
 ```toml
 [bootstrap]
 role = "leader"
-bind = "0.0.0.0:7090"
+bind = "10.8.0.1:7090"
 parties = 3
 ```
+
+Or bound to loopback, with each member reaching it through an SSH tunnel
+(`ssh -N -L 7090:127.0.0.1:7090 <leader-host>`, and `leader_url =
+"http://127.0.0.1:7090"` on the member):
+
+```toml
+[bootstrap]
+role = "leader"
+bind = "127.0.0.1:7090"
+parties = 3
+```
+
+Under relay the leader admits the first `parties − 1` registrations, so its
+bootstrap port must be reachable only by the members during setup. `otzi setup`
+warns when a relay leader's `bind` is every interface (`0.0.0.0` or `::`). The
+peer-mesh leader admits only its `[[peers]]` endpoints, and `0.0.0.0` is fine
+there.
 
 Example (leaf):
 

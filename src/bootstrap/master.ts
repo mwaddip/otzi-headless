@@ -80,9 +80,27 @@ export interface MasterBootstrapInputs {
   logger?: Logger;
 }
 
+/**
+ * Registrations the leader refused, one per refused request, by reason (facts/bootstrap.md,
+ * `MasterRefusals`). Requests refused before admission (wrong path, invalid JSON, a legacy
+ * `node_id`, a malformed pubkey) are not registrations and are not counted.
+ */
+export interface MasterRefusals {
+  /** Count admission: 409 `bootstrap is full`. */
+  full: number;
+  /** 409: a pubkey already registered or the leader's own; endpoints admission: an endpoint already registered. */
+  duplicate: number;
+  /** Count admission: 400, the body carried an endpoint. */
+  endpointPresent: number;
+  /** Endpoints admission: 404 off the allowlist, or 400 for a missing or invalid endpoint. */
+  notAllowed: number;
+}
+
 export interface MasterBootstrapResult {
   book: PubkeyBook;
   fingerprint: string;
+  /** Taken after the server closed: it includes refusals answered while connections drained. */
+  refused: MasterRefusals;
 }
 
 interface RegisteredEntry {
@@ -159,6 +177,7 @@ export async function runMasterBootstrap(
   }
 
   const gate = new CompletionGate();
+  const refused: MasterRefusals = { full: 0, duplicate: 0, endpointPresent: 0, notAllowed: 0 };
 
   const completeIfReady = (): void => {
     if (gate.isSettled) return;
@@ -189,6 +208,7 @@ export async function runMasterBootstrap(
       registered,
       gate,
       completeIfReady,
+      refused,
       log,
     });
   });
@@ -224,16 +244,19 @@ export async function runMasterBootstrap(
     alreadyRegistered: registered.size,
   });
 
+  let book: PubkeyBook;
+  let fingerprint: string;
   try {
-    const book = await gate.promise;
-    const fingerprint = await computeFingerprint(book);
-    return { book, fingerprint };
+    book = await gate.promise;
+    fingerprint = await computeFingerprint(book);
   } finally {
     clearTimeout(timer);
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
   }
+  // After the close: a registration that was still in flight has been answered and counted.
+  return { book, fingerprint, refused: { ...refused } };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -250,6 +273,8 @@ interface HandlerContext {
   registered: Map<string, RegisteredEntry>;
   gate: CompletionGate;
   completeIfReady: () => void;
+  /** Counted per refused registration. */
+  refused: MasterRefusals;
   log: Logger;
 }
 
@@ -319,19 +344,24 @@ function admitByCount(
   ctx: HandlerContext,
 ): boolean {
   if ('advertised_endpoint' in body || 'advertisedEndpoint' in body) {
+    ctx.refused.endpointPresent++;
     respondJson(res, 400, { error: ENDPOINT_IN_RELAY_ERROR });
     return false;
   }
   // Before the count: a node that registers twice is told it is already in.
   if (lowerHex === ctx.selfPublicKeyHex) {
+    ctx.refused.duplicate++;
     respondJson(res, 409, { error: "publicKey already registered (it is the leader's own key)" });
     return false;
   }
   if (ctx.registered.has(lowerHex)) {
+    ctx.refused.duplicate++;
     respondJson(res, 409, { error: 'publicKey already registered' });
     return false;
   }
   if (ctx.registered.size >= ctx.expectedTotal) {
+    ctx.refused.full++;
+    ctx.log.warn('master bootstrap: refused a registration, the ring is full', { keyId: keyId(lowerHex) });
     respondJson(res, 409, { error: BOOTSTRAP_FULL_ERROR });
     return false;
   }
@@ -360,6 +390,7 @@ function admitByEndpoint(
 ): boolean {
   const rawEndpoint = body.advertised_endpoint ?? body.advertisedEndpoint;
   if (typeof rawEndpoint !== 'string' || rawEndpoint.length === 0) {
+    ctx.refused.notAllowed++;
     respondJson(res, 400, { error: ENDPOINT_MISSING_ERROR });
     return false;
   }
@@ -369,6 +400,7 @@ function admitByEndpoint(
     advertisedEndpoint = canonicalizeEndpoint(rawEndpoint);
   } catch (err) {
     if (err instanceof EndpointParseError) {
+      ctx.refused.notAllowed++;
       respondJson(res, 400, { error: `invalid advertised_endpoint: ${err.message}` });
       return false;
     }
@@ -376,12 +408,14 @@ function admitByEndpoint(
   }
 
   if (!expectedAllowlist.has(advertisedEndpoint)) {
+    ctx.refused.notAllowed++;
     respondJson(res, 404, {
       error: `advertised_endpoint '${advertisedEndpoint}' not on expected-peer allowlist`,
     });
     return false;
   }
   if (ctx.registered.has(advertisedEndpoint)) {
+    ctx.refused.duplicate++;
     respondJson(res, 409, { error: `endpoint '${advertisedEndpoint}' already registered` });
     return false;
   }
@@ -389,6 +423,7 @@ function admitByEndpoint(
   // Pubkey-collision check across already-registered entries (incl. self).
   for (const r of ctx.registered.values()) {
     if (toHex(r.publicKey).toLowerCase() === lowerHex) {
+      ctx.refused.duplicate++;
       respondJson(res, 409, { error: `publicKey already registered for a different endpoint` });
       return false;
     }

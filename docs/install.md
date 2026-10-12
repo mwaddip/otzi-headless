@@ -80,14 +80,20 @@ follow up with `sudo apt -f install` to resolve.)
    ```
      otzi: setup complete — node-a
      fingerprint: 3f2a-9c41-07be-d5e0-6a18-b2c7
-     this node: 1c9e04ab
-     party 0: 1c9e04ab  node-a.example:8800
-     party 1: 7d20f3c5  node-b.example:8800
-     party 2: e4b1a960  node-c.example:8800
+     this node: 1c9e04ab5d2f7a10
+     ring size: 3
+     party 0: 1c9e04ab5d2f7a10  node-a.example:8800
+     party 1: 7d20f3c58e1b9264  node-b.example:8800
+     party 2: e4b1a960c37d0f5e  node-c.example:8800
+     refused registrations: none
    ```
-   A key id is the first 8 hex characters of SHA-256 over a node's identity
-   pubkey. A relay book has no endpoints, so its `party` lines end after the key id.
-   Before going further:
+   A key id is the first 16 hex characters (64 bits) of SHA-256 over a node's
+   identity pubkey. A relay book has no endpoints, so its `party` lines end after
+   the key id. Two entries with the same key id get a `⚠ duplicate key id <id>`
+   line. Only the leader prints `refused registrations:`: how many registrations
+   it turned away, by reason (under relay: after the ring was full, duplicate,
+   with an endpoint; under peer-mesh: duplicate, not on the `[[peers]]`
+   allowlist). Before going further:
    - **Compare the fingerprint on every node out of band.** A mismatch means
      someone tampered with the exchange: delete `/var/lib/otzi/pubkeys.json` on
      every node and redo setup.
@@ -96,6 +102,8 @@ follow up with `sudo apt -f install` to resolve.)
      someone else registered: delete `/var/lib/otzi/pubkeys.json` on every node and
      redo setup. The fingerprint cannot catch this, because the extra key is in
      every node's book.
+   - **Count the party lines.** There must be exactly one per node you set up,
+     and `ring size:` must be that number.
 
    partyIds are assigned deterministically by sorted-pubkey-bytes order — every
    node observes the same mapping.
@@ -104,11 +112,16 @@ follow up with `sudo apt -f install` to resolve.)
    - **Peer-mesh:** the leader admits only the endpoints in its `[[peers]]`.
    - **Relay:** nodes have no endpoints, so the leader admits the first
      `parties − 1` registrations, where `[bootstrap] parties` on the leader is the
-     ring size including itself (see [config.md](config.md#bootstrap)).
+     ring size including itself (see [config.md](config.md#bootstrap)). The
+     leader's `parties` must equal the number of nodes you set up: one too low
+     turns a member away with `bootstrap is full`, one too high leaves the leader
+     waiting until it times out.
    - A member whose transport differs from the leader's fails with
      `setup: the leader expects … registrations …; this node is configured for … — use the same transport on every node`.
    - A member that fails with `setup: bootstrap is full` was beaten to its slot by
-     someone else. Likewise, if the leader finishes before all your members have
+     someone else, or the leader's `parties` is lower than the number of nodes; the
+     leader's `refused registrations:` line counts the registrations it turned away
+     after the ring was full. Likewise, if the leader finishes before all your members have
      registered, someone else filled a slot; a member that arrives after that
      fails with `register: POST failed: … (ECONNREFUSED); the leader is not
      accepting registrations — …`. That message also appears when the leader has
@@ -127,6 +140,12 @@ follow up with `sudo apt -f install` to resolve.)
    - a loopback bind reached through SSH tunnels: `bind = "127.0.0.1:7090"` on the
      leader, and on each member `ssh -N -L 7090:127.0.0.1:7090 <leader-host>` with
      `leader_url = "http://127.0.0.1:7090"`.
+
+   The installer's bootstrap bind defaults to `0.0.0.0:7090`, which peer-mesh
+   needs reachable by the members. Under relay, prefer the VPN address or the
+   loopback-plus-tunnel bind above: a relay leader bound to every interface
+   (`0.0.0.0` or `::`) prints a warning that the port must be reachable only by
+   the members during setup.
 
    The leader stops listening once every member has registered. Remove any
    firewall opening you made for setup.
@@ -177,7 +196,9 @@ follow up with `sudo apt -f install` to resolve.)
    ```
    otzi vault
    ```
-   The address and `<threshold>-of-<parties>` must be identical on all nodes.
+   The address and `<threshold>-of-<parties>` must be identical on all nodes,
+   and `<parties>` must be the number of nodes you set up (under relay, the
+   leader's `[bootstrap] parties`).
    `otzi vault` asks the running daemon for the vault it loaded and compares
    `vault-pubkey.json` with the answer; a file that differs is refused (see
    [`cli.md`](./cli.md)).

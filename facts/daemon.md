@@ -452,10 +452,12 @@
 **Public surface:**
 - **`setupMaster(configPath, bind): Promise<void>`**
   - **Pre:** Config path + bind address (host:port) provided.
-  - **Post:** Loads config; picks the admission from `[transport] kind` (peer-mesh → `{ kind: 'endpoints', selfEndpoint: transport.advertised_endpoint, expectedPeers: [[peers]] }`; relay → `{ kind: 'count', parties: bootstrap.parties }`); loads/generates identity key; runs bootstrap master; writes pubkey book; prints the setup banner.
+  - **Post:** Loads config; picks the admission from `[transport] kind` (peer-mesh → `{ kind: 'endpoints', selfEndpoint: transport.advertised_endpoint, expectedPeers: [[peers]] }`; relay → `{ kind: 'count', parties: bootstrap.parties }`); loads/generates identity key; under relay, when `isWildcardBind(bind)`, prints one warning before listening (Ruling P16): `otzi: ⚠ the bootstrap bind <bind> listens on every interface, and under relay the leader admits the first <parties − 1> registrations: keep this port reachable only by the members during setup (a VPN, a firewall rule, or a loopback bind reached through an SSH tunnel)`; runs bootstrap master; writes pubkey book; prints the setup banner with the leader's refusal line (below). Peer-mesh admits by endpoint allowlist and gets no wildcard warning.
   - **Throws:** peer-mesh without `transport.advertised_endpoint`; relay without `[bootstrap] parties` (`setup: relay mode needs [bootstrap] parties on the leader …` — the config parser already requires it on a relay leader, so only a config with no `[bootstrap]` reaches this).
   - **Idempotent:** If the pubkey book already exists, re-prints the banner without re-bootstrapping.
   - **Identity:** Reused if file exists; generated if missing (mode 0660).
+
+- **`isWildcardBind(bind: string): boolean`** — `true` when the host of `host:port` (brackets stripped) is `0.0.0.0` or an all-zero IPv6 address (`::`, `0:0:0:0:0:0:0:0`, `::0`, …); `false` for every other host, loopback included.
 
 - **`setupMember(configPath, masterUrl): Promise<void>`**
   - **Pre:** Config path + master URL provided.
@@ -466,8 +468,11 @@
   - `fingerprint: xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` from `computeFingerprint`;
   - `this node: <keyId>` — this node's identity pubkey (`keyId` from `pubkey-book.ts`); on a re-print with no identity file, `this node: no identity key at <file>`;
   - a warning right after that line when the daemon could not start with this book: `⚠ no identity key — the daemon cannot start; restore it from a backup, or delete pubkeys.json on every node and redo setup` (no identity file), or `⚠ this node's key is not in this book — the daemon will not start; delete pubkeys.json on every node and redo setup` (an identity whose pubkey matches no entry). A fresh setup never prints either, since the member and master checks guarantee the key is in the book; only a re-print can;
+  - `ring size: <N>` (the number of book entries), right before the party lines;
   - one line per book entry in partyId order: `party <partyId>: <keyId>`, followed by two spaces and the entry's endpoint when it has one (peer-mesh);
-  - the instruction to compare the fingerprint out of band with every other operator before any DKG, and `Confirm every key id above belongs to one of your nodes; an unknown id means someone else registered — delete pubkeys.json on every node and redo setup.`
+  - `⚠ duplicate key id <id>`, once per key id that two or more entries share (in partyId order of first appearance), right after the party lines;
+  - leader only, after a bootstrap it ran (not on a re-print), the registrations it refused (`MasterBootstrapResult.refused`): `refused registrations: none`, or under relay `refused registrations: <full> after the ring was full, <duplicate> duplicate, <endpointPresent> with an endpoint`, under peer-mesh `refused registrations: <duplicate> duplicate, <notAllowed> not on the [[peers]] allowlist`; under relay with `full > 0` also `⚠ <full> registration(s) arrived after the ring was full: if one of your nodes failed with "bootstrap is full", someone else took its place — abort and redo setup`;
+  - the instruction to compare the fingerprint out of band with every other operator before any DKG, `Confirm every key id above belongs to one of your nodes; an unknown id means someone else registered — delete pubkeys.json on every node and redo setup.`, and `Count the party lines: there must be exactly one per node you set up.`
 
 - **Validation:** `identity_key_file` and `pubkey_book_file` must be set in config; missing paths fail immediately.
 
@@ -479,7 +484,7 @@
 **Invariants:**
 - Setup is idempotent; re-running after abort is safe.
 - The fingerprint must match across all nodes (operators compare it); a mismatch means tampering — delete the books and redo setup.
-- Every key id in the banner must belong to one of the operators' own nodes; an unknown one means someone else registered (in relay mode anyone who reaches the bootstrap port can) — delete the books and redo setup.
+- Every key id in the banner must belong to one of the operators' own nodes, and there must be exactly one party line per node set up; an unknown or extra one means someone else registered (in relay mode anyone who reaches the bootstrap port can) — delete the books and redo setup. A key id is 64 bits, so grinding a key to match an operator's id is out of reach; a duplicate id warning still flags two entries an operator cannot tell apart.
 
 **Cross-component contracts:**
 - Depends on: Config loader, bootstrap runners (`runMasterBootstrap`, `runMemberRegister`), identity crypto, pubkey book serialization.

@@ -377,8 +377,8 @@ EOF
 otzi-headless installed. Next steps:
 
   1. Bootstrap pubkey exchange, leader first. Compare the printed fingerprint
-     on every node, and confirm every key id it lists belongs to one of your
-     nodes, before going further:
+     on every node, confirm every key id it lists belongs to one of your nodes,
+     and count its party lines (exactly one per node), before going further:
        sudo -u otzi otzi setup /etc/otzi/daemon.toml
   2. Create /etc/otzi/otzi.env (owner root:root, mode 600) with one line. The
      unit loads it, and the daemon refuses to start without the password
@@ -422,7 +422,9 @@ backing off from 1 s to 30 s, so the order is not strict:
   e. On every node, [transport] url in /etc/otzi/daemon.toml must be that
      wss:// URL ($RELAY_URL_NOTE).
 Under relay the bootstrap leader admits members by count, so during step 1 keep
-the leader's bootstrap port reachable only by the ring members.
+the leader's bootstrap port reachable only by the ring members (a VPN address,
+or a loopback bind reached through an SSH tunnel, rather than 0.0.0.0), and set
+the leader's [bootstrap] parties to the number of nodes.
 EOF
         if [ -n "$PARTIES_OK" ]; then
           cat <<EOF

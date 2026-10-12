@@ -107,11 +107,15 @@ export async function computeFingerprint(book: PubkeyBook): Promise<string> {
   return Array.from({ length: 6 }, (_, i) => hex.slice(i * 4, i * 4 + 4)).join('-');
 }
 
+/** Hex characters in a key id: 64 bits. */
+const KEY_ID_HEX_LEN = 16;
+
 /**
- * Key id — the first 8 lowercase hex characters of SHA-256 over the raw
- * 65-byte pubkey. A short per-key label for operators to confirm that every
+ * Key id — the first 16 lowercase hex characters (64 bits) of SHA-256 over the
+ * raw 65-byte pubkey. A short per-key label for operators to confirm that every
  * entry in the book belongs to one of their own nodes. The fingerprint proves
  * all nodes hold the same book; key ids prove the book holds only your keys.
+ * 64 bits keep a key ground to match an operator's id out of reach (Ruling P15).
  */
 export function keyId(publicKeyHex: string): string {
   if (publicKeyHex.length !== PUBKEY_HEX_LEN)
@@ -119,7 +123,7 @@ export function keyId(publicKeyHex: string): string {
       `keyId: publicKeyHex must be ${PUBKEY_HEX_LEN} chars (65 bytes), got ${publicKeyHex.length}`,
     );
   if (!/^[0-9a-f]+$/i.test(publicKeyHex)) throw new Error('keyId: publicKeyHex must be hex');
-  return createHash('sha256').update(fromHex(publicKeyHex)).digest('hex').slice(0, 8);
+  return createHash('sha256').update(fromHex(publicKeyHex)).digest('hex').slice(0, KEY_ID_HEX_LEN);
 }
 
 function validateEntry(e: PubkeyBookEntry, path: string): void {

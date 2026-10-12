@@ -18,7 +18,7 @@
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
-import { runMasterBootstrap, type MasterAdmission } from '../bootstrap/master';
+import { runMasterBootstrap, type MasterAdmission, type MasterRefusals } from '../bootstrap/master';
 import {
   computeFingerprint,
   keyId,
@@ -60,15 +60,39 @@ export async function setupMaster(configPath: string, bind: string): Promise<voi
       `otzi: setup master — listening on ${bind}, expecting ${admission.parties - 1} peer(s) to register ` +
         '(relay: the first to register are admitted — keep this port reachable only by the members)',
     );
+    // Count admission trusts whoever reaches the port first (Ruling P16).
+    if (isWildcardBind(bind))
+      console.error(
+        `otzi: ⚠ the bootstrap bind ${bind} listens on every interface, and under relay the leader admits the first ` +
+          `${admission.parties - 1} registrations: keep this port reachable only by the members during setup ` +
+          '(a VPN, a firewall rule, or a loopback bind reached through an SSH tunnel)',
+      );
   }
-  const { book, fingerprint } = await runMasterBootstrap({
+  const { book, fingerprint, refused } = await runMasterBootstrap({
     self: { identity },
     admission,
     bind,
   });
 
   await writePubkeyBookFile(config, book);
-  announceComplete({ fingerprint, book, selfPublicKeyHex: toHex(identity.publicKeyRaw), config });
+  announceComplete({
+    fingerprint,
+    book,
+    selfPublicKeyHex: toHex(identity.publicKeyRaw),
+    config,
+    refused: { admission: admission.kind, counts: refused },
+  });
+}
+
+/**
+ * Whether `bind` (`host:port`) listens on every interface: the host, brackets
+ * stripped, is `0.0.0.0` or an all-zero IPv6 address (`::`, `0:0:0:0:0:0:0:0`, …).
+ */
+export function isWildcardBind(bind: string): boolean {
+  const m = /^(.+):\d+$/.exec(bind);
+  if (!m) return false;
+  const host = m[1]!.replace(/^\[(.*)\]$/, '$1');
+  return host === '0.0.0.0' || (host.includes(':') && /^[0:]+$/.test(host));
 }
 
 export async function setupMember(configPath: string, masterUrl: string): Promise<void> {
@@ -222,9 +246,11 @@ function announceComplete(args: {
   /** `null` when a re-run finds no identity file. */
   selfPublicKeyHex: string | null;
   config: DaemonConfig;
+  /** The leader's refusals, after a bootstrap it ran (never on a re-print or on a member). */
+  refused?: { admission: MasterAdmission['kind']; counts: MasterRefusals };
   note?: string;
 }): void {
-  const { fingerprint, book, selfPublicKeyHex, config, note } = args;
+  const { fingerprint, book, selfPublicKeyHex, config, refused, note } = args;
   const selfInBook =
     selfPublicKeyHex !== null &&
     book.entries.some((e) => e.publicKeyHex.toLowerCase() === selfPublicKeyHex.toLowerCase());
@@ -246,10 +272,17 @@ function announceComplete(args: {
     console.error(
       "  ⚠ this node's key is not in this book — the daemon will not start; delete pubkeys.json on every node and redo setup",
     );
+  console.error(`  ring size: ${book.entries.length}`);
+  const ids = new Map<string, number>();
   for (const e of book.entries) {
+    const id = keyId(e.publicKeyHex);
+    ids.set(id, (ids.get(id) ?? 0) + 1);
     const endpoint = e.advertisedEndpoint !== undefined ? `  ${e.advertisedEndpoint}` : '';
-    console.error(`  party ${e.partyId}: ${keyId(e.publicKeyHex)}${endpoint}`);
+    console.error(`  party ${e.partyId}: ${id}${endpoint}`);
   }
+  // Two entries an operator cannot tell apart by their id (Ruling P15).
+  for (const [id, count] of ids) if (count > 1) console.error(`  ⚠ duplicate key id ${id}`);
+  if (refused) for (const line of refusalLines(refused.admission, refused.counts)) console.error(`  ${line}`);
   console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.error('  ⚠ Compare this fingerprint with EVERY other operator out of band (voice call, signed message) before running any DKG.');
   console.error('  If any node reports a different value, someone tampered with');
@@ -258,6 +291,22 @@ function announceComplete(args: {
   console.error(
     '  Confirm every key id above belongs to one of your nodes; an unknown id means someone else registered — delete pubkeys.json on every node and redo setup.',
   );
+  console.error('  Count the party lines: there must be exactly one per node you set up.');
   if (note) console.error(`  note: ${note}`);
   console.error('');
+}
+
+/** The leader's refusal summary for the banner: the reasons its admission can refuse for. */
+function refusalLines(admission: MasterAdmission['kind'], r: MasterRefusals): string[] {
+  if (r.full + r.duplicate + r.endpointPresent + r.notAllowed === 0) return ['refused registrations: none'];
+  if (admission === 'endpoints')
+    return [`refused registrations: ${r.duplicate} duplicate, ${r.notAllowed} not on the [[peers]] allowlist`];
+  const lines = [
+    `refused registrations: ${r.full} after the ring was full, ${r.duplicate} duplicate, ${r.endpointPresent} with an endpoint`,
+  ];
+  if (r.full > 0)
+    lines.push(
+      `⚠ ${r.full} registration(s) arrived after the ring was full: if one of your nodes failed with "bootstrap is full", someone else took its place — abort and redo setup`,
+    );
+  return lines;
 }
