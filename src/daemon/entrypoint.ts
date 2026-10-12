@@ -209,7 +209,6 @@ export async function runRelayCommand(args: string[]): Promise<void> {
   if (listen === undefined) throw new Error(`otzi relay needs --listen <host:port>\n${usage()}`);
 
   const server = new RelayServer({ listen, logger: createConsoleLogger() });
-  await server.start();
 
   const shutdown = async (signal: string) => {
     console.error(`received ${signal}, shutting down`);
@@ -219,8 +218,20 @@ export async function runRelayCommand(args: string[]): Promise<void> {
       process.exit(0);
     }
   };
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  // Installed before the bind: `start()` writes the listen line, the relay's ready signal, and a
+  // signal sent the moment it appears must reach these handlers, not the default action.
+  const onSigint = () => void shutdown('SIGINT');
+  const onSigterm = () => void shutdown('SIGTERM');
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
+  try {
+    await server.start();
+  } catch (err) {
+    // Nothing is listening and the caller exits 1: leave no handler behind.
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

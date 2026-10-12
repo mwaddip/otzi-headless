@@ -311,4 +311,28 @@ describe('otzi relay', () => {
     expect(process.listenerCount('SIGINT')).toBe(sigint);
     expect(process.listenerCount('SIGTERM')).toBe(sigterm);
   });
+
+  it('otzi relay has its signal handlers in place when it writes the listen line', async () => {
+    // The listen line is the ready signal: a SIGINT/SIGTERM sent the moment it appears must reach the
+    // handlers, not the default action that kills the process.
+    const before = { SIGINT: process.listeners('SIGINT'), SIGTERM: process.listeners('SIGTERM') };
+    const added = (signal: 'SIGINT' | 'SIGTERM') => process.listeners(signal).filter(l => !before[signal].includes(l));
+    const atListenLine: Array<{ SIGINT: number; SIGTERM: number }> = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+      if (String(chunk).includes('RelayServer: listening'))
+        atListenLine.push({ SIGINT: added('SIGINT').length, SIGTERM: added('SIGTERM').length });
+      return true;
+    }) as typeof process.stderr.write);
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as typeof process.exit);
+    try {
+      await runRelayCommand(['--listen', '127.0.0.1:0']);
+      expect(atListenLine).toEqual([{ SIGINT: 1, SIGTERM: 1 }]);
+    } finally {
+      // The relay's own SIGTERM handler stops it (process.exit is stubbed); then both handlers go.
+      for (const handler of added('SIGTERM')) (handler as (signal: string) => void)('SIGTERM');
+      if (added('SIGTERM').length > 0) await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+      for (const signal of ['SIGINT', 'SIGTERM'] as const) for (const handler of added(signal)) process.off(signal, handler);
+      vi.restoreAllMocks();
+    }
+  });
 });
