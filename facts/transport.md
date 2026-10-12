@@ -398,6 +398,10 @@
   - **Post:** Registers handler to serve pull requests from peers. Returns unsubscribe function.
   - **Throws:** `Error` if handler already registered.
 
+- `isConnected(partyId: PartyId): boolean` (Transport interface)
+  - **Post:** `true` for self. For a peer, `true` while it has a `PeerConnection` that has not closed: `dial` / `acceptInbound` return one only after the Noise-KK handshake completed, so an open WebSocket still handshaking (or a dial in backoff) is not connected. `false` for an unknown partyId and after `stop()`.
+  - **Throws:** Never.
+
 **Invariants:**
 - Role: lower partyId dials, higher partyId listens (asymmetric).
 - Initiator side redials on disconnect with exponential backoff: 1s, 2s, 4s, 8s, capped at 10s.
@@ -563,6 +567,10 @@
   - **Pre:** handler not already registered.
   - **Post:** Registers pull server.
   - **Throws:** `Error` if handler already registered.
+
+- `isConnected(partyId: PartyId): boolean` (Transport interface)
+  - **Post:** `true` for self. For a peer, `true` while its status is `connected` with a session (the Noise-KK handshake over the relay completed and no session end has happened since). `false` for `disconnected`, `waiting-for-hs1` and `waiting-for-hs2`, for every peer while the relay socket is down (a drop marks them all `disconnected`), for an unknown partyId and after `stop()`. It has no side effect: unlike a send or pull, it never starts a handshake.
+  - **Throws:** Never.
 
 **Invariants:**
 - Role: lower partyId is initiator (sends hs1 when peer appears), higher is responder (waits for hs1).

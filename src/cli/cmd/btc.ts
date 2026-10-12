@@ -22,7 +22,7 @@ import { labelFor } from '../../otzi/lib/address-book';
 import { analyzeProposal, explorerTxUrl, formatBtc, type ProposalAnalysis } from '../../otzi/lib/bitcoin';
 import type { AddressBookEntry, SendProposal } from '../../otzi/lib/vault-types';
 import { displayText, errorReason } from '../../util/text';
-import { DaemonClient, type RequestOptions } from '../daemon-client';
+import { DaemonClient, DaemonClientError, type RequestOptions } from '../daemon-client';
 import { formatSats, parseBtcAmount, type BtcUnit } from '../units';
 import { NO_VAULT_NOTE, askDaemon, infoFromRequest, notVerifiedNote, vaultMismatch } from '../vault-check';
 
@@ -112,6 +112,9 @@ async function viaEsplora<T>(base: string, call: Promise<T>): Promise<T> {
 
 const money = (sats: bigint | number): string => `${sats} sats (${formatBtc(Number(sats))} BTC)`;
 
+/** Appended to the daemon's 503 (facts/daemon.md, `btc.ts`): nothing happened, so the same command can simply run again. */
+const RETRY_HINT = 'Nothing was announced or signed. This is temporary: run the same command again to retry.';
+
 /**
  * Asks the daemon to sign `proposal` and checks the reply against it. The
  * reply must be the proposal's own transaction with a signature on every
@@ -123,7 +126,14 @@ async function signProposal(
   proposal: SendProposal,
   proposalTxid: string,
 ): Promise<{ txid: string; signedTxHex: string }> {
-  const reply = await client.request<{ txid?: unknown; signedTxHex?: unknown }>({ op: 'sign', proposal });
+  let reply: { txid?: unknown; signedTxHex?: unknown };
+  try {
+    reply = await client.request<{ txid?: unknown; signedTxHex?: unknown }>({ op: 'sign', proposal });
+  } catch (err) {
+    // The leader refused before its gate (a signer not connected, or its cap): retryable.
+    if (err instanceof DaemonClientError && err.status === 503) throw new DaemonClientError(503, `${err.message}\n${RETRY_HINT}`);
+    throw err;
+  }
   if (
     typeof reply?.txid !== 'string' ||
     typeof reply.signedTxHex !== 'string' ||

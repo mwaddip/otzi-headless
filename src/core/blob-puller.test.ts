@@ -19,6 +19,7 @@ function stubTransport(pullImpl?: (key: BlobKey) => Promise<Uint8Array | null>):
       return pullImpl ? pullImpl(key) : null;
     },
     servePulls: () => () => {},
+    isConnected: () => true,
   };
   return { transport, calls };
 }

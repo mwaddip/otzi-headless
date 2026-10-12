@@ -14,8 +14,11 @@
  *     the signed transaction; it never broadcasts it to the chain.
  *
  * Refusals before the announce (409, 400, a gate non-approve) leave peers
- * untouched. Each ceremony runs under its ceremony deadline as a whole, and
- * its pulls retry until then.
+ * untouched. So do the retryable 503s, which come before the gate and consume
+ * no approval: another party of the ceremony is not connected (spec §3.2,
+ * Ruling P10), or this node already leads `MAX_LIVE_SIGNINGS_PER_LEADER`
+ * signings (Ruling P13). Each ceremony runs under its ceremony deadline as a
+ * whole, and its pulls retry until then.
  */
 
 import type { Rng } from '@mwaddip/frots';
@@ -26,6 +29,7 @@ import { encodeMessage, type CeremonyMessage } from '../core/messages';
 import { leadSigning } from '../core/sign-ceremony';
 import type { PartyId } from '../core/types';
 import type { ApprovalGate, CeremonySpec, Decision } from '../gate/types';
+import { MAX_LIVE_SIGNINGS_PER_LEADER } from '../orchestrator/orchestrator';
 import { buildDkgSpec, buildSigningSpec } from '../orchestrator/spec-builder';
 import { NOOP_LOGGER, type Logger } from '../orchestrator/types';
 import { finalizeSend } from '../otzi/backend/bitcoin';
@@ -115,6 +119,12 @@ interface CeremonyDeadline {
 export class LeaderDispatcher {
   private readonly deps: LeaderDeps;
   private readonly log: Logger;
+  /**
+   * Signing requests past the cap check, until they settle: the ones awaiting
+   * the gate and the ones running. At most `MAX_LIVE_SIGNINGS_PER_LEADER`, the
+   * participants' cap on the ceremonies one leader holds live on them.
+   */
+  private ledSignings = 0;
 
   constructor(deps: LeaderDeps) {
     this.deps = deps;
@@ -132,6 +142,8 @@ export class LeaderDispatcher {
     try {
       // Checked while the slot is held: a DKG this node joined and committed meanwhile is seen.
       if (await this.deps.vaultExists()) throw new RequestError(409, VAULT_HELD);
+      // Before the gate: an announce a peer cannot hear would only hang to the deadline.
+      this.requireConnected([...peersById.keys()].sort((a, b) => a - b), 'party');
 
       const parties = peersById.size;
       const threshold = parties;
@@ -201,55 +213,82 @@ export class LeaderDispatcher {
       throw new RequestError(400, errorMessage(err));
     }
     const label = await this.labeler(ceremonyId);
-    await this.approve(buildSigningSpec(analysis, this.specBase(ceremonyId), network, label));
-
-    // The authoritative reservation: the id may have been taken while the gate deliberated.
-    const slot = this.deps.slots.beginLocalSigning(ceremonyId);
-    if (!slot) throw new RequestError(409, idInUse(ceremonyId));
-    const deadline = this.startDeadline('signing');
+    // Before the gate, so a 503 consumes no approval; the cap is checked and taken with no await
+    // in between, so concurrent requests cannot overshoot it.
+    this.requireConnected(signers, 'signer');
+    if (this.ledSignings >= MAX_LIVE_SIGNINGS_PER_LEADER) {
+      throw new RequestError(503, `this node already leads ${MAX_LIVE_SIGNINGS_PER_LEADER} live signing ceremonies; retry later`);
+    }
+    this.ledSignings++;
     try {
-      let result: LeaderSignResult;
+      await this.approve(buildSigningSpec(analysis, this.specBase(ceremonyId), network, label));
+
+      // The authoritative reservation: the id may have been taken while the gate deliberated.
+      const slot = this.deps.slots.beginLocalSigning(ceremonyId);
+      if (!slot) throw new RequestError(409, idInUse(ceremonyId));
+      const deadline = this.startDeadline('signing');
       try {
-        const spec = {
-          ceremonyId,
-          signers,
-          sighashes: analysis.sighashes.map(s => fromHex(s.hash)),
-          keyPackage: vault.keyPackage,
-          publicKeyPackage: vault.publicKeyPackage,
-          rng: this.deps.rng,
-        };
-        this.log.info(`leader: signing ${ceremonyId}: ${analysis.inputs.length} inputs, signers ${signers.join(',')}`, {
-          ceremonyId,
-          txid: analysis.txid,
-        });
-        const signatures = await leadSigning(this.ceremonyIo('signing'), spec, proposal, deadline.signal);
-        const signaturesHex = signatures.map(s => toHex(s));
-        const finalized = finalizeSend(
-          proposal.tx,
-          proposal.prevouts,
-          signaturesHex.map((signature, index) => ({ index, signature })),
-          vaultPayment(vaultKey, network).outputKey,
-        );
-        result = { ceremonyId, txid: finalized.txid, signedTxHex: finalized.hex, signaturesHex };
-      } catch (err) {
-        const failure = deadline.signal.aborted ? new Error(deadlineReason(deadline), { cause: err }) : err;
-        const reason = errorMessage(failure);
-        this.log.warn(`leader: signing ${ceremonyId} failed: ${reason}`, { ceremonyId });
-        await this.broadcastBestEffort({ v: 2, kind: 'signoff-aborted', ceremonyId, reason: reason.slice(0, MAX_REASON_LENGTH) });
-        throw failure;
+        let result: LeaderSignResult;
+        try {
+          const spec = {
+            ceremonyId,
+            signers,
+            sighashes: analysis.sighashes.map(s => fromHex(s.hash)),
+            keyPackage: vault.keyPackage,
+            publicKeyPackage: vault.publicKeyPackage,
+            rng: this.deps.rng,
+          };
+          this.log.info(`leader: signing ${ceremonyId}: ${analysis.inputs.length} inputs, signers ${signers.join(',')}`, {
+            ceremonyId,
+            txid: analysis.txid,
+          });
+          const signatures = await leadSigning(this.ceremonyIo('signing'), spec, proposal, deadline.signal);
+          const signaturesHex = signatures.map(s => toHex(s));
+          const finalized = finalizeSend(
+            proposal.tx,
+            proposal.prevouts,
+            signaturesHex.map((signature, index) => ({ index, signature })),
+            vaultPayment(vaultKey, network).outputKey,
+          );
+          result = { ceremonyId, txid: finalized.txid, signedTxHex: finalized.hex, signaturesHex };
+        } catch (err) {
+          const failure = deadline.signal.aborted ? new Error(deadlineReason(deadline), { cause: err }) : err;
+          const reason = errorMessage(failure);
+          this.log.warn(`leader: signing ${ceremonyId} failed: ${reason}`, { ceremonyId });
+          await this.broadcastBestEffort({ v: 2, kind: 'signoff-aborted', ceremonyId, reason: reason.slice(0, MAX_REASON_LENGTH) });
+          throw failure;
+        }
+        await this.broadcastBestEffort({ v: 2, kind: 'signoff-done', ceremonyId, signaturesHex: result.signaturesHex });
+        this.log.info(`leader: signing ${ceremonyId} done: txid ${result.txid}`, { ceremonyId, txid: result.txid });
+        return result;
+      } finally {
+        deadline.clear();
+        // Clear first, then release: the id never comes free before its blobs' clear is scheduled.
+        this.clearLater(ceremonyId, 'signing');
+        slot.end();
       }
-      await this.broadcastBestEffort({ v: 2, kind: 'signoff-done', ceremonyId, signaturesHex: result.signaturesHex });
-      this.log.info(`leader: signing ${ceremonyId} done: txid ${result.txid}`, { ceremonyId, txid: result.txid });
-      return result;
     } finally {
-      deadline.clear();
-      // Clear first, then release: the id never comes free before its blobs' clear is scheduled.
-      this.clearLater(ceremonyId, 'signing');
-      slot.end();
+      // After the slot's end: the request has settled, so its place frees.
+      this.ledSignings--;
     }
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
+
+  /**
+   * Every party in `parties` other than this node must be connected now
+   * (`Transport.isConnected`); the first that is not is a retryable 503. A
+   * snapshot: a peer that drops after it misses the announce, and that
+   * ceremony fails at its deadline.
+   */
+  private requireConnected(parties: readonly PartyId[], role: 'signer' | 'party'): void {
+    const { transport } = this.deps.io;
+    for (const p of parties) {
+      if (p === this.deps.node.partyId || transport.isConnected(p)) continue;
+      this.log.warn(`leader: ${role} ${p} is not connected; refusing before the gate`, { partyId: p });
+      throw new RequestError(503, `${role} ${p} is not connected; retry when the ring is connected`);
+    }
+  }
 
   private specBase(ceremonyId: string) {
     return { ceremonyId, leader: this.deps.node.id, role: 'leader' as const };

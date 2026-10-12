@@ -704,6 +704,22 @@ describe('otzi btc', () => {
       expect(esplora.broadcasts).toHaveLength(0);
     });
 
+    it('a 503 refusal (the ring is not connected) carries a retry hint and broadcasts nothing', async () => {
+      esplora.fund(address, 80_000);
+      client.fail = new DaemonClientError(503, 'signer 2 is not connected; retry when the ring is connected');
+      const err = await btcSend({ configPath, vaultPath, bookPath, to: DEST, amount: '50000' }, deps()).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(DaemonClientError);
+      expect(err).toMatchObject({ status: 503 });
+      expect((err as Error).message).toBe(
+        'signer 2 is not connected; retry when the ring is connected\n' +
+          'Nothing was announced or signed. This is temporary: run the same command again to retry.',
+      );
+      expect(esplora.broadcasts).toHaveLength(0);
+    });
+
     it('rejects a daemon reply without a signed transaction', async () => {
       esplora.fund(address, 80_000);
       client.reply = { ceremonyId: 'sign-x', status: 'done' };
@@ -803,6 +819,29 @@ describe('otzi btc', () => {
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain(bookPath);
       expect(client.requests).toHaveLength(1);
+    });
+
+    it('a 503 refusal (the leader is at its cap) carries a retry hint', async () => {
+      const proposalPath = await writeProposal(makeProposal(vault, NETWORK));
+      client.fail = new DaemonClientError(503, 'this node already leads 32 live signing ceremonies; retry later');
+      for (const broadcast of [false, true]) {
+        await expect(btcSign({ configPath, vaultPath, bookPath, proposalPath, broadcast }, deps())).rejects.toMatchObject({
+          status: 503,
+          message:
+            'this node already leads 32 live signing ceremonies; retry later\n' +
+            'Nothing was announced or signed. This is temporary: run the same command again to retry.',
+        });
+      }
+      expect(esplora.broadcasts).toEqual([]);
+    });
+
+    it('passes any other daemon refusal through unchanged', async () => {
+      const proposalPath = await writeProposal(makeProposal(vault, NETWORK));
+      client.fail = new DaemonClientError(500, 'ceremony deadline of 300000 ms passed');
+      await expect(btcSign({ configPath, vaultPath, bookPath, proposalPath, broadcast: false }, deps())).rejects.toMatchObject({
+        status: 500,
+        message: 'ceremony deadline of 300000 ms passed',
+      });
     });
 
     it('does not print a summary for a proposal it refuses', async () => {

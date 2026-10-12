@@ -1,11 +1,12 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { DkgShareKeptError, type ShareStager } from '../core/dkg-ceremony';
+import { setInMemoryPartition } from '../core/in-memory-transport';
 import { parseMessage, type CeremonyMessage } from '../core/messages';
 import type { BlobKey, PartyId } from '../core/types';
 import { AutoGate } from '../gate/factory';
 import { PolicyGate } from '../gate/policy';
 import type { ApprovalGate, CeremonySpec, Decision } from '../gate/types';
-import { Orchestrator } from '../orchestrator/orchestrator';
+import { MAX_LIVE_SIGNINGS_PER_LEADER, Orchestrator } from '../orchestrator/orchestrator';
 import { rng } from '../otzi/lib/dkg.fixture';
 import type { DecryptedShare } from '../otzi/lib/share-file';
 import type { NetworkName } from '../otzi/lib/vault-types';
@@ -638,4 +639,148 @@ describe('LeaderDispatcher with this node\'s orchestrator as its slots', () => {
     expect(again).toMatchObject({ status: 409, message: 'ceremony id pay-once is already in use on this node' });
     expect(gate.specs).toHaveLength(1);
   });
+});
+
+describe('LeaderDispatcher: a ring that is not connected (fail fast)', () => {
+  it('sign answers 503 naming a signer that is not connected, before the gate and the announce', async () => {
+    const ring = makeRing(3);
+    const seen = inbox(ring[1]!);
+    const slots = fakeSlots();
+    const gate = new RecordingGate(new AutoGate());
+    setInMemoryPartition(ring[0]!.io.transport, 2, true);
+
+    const err = await rejection(
+      leaderOn(ring[0]!, { gate, slots: slots.slots }).sign({
+        ceremonyId: 'pay-dc',
+        signers: [0, 1, 2],
+        proposal: makeProposal(tv.vaultKey, NET),
+      }),
+    );
+    expect(err).toBeInstanceOf(RequestError);
+    expect(err).toMatchObject({ status: 503, message: 'signer 2 is not connected; retry when the ring is connected' });
+    expect(gate.specs).toEqual([]);
+    expect(slots.signingIds).toEqual([]);
+    expect(seen).toEqual([]);
+    expect(ring[0]!.io.store.list('pay-dc')).toEqual([]);
+  });
+
+  it('names the first signer that is not connected, in signers order', async () => {
+    const ring = makeRing(3);
+    setInMemoryPartition(ring[0]!.io.transport, 1, true);
+    setInMemoryPartition(ring[0]!.io.transport, 2, true);
+    const err = await rejection(
+      leaderOn(ring[0]!).sign({ ceremonyId: 'pay-dc2', signers: [0, 2, 1], proposal: makeProposal(tv.vaultKey, NET) }),
+    );
+    expect(err).toMatchObject({ status: 503, message: 'signer 2 is not connected; retry when the ring is connected' });
+  });
+
+  it('a 503 consumes no approval: once the ring reconnects the same request signs', async () => {
+    const ring = makeRing(3);
+    const own = cosigner(ring[0]!, shareOf(0));
+    const [c1, c2] = [cosigner(ring[1]!, shareOf(1)), cosigner(ring[2]!, shareOf(2))];
+    // One approval per hour: a refusal that consumed it would leave the retry rejected.
+    const gate = new RecordingGate(new PolicyGate({ maxCeremoniesPerHour: 1 }));
+    const leader = leaderOn(ring[0]!, { gate, slots: own, ceremonyDeadlines: { signingMs: 10_000, dkgMs: 10_000 } });
+    const req = { ceremonyId: 'pay-retry', signers: [0, 1, 2], proposal: makeProposal(tv.vaultKey, NET) };
+
+    setInMemoryPartition(ring[0]!.io.transport, 1, true);
+    expect(await rejection(leader.sign(req))).toMatchObject({ status: 503 });
+    expect(gate.specs).toEqual([]);
+
+    setInMemoryPartition(ring[0]!.io.transport, 1, false);
+    const signed = await leader.sign(req);
+    expect(signed.txid).toMatch(/^[0-9a-f]{64}$/);
+    expect(gate.specs).toHaveLength(1);
+    for (const c of [c1, c2]) expect(await c.waitFor('pay-retry', 5_000)).toMatchObject({ status: 'done' });
+  });
+
+  it('runDkg answers 503 naming a party that is not connected, before the gate and the announce', async () => {
+    const ring = makeRing(3);
+    const seen = inbox(ring[2]!);
+    const slots = fakeSlots();
+    const gate = new RecordingGate(new AutoGate());
+    const stager = recordingStager();
+    setInMemoryPartition(ring[0]!.io.transport, 1, true);
+
+    const err = await rejection(
+      leaderOn(ring[0]!, { vault: undefined, gate, slots: slots.slots, createStager: () => stager }).runDkg({
+        ceremonyId: 'gen-dc',
+      }),
+    );
+    expect(err).toBeInstanceOf(RequestError);
+    expect(err).toMatchObject({ status: 503, message: 'party 1 is not connected; retry when the ring is connected' });
+    expect(gate.specs).toEqual([]);
+    expect(seen).toEqual([]);
+    expect(stager.calls).toEqual([]);
+    // The DKG slot was taken (the 409 checks come first) and is released.
+    expect(slots.dkgIds).toEqual(['gen-dc']);
+    expect(slots.dkgEnds).toBe(1);
+  });
+});
+
+describe('LeaderDispatcher: at most 32 led signings', () => {
+  const proposal = () => makeProposal(tv.vaultKey, NET);
+
+  it('the 33rd request awaiting the gate is refused with 503 before the gate; a place frees when one settles', async () => {
+    expect(MAX_LIVE_SIGNINGS_PER_LEADER).toBe(32);
+    const ring = makeRing(3);
+    const seen = inbox(ring[1]!);
+    const decide: Array<(d: Decision) => void> = [];
+    const gate = new FixedGate(() => new Promise<Decision>(resolve => decide.push(resolve)));
+    const leader = leaderOn(ring[0]!, { gate });
+
+    const held = Array.from({ length: 32 }, (_, i) =>
+      rejection(leader.sign({ ceremonyId: `cap-${i}`, signers: [0, 1, 2], proposal: proposal() })),
+    );
+    await vi.waitFor(() => expect(gate.specs).toHaveLength(32), { timeout: 5_000, interval: 10 });
+
+    const over = await rejection(leader.sign({ ceremonyId: 'cap-32', signers: [0, 1, 2], proposal: proposal() }));
+    expect(over).toBeInstanceOf(RequestError);
+    expect(over).toMatchObject({ status: 503, message: 'this node already leads 32 live signing ceremonies; retry later' });
+    expect(gate.specs).toHaveLength(32);
+
+    // One settles (its gate rejects): its place frees, and the next request reaches the gate.
+    decide[0]!('reject');
+    expect(await held[0]).toBeInstanceOf(GateRejection);
+    const next = rejection(leader.sign({ ceremonyId: 'cap-33', signers: [0, 1, 2], proposal: proposal() }));
+    await vi.waitFor(() => expect(gate.specs).toHaveLength(33), { timeout: 5_000, interval: 10 });
+    expect(gate.specs[32]).toMatchObject({ ceremonyId: 'cap-33' });
+    // Full again.
+    expect(await rejection(leader.sign({ ceremonyId: 'cap-34', signers: [0, 1, 2], proposal: proposal() }))).toMatchObject({
+      status: 503,
+    });
+
+    for (const d of decide.slice(1)) d('reject');
+    for (const r of await Promise.all([...held.slice(1), next])) expect(r).toBeInstanceOf(GateRejection);
+    expect(seen).toEqual([]);
+  });
+
+  it('counts announced ceremonies until they settle', async () => {
+    const CEREMONY_MS = 3_000;
+    const ring = makeRing(3, ONE_ATTEMPT);
+    const seen = inbox(ring[1]!);
+    let approvals = 0;
+    // Approves the first 32; the request after them only has to reach the gate.
+    const gate = new FixedGate(async () => (approvals++ < 32 ? 'approve' : 'reject'));
+    const leader = leaderOn(ring[0]!, { gate, ceremonyDeadlines: { signingMs: CEREMONY_MS, dkgMs: CEREMONY_MS } });
+
+    // Nobody else takes part: each ceremony pulls until its deadline.
+    const live = Array.from({ length: 32 }, (_, i) =>
+      rejection(leader.sign({ ceremonyId: `led-${i}`, signers: [0, 1, 2], proposal: proposal() })),
+    );
+    await vi.waitFor(() => expect(seen.filter(m => m.kind === 'announce-sign')).toHaveLength(32), {
+      timeout: CEREMONY_MS - 500,
+      interval: 10,
+    });
+    const over = await rejection(leader.sign({ ceremonyId: 'led-32', signers: [0, 1, 2], proposal: proposal() }));
+    expect(over).toMatchObject({ status: 503, message: 'this node already leads 32 live signing ceremonies; retry later' });
+    expect(gate.specs).toHaveLength(32);
+
+    for (const err of await Promise.all(live)) {
+      expect((err as Error).message).toBe(`ceremony deadline of ${CEREMONY_MS} ms passed`);
+    }
+    const after = await rejection(leader.sign({ ceremonyId: 'led-33', signers: [0, 1, 2], proposal: proposal() }));
+    expect(after).toBeInstanceOf(GateRejection);
+    expect(gate.specs).toHaveLength(33);
+  }, 20_000);
 });

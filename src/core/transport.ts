@@ -39,4 +39,12 @@ export interface Transport {
    * handler per transport.
    */
   servePulls(handler: (from: PartyId, key: BlobKey) => Uint8Array | null): Unsubscribe;
+
+  /**
+   * Whether this transport holds an authenticated session with `partyId` right
+   * now, so a broadcast would reach it (facts/core.md, `isConnected`). Always
+   * `true` for self; `false` for a party outside the ring. A snapshot with no
+   * side effect: it never starts a connection or a handshake.
+   */
+  isConnected(partyId: PartyId): boolean;
 }

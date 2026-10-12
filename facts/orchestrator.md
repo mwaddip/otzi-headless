@@ -78,7 +78,7 @@
 
 **Public surface:**
 - `export const MAX_LIVE_SIGNINGS_PER_LEADER = 32`
-  - **Meaning:** the most signing ceremonies one remote leader may have live on this node at once (see `announce-sign`, step 5). Every live signing tracker holds a deadline timer, an abort controller and a pull loop — for an `exec` or `webhook` gate until the operator decides — so a ring member that announces without end must not make every participant hold trackers without bound. DKG is unaffected (at most one DKG is live per node). The ceremonies this node leads itself are local slots, never trackers, so they are not counted.
+  - **Meaning:** the most signing ceremonies one remote leader may have live on this node at once (see `announce-sign`, step 5). Every live signing tracker holds a deadline timer, an abort controller and a pull loop — for an `exec` or `webhook` gate until the operator decides — so a ring member that announces without end must not make every participant hold trackers without bound. DKG is unaffected (at most one DKG is live per node). The ceremonies this node leads itself are local slots, never trackers, so they are not counted. `LeaderDispatcher.sign` applies the same limit to the signings this node leads (a 503 before its gate; see [daemon.md](daemon.md), `leader.ts`), so a leader does not announce more concurrent signings than its participants accept from it.
 
 - `class Orchestrator`
   - **`constructor(deps: OrchestratorDeps)`**

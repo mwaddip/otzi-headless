@@ -358,6 +358,13 @@ export class RelayTransport implements Transport {
     };
   }
 
+  /** Self, or a peer whose handshake over the relay completed and whose session has not ended since. No side effect. */
+  isConnected(partyId: PartyId): boolean {
+    if (partyId === this.partyId) return true;
+    const peer = this.peerStates.get(partyId);
+    return peer !== undefined && peer.status === 'connected' && peer.session !== null;
+  }
+
   // ─────────────────────────────────────────────────────────────────────
   // Relay message dispatch
   // ─────────────────────────────────────────────────────────────────────

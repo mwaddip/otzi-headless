@@ -132,7 +132,7 @@
 **Purpose:** Daemon API request parsing and input rules (spec §6.1).
 
 **Public surface:**
-- `class RequestError extends Error { constructor(readonly status: 400 | 409, message: string) }`
+- `class RequestError extends Error { constructor(readonly status: 400 | 409 | 503, message: string) }` — the handler answers `status` with `{ error: message }`. 503 is the leader's retryable refusal before its gate (`leader.ts`): nothing was announced and no approval was consumed.
 - `const NO_VAULT_MESSAGE = 'no vault loaded — run otzi generate, then restart the daemon'` — the 409 text for every op that needs a loaded vault (`vault-info`, `sign`).
 - `interface LeaderSignRequest { ceremonyId: string; signers: PartyId[]; proposal: SendProposal }`
 
@@ -223,9 +223,10 @@
     2. `slots.ceremonyIdInUse(ceremonyId)` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`.
     3. `slots.beginLocalDkg(ceremonyId)`; `null` → `RequestError(409, 'a DKG is already running on this node')`. From here on, `end()` runs in a `finally`.
     4. `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`. Checked while the slot is held, so a DKG this node joined and committed meanwhile is seen.
-    5. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })` (`peerIds` = every `peersById` label in party order); non-approve → `GateRejection`.
-    6. `createStager()`; random 32-byte session ID from `rng`; start the ceremony deadline; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, stager, AbortSignal.any([slot.signal, deadline]))`.
-    7. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
+    5. Every other party (`peersById` keys, ascending) must be connected (`io.transport.isConnected`); the first that is not → `RequestError(503, 'party <id> is not connected; retry when the ring is connected')` (and a warn line `leader: <party|signer> <id> is not connected; refusing before the gate`). The gate is not asked, so no approval is consumed, and nothing is announced.
+    6. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })` (`peerIds` = every `peersById` label in party order); non-approve → `GateRejection`.
+    7. `createStager()`; random 32-byte session ID from `rng`; start the ceremony deadline; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, stager, AbortSignal.any([slot.signal, deadline]))`.
+    8. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
     - **Throws:** `RequestError`, `GateRejection`, the deadline error above, or the `runDkgCeremony` error (which already broadcast `signoff-aborted`, unless its signal aborted it). A failure is logged at warn level, or at error level for a `DkgShareKeptError`: the 500 body's `error` then says the staged share was kept at `<share path>.pending` and to check the other nodes with `otzi vault`.
     - **Post:** From the announce on, success and failure both `scheduleClear` the ceremony with the DKG retention. The new vault is on disk but not loaded; signing on it needs a daemon restart.
 
@@ -233,15 +234,20 @@
     1. No vault → `RequestError(409, NO_VAULT_MESSAGE)`.
     2. `slots.ceremonyIdInUse(ceremonyId)` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. A reused id never reaches the gate: no policy rate-window approval is consumed and no exec / webhook approver is asked.
     3. `analysis = analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), network)`; a throw → `RequestError(400, <message>)`.
-    4. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)` (labels from `addressBook` when present; a rejected `addressBook()` means no labels and one warn line); non-approve → `GateRejection`.
-    5. `slots.beginLocalSigning(ceremonyId)` — the authoritative reservation (an id taken while the gate deliberated is caught here); `null` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. From here on, a `finally` clears the deadline timer, schedules the blob clear (signing retention) and then calls `end()` — the orchestrator's settle order (clear, then record), so the id never comes free before its blobs' clear is scheduled.
-    6. Start the ceremony deadline; `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal, deadline)` — this broadcasts `announce-sign`.
-    7. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` (`src/otzi/backend/bitcoin.ts`) → signed hex and txid.
-    8. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`. A failed `signoff-done` broadcast is logged at warn and the signed transaction is still returned (participants settle `timeout` at their deadline).
-    - **Failure in steps 6–7:** broadcast `signoff-aborted {ceremonyId, reason}` (`reason` = the error message — `ceremony deadline of <ms> ms passed` when the deadline aborted it — at most 1024 characters; the broadcast is best-effort) and rethrow (handler → 500).
+    4. Read the output labels (`addressBook` when present; a rejected `addressBook()` means no labels and one warn line).
+    5. Every signer other than this node (in `signers` order) must be connected (`io.transport.isConnected`); the first that is not → `RequestError(503, 'signer <id> is not connected; retry when the ring is connected')` (and a warn line `leader: <party|signer> <id> is not connected; refusing before the gate`).
+    6. When this node already leads `MAX_LIVE_SIGNINGS_PER_LEADER` (32, `src/orchestrator/orchestrator.ts`) live signings → `RequestError(503, 'this node already leads 32 live signing ceremonies; retry later')`. Otherwise this request takes one of them, in the same synchronous step as the check (concurrent requests cannot overshoot), and gives it back in a `finally` when `sign` returns or throws — after the slot's `end()`. A led signing therefore counts from here, through the gate and the ceremony, until the request settles: the participants' cap (`announce-sign` in [orchestrator.md](orchestrator.md)) counts this leader's ceremonies from the announce, and a leader past it would announce ceremonies its participants drop. Steps 5 and 6 come before the gate: a 503 consumes no approval and announces nothing.
+    7. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)`; non-approve → `GateRejection`.
+    8. `slots.beginLocalSigning(ceremonyId)` — the authoritative reservation (an id taken while the gate deliberated is caught here); `null` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. From here on, a `finally` clears the deadline timer, schedules the blob clear (signing retention) and then calls `end()` — the orchestrator's settle order (clear, then record), so the id never comes free before its blobs' clear is scheduled.
+    9. Start the ceremony deadline; `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal, deadline)` — this broadcasts `announce-sign`.
+    10. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` (`src/otzi/backend/bitcoin.ts`) → signed hex and txid.
+    11. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`. A failed `signoff-done` broadcast is logged at warn and the signed transaction is still returned (participants settle `timeout` at their deadline).
+    - **Failure in steps 9–10:** broadcast `signoff-aborted {ceremonyId, reason}` (`reason` = the error message — `ceremony deadline of <ms> ms passed` when the deadline aborted it — at most 1024 characters; the broadcast is best-effort) and rethrow (handler → 500).
 
 **Invariants:**
-- Nothing is announced unless the leader's own analysis and gate passed (400 / 403 leave peers untouched) and this node holds the ceremony's slot (409 otherwise).
+- Nothing is announced unless the leader's own analysis and gate passed (400 / 403 leave peers untouched), every other party of the ceremony was connected when the leader checked (503 otherwise), and this node holds the ceremony's slot (409 otherwise).
+- The connectivity check is a snapshot taken before the gate. A peer that drops between the check and the announce misses the announce; nothing re-announces it, and the ceremony then fails at its deadline as before.
+- At most `MAX_LIVE_SIGNINGS_PER_LEADER` (32) signing requests are past step 6 at once on this node; the 33rd gets 503 without reaching the gate, and a place frees when one of them settles.
 - The leader never broadcasts the transaction; it returns it.
 - The leader's own gate is evaluated once per request.
 - Signoffs come only from the leader for signing; DKG aborts come from whichever node fails.
@@ -545,7 +551,7 @@
 - `generate(opts: { configPath: string; ceremonyId?: string }, deps?: CliDeps): Promise<{ ceremonyId: string; address: string; network: NetworkName }>`
   - **Pre:** The daemon on this node is running and holds no vault; every other daemon in the ring is running and holds no vault.
   - **Post:** Sends `{ op: 'dkg', ceremonyId? }` through `deps.client` or `DaemonClient.fromConfig(configPath)`; returns the response's `ceremonyId`, `address`, `network`.
-  - **Throws:** `DaemonClientError` (409 when the node already holds a vault, 403 gate reject, 500 ceremony failure); `Error` when the reply lacks `ceremonyId`, `address` or `network`.
+  - **Throws:** `DaemonClientError` (409 when the node already holds a vault, 403 gate reject, 503 when a party is not connected, 500 ceremony failure); `Error` when the reply lacks `ceremonyId`, `address` or `network`.
   - **Banner (entrypoint):** ceremony ID, network, vault address, share path, and the instruction to restart every daemon to load the new share.
 
 ### `vault.ts`
@@ -602,7 +608,7 @@
   5. `buildSend({ utxos, vault: vaultKey, network, to, amount, feeRate })`. `InsufficientFundsError` becomes `Error('insufficient funds: <available> sats (<btc> BTC) confirmed, <needed> sats (<btc> BTC) needed at <rate> sat/vB')`, plus `; a further <n> sats (<btc> BTC) is unconfirmed and is not spent until it confirms` when unconfirmed coins exist.
   6. More than 255 prevouts → `Error('this send needs <k> inputs; at most 255 fit in one transaction — consolidate first')` before any daemon call.
   7. `analyzeProposal` on the built proposal gives the summary (format under `btcSign`, labels from the book read in step 2), written through `deps.summary` (default stderr) before the daemon is asked to sign. A send refused in steps 1–6 prints no summary.
-  8. Daemon `{ op: 'sign', proposal: { network, tx, prevouts } }`, then the reply check (below).
+  8. Daemon `{ op: 'sign', proposal: { network, tx, prevouts } }`, then the reply check (below). A 503 refusal (a signer not connected, or the leader's cap) is rethrown as `DaemonClientError(503, '<daemon message>\nNothing was announced or signed. This is temporary: run the same command again to retry.')` — the retry hint (`btcSign` too); any other daemon status is thrown as it is.
   9. `broadcastTx(base, signedTxHex)`; on failure throw `BroadcastFailedError('broadcast failed — Esplora <base>: <reason>', txid, signedTxHex)`. The txid Esplora answers only cross-checks the daemon's: when it differs, `deps.warn` gets `warning: Esplora <base> answered txid '<x>' for the broadcast, but the signed transaction is <txid>` and the send still succeeds.
   - **Reply check (`btcSend` and `btcSign`, before anything is broadcast or returned):** the reply must carry a string `txid` and hex `signedTxHex` (`Error("daemon reply to 'sign' has no signed transaction (txid, signedTxHex)")`), and `signedTxHex` must decode as a transaction (`the signed transaction in the daemon's reply cannot be decoded: …`) whose txid equals the reply's `txid` (`daemon reply is inconsistent: it names txid <a> but its signed transaction is <b>`), equals `analyzeProposal`'s txid for the proposal, and whose serialization without witnesses equals `proposal.tx` (`daemon signed a different transaction than the proposal (proposal <a>, signed <b>); not broadcasting it`), and every input must carry witness data (`the daemon's signed transaction has no signature for input <i>; not broadcasting it`). Anything else is thrown and nothing is broadcast; a txid alone proves nothing, because a segwit txid ignores witnesses.
   - **Post:** Returns the daemon's txid and `explorerTxUrl(base, txid)`.

@@ -298,6 +298,50 @@ describe('RelayTransport — 2-peer', () => {
     await nodes[0]!.transport.stop();
     nodes = [];
   }, 10_000);
+
+  it('isConnected: self always; a peer only with a completed handshake; nobody once the relay is gone or after stop()', async () => {
+    const port = await freePort();
+    server = new RelayServer({ listen: `127.0.0.1:${port}` });
+    await server.start();
+    nodes = await buildRelayRing(2, `ws://127.0.0.1:${port}`, 'ring-is-connected', { reconnect: { initialMs: 50, maxMs: 200 } });
+    const [a, b] = [nodes[0]!.transport, nodes[1]!.transport];
+    expect(a.isConnected(0)).toBe(true);
+    expect(a.isConnected(1)).toBe(false);
+    expect(a.isConnected(7)).toBe(false);
+
+    // On the relay without its peer: still not connected.
+    await a.start();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(a.isConnected(1)).toBe(false);
+
+    await b.start();
+    await waitForRing(nodes);
+    expect(a.isConnected(1)).toBe(true);
+    expect(b.isConnected(0)).toBe(true);
+
+    // The relay goes away: every peer is disconnected at once.
+    await server.stop();
+    server = null;
+    await vi.waitFor(() => expect([a.isConnected(1), b.isConnected(0)]).toEqual([false, false]), {
+      timeout: 5_000,
+      interval: 20,
+    });
+    expect(a.isConnected(0)).toBe(true);
+
+    // It comes back: the reconnect re-handshakes and both are connected again.
+    server = new RelayServer({ listen: `127.0.0.1:${port}` });
+    await server.start();
+    await vi.waitFor(() => expect([a.isConnected(1), b.isConnected(0)]).toEqual([true, true]), {
+      timeout: 10_000,
+      interval: 20,
+    });
+
+    await b.stop();
+    expect(b.isConnected(0)).toBe(false);
+    expect(b.isConnected(1)).toBe(true);
+    // a hears peer-left from the relay.
+    await vi.waitFor(() => expect(a.isConnected(1)).toBe(false), { timeout: 5_000, interval: 20 });
+  }, 20_000);
 });
 
 describe('RelayTransport — 3-peer mesh via relay', () => {

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { PullOpts } from '../core/blob-puller';
-import { createInMemoryRing } from '../core/in-memory-transport';
+import { createInMemoryRing, setInMemoryPartition } from '../core/in-memory-transport';
 import type { Transport } from '../core/transport';
 import type { PartyId } from '../core/types';
 import type { CeremonyOutcome, Logger } from '../orchestrator/types';
@@ -222,6 +222,30 @@ describe('Daemon API: refusals', () => {
 
     const res = await post(urls[0]!, { op: 'dkg', ceremonyId: 'gen-exists' });
     expect(res).toEqual({ status: 409, json: { error: 'this node already holds a vault' } });
+    expect(broadcast).not.toHaveBeenCalled();
+  });
+
+  it('dkg and sign return a retryable 503 and broadcast nothing while a peer is not connected', async () => {
+    const fresh = await cluster();
+    const setup = await fresh.boot();
+    setInMemoryPartition(setup.transports[0]!, 2, true);
+    const dkgBroadcast = vi.spyOn(setup.transports[0]!, 'broadcast');
+    expect(await post(setup.urls[0]!, { op: 'dkg', ceremonyId: 'gen-dc' })).toEqual({
+      status: 503,
+      json: { error: 'party 2 is not connected; retry when the ring is connected' },
+    });
+    expect(dkgBroadcast).not.toHaveBeenCalled();
+    await fresh.shutdown();
+
+    const c = await cluster();
+    const tv = await writeShares(c);
+    const { urls, transports } = await c.boot();
+    setInMemoryPartition(transports[0]!, 1, true);
+    const broadcast = vi.spyOn(transports[0]!, 'broadcast');
+    expect(await post(urls[0]!, { op: 'sign', ceremonyId: 'pay-dc', proposal: makeProposal(tv.vaultKey, NET) })).toEqual({
+      status: 503,
+      json: { error: 'signer 1 is not connected; retry when the ring is connected' },
+    });
     expect(broadcast).not.toHaveBeenCalled();
   });
 

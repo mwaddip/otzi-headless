@@ -79,6 +79,12 @@
     - **Throws:** InMemoryTransport throws if a handler is already registered.
     - **Concurrency:** Handler may fire concurrently from multiple peer pull requests; should be thread-safe or use a lock.
 
+  - `isConnected(partyId: PartyId) → boolean`
+    - **Pre:** none.
+    - **Post:** `true` for this node's own `partyId`. For another ring member, `true` exactly when this transport holds an authenticated session with that peer right now, so a broadcast would reach it: `RelayTransport` — the peer's status is `connected`; `PeerMeshTransport` — a `PeerConnection` whose handshake completed and that has not closed (an open TCP or WebSocket connection alone does not count); `InMemoryTransport` — the pair is not partitioned. `false` otherwise, and for a party outside the ring. It is a snapshot: the session may end the moment after.
+    - **Throws:** Never.
+    - **Cross-component:** `LeaderDispatcher` asks it for every other signer (`sign`) and every other party (`runDkg`) before its gate, and answers 503 when one is not connected (see [daemon.md](daemon.md), `leader.ts`).
+
 **Invariants:**
 - `from` in every broadcast/pull callback is authenticated (the peer genuinely sent the message).
 - Test transports (InMemoryTransport) may bypass E2E encryption but MUST preserve authenticated-`from` semantics.
@@ -111,8 +117,14 @@
   - **Memory:** Each transport holds references to the entire ring; no cleanup needed per ceremony.
   - **Invariants:**
     - At most one `pullHandler` per transport.
-    - Broadcasts route to all other peers (partyId check prevents self-delivery).
-    - Pull requests go directly to the target peer's `servePull` method (no async wrapping, no null-then-wait).
+    - Broadcasts route to all other peers (partyId check prevents self-delivery), except a partitioned one.
+    - Pull requests go directly to the target peer's `servePull` method (no async wrapping, no null-then-wait); a pull to a partitioned peer returns `null`.
+    - `isConnected(p)`: `true` for self, and for a ring member the pair is not partitioned with; `false` for a partitioned one or a party outside the ring.
+
+- `function setInMemoryPartition(transport: Transport, peer: PartyId, partitioned: boolean) → void` (test hook)
+  - **Pre:** `transport` came from `createInMemoryRing`; `peer` is another member of its ring.
+  - **Post:** Cuts (`true`) or restores (`false`) the link between `transport` and `peer`, both ways: while cut, each reports the other not connected, a broadcast from either does not reach the other, and a pull between them returns `null`. Every other pair is unaffected. A new ring has no partition.
+  - **Throws:** when `transport` is not an in-memory transport, or `peer` is self or outside the ring.
 
 **Cross-component contracts:**
 - Used by: tests that exercise ceremony mechanics without real networking (`src/testing/ring.ts`).

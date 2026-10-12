@@ -45,7 +45,7 @@ through Esplora.
   - `register: master responded 408: master bootstrap timed out after <ms>ms: received <r> of <e> registrations` — the leader gave up waiting; it prints the same message. Under relay, check the leader's `[bootstrap] parties`.
 - `otzi generate [--config <path>] [--ceremony-id <id>]` — run the run-once DKG through the local daemon (the `dkg` op). Run it on exactly one node; every other daemon in the ring must be running. The vault is n-of-n: `parties` is the ring size and `threshold = parties`. The banner prints the vault address, the network, the share path, and the instruction to **restart every daemon** so each loads its new share.
 
-  Fails with `409` when this node already holds a vault, `403` when this node's gate rejects, `500` when the ceremony fails or times out. A DKG that fails before any node commits leaves no share at the share path on any node and can be re-run; a staged `<share path>.pending` left behind is overwritten by the next DKG.
+  Fails with `409` when this node already holds a vault, `503` when another node is not connected to this one (nothing was announced; start it or wait for its transport to reconnect, then run the command again), `403` when this node's gate rejects, `500` when the ceremony fails or times out. A DKG that fails before any node commits leaves no share at the share path on any node and can be re-run; a staged `<share path>.pending` left behind is overwritten by the next DKG.
 
   A DKG can also fail on one node after another node has committed the vault (for example when a node loses its connection during the last exchange). A node that had already published its confirmation therefore never deletes its staged share: it keeps `<share path>.pending`, and the error (in the `500` reply when it is this node, in the daemon log otherwise) names the file and the vault address. Run `otzi vault` on the other nodes (it shows a committed vault even before that node's daemon has been restarted, with a warning that the values are not verified). If any of them shows that address, rename the `.pending` file to the share path on this node (`sudo mv <share path>.pending <share path>`) and restart its daemon. If none does, the vault was never created: remove the `.pending` files and run `otzi generate` again.
 
@@ -78,6 +78,8 @@ through Esplora.
 - `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` — sign a proposal someone else built. `proposal.json` holds `{ "network", "tx", "prevouts" }` (see [`api.md`](./api.md) § `op: "sign"`). The file is checked against the daemon first, as for `send`; then analysis runs locally, so a proposal this vault would not sign fails before the daemon is asked to sign. The analysis summary (outputs with their address-book labels, change, fee, fee rate) goes to stderr before the daemon is asked to sign; stdout gets the txid and the signed hex. Without `--broadcast` nothing is posted; with it, the CLI posts the transaction and prints the explorer URL as a third stdout line.
 
 Every node in the signer set analyses the proposal against its own key and runs its own gate. If a node declines, the leader's ceremony fails and the command exits with the daemon's `500` error.
+
+When the daemon answers `503` — another signer is not connected to this node, or this node already leads 32 signings — nothing was announced and no gate approval was used. `send` and `sign` print the daemon's reason followed by `Nothing was announced or signed. This is temporary: run the same command again to retry.` and exit 1.
 
 ### Address book
 

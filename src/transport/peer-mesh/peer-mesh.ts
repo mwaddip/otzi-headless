@@ -296,6 +296,17 @@ export class PeerMeshTransport implements Transport {
     };
   }
 
+  /**
+   * Self, or a peer with a live `PeerConnection`: `dial` / `acceptInbound`
+   * return one only after the Noise-KK handshake, so an open socket still
+   * handshaking (or a dial in backoff) does not count.
+   */
+  isConnected(partyId: PartyId): boolean {
+    if (partyId === this.partyId) return true;
+    const conn = this.peerStates.get(partyId)?.connection;
+    return conn != null && !conn.isClosed;
+  }
+
   // ─────────────────────────────────────────────────────────────────────
   // Internal — connection lifecycle
   // ─────────────────────────────────────────────────────────────────────
