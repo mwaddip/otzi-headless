@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -278,13 +278,14 @@ describe('CronTrigger — scheduling', () => {
     });
     t.start();
     try {
-      await new Promise((resolve) => setTimeout(resolve, 2_200));
-      // Handler should have fired at least twice despite errors each time.
-      expect(calls).toBeGreaterThanOrEqual(2);
+      // Handler should fire again after a throw. Waiting for the second firing rather than
+      // sampling a fixed 2.2 s window: two every-second firings can take up to 2 s to arrive,
+      // and a loaded CI runner's timer lag or clock step overran the 0.2 s that left.
+      await vi.waitFor(() => expect(calls).toBeGreaterThanOrEqual(2), { timeout: 6_000, interval: 50 });
     } finally {
       t.stop();
     }
-  }, 5_000);
+  }, 10_000);
 
   it('double-start is idempotent; double-stop is idempotent', () => {
     const t = new CronTrigger({
