@@ -437,6 +437,15 @@ docker exec "$CONTAINER" grep -q "systemctl enable --now otzi-relay" /tmp/relay-
 docker exec "$CONTAINER" grep -qF "(this node: wss://relay.example)" /tmp/relay-install.log || { echo "FAIL: install output does not name this node's relay URL"; exit 1; }
 echo "OK: relay leader renders parties = 3, no [[peers]], and parses"
 
+echo ">> relay variant: an upper-case scheme is accepted and written lowercased"
+install_relay_variant leader 3 WSS://Relay.Example
+docker exec "$CONTAINER" bash -euo pipefail -c '
+grep -qx "url = \"wss://Relay.Example\"" /etc/otzi/daemon.toml || { echo "FAIL: WSS://Relay.Example not written as wss://Relay.Example"; exit 1; }
+! grep -q "WARNING.*relay URL" /tmp/relay-install.log || { echo "FAIL: an upper-case scheme was warned about"; exit 1; }
+'
+daemon_toml_parses "relay leader, upper-case scheme" "OTZI_SHARE_PASSWORD"
+echo "OK: the relay URL scheme is matched in any case and written lowercased"
+
 echo ">> relay variant: leaf (a stale parties answer must not be written)"
 install_relay_variant leaf 7 wss://relay.example
 docker exec "$CONTAINER" bash -euo pipefail -c '

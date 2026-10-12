@@ -250,7 +250,7 @@ describe('vault command', () => {
   });
 
   describe('other daemon answers', () => {
-    it.each([401, 403, 500])('passes a %i refusal through', async (status) => {
+    it.each([400, 500])('passes a %i refusal through', async (status) => {
       const client = fakeClient(new DaemonClientError(status, 'daemon said no'));
       await expect(vault({ configPath, vaultPath }, { client, warn })).rejects.toMatchObject({
         status,
@@ -274,6 +274,15 @@ describe('vault command', () => {
       const out = await vault({ configPath, vaultPath }, { client: fakeClient(error), warn });
       expect(out.split('\n')).toEqual(['network:   testnet4', `address:   ${file.address}`, 'threshold: 2-of-3']);
       expect(notes).toEqual([`not verified against the daemon (${error.message})`]);
+    });
+
+    it.each([
+      [401, 'unauthorized'],
+      [403, 'forbidden host'],
+    ])('a daemon that answers %i cannot be asked: the file values and a note naming the status', async (status, message) => {
+      const out = await vault({ configPath, vaultPath }, { client: fakeClient(new DaemonClientError(status, message)), warn });
+      expect(out.split('\n')).toEqual(['network:   testnet4', `address:   ${file.address}`, 'threshold: 2-of-3']);
+      expect(notes).toEqual([`not verified against the daemon (${status} ${message})`]);
     });
 
     it('keeps the --json output of the file as it is', async () => {

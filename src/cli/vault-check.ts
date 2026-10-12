@@ -46,9 +46,9 @@ export function notVerifiedNote(reason: string): string {
  * Ask the daemon for its vault. A daemon that answers 409 holds no vault. A
  * client that cannot be built (`getClient` throws: the config is unreadable, or
  * names no way to reach the daemon), a system error while asking (no socket,
- * connection refused, socket not readable) and no answer within `timeoutMs`
- * (the request is then aborted, so the process can exit) all mean nothing could
- * be asked. Anything else (another status, a reply that is not JSON or not a
+ * connection refused, socket not readable), a 401 or 403 (the daemon refuses
+ * this CLI itself) and no answer within `timeoutMs` (the request is then
+ * aborted, so the process can exit) all mean nothing could be asked. Anything else (another status, a reply that is not JSON or not a
  * vault-info) is a daemon that answered badly and is thrown.
  */
 export async function askDaemon(
@@ -83,6 +83,10 @@ export async function askDaemon(
     if (timedOut) return silent;
     if (err instanceof DaemonClientError) {
       if (err.status === 409) return { kind: 'no-vault' };
+      // The daemon will not answer this CLI (a token it does not send, a Host it refuses): nothing
+      // could be asked, as when it is down (Ruling P17).
+      if (err.status === 401 || err.status === 403)
+        return { kind: 'unreachable', reason: displayText(`${err.status} ${err.message}`) };
       throw err;
     }
     if (typeof (err as { code?: unknown } | null)?.code === 'string')

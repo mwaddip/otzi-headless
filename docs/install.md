@@ -49,7 +49,8 @@ follow up with `sudo apt -f install` to resolve.)
        separated `host[:port]` list of every other node — on a leaf,
        the leader is auto-derived from the bootstrap leader URL, so
        you only list peers *other than* the leader).
-     - For `relay`: **Relay URL** (`ws://` or `wss://`; the same on every node, see
+     - For `relay`: **Relay URL** (`ws://` or `wss://`, the scheme in any case,
+       written lowercased; the same on every node, see
        [Relay coordinator](#relay-coordinator)). Any other answer, or none, is left
        out of `daemon.toml` with a warning on stderr, and the daemon and `otzi setup`
        then refuse the config with `config transport.url: required when
@@ -273,8 +274,12 @@ the identity key or the daemon's environment (see [Service sandbox](#service-san
    It logs `RelayServer: listening {"host":"127.0.0.1","port":7100}` at start, then
    one line per connect and disconnect. It restarts itself after a crash
    (`Restart=on-failure`). Daemons that lose the relay redial it with a backoff of
-   1 s up to 30 s and re-handshake with their peers, so a relay restart only
-   delays a ceremony in flight; it does not need a daemon restart.
+   1 s up to 30 s and re-handshake with their peers; a relay restart does not
+   need a daemon restart. While a node is disconnected no ceremony starts: a
+   `sign` or `dkg` request gets a retryable `503` (`signer <id> is not
+   connected`) before the leader's gate, so retry once the ring has reconnected.
+   A ceremony already in flight when the relay drops only waits: its pulls retry
+   and it completes after the reconnect if that comes before its deadline.
 
 5. **Point every node at it.** `[transport] url` in `/etc/otzi/daemon.toml` is the
    `wss://` URL of the proxy, the same on all nodes (`url = "wss://relay.example"`;

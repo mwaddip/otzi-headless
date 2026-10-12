@@ -62,7 +62,28 @@ describe('askDaemon', () => {
     ).toEqual({ kind: 'unreachable', reason: 'cannot read the config' });
   });
 
-  it.each([401, 403, 500])('throws what the daemon answered with %i', async (status) => {
+  it.each([
+    [401, 'unauthorized'],
+    [403, 'forbidden host'],
+  ])('a %i means the CLI cannot ask: unreachable, the status and message as the reason', async (status, message) => {
+    const client = {
+      vaultInfo: async (): Promise<VaultInfo> => {
+        throw new DaemonClientError(status, message);
+      },
+    };
+    expect(await askDaemon(() => client)).toEqual({ kind: 'unreachable', reason: `${status} ${message}` });
+  });
+
+  it('a 401 message is shown without control characters', async () => {
+    const client = {
+      vaultInfo: async (): Promise<VaultInfo> => {
+        throw new DaemonClientError(401, 'un\u001b[31mauthorized\nnext');
+      },
+    };
+    expect(await askDaemon(() => client)).toEqual({ kind: 'unreachable', reason: '401 un[31mauthorized next' });
+  });
+
+  it.each([400, 500])('throws what the daemon answered with %i', async (status) => {
     const client = {
       vaultInfo: async (): Promise<VaultInfo> => {
         throw new DaemonClientError(status, 'daemon said no');

@@ -234,6 +234,16 @@ describe('otzi btc', () => {
         expect(warnings[0]).toMatch(/^not verified against the daemon \(connect ENOENT .*otzi-test\.sock\)$/);
       });
 
+      it('prints the balance, with the note, when the daemon refuses the CLI with 401 or 403', async () => {
+        esplora.fund(address, 80_000);
+        for (const [status, message] of [[401, 'unauthorized'], [403, 'forbidden host']] as const) {
+          warnings.length = 0;
+          client.infoError = new DaemonClientError(status, message);
+          expect(await btcBalance({ configPath, vaultPath }, deps())).toBe('confirmed: 80000\nunconfirmed: 0');
+          expect(warnings).toEqual([`not verified against the daemon (${status} ${message})`]);
+        }
+      });
+
       it('passes on a daemon that answers badly', async () => {
         client.infoError = new DaemonClientError(500, 'internal error');
         await expect(btcBalance({ configPath, vaultPath }, deps())).rejects.toMatchObject({ status: 500 });
@@ -328,6 +338,12 @@ describe('otzi btc', () => {
         await expect(send()).rejects.toThrow(
           /cannot check .*vault-pubkey\.json against the daemon: connect ECONNREFUSED \/run\/otzi\/otzi\.sock/,
         );
+        expect(client.requests).toHaveLength(0);
+      });
+
+      it('refuses when the daemon will not answer the CLI (401), naming the status', async () => {
+        client.infoError = new DaemonClientError(401, 'unauthorized');
+        await expect(send()).rejects.toThrow(/cannot check .*vault-pubkey\.json against the daemon: 401 unauthorized/);
         expect(client.requests).toHaveLength(0);
       });
 

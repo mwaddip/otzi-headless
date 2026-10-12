@@ -221,14 +221,19 @@ BANNER
       fi
 
       # [transport] url (relay): the daemon dials it as a WebSocket, so only a ws:// or
-      # wss:// URL is written. A blank or other answer is left out with a warning, and
-      # the parser then refuses the config naming transport.url, rather than the
-      # daemon failing later against an address it cannot dial.
+      # wss:// URL is written. The scheme is matched in any case (a URL scheme is
+      # case-insensitive) and written lowercased; the rest is kept as given. A blank or
+      # other answer is left out with a warning, and the parser then refuses the config
+      # naming transport.url, rather than the daemon failing later against an address
+      # it cannot dial.
       RELAY_URL_OK=""
       if [ "$TRANSPORT" = "relay" ]; then
         RELAY_URL="$(printf '%s' "$RELAY_URL" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        case "$RELAY_URL" in
-          ws://?*|wss://?*) RELAY_URL_OK="$RELAY_URL" ;;
+        # "WSS://host" -> "wss://host": the scheme lowercased, the rest kept. No "://", no change.
+        RELAY_SCHEME="$(printf '%s' "$RELAY_URL" | sed -n 's#^\([A-Za-z][A-Za-z]*\)://.*$#\1#p' | tr 'A-Z' 'a-z')"
+        if [ -n "$RELAY_SCHEME" ]; then RELAY_URL_NORM="$RELAY_SCHEME://${RELAY_URL#*://}"; else RELAY_URL_NORM="$RELAY_URL"; fi
+        case "$RELAY_URL_NORM" in
+          ws://?*|wss://?*) RELAY_URL_OK="$RELAY_URL_NORM" ;;
           "")
             echo "otzi-headless: WARNING — no relay URL given: it must be a ws:// or wss:// URL, for example wss://relay.example." >&2
             echo "otzi-headless: set url under [transport] in /etc/otzi/daemon.toml before running 'otzi setup'." >&2
