@@ -182,7 +182,7 @@ builds the proposal and broadcasts the result.
  ────────────────                              ────────────
  validate the request           ─ 400
  analyse proposal, own key      ─ 400
- every signer connected; < 32 led ─ 503
+ signers connected, < 32 led    ─ 503
  own gate                       ─ 403
  announce-sign {signers, proposal} ──────────► sender is the pinned leader
                                                ceremonyId new · signers valid
