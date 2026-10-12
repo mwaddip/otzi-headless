@@ -32,7 +32,7 @@ After this change, a federation can be installed, bootstrapped, key-generated an
   - The host is required, as today (`RelayServer` rejects a missing host).
   - The command needs no daemon config and no vault.
 - **Unit.** `packaging/deb/lib/systemd/system/otzi-relay.service`:
-  - runs as `User=otzi`;
+  - runs with `DynamicUser=yes` (a transient uid, never the key-holding daemon's `otzi` user) and `ProtectProc=invisible` (Ruling P12);
   - `EnvironmentFile=/etc/otzi/relay.env`, which holds `OTZI_RELAY_LISTEN=127.0.0.1:7100`;
   - `ExecStart=/usr/bin/otzi relay --listen ${OTZI_RELAY_LISTEN}`;
   - the same hardening as `otzi.service`, with no writable paths.
@@ -47,7 +47,7 @@ After this change, a federation can be installed, bootstrapped, key-generated an
   - its pending pulls resolve `null`.
 - **Retry.** Reconnect attempts follow 1 s, 2 s, 4 s … up to 30 s, with small jitter. A successful `hello`/ack resets the delay. The existing roster logic (ack, `peer-joined`) then starts the initiator handshakes.
 - **Stop.** `stop()` cancels any pending reconnect.
-- **Sends while disconnected.** Broadcasts and pulls skip a disconnected peer, as today, and pulls return `null`. Ceremony pulls already retry until their deadline, so a short relay outage only delays a ceremony.
+- **Sends while disconnected.** Broadcasts and pulls skip a disconnected peer, as today, and pulls return `null`. Ceremony pulls already retry until their deadline, so a short outage during a ceremony only delays it; a ceremony is not started while a required peer is disconnected — the leader answers 503 before its gate (Ruling P10).
 - **Contract.** `facts/transport.md`'s "Operator restart required for relay reconnect" is replaced by this rule.
 
 ### 3.3 Config (R3, R5)
@@ -76,7 +76,7 @@ After this change, a federation can be installed, bootstrapped, key-generated an
   - Once the count is reached, any further registration gets 409 with "bootstrap is full".
   - Entries are sorted by raw pubkey and assigned partyIds as today.
 - **Member, relay mode.** It registers without an endpoint and checks that its own entry in the returned book has none.
-- **Key ids, both modes.** Every node's completion banner now prints this node's key id and the key id of every ring entry. A key id is the first 8 hex characters of SHA-256 over the raw pubkey.
+- **Key ids, both modes.** Every node's completion banner now prints this node's key id and the key id of every ring entry. A key id is the first 16 hex characters of SHA-256 over the raw pubkey (Ruling P15). The banner also prints `ring size: N` and warns on duplicate key ids.
   - Fingerprint comparison proves every node holds the same book. Key ids prove the book holds only the operators' own keys.
   - In relay mode this matters more: anyone who can reach the bootstrap port during setup could register, and the fingerprint would not show it.
   - The banner and docs say: compare the fingerprint on every node, and confirm each listed key id belongs to one of your nodes. A node refused with "bootstrap is full" means someone else registered, so abort and redo setup.
