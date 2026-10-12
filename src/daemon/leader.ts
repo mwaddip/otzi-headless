@@ -136,14 +136,15 @@ export class LeaderDispatcher {
     const { network, peersById, rng } = this.deps;
     if (this.deps.vault) throw new RequestError(409, VAULT_HELD);
     if (this.deps.slots.ceremonyIdInUse(ceremonyId)) throw new RequestError(409, idInUse(ceremonyId));
+    // Before the gate: an announce a peer cannot hear would only hang to the deadline.
+    // Before the slot: releasing a slot keeps its id taken, and a 503 is retried with the same id.
+    this.requireConnected([...peersById.keys()].sort((a, b) => a - b), 'party');
 
     const slot = this.deps.slots.beginLocalDkg(ceremonyId);
     if (!slot) throw new RequestError(409, 'a DKG is already running on this node');
     try {
       // Checked while the slot is held: a DKG this node joined and committed meanwhile is seen.
       if (await this.deps.vaultExists()) throw new RequestError(409, VAULT_HELD);
-      // Before the gate: an announce a peer cannot hear would only hang to the deadline.
-      this.requireConnected([...peersById.keys()].sort((a, b) => a - b), 'party');
 
       const parties = peersById.size;
       const threshold = parties;

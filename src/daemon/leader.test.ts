@@ -712,9 +712,23 @@ describe('LeaderDispatcher: a ring that is not connected (fail fast)', () => {
     expect(gate.specs).toEqual([]);
     expect(seen).toEqual([]);
     expect(stager.calls).toEqual([]);
-    // The DKG slot was taken (the 409 checks come first) and is released.
-    expect(slots.dkgIds).toEqual(['gen-dc']);
-    expect(slots.dkgEnds).toBe(1);
+    // Checked before the DKG slot is taken: a 503 never reserves the ceremony id.
+    expect(slots.dkgIds).toEqual([]);
+    expect(slots.dkgEnds).toBe(0);
+  });
+
+  it('a DKG 503 leaves its ceremony id free: once the ring reconnects the same id reaches the gate', async () => {
+    const ring = makeRing(3);
+    const own = cosigner(ring[0]!);
+    const gate = new RecordingGate(new FixedGate(async () => 'reject'));
+    const leader = leaderOn(ring[0]!, { vault: undefined, gate, slots: own, createStager: () => recordingStager() });
+
+    setInMemoryPartition(ring[0]!.io.transport, 1, true);
+    expect(await rejection(leader.runDkg({ ceremonyId: 'gen-retry' }))).toMatchObject({ status: 503 });
+
+    setInMemoryPartition(ring[0]!.io.transport, 1, false);
+    expect(await rejection(leader.runDkg({ ceremonyId: 'gen-retry' }))).toBeInstanceOf(GateRejection);
+    expect(gate.specs).toHaveLength(1);
   });
 });
 

@@ -221,9 +221,9 @@
   - **`runDkg(req: { ceremonyId: string }): Promise<{ ceremonyId: string; address: string; internalKey: string; network: NetworkName }>`**
     1. `deps.vault` set → `RequestError(409, 'this node already holds a vault')`.
     2. `slots.ceremonyIdInUse(ceremonyId)` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`.
-    3. `slots.beginLocalDkg(ceremonyId)`; `null` → `RequestError(409, 'a DKG is already running on this node')`. From here on, `end()` runs in a `finally`.
-    4. `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`. Checked while the slot is held, so a DKG this node joined and committed meanwhile is seen.
-    5. Every other party (`peersById` keys, ascending) must be connected (`io.transport.isConnected`); the first that is not → `RequestError(503, 'party <id> is not connected; retry when the ring is connected')` (and a warn line `leader: <party|signer> <id> is not connected; refusing before the gate`). The gate is not asked, so no approval is consumed, and nothing is announced.
+    3. Every other party (`peersById` keys, ascending) must be connected (`io.transport.isConnected`); the first that is not → `RequestError(503, 'party <id> is not connected; retry when the ring is connected')` (and a warn line `leader: <party|signer> <id> is not connected; refusing before the gate`). The gate is not asked, so no approval is consumed, and nothing is announced. Checked before the slot is taken, so the 503 leaves `ceremonyId` free: a retry with the same id is not refused as in use.
+    4. `slots.beginLocalDkg(ceremonyId)`; `null` → `RequestError(409, 'a DKG is already running on this node')`. From here on, `end()` runs in a `finally`.
+    5. `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`. Checked while the slot is held, so a DKG this node joined and committed meanwhile is seen.
     6. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })` (`peerIds` = every `peersById` label in party order); non-approve → `GateRejection`.
     7. `createStager()`; random 32-byte session ID from `rng`; start the ceremony deadline; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, stager, AbortSignal.any([slot.signal, deadline]))`.
     8. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
