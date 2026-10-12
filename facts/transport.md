@@ -495,7 +495,7 @@
 
 - `stop(): Promise<void>`
   - **Pre:** Relay started or already stopped (idempotent).
-  - **Post:** Stops the heartbeat, closes all peer WebSockets, clears ring map, shuts down servers.
+  - **Post:** Stops the heartbeat and clears the ring map, then: terminates every WebSocket client that is not registered (it never sent a `hello`, so it has nothing to flush — with an external HTTP server, `ws` would otherwise wait for it forever); closes every registered one (a close frame, as before); closes the `WebSocketServer` (no new upgrades). Registered clients get `STOP_GRACE_MS` (2 000 ms) to finish the close handshake; any WebSocket still open after it is terminated, with one warn line `RelayServer: terminating connections that did not close within the grace period` (`{ connections, graceMs }`). Then the HTTP listener is closed (after the WebSockets, so a `stop()` during the bind still lets `start()` see its listener and close it) and every HTTP connection that never upgraded (a bare TCP connection, an unanswered plain HTTP request; the relay answers none) is destroyed (`closeAllConnections`); `stop()` resolves once the listener has closed, logging `RelayServer: stopped`. No client can hold it: it resolves within the grace plus the time to tear sockets down.
 
 - `address(): { host: string; port: number } | null`
   - **Pre:** Relay is started.
@@ -513,7 +513,7 @@
 - **No L4 source-IP filter.** Multiplexing is by `partyId` from the client `hello`, not by remote address; any host that can reach the relay can attempt to claim a partyId. Cryptographic auth (Noise-KK + P-256 pubkey book at the peer layer) is the only gate on relay'd traffic. This is the deliberate counterpart to peer-mesh's `verifyClient` allowlist — the relay path trades the L4 pre-filter for routability through NAT / shared infrastructure.
 - WebSocket errors and closes both trigger cleanup.
 - **Heartbeat.** Every `heartbeatMs` (default 20 s) the relay pings every connection, registered or not. A connection that has not answered the previous ping is terminated instead. Its close then frees its partyId slot and sends `peer-left` to the ring, as any close does. A dead client is gone within two intervals (20–40 s by default), so a reconnecting node is not refused its own slot for long.
-- Graceful shutdown closes all peer sockets; no forced close.
+- Shutdown closes registered peer sockets gracefully (a close frame) and forces only what cannot or did not close: unregistered clients at once, registered ones that did not finish the close handshake after the 2 s grace, and connections that never upgraded.
 
 **Cross-component contracts:**
 - Depends on: Node.js http, WebSocket (ws library), relay wire format.

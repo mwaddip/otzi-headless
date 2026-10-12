@@ -196,6 +196,9 @@ async function runSetupCommand(args: string[]): Promise<void> {
 // `otzi relay`
 // ─────────────────────────────────────────────────────────────────────────
 
+/** A signal-initiated `otzi relay` shutdown exits by then at the latest (facts/daemon.md, `runRelayCommand`). */
+export const RELAY_SHUTDOWN_DEADLINE_MS = 5_000;
+
 /**
  * Run the relay server (`RelayServer`) until SIGINT or SIGTERM. Needs no daemon
  * config and no vault. There is no default address: the host is required, so a
@@ -212,9 +215,15 @@ export async function runRelayCommand(args: string[]): Promise<void> {
 
   const shutdown = async (signal: string) => {
     console.error(`received ${signal}, shutting down`);
+    // `stop()` gives clients a 2 s grace; whatever still holds it, the process exits in time.
+    const deadline = setTimeout(() => {
+      console.error(`otzi relay: shutdown did not finish within ${RELAY_SHUTDOWN_DEADLINE_MS / 1000} s; exiting`);
+      process.exit(0);
+    }, RELAY_SHUTDOWN_DEADLINE_MS);
     try {
       await server.stop();
     } finally {
+      clearTimeout(deadline);
       process.exit(0);
     }
   };

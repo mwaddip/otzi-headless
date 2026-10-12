@@ -199,6 +199,104 @@ describe('RelayServer — roster + routing', () => {
   });
 });
 
+describe('RelayServer — stop() never waits on a client', () => {
+  const STOP_BUDGET_MS = 3_000;
+  let server: RelayServer | null = null;
+  const cleanups: Array<() => void> = [];
+  afterEach(async () => {
+    for (const c of cleanups.splice(0)) c();
+    if (server) await server.stop();
+    server = null;
+  });
+
+  async function startRelay(logger?: Logger): Promise<number> {
+    server = new RelayServer({ listen: '127.0.0.1:0', ...(logger ? { logger } : {}) });
+    await server.start();
+    return server.address()!.port;
+  }
+
+  async function openClient(port: number): Promise<{ ws: WebSocket; closed: Promise<number> }> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    cleanups.push(() => ws.terminate());
+    const closed = new Promise<number>((resolve) => ws.once('close', (code) => resolve(code)));
+    ws.on('error', () => {});
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => resolve());
+      ws.once('error', reject);
+    });
+    return { ws, closed };
+  }
+
+  async function register(ws: WebSocket, partyId: number): Promise<void> {
+    const ack = new Promise<unknown>((resolve) => ws.once('message', (d) => resolve(JSON.parse(d.toString('utf8')))));
+    ws.send(JSON.stringify({ kind: 'hello', ringId: 'ring-stop', partyId }));
+    expect(await ack).toMatchObject({ kind: 'ack' });
+  }
+
+  /** How long `server.stop()` took, or 'still pending' after the budget. */
+  async function timedStop(): Promise<number | 'still pending'> {
+    const started = Date.now();
+    const outcome = await settledWithin(server!.stop(), STOP_BUDGET_MS);
+    return outcome === 'still pending' ? outcome : Date.now() - started;
+  }
+
+  it('a client that connected and never sent hello is terminated at once', async () => {
+    const port = await startRelay();
+    const silent = await openClient(port);
+    const took = await timedStop();
+    expect(took).not.toBe('still pending');
+    expect(took as number).toBeLessThan(STOP_BUDGET_MS);
+    expect(await silent.closed).toBe(1006); // terminated: no close handshake
+    server = null;
+  }, 15_000);
+
+  it('a registered client gets a normal close, as before', async () => {
+    const { logger, warns } = capturingLogger();
+    const port = await startRelay(logger);
+    const client = await openClient(port);
+    await register(client.ws, 0);
+    const took = await timedStop();
+    expect(took).not.toBe('still pending');
+    expect(took as number).toBeLessThan(1_500);
+    expect(await client.closed).toBe(1005); // a close frame (no status code), not a termination
+    expect(warns).toEqual([]);
+    server = null;
+  }, 15_000);
+
+  it('a registered client that does not answer the close is terminated after the 2 s grace', async () => {
+    const { logger, warns } = capturingLogger();
+    const port = await startRelay(logger);
+    const client = await openClient(port);
+    await register(client.ws, 0);
+    // It stops reading: the relay's close frame is never answered.
+    (client.ws as unknown as { _socket: net.Socket })._socket.pause();
+    const took = await timedStop();
+    expect(took).not.toBe('still pending');
+    expect(took as number).toBeGreaterThanOrEqual(1_900);
+    expect(warns.map((w) => w.msg)).toEqual(['RelayServer: terminating connections that did not close within the grace period']);
+    server = null;
+  }, 15_000);
+
+  it('a bare TCP connection and an unanswered plain HTTP request do not hold stop()', async () => {
+    const port = await startRelay();
+    const bare = net.connect(port, '127.0.0.1');
+    const http = net.connect(port, '127.0.0.1');
+    for (const sock of [bare, http]) {
+      cleanups.push(() => sock.destroy());
+      sock.on('error', () => {});
+      await new Promise<void>((resolve) => sock.once('connect', () => resolve()));
+    }
+    http.write('GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    await new Promise((r) => setTimeout(r, 50));
+    const closed = Promise.all([bare, http].map((sock) => new Promise<void>((resolve) => sock.once('close', () => resolve()))));
+    const took = await timedStop();
+    expect(took).not.toBe('still pending');
+    expect(took as number).toBeLessThan(STOP_BUDGET_MS);
+    await closed;
+    server = null;
+  }, 15_000);
+});
+
 /** Whether anything accepts a TCP connection on this loopback port. */
 async function acceptsConnections(port: number): Promise<boolean> {
   return new Promise((resolve) => {

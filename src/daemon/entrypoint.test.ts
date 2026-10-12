@@ -266,6 +266,28 @@ describe('otzi relay', () => {
     expect(relay.stdout()).toBe('');
   }, 60_000);
 
+  it('a client that never sent hello does not delay the exit on SIGTERM', async () => {
+    const relay = spawnRelay(['--listen', '127.0.0.1:0']);
+    const port = await relay.port();
+    const silent = new WebSocket(`ws://127.0.0.1:${port}`);
+    silent.on('error', () => {});
+    try {
+      await new Promise<void>((resolve, reject) => {
+        silent.once('open', () => resolve());
+        silent.once('error', reject);
+      });
+      const signalled = Date.now();
+      relay.child.kill('SIGTERM');
+      expect(await relay.exited).toEqual({ code: 0, signal: null });
+      // Well under the 5 s hard deadline: the relay stopped, nothing timed out.
+      expect(Date.now() - signalled).toBeLessThan(4_000);
+      expect(relay.stderr()).toContain('RelayServer: stopped');
+      expect(relay.stderr()).not.toContain('did not finish');
+    } finally {
+      silent.terminate();
+    }
+  }, 60_000);
+
   it('stops on SIGINT too, with exit status 0 and nothing on stdout', async () => {
     const relay = spawnRelay(['--listen', '127.0.0.1:0']);
     await relay.port();
@@ -310,6 +332,43 @@ describe('otzi relay', () => {
     }
     expect(process.listenerCount('SIGINT')).toBe(sigint);
     expect(process.listenerCount('SIGTERM')).toBe(sigterm);
+  });
+
+  it('otzi relay exits 0 at a hard 5 s deadline when stopping the relay hangs', async () => {
+    const before = { SIGINT: process.listeners('SIGINT'), SIGTERM: process.listeners('SIGTERM') };
+    const added = (signal: 'SIGINT' | 'SIGTERM') => process.listeners(signal).filter(l => !before[signal].includes(l));
+    const realStop = RelayServer.prototype.stop;
+    let running: RelayServer | undefined;
+    vi.spyOn(RelayServer.prototype, 'stop').mockImplementation(function (this: RelayServer) {
+      running = this;
+      return new Promise<void>(() => {}); // never settles
+    });
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as typeof process.exit);
+    let stderr = '';
+    vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+      stderr += String(chunk);
+      return true;
+    }) as typeof process.stderr.write);
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      stderr += `${args.join(' ')}\n`;
+    });
+    try {
+      await runRelayCommand(['--listen', '127.0.0.1:0']);
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      for (const handler of added('SIGTERM')) (handler as (signal: string) => void)('SIGTERM');
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(exit).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(exit).toHaveBeenCalledTimes(1);
+      expect(exit).toHaveBeenCalledWith(0);
+      expect(stderr).toContain('received SIGTERM, shutting down');
+      expect(stderr).toContain('otzi relay: shutdown did not finish within 5 s; exiting');
+    } finally {
+      vi.useRealTimers();
+      for (const signal of ['SIGINT', 'SIGTERM'] as const) for (const handler of added(signal)) process.off(signal, handler);
+      vi.restoreAllMocks();
+      if (running) await realStop.call(running);
+    }
   });
 
   it('otzi relay has its signal handlers in place when it writes the listen line', async () => {

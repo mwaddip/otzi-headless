@@ -44,6 +44,8 @@ export interface RelayServerOptions {
 }
 
 const DEFAULT_HEARTBEAT_MS = 20_000;
+/** How long `stop()` gives registered clients to finish the close handshake before it terminates them. */
+const STOP_GRACE_MS = 2_000;
 
 interface PartyConnection {
   partyId: PartyId;
@@ -125,21 +127,47 @@ export class RelayServer {
     this.log.info('RelayServer: listening', this.address() ?? {});
   }
 
+  /**
+   * Resolves once nothing is left (facts/transport.md, `stop()`). No client can
+   * hold it: unregistered clients and connections that never upgraded have
+   * nothing to flush and are dropped, and registered clients get the grace
+   * period for their close handshake, then are terminated.
+   */
   async stop(): Promise<void> {
     if (!this.wss) return;
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = null;
-    for (const ring of this.rings.values()) {
-      for (const conn of ring.parties.values()) conn.ws.close();
-    }
-    this.rings.clear();
     const wss = this.wss;
     const httpServer = this.httpServer;
     this.wss = null;
     this.httpServer = null;
-    await new Promise<void>((resolve) => wss.close(() => resolve()));
+
+    const registered = new Set<WebSocket>();
+    for (const ring of this.rings.values()) {
+      for (const conn of ring.parties.values()) registered.add(conn.ws);
+    }
+    this.rings.clear();
+    // With an external HTTP server, `ws` reports closed only once every client is gone: a client
+    // that connected and never sent hello would hold stop() forever. It has nothing to flush.
+    for (const ws of wss.clients) if (!registered.has(ws)) ws.terminate();
+    for (const ws of registered) ws.close();
+    // No new upgrades from here (`ws` drops its upgrade listener).
+    const wssClosed = new Promise<void>((resolve) => wss.close(() => resolve()));
+    if (!(await settlesWithin(wssClosed, STOP_GRACE_MS))) {
+      this.log.warn('RelayServer: terminating connections that did not close within the grace period', {
+        connections: wss.clients.size,
+        graceMs: STOP_GRACE_MS,
+      });
+      for (const ws of wss.clients) ws.terminate();
+      await wssClosed;
+    }
     if (httpServer) {
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      // After the WebSockets, so a stop() during the bind lets start() see its listener first.
+      const httpClosed = new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      // What is left never upgraded (a bare TCP connection, a plain HTTP request the relay never
+      // answers): nothing to flush, and `close()` alone would wait for it.
+      httpServer.closeAllConnections();
+      await httpClosed;
     }
     this.log.info('RelayServer: stopped');
   }
@@ -279,6 +307,19 @@ export class RelayServer {
       this.rings.set(ringId, ring);
     }
     return ring;
+  }
+}
+
+/** Whether `p` settles within `ms`; the timer is cleared either way. */
+async function settlesWithin(p: Promise<void>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    return await Promise.race([p.then(() => true as const), late]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
