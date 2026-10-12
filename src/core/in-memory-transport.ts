@@ -13,6 +13,8 @@ class InMemoryTransport implements Transport {
   private readonly ring: Map<PartyId, InMemoryTransport>;
   private readonly broadcastHandlers = new Set<(from: PartyId, msg: Uint8Array) => void>();
   private pullHandler: ((from: PartyId, key: BlobKey) => Uint8Array | null) | null = null;
+  /** Peers the test cut this node off from (`setInMemoryPartition`), both ways. */
+  private readonly partitioned = new Set<PartyId>();
 
   constructor(partyId: PartyId, peers: readonly PartyId[], ring: Map<PartyId, InMemoryTransport>) {
     this.partyId = partyId;
@@ -22,7 +24,7 @@ class InMemoryTransport implements Transport {
 
   async broadcast(msg: Uint8Array): Promise<void> {
     for (const [id, peer] of this.ring) {
-      if (id === this.partyId) continue;
+      if (id === this.partyId || this.partitioned.has(id)) continue;
       peer.deliverBroadcast(this.partyId, msg);
     }
   }
@@ -35,6 +37,7 @@ class InMemoryTransport implements Transport {
   async pull(key: BlobKey): Promise<Uint8Array | null> {
     const peer = this.ring.get(key.from);
     if (!peer) throw new Error(`Unknown peer ${key.from}`);
+    if (this.partitioned.has(key.from)) return null;
     return peer.servePull(this.partyId, key);
   }
 
@@ -42,6 +45,11 @@ class InMemoryTransport implements Transport {
     if (this.pullHandler) throw new Error('Pull handler already registered for this transport');
     this.pullHandler = handler;
     return () => { this.pullHandler = null; };
+  }
+
+  isConnected(partyId: PartyId): boolean {
+    if (partyId === this.partyId) return true;
+    return this.ring.has(partyId) && !this.partitioned.has(partyId);
   }
 
   /** @internal — called by peer transports in the same ring. */
@@ -52,6 +60,17 @@ class InMemoryTransport implements Transport {
   /** @internal — called by peer transports in the same ring. */
   servePull(from: PartyId, key: BlobKey): Uint8Array | null {
     return this.pullHandler ? this.pullHandler(from, key) : null;
+  }
+
+  /** @internal — `setInMemoryPartition`. */
+  setPartition(peer: PartyId, partitioned: boolean): void {
+    if (peer === this.partyId) throw new Error(`setInMemoryPartition: party ${peer} is self`);
+    const other = this.ring.get(peer);
+    if (!other) throw new Error(`setInMemoryPartition: party ${peer} is not in the ring`);
+    for (const [a, b] of [[this, peer], [other, this.partyId]] as const) {
+      if (partitioned) a.partitioned.add(b);
+      else a.partitioned.delete(b);
+    }
   }
 }
 
@@ -65,4 +84,16 @@ export function createInMemoryRing(peers: readonly PartyId[]): Map<PartyId, Tran
     ring.set(id, new InMemoryTransport(id, peers, ring));
   }
   return ring as Map<PartyId, Transport>;
+}
+
+/**
+ * Test hook (facts/core.md, `in-memory-transport.ts`): cut (`partitioned`
+ * true) or restore the link between `transport` and `peer`, both ways. While
+ * cut, each reports the other not connected, broadcasts between them are
+ * dropped and pulls between them return `null`; every other pair is untouched.
+ */
+export function setInMemoryPartition(transport: Transport, peer: PartyId, partitioned: boolean): void {
+  if (!(transport instanceof InMemoryTransport))
+    throw new Error('setInMemoryPartition: not an in-memory transport (createInMemoryRing)');
+  transport.setPartition(peer, partitioned);
 }

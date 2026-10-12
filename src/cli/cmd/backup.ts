@@ -15,6 +15,11 @@
  * KDF: PBKDF2-SHA256, 600,000 iterations (OWASP 2026), 32B → AES-256 key.
  * Cipher: AES-256-GCM (authenticated; tampering → decrypt fails cleanly).
  *
+ * The share, identity and pubkey-book paths come from daemon.toml. Backup
+ * refuses any that `otzi restore` would refuse (not a direct child of
+ * /etc/otzi or /var/lib/otzi, or two naming the same file), before it writes
+ * anything: better to fail now than to find an unrestorable archive later.
+ *
  * Password: 32 chars from base62 (`[A-Za-z0-9]`, ~190 bits entropy), generated
  * here — operators don't choose, so we don't have to police weak passwords.
  *
@@ -38,6 +43,8 @@ import { dirname, join } from 'node:path';
 import { create as tarCreate } from 'tar';
 import { parse as parseToml } from 'smol-toml';
 import { DEFAULT_ADDRESS_BOOK_PATH } from '../../address-book/store';
+import { displayText } from '../../util/text';
+import { FIXED_STATE_FILES, FIXED_TAR_PATHS, resolveStatePaths } from '../state-paths';
 
 export { DEFAULT_ADDRESS_BOOK_PATH };
 export const DEFAULT_DAEMON_CONFIG_PATH = '/etc/otzi/daemon.toml';
@@ -54,6 +61,15 @@ export const BACKUP_TAG_LEN = 16;
 export const BACKUP_HEADER_LEN =
   BACKUP_MAGIC_LEN + BACKUP_SALT_LEN + BACKUP_IV_LEN + BACKUP_TAG_LEN; // 76
 export const BACKUP_PBKDF2_ITERATIONS = 600_000;
+
+/**
+ * The tar paths of the files whose place is fixed (not named by daemon.toml):
+ * the list of `state-paths.ts`, which restore writes from. The `DEFAULT_*_PATH`
+ * above are where backup reads them on the host (a test asserts they agree).
+ */
+const DAEMON_CONFIG_TAR = FIXED_STATE_FILES.daemonConfig;
+const VAULT_PUBKEY_TAR = FIXED_STATE_FILES.vaultPubkey;
+const ADDRESS_BOOK_TAR = FIXED_STATE_FILES.addressBook;
 
 const BASE62_ALPHABET =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -160,16 +176,23 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
   const rawConfig = parseToml(configText) as Record<string, unknown>;
   const shareTable = (rawConfig.share ?? {}) as Record<string, unknown>;
   const nodeTable = (rawConfig.node ?? {}) as Record<string, unknown>;
-  const sharePath =
-    typeof shareTable.path === 'string' ? shareTable.path : DEFAULT_SHARE_PATH;
-  const identityPath =
-    typeof nodeTable.identity_key_file === 'string'
-      ? nodeTable.identity_key_file
-      : DEFAULT_IDENTITY_PATH;
-  const pubkeyBookPath =
-    typeof nodeTable.pubkey_book_file === 'string'
-      ? nodeTable.pubkey_book_file
-      : DEFAULT_PUBKEY_BOOK_PATH;
+  const named = (value: unknown, fallback: string): string => (typeof value === 'string' ? value : fallback);
+
+  // The tar paths of the three, by the rule restore applies. Before anything
+  // else is looked at, so a refusal leaves nothing behind.
+  const [shareTar, identityTar, pubkeyBookTar] = resolveStatePaths(
+    [
+      { key: '[share].path', path: named(shareTable.path, DEFAULT_SHARE_PATH) },
+      { key: '[node].identity_key_file', path: named(nodeTable.identity_key_file, DEFAULT_IDENTITY_PATH) },
+      { key: '[node].pubkey_book_file', path: named(nodeTable.pubkey_book_file, DEFAULT_PUBKEY_BOOK_PATH) },
+    ],
+    FIXED_TAR_PATHS,
+    (key, path, why) =>
+      new Error(`cannot back up: ${key} = ${displayText(path)} ${why}; otzi restore would refuse the archive`),
+  ) as [string, string, string];
+  const shareSource = onHost(`/${shareTar}`);
+  const identitySource = onHost(`/${identityTar}`);
+  const pubkeyBookSource = onHost(`/${pubkeyBookTar}`);
 
   const vaultPubkeySource =
     opts.pathOverrides?.vaultPubkey ?? onHost(DEFAULT_VAULT_PUBKEY_PATH);
@@ -180,28 +203,12 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
   // slash) so restore can `chroot`-style place them back at the corresponding
   // absolute paths.
   const fileSet: FileEntry[] = [
-    { tarPath: 'etc/otzi/daemon.toml', sourcePath: configPath, required: true },
-    { tarPath: stripLeadingSlash(sharePath), sourcePath: onHost(sharePath), required: true },
-    {
-      tarPath: stripLeadingSlash(pubkeyBookPath),
-      sourcePath: onHost(pubkeyBookPath),
-      required: true,
-    },
-    {
-      tarPath: stripLeadingSlash(identityPath),
-      sourcePath: onHost(identityPath),
-      required: true,
-    },
-    {
-      tarPath: 'var/lib/otzi/vault-pubkey.json',
-      sourcePath: vaultPubkeySource,
-      required: false,
-    },
-    {
-      tarPath: stripLeadingSlash(DEFAULT_ADDRESS_BOOK_PATH),
-      sourcePath: addressBookSource,
-      required: false,
-    },
+    { tarPath: DAEMON_CONFIG_TAR, sourcePath: configPath, required: true },
+    { tarPath: shareTar, sourcePath: shareSource, required: true },
+    { tarPath: pubkeyBookTar, sourcePath: pubkeyBookSource, required: true },
+    { tarPath: identityTar, sourcePath: identitySource, required: true },
+    { tarPath: VAULT_PUBKEY_TAR, sourcePath: vaultPubkeySource, required: false },
+    { tarPath: ADDRESS_BOOK_TAR, sourcePath: addressBookSource, required: false },
   ];
 
   // --- Step 3: required-file existence pre-flight. Fail loudly if any is
@@ -223,7 +230,7 @@ export async function runBackup(opts: BackupOptions = {}): Promise<BackupResult>
   // at restore time. Falls back to undefined on malformed share.
   let partyId: number | undefined;
   try {
-    const shareRaw = JSON.parse(await readFile(onHost(sharePath), 'utf8')) as {
+    const shareRaw = JSON.parse(await readFile(shareSource, 'utf8')) as {
       partyId?: unknown;
     };
     if (typeof shareRaw.partyId === 'number') partyId = shareRaw.partyId;

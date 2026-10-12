@@ -1,11 +1,12 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { DkgShareKeptError, type ShareStager } from '../core/dkg-ceremony';
+import { setInMemoryPartition } from '../core/in-memory-transport';
 import { parseMessage, type CeremonyMessage } from '../core/messages';
 import type { BlobKey, PartyId } from '../core/types';
 import { AutoGate } from '../gate/factory';
 import { PolicyGate } from '../gate/policy';
 import type { ApprovalGate, CeremonySpec, Decision } from '../gate/types';
-import { Orchestrator } from '../orchestrator/orchestrator';
+import { MAX_LIVE_SIGNINGS_PER_LEADER, Orchestrator } from '../orchestrator/orchestrator';
 import { rng } from '../otzi/lib/dkg.fixture';
 import type { DecryptedShare } from '../otzi/lib/share-file';
 import type { NetworkName } from '../otzi/lib/vault-types';
@@ -39,6 +40,12 @@ const peersById: ReadonlyMap<PartyId, string> = new Map([
  */
 const ONE_ATTEMPT = { maxAttempts: 1, initialDelayMs: 5, maxDelayMs: 20, deadlineMs: 60_000 };
 const DEADLINE_MS = 400;
+/**
+ * A deadline for DKGs that must get past staging, confirmation or commit
+ * before it passes: they take about 0.4 s idle and 1.1 s with the CPU
+ * oversubscribed twice over.
+ */
+const LOADED_DKG_MS = 4_000;
 const RETENTION_MS = 40;
 
 let tv: TestVault;
@@ -414,13 +421,27 @@ describe('LeaderDispatcher.runDkg', () => {
 // ─── Ceremony deadline (R26) ─────────────────────────────────────────────
 
 describe('LeaderDispatcher ceremony deadline', () => {
-  const CEREMONY_MS = 1_000;
-  /** Node 1's round-1 blob reaches the leader this late; per-pull deadlines alone would fail at ≥ 1 700 ms. */
-  const LATE_MS = 700;
+  const CEREMONY_MS = 2_000;
+  /**
+   * Node 1's round-1 blob reaches the leader this late. A per-pull or per-round
+   * deadline would then fail at least CEREMONY_MS after round 1 completes; the
+   * ceremony deadline fails CEREMONY_MS after the start. Both margins (round 1
+   * done before the deadline; the failure well under CEREMONY_MS after round 1)
+   * are 1 s, many times what round 1 takes even under CPU load.
+   */
+  const LATE_MS = 1_000;
   /** The leader does not get `held` blobs from its peers while `held` says so. */
   function holdBack(node: RingNode, held: (key: BlobKey) => boolean): void {
     const pull = node.io.transport.pull.bind(node.io.transport);
     node.io.transport.pull = async key => (held(key) ? null : pull(key));
+  }
+  /** When `node` first stores a blob `matches` accepts (epoch ms), or null while it has not. */
+  function firstStored(node: RingNode, matches: (key: BlobKey) => boolean): { at: number | null } {
+    const seen: { at: number | null } = { at: null };
+    node.io.store.onPut(key => {
+      if (seen.at === null && matches(key)) seen.at = Date.now();
+    });
+    return seen;
   }
 
   it('a leader whose co-signer never answers round 2 fails at the signing deadline', async () => {
@@ -433,16 +454,20 @@ describe('LeaderDispatcher ceremony deadline', () => {
       ring[0]!,
       k => k.from === 1 && (k.round === 'sign-r2' || (k.round === 'sign-r1' && Date.now() - started < LATE_MS)),
     );
+    const round1Done = firstStored(ring[0]!, k => k.ceremonyId === 'pay-late' && k.round === 'sign-r2' && k.from === 0);
 
     const err = await rejection(
       leader.sign({ ceremonyId: 'pay-late', signers: [0, 1, 2], proposal: makeProposal(tv.vaultKey, NET) }),
     );
-    const elapsed = Date.now() - started;
+    const failedAt = Date.now();
     expect((err as Error).message).toBe(`ceremony deadline of ${CEREMONY_MS} ms passed`);
-    expect(elapsed).toBeGreaterThanOrEqual(CEREMONY_MS - 50);
-    expect(elapsed).toBeLessThan(LATE_MS + CEREMONY_MS - 300);
-    // The leader got past round 1 (it produced its own sign-r2) before the deadline stopped it.
+    expect(failedAt - started).toBeGreaterThanOrEqual(CEREMONY_MS - 50);
+    // The leader got past round 1 (it produced its own sign-r2) before the deadline stopped it,
+    // and failed less than CEREMONY_MS after that: the deadline runs from the start, not per pull.
     expect(ring[0]!.io.store.has({ ceremonyId: 'pay-late', round: 'sign-r2', from: 0 })).toBe(true);
+    expect(round1Done.at).not.toBeNull();
+    expect(round1Done.at! - started).toBeGreaterThanOrEqual(LATE_MS);
+    expect(failedAt - round1Done.at!).toBeLessThan(CEREMONY_MS);
     expect(slots.signingEnds).toBe(1);
     for (const c of [c1, c2]) {
       expect(await c.waitFor('pay-late', 5_000)).toMatchObject({
@@ -450,7 +475,7 @@ describe('LeaderDispatcher ceremony deadline', () => {
         reason: `ceremony deadline of ${CEREMONY_MS} ms passed`,
       });
     }
-  });
+  }, 20_000);
 
   it('a leader whose co-signer never answers DKG round 2 fails at the DKG deadline', async () => {
     const ring = makeRing(3, ONE_ATTEMPT);
@@ -468,14 +493,18 @@ describe('LeaderDispatcher ceremony deadline', () => {
       ring[0]!,
       k => k.from === 1 && (k.round === 'dkg-r2' || (k.round === 'dkg-r1' && Date.now() - started < LATE_MS)),
     );
+    const round1Done = firstStored(ring[0]!, k => k.ceremonyId === 'gen-late' && k.round === 'dkg-r2' && k.from === 0);
 
     const err = await rejection(leader.runDkg({ ceremonyId: 'gen-late' }));
-    const elapsed = Date.now() - started;
+    const failedAt = Date.now();
     expect((err as Error).message).toBe(`DKG aborted: ceremony deadline of ${CEREMONY_MS} ms passed`);
-    expect(elapsed).toBeGreaterThanOrEqual(CEREMONY_MS - 50);
-    expect(elapsed).toBeLessThan(LATE_MS + CEREMONY_MS - 300);
-    // Round 1 completed (the leader produced its round-2 shares) before the deadline stopped it.
+    expect(failedAt - started).toBeGreaterThanOrEqual(CEREMONY_MS - 50);
+    // Round 1 completed (the leader produced its round-2 shares) before the deadline stopped it,
+    // and the DKG failed less than CEREMONY_MS after that: the deadline runs from the start, not per pull.
     expect(ring[0]!.io.store.list('gen-late', 'dkg-r2').filter(b => b.key.from === 0)).toHaveLength(2);
+    expect(round1Done.at).not.toBeNull();
+    expect(round1Done.at! - started).toBeGreaterThanOrEqual(LATE_MS);
+    expect(failedAt - round1Done.at!).toBeLessThan(CEREMONY_MS);
     expect(stager.calls).toEqual(['discard']);
     expect(slots.dkgEnds).toBe(1);
     // The leader announced the abort itself: the ceremony's own abort path stays silent on a signal.
@@ -485,7 +514,7 @@ describe('LeaderDispatcher ceremony deadline', () => {
         reason: `ceremony deadline of ${CEREMONY_MS} ms passed`,
       });
     }
-  });
+  }, 20_000);
 });
 
 describe('LeaderDispatcher: a DKG that fails after its confirmation', () => {
@@ -498,7 +527,7 @@ describe('LeaderDispatcher: a DKG that fails after its confirmation', () => {
       vault: undefined,
       slots: fakeSlots().slots,
       createStager: () => stager,
-      ceremonyDeadlines: { signingMs: 1_000, dkgMs: 1_000 },
+      ceremonyDeadlines: { signingMs: LOADED_DKG_MS, dkgMs: LOADED_DKG_MS },
       logger: { debug: () => {}, info: () => {}, warn: () => {}, error: msg => lines.push(msg) },
     });
     // The leader never gets party 1's confirmation; the co-signers get every one and commit.
@@ -509,58 +538,87 @@ describe('LeaderDispatcher: a DKG that fails after its confirmation', () => {
 
     expect(err).toBeInstanceOf(DkgShareKeptError);
     expect((err as Error).message).toMatch(
-      /^DKG aborted: ceremony deadline of 1000 ms passed; this node published its confirmation of vault tb1p[0-9a-z]+, so its staged share was kept at \/test\/share\.json\.pending: run 'otzi vault' on the other nodes/,
+      new RegExp(
+        `^DKG aborted: ceremony deadline of ${LOADED_DKG_MS} ms passed; this node published its confirmation of vault tb1p[0-9a-z]+, ` +
+          `so its staged share was kept at /test/share\\.json\\.pending: run 'otzi vault' on the other nodes`,
+      ),
     );
     expect(stager.calls).toEqual(['stage']);
     expect(lines).toEqual([`leader: dkg gen-kept failed: ${(err as Error).message}`]);
     for (const c of [c1, c2]) expect(await c.waitFor('gen-kept', 5_000)).toMatchObject({ status: 'done' });
-  });
+  }, 20_000);
 });
 
 describe('LeaderDispatcher: the deadline does not hide the failure that was thrown', () => {
-  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  const DKG_MS = LOADED_DKG_MS;
+  const deadlines = { signingMs: DKG_MS, dkgMs: DKG_MS };
+
+  /** Resolves when the leader's own ceremony deadline fires. */
+  function deadlinePassed(leader: LeaderDispatcher): Promise<void> {
+    const internals = leader as unknown as { startDeadline(kind: string): { signal: AbortSignal } };
+    const startDeadline = internals.startDeadline.bind(leader);
+    return new Promise(resolve => {
+      internals.startDeadline = kind => {
+        const deadline = startDeadline(kind);
+        deadline.signal.addEventListener('abort', () => resolve(), { once: true });
+        return deadline;
+      };
+    });
+  }
 
   it('a DKG whose staging fails as the deadline passes names both', async () => {
     const ring = makeRing(3);
     cosigner(ring[1]!);
     cosigner(ring[2]!);
     const stager = recordingStager();
+    const leader = leaderOn(ring[0]!, {
+      vault: undefined,
+      slots: fakeSlots().slots,
+      createStager: () => stager,
+      ceremonyDeadlines: deadlines,
+    });
+    const passed = deadlinePassed(leader);
     stager.stage = async () => {
       stager.calls.push('stage');
-      await sleep(DEADLINE_MS + 200);
+      await passed; // the failure strikes once the deadline has passed
       throw new Error('disk full');
     };
-    const leader = leaderOn(ring[0]!, { vault: undefined, slots: fakeSlots().slots, createStager: () => stager });
 
     const err = await rejection(leader.runDkg({ ceremonyId: 'gen-disk' }));
 
-    expect((err as Error).message).toBe(`DKG aborted: ceremony deadline of ${DEADLINE_MS} ms passed (disk full)`);
+    expect((err as Error).message).toBe(`DKG aborted: ceremony deadline of ${DKG_MS} ms passed (disk full)`);
     expect(((err as Error).cause as Error).message).toBe('DKG aborted: disk full');
-  });
+  }, 20_000);
 
   it('a kept share is reported with the failure that was thrown and the recovery', async () => {
     const ring = makeRing(3);
     cosigner(ring[1]!);
     cosigner(ring[2]!);
     const stager = recordingStager();
+    const leader = leaderOn(ring[0]!, {
+      vault: undefined,
+      slots: fakeSlots().slots,
+      createStager: () => stager,
+      ceremonyDeadlines: deadlines,
+    });
+    const passed = deadlinePassed(leader);
     stager.commit = async () => {
       stager.calls.push('commit');
-      await sleep(DEADLINE_MS + 200);
+      await passed;
       throw new Error('share path already exists: /test/share.json');
     };
-    const leader = leaderOn(ring[0]!, { vault: undefined, slots: fakeSlots().slots, createStager: () => stager });
 
     const err = await rejection(leader.runDkg({ ceremonyId: 'gen-exists' }));
 
     expect(err).toBeInstanceOf(DkgShareKeptError);
     expect((err as Error).message).toMatch(
       new RegExp(
-        `^DKG aborted: ceremony deadline of ${DEADLINE_MS} ms passed \\(share path already exists: /test/share\\.json\\); ` +
+        `^DKG aborted: ceremony deadline of ${DKG_MS} ms passed \\(share path already exists: /test/share\\.json\\); ` +
           `this node published its confirmation of vault tb1p[0-9a-z]+, so its staged share was kept at /test/share\\.json\\.pending: `,
       ),
     );
     expect(stager.calls).toEqual(['stage', 'commit']);
-  });
+  }, 20_000);
 });
 
 describe('LeaderDispatcher with this node\'s orchestrator as its slots', () => {
@@ -581,4 +639,162 @@ describe('LeaderDispatcher with this node\'s orchestrator as its slots', () => {
     expect(again).toMatchObject({ status: 409, message: 'ceremony id pay-once is already in use on this node' });
     expect(gate.specs).toHaveLength(1);
   });
+});
+
+describe('LeaderDispatcher: a ring that is not connected (fail fast)', () => {
+  it('sign answers 503 naming a signer that is not connected, before the gate and the announce', async () => {
+    const ring = makeRing(3);
+    const seen = inbox(ring[1]!);
+    const slots = fakeSlots();
+    const gate = new RecordingGate(new AutoGate());
+    setInMemoryPartition(ring[0]!.io.transport, 2, true);
+
+    const err = await rejection(
+      leaderOn(ring[0]!, { gate, slots: slots.slots }).sign({
+        ceremonyId: 'pay-dc',
+        signers: [0, 1, 2],
+        proposal: makeProposal(tv.vaultKey, NET),
+      }),
+    );
+    expect(err).toBeInstanceOf(RequestError);
+    expect(err).toMatchObject({ status: 503, message: 'signer 2 is not connected; retry when the ring is connected' });
+    expect(gate.specs).toEqual([]);
+    expect(slots.signingIds).toEqual([]);
+    expect(seen).toEqual([]);
+    expect(ring[0]!.io.store.list('pay-dc')).toEqual([]);
+  });
+
+  it('names the first signer that is not connected, in signers order', async () => {
+    const ring = makeRing(3);
+    setInMemoryPartition(ring[0]!.io.transport, 1, true);
+    setInMemoryPartition(ring[0]!.io.transport, 2, true);
+    const err = await rejection(
+      leaderOn(ring[0]!).sign({ ceremonyId: 'pay-dc2', signers: [0, 2, 1], proposal: makeProposal(tv.vaultKey, NET) }),
+    );
+    expect(err).toMatchObject({ status: 503, message: 'signer 2 is not connected; retry when the ring is connected' });
+  });
+
+  it('a 503 consumes no approval: once the ring reconnects the same request signs', async () => {
+    const ring = makeRing(3);
+    const own = cosigner(ring[0]!, shareOf(0));
+    const [c1, c2] = [cosigner(ring[1]!, shareOf(1)), cosigner(ring[2]!, shareOf(2))];
+    // One approval per hour: a refusal that consumed it would leave the retry rejected.
+    const gate = new RecordingGate(new PolicyGate({ maxCeremoniesPerHour: 1 }));
+    const leader = leaderOn(ring[0]!, { gate, slots: own, ceremonyDeadlines: { signingMs: 10_000, dkgMs: 10_000 } });
+    const req = { ceremonyId: 'pay-retry', signers: [0, 1, 2], proposal: makeProposal(tv.vaultKey, NET) };
+
+    setInMemoryPartition(ring[0]!.io.transport, 1, true);
+    expect(await rejection(leader.sign(req))).toMatchObject({ status: 503 });
+    expect(gate.specs).toEqual([]);
+
+    setInMemoryPartition(ring[0]!.io.transport, 1, false);
+    const signed = await leader.sign(req);
+    expect(signed.txid).toMatch(/^[0-9a-f]{64}$/);
+    expect(gate.specs).toHaveLength(1);
+    for (const c of [c1, c2]) expect(await c.waitFor('pay-retry', 5_000)).toMatchObject({ status: 'done' });
+  });
+
+  it('runDkg answers 503 naming a party that is not connected, before the gate and the announce', async () => {
+    const ring = makeRing(3);
+    const seen = inbox(ring[2]!);
+    const slots = fakeSlots();
+    const gate = new RecordingGate(new AutoGate());
+    const stager = recordingStager();
+    setInMemoryPartition(ring[0]!.io.transport, 1, true);
+
+    const err = await rejection(
+      leaderOn(ring[0]!, { vault: undefined, gate, slots: slots.slots, createStager: () => stager }).runDkg({
+        ceremonyId: 'gen-dc',
+      }),
+    );
+    expect(err).toBeInstanceOf(RequestError);
+    expect(err).toMatchObject({ status: 503, message: 'party 1 is not connected; retry when the ring is connected' });
+    expect(gate.specs).toEqual([]);
+    expect(seen).toEqual([]);
+    expect(stager.calls).toEqual([]);
+    // Checked before the DKG slot is taken: a 503 never reserves the ceremony id.
+    expect(slots.dkgIds).toEqual([]);
+    expect(slots.dkgEnds).toBe(0);
+  });
+
+  it('a DKG 503 leaves its ceremony id free: once the ring reconnects the same id reaches the gate', async () => {
+    const ring = makeRing(3);
+    const own = cosigner(ring[0]!);
+    const gate = new RecordingGate(new FixedGate(async () => 'reject'));
+    const leader = leaderOn(ring[0]!, { vault: undefined, gate, slots: own, createStager: () => recordingStager() });
+
+    setInMemoryPartition(ring[0]!.io.transport, 1, true);
+    expect(await rejection(leader.runDkg({ ceremonyId: 'gen-retry' }))).toMatchObject({ status: 503 });
+
+    setInMemoryPartition(ring[0]!.io.transport, 1, false);
+    expect(await rejection(leader.runDkg({ ceremonyId: 'gen-retry' }))).toBeInstanceOf(GateRejection);
+    expect(gate.specs).toHaveLength(1);
+  });
+});
+
+describe('LeaderDispatcher: at most 32 led signings', () => {
+  const proposal = () => makeProposal(tv.vaultKey, NET);
+
+  it('the 33rd request awaiting the gate is refused with 503 before the gate; a place frees when one settles', async () => {
+    expect(MAX_LIVE_SIGNINGS_PER_LEADER).toBe(32);
+    const ring = makeRing(3);
+    const seen = inbox(ring[1]!);
+    const decide: Array<(d: Decision) => void> = [];
+    const gate = new FixedGate(() => new Promise<Decision>(resolve => decide.push(resolve)));
+    const leader = leaderOn(ring[0]!, { gate });
+
+    const held = Array.from({ length: 32 }, (_, i) =>
+      rejection(leader.sign({ ceremonyId: `cap-${i}`, signers: [0, 1, 2], proposal: proposal() })),
+    );
+    await vi.waitFor(() => expect(gate.specs).toHaveLength(32), { timeout: 5_000, interval: 10 });
+
+    const over = await rejection(leader.sign({ ceremonyId: 'cap-32', signers: [0, 1, 2], proposal: proposal() }));
+    expect(over).toBeInstanceOf(RequestError);
+    expect(over).toMatchObject({ status: 503, message: 'this node already leads 32 live signing ceremonies; retry later' });
+    expect(gate.specs).toHaveLength(32);
+
+    // One settles (its gate rejects): its place frees, and the next request reaches the gate.
+    decide[0]!('reject');
+    expect(await held[0]).toBeInstanceOf(GateRejection);
+    const next = rejection(leader.sign({ ceremonyId: 'cap-33', signers: [0, 1, 2], proposal: proposal() }));
+    await vi.waitFor(() => expect(gate.specs).toHaveLength(33), { timeout: 5_000, interval: 10 });
+    expect(gate.specs[32]).toMatchObject({ ceremonyId: 'cap-33' });
+    // Full again.
+    expect(await rejection(leader.sign({ ceremonyId: 'cap-34', signers: [0, 1, 2], proposal: proposal() }))).toMatchObject({
+      status: 503,
+    });
+
+    for (const d of decide.slice(1)) d('reject');
+    for (const r of await Promise.all([...held.slice(1), next])) expect(r).toBeInstanceOf(GateRejection);
+    expect(seen).toEqual([]);
+  });
+
+  it('counts announced ceremonies until they settle', async () => {
+    const CEREMONY_MS = 3_000;
+    const ring = makeRing(3, ONE_ATTEMPT);
+    const seen = inbox(ring[1]!);
+    let approvals = 0;
+    // Approves the first 32; the request after them only has to reach the gate.
+    const gate = new FixedGate(async () => (approvals++ < 32 ? 'approve' : 'reject'));
+    const leader = leaderOn(ring[0]!, { gate, ceremonyDeadlines: { signingMs: CEREMONY_MS, dkgMs: CEREMONY_MS } });
+
+    // Nobody else takes part: each ceremony pulls until its deadline.
+    const live = Array.from({ length: 32 }, (_, i) =>
+      rejection(leader.sign({ ceremonyId: `led-${i}`, signers: [0, 1, 2], proposal: proposal() })),
+    );
+    await vi.waitFor(() => expect(seen.filter(m => m.kind === 'announce-sign')).toHaveLength(32), {
+      timeout: CEREMONY_MS - 500,
+      interval: 10,
+    });
+    const over = await rejection(leader.sign({ ceremonyId: 'led-32', signers: [0, 1, 2], proposal: proposal() }));
+    expect(over).toMatchObject({ status: 503, message: 'this node already leads 32 live signing ceremonies; retry later' });
+    expect(gate.specs).toHaveLength(32);
+
+    for (const err of await Promise.all(live)) {
+      expect((err as Error).message).toBe(`ceremony deadline of ${CEREMONY_MS} ms passed`);
+    }
+    const after = await rejection(leader.sign({ ceremonyId: 'led-33', signers: [0, 1, 2], proposal: proposal() }));
+    expect(after).toBeInstanceOf(GateRejection);
+    expect(gate.specs).toHaveLength(33);
+  }, 20_000);
 });

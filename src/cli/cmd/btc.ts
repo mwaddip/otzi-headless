@@ -22,8 +22,9 @@ import { labelFor } from '../../otzi/lib/address-book';
 import { analyzeProposal, explorerTxUrl, formatBtc, type ProposalAnalysis } from '../../otzi/lib/bitcoin';
 import type { AddressBookEntry, SendProposal } from '../../otzi/lib/vault-types';
 import { displayText, errorReason } from '../../util/text';
-import { DaemonClient } from '../daemon-client';
+import { DaemonClient, DaemonClientError, type RequestOptions } from '../daemon-client';
 import { formatSats, parseBtcAmount, type BtcUnit } from '../units';
+import { NO_VAULT_NOTE, askDaemon, infoFromRequest, notVerifiedNote, vaultMismatch } from '../vault-check';
 
 /** The most the CLI accepts as a fee rate, from Esplora or from `--fee-rate`: sat/vB. */
 export const MAX_FEE_RATE = 10_000;
@@ -31,7 +32,7 @@ export const MAX_FEE_RATE = 10_000;
 /** Test seams: the CLI's connection to the daemon and its writers. */
 export interface CliDeps {
   /** Default: `DaemonClient` from the config. */
-  client?: { request<T>(body: unknown): Promise<T> };
+  client?: { request<T>(body: unknown, options?: RequestOptions): Promise<T> };
   /** Receives the analysis summary before the daemon is asked to sign. Default: stderr. */
   summary?: (text: string) => void;
   /** Receives non-fatal warnings. Default: stderr. */
@@ -57,6 +58,8 @@ export class BroadcastFailedError extends Error {
 interface Context {
   config: DaemonConfig;
   vault: VaultPubkeyFile;
+  /** Where `vault` was read from. */
+  vaultPath: string;
   /** Esplora base URL: `[network].esplora_url`, else the network's default. */
   base: string;
 }
@@ -64,12 +67,30 @@ interface Context {
 async function loadContext(configPath: string, vaultPath?: string): Promise<Context> {
   const vault = await readVaultPubkeyFile(vaultPath);
   const config = await loadDaemonConfig(configPath);
+  const path = vaultPath ?? DEFAULT_VAULT_PUBKEY_PATH;
   if (config.network.name !== vault.network) {
-    throw new Error(
-      `${vaultPath ?? DEFAULT_VAULT_PUBKEY_PATH} is for ${vault.network} but ${configPath} configures ${config.network.name}`,
-    );
+    throw new Error(`${path} is for ${vault.network} but ${configPath} configures ${config.network.name}`);
   }
-  return { config, vault, base: chainApiUrl({ network: vault.network, esploraUrl: config.network.esploraUrl }) };
+  return { config, vault, vaultPath: path, base: chainApiUrl({ network: vault.network, esploraUrl: config.network.esploraUrl }) };
+}
+
+// ─── The vault metadata against the daemon ─────────────────────────────────
+
+type VaultSource = Parameters<typeof askDaemon>[0];
+
+/**
+ * `send` and `sign` take their change address, keys and network from
+ * `vault-pubkey.json` and then ask the daemon to sign, so the file must be the
+ * vault the daemon has loaded: a file the daemon does not vouch for (it differs,
+ * the daemon holds no vault, or it cannot be asked) is an error, before anything
+ * is built, summarised or signed.
+ */
+async function requireDaemonVault(path: string, file: VaultPubkeyFile, source: VaultSource): Promise<void> {
+  const answer = await askDaemon(source);
+  if (answer.kind === 'unreachable') throw new Error(`cannot check ${path} against the daemon: ${answer.reason}`);
+  if (answer.kind === 'no-vault') throw new Error('the daemon has not loaded a vault — restart it to load the share');
+  const mismatch = vaultMismatch(path, file, answer.info);
+  if (mismatch) throw mismatch;
 }
 
 // ─── Esplora errors ─────────────────────────────────────────────────────────
@@ -91,6 +112,9 @@ async function viaEsplora<T>(base: string, call: Promise<T>): Promise<T> {
 
 const money = (sats: bigint | number): string => `${sats} sats (${formatBtc(Number(sats))} BTC)`;
 
+/** Appended to the daemon's 503 (facts/daemon.md, `btc.ts`): nothing happened, so the same command can simply run again. */
+const RETRY_HINT = 'Nothing was announced or signed. This is temporary: run the same command again to retry.';
+
 /**
  * Asks the daemon to sign `proposal` and checks the reply against it. The
  * reply must be the proposal's own transaction with a signature on every
@@ -102,7 +126,14 @@ async function signProposal(
   proposal: SendProposal,
   proposalTxid: string,
 ): Promise<{ txid: string; signedTxHex: string }> {
-  const reply = await client.request<{ txid?: unknown; signedTxHex?: unknown }>({ op: 'sign', proposal });
+  let reply: { txid?: unknown; signedTxHex?: unknown };
+  try {
+    reply = await client.request<{ txid?: unknown; signedTxHex?: unknown }>({ op: 'sign', proposal });
+  } catch (err) {
+    // The leader refused before its gate (a signer not connected, or its cap): retryable.
+    if (err instanceof DaemonClientError && err.status === 503) throw new DaemonClientError(503, `${err.message}\n${RETRY_HINT}`);
+    throw err;
+  }
   if (
     typeof reply?.txid !== 'string' ||
     typeof reply.signedTxHex !== 'string' ||
@@ -158,8 +189,25 @@ async function broadcast(
 
 // ─── otzi btc balance ───────────────────────────────────────────────────────
 
-export async function btcBalance(opts: { configPath: string; vaultPath?: string; unit?: BtcUnit }): Promise<string> {
-  const { vault, base } = await loadContext(opts.configPath, opts.vaultPath);
+/**
+ * Reading a balance needs no daemon, so it is checked against the daemon when
+ * there is one to ask: a file that differs is an error (it would show the balance
+ * of the wrong address), and a daemon that cannot be reached or holds no vault
+ * leaves the balance with a note that it was not verified.
+ */
+export async function btcBalance(
+  opts: { configPath: string; vaultPath?: string; unit?: BtcUnit },
+  deps: CliDeps = {},
+): Promise<string> {
+  const { config, vault, vaultPath, base } = await loadContext(opts.configPath, opts.vaultPath);
+  const warn = deps.warn ?? console.error;
+  const answer = await askDaemon(() => infoFromRequest(deps.client ?? DaemonClient.fromParsed(config)));
+  if (answer.kind === 'unreachable') warn(notVerifiedNote(answer.reason));
+  else if (answer.kind === 'no-vault') warn(NO_VAULT_NOTE);
+  else {
+    const mismatch = vaultMismatch(vaultPath, vault, answer.info);
+    if (mismatch) throw mismatch;
+  }
   const balance = await viaEsplora(base, getBalance(base, vault.address));
   const unit = opts.unit ?? 'sats';
   return [
@@ -194,7 +242,7 @@ export async function btcSend(
   opts: { configPath: string; vaultPath?: string; bookPath?: string; to: string; amount: string; feeRate?: number },
   deps: CliDeps = {},
 ): Promise<{ txid: string; explorerUrl: string }> {
-  const { config, vault, base } = await loadContext(opts.configPath, opts.vaultPath);
+  const { config, vault, vaultPath, base } = await loadContext(opts.configPath, opts.vaultPath);
   const network: NetworkName = vault.network;
 
   // Everything that can be checked locally is checked before Esplora or the daemon is touched.
@@ -208,6 +256,8 @@ export async function btcSend(
     throw new Error(`fee rate must be more than 0 and at most ${MAX_FEE_RATE} sat/vB (got ${opts.feeRate})`);
   }
   const client = deps.client ?? DaemonClient.fromParsed(config);
+  // The file's key builds the change output: it must be the vault the daemon will sign for.
+  await requireDaemonVault(vaultPath, vault, () => infoFromRequest(client));
 
   const coins = await viaEsplora(base, getUtxos(base, vault.address));
   const confirmed = coins.filter(c => c.confirmed);
@@ -284,11 +334,13 @@ export async function btcSign(
   opts: { configPath: string; vaultPath?: string; bookPath?: string; proposalPath: string; broadcast: boolean },
   deps: CliDeps = {},
 ): Promise<{ txid: string; signedTxHex: string; summary: string; explorerUrl?: string }> {
-  const { config, vault, base } = await loadContext(opts.configPath, opts.vaultPath);
+  const { config, vault, vaultPath, base } = await loadContext(opts.configPath, opts.vaultPath);
   const client = deps.client ?? DaemonClient.fromParsed(config);
   const warn = deps.warn ?? console.error;
 
   const proposal = await readProposal(opts.proposalPath);
+  // Before the file's key analyses the proposal and the summary is shown.
+  await requireDaemonVault(vaultPath, vault, () => infoFromRequest(client));
   let analysis: ProposalAnalysis;
   try {
     analysis = analyzeProposal(proposal, vault.vaultKey, vault.network);

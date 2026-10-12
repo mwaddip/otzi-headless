@@ -6,11 +6,23 @@
 #   - install completes cleanly
 #   - /usr/bin/otzi runs and prints usage
 #   - /etc/otzi/daemon.toml is rendered with the expected fields
-#   - /lib/systemd/system/otzi.service is registered
+#   - /lib/systemd/system/otzi.service is registered and carries the sandbox directives
 #   - otzi user/group exist
+#   - a backup/purge/restore round-trip puts the node back, and a later upgrade
+#     (reinstall) leaves the restored daemon.toml and share alone
 #   - `otzi daemon` against the rendered config gets past parse + transport
 #     init and errors on the missing OTZI_SHARE_PASSWORD env var (proves the
 #     bundle loads + the parser accepts the rendered TOML end-to-end).
+#   - the relay server unit (otzi-relay.service) is installed with its sandbox
+#     directives (a transient DynamicUser, never the otzi user) and left disabled,
+#     and /etc/otzi/relay.env holds the loopback listen address and survives a
+#     reconfigure
+#   - nothing creates /run/otzi before the daemon starts (no tmpfiles entry, no
+#     postinst mkdir): the unit's RuntimeDirectory= owns it
+#   - relay-transport installs (leader with `parties` 3, leaf) render a
+#     daemon.toml with no [[peers]] that parses; a bad `parties` or a relay URL
+#     without ws:// or wss:// is left out with a warning; peer-mesh never gets
+#     `parties`
 #
 # Usage: bash scripts/test-deb-container.sh
 set -euo pipefail
@@ -64,6 +76,9 @@ otzi-headless otzi-headless/advertised-endpoint string 192.0.2.1:8800
 otzi-headless otzi-headless/peers string 192.0.2.2:8800,192.0.2.3:8800
 otzi-headless otzi-headless/bootstrap-bind string 0.0.0.0:7090
 otzi-headless otzi-headless/node-id string testnode-a
+# A ring size left over from an earlier relay answer: peer-mesh refuses the key, so
+# the postinst must not write it.
+otzi-headless otzi-headless/parties string 5
 EOF
 
 apt-get install -y /tmp/otzi-headless.deb
@@ -76,6 +91,14 @@ test -f /usr/lib/otzi/entrypoint.mjs || { echo "missing entrypoint bundle"; exit
 test -f /lib/systemd/system/otzi.service || { echo "missing systemd unit"; exit 1; }
 grep -qx "EnvironmentFile=-/etc/otzi/otzi.env" /lib/systemd/system/otzi.service \
                                        || { echo "unit does not load /etc/otzi/otzi.env"; exit 1; }
+# The sandbox directives (docs/install.md, Service sandbox): a unit that lost one would still install.
+for LINE in ProtectSystem=strict ProtectHome=true PrivateTmp=true PrivateDevices=true NoNewPrivileges=true \
+            ReadWritePaths=/var/lib/otzi ProtectKernelTunables=true ProtectKernelModules=true \
+            ProtectKernelLogs=true ProtectControlGroups=true ProtectClock=true ProtectHostname=true \
+            RestrictSUIDSGID=true "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK" \
+            RuntimeDirectory=otzi RuntimeDirectoryMode=3770; do
+  grep -qx "$LINE" /lib/systemd/system/otzi.service || { echo "unit lacks $LINE"; exit 1; }
+done
 test -f /etc/otzi/daemon.toml      || { echo "missing daemon.toml"; exit 1; }
 getent passwd otzi >/dev/null      || { echo "missing otzi user"; exit 1; }
 getent group otzi >/dev/null       || { echo "missing otzi group"; exit 1; }
@@ -100,7 +123,37 @@ grep -q "^bind = \"0.0.0.0:7090\""                 /etc/otzi/daemon.toml
 ! grep -q "wallet_address" /etc/otzi/daemon.toml || { echo "FAIL: legacy wallet_address present"; exit 1; }
 ! grep -qE "^listen = "  /etc/otzi/daemon.toml || { echo "FAIL: legacy listen = present";    exit 1; }
 ! grep -q "opnet_rpc"    /etc/otzi/daemon.toml || { echo "FAIL: legacy opnet_rpc present";    exit 1; }
+# parties is for a relay leader only; the parser refuses it under peer-mesh.
+! grep -q "^parties"     /etc/otzi/daemon.toml || { echo "FAIL: peer-mesh daemon.toml carries parties"; exit 1; }
 echo "OK: rendered toml"
+'
+
+echo ">> verifying the relay server unit and relay.env"
+docker exec "$CONTAINER" bash -euo pipefail -c '
+UNIT=/lib/systemd/system/otzi-relay.service
+test -f "$UNIT" || { echo "missing $UNIT"; exit 1; }
+# The listen address comes from relay.env, the user is a transient one, and the command is the relay verb.
+for LINE in DynamicUser=yes ProtectProc=invisible EnvironmentFile=/etc/otzi/relay.env \
+            "ExecStart=/usr/bin/otzi relay --listen \${OTZI_RELAY_LISTEN}" Restart=on-failure \
+            ProtectSystem=strict ProtectHome=true PrivateTmp=true PrivateDevices=true NoNewPrivileges=true \
+            ProtectKernelTunables=true ProtectKernelModules=true ProtectKernelLogs=true \
+            ProtectControlGroups=true ProtectClock=true ProtectHostname=true RestrictSUIDSGID=true \
+            "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK" \
+            RestrictNamespaces=true RestrictRealtime=true LockPersonality=true SystemCallArchitectures=native; do
+  grep -qxF "$LINE" "$UNIT" || { echo "relay unit lacks $LINE"; exit 1; }
+done
+# The relay writes nothing and keeps no socket directory, and it never runs as a named user:
+# on a coordinator that is also a ring node, that user would be otzi, which owns the share.
+for KEY in ReadWritePaths RuntimeDirectory RuntimeDirectoryMode User Group; do
+  ! grep -q "^$KEY=" "$UNIT" || { echo "relay unit sets $KEY"; exit 1; }
+done
+# Installed, never enabled: nothing under /etc/systemd/system links to it.
+[ -z "$(find /etc/systemd/system -name otzi-relay.service 2>/dev/null)" ] || { echo "FAIL: otzi-relay.service is enabled"; exit 1; }
+
+test -f /etc/otzi/relay.env || { echo "FAIL: missing /etc/otzi/relay.env"; exit 1; }
+[ "$(stat -c "%a %U:%G" /etc/otzi/relay.env)" = "644 root:root" ] || { echo "FAIL: relay.env mode/owner is $(stat -c "%a %U:%G" /etc/otzi/relay.env), want 644 root:root"; exit 1; }
+grep -qxF "OTZI_RELAY_LISTEN=127.0.0.1:7100" /etc/otzi/relay.env || { echo "FAIL: relay.env lacks the loopback default"; exit 1; }
+echo "OK: relay unit installed disabled, relay.env created"
 '
 
 echo ">> verifying phase 9a perms"
@@ -108,9 +161,13 @@ docker exec "$CONTAINER" bash -euo pipefail -c '
 stat -c "%a %U:%G" /etc/otzi      | grep -q "^2750 root:otzi$"     || { echo "FAIL: /etc/otzi mode/owner";       exit 1; }
 stat -c "%a %U:%G" /etc/otzi/daemon.toml | grep -q "^640 root:otzi$" || { echo "FAIL: daemon.toml mode/owner";    exit 1; }
 stat -c "%a %U:%G" /var/lib/otzi  | grep -q "^2770 root:otzi$"     || { echo "FAIL: /var/lib/otzi mode/owner";   exit 1; }
-test -d /var/run/otzi             || { echo "FAIL: /var/run/otzi missing"; exit 1; }
-stat -c "%a %U:%G" /var/run/otzi  | grep -q "^2770 root:otzi$"     || { echo "FAIL: /var/run/otzi mode/owner";   exit 1; }
-echo "OK: phase 9a perms"
+# The socket directory belongs to the unit: RuntimeDirectory=otzi with RuntimeDirectoryMode=3770
+# (asserted with the layout) creates it when the daemon starts and removes it when it stops. The
+# daemon has not started here, so it must not exist: a directory nobody owns would let a group
+# member plant a socket for the CLI to trust.
+! test -e /run/otzi               || { echo "FAIL: /run/otzi exists before the daemon started ($(stat -c "%a %U:%G" /run/otzi))"; exit 1; }
+! test -e /usr/lib/tmpfiles.d/otzi.conf || { echo "FAIL: the package ships a tmpfiles.d entry for /run/otzi"; exit 1; }
+echo "OK: phase 9a perms, no /run/otzi before the daemon starts"
 '
 
 echo ">> verifying postinst removes files earlier releases left behind"
@@ -123,6 +180,12 @@ dpkg-reconfigure otzi-headless >/dev/null
 ! test -e /etc/otzi/manifest.otzi.json   || { echo "FAIL: manifest.otzi.json not removed"; exit 1; }
 [ "$(sha256sum /etc/otzi/daemon.toml | cut -d" " -f1)" = "$CONFIG_SUM" ] || { echo "FAIL: reconfigure rewrote daemon.toml"; exit 1; }
 echo "OK: leftovers removed, daemon.toml kept"
+
+# relay.env belongs to the operator once it exists: a reconfigure must not put the default back.
+printf "%s\n" "OTZI_RELAY_LISTEN=127.0.0.1:7199" >/etc/otzi/relay.env
+dpkg-reconfigure otzi-headless >/dev/null
+grep -qxF "OTZI_RELAY_LISTEN=127.0.0.1:7199" /etc/otzi/relay.env || { echo "FAIL: reconfigure rewrote relay.env"; exit 1; }
+echo "OK: relay.env edit kept"
 '
 
 echo ">> running otzi (usage banner)"
@@ -164,7 +227,9 @@ docker exec "$CONTAINER" bash -euo pipefail -c '
 printf "%s\n" "{\"v\":1,\"data\":\"synthetic-share-payload\"}" >/var/lib/otzi/share.json
 printf "%s\n" "{\"pkcs8Hex\":\"deadbeef\",\"publicKeyHex\":\"cafe\"}" >/var/lib/otzi/identity.json
 printf "%s\n" "[]" >/var/lib/otzi/pubkeys.json
-chown otzi:otzi /var/lib/otzi/share.json /var/lib/otzi/identity.json /var/lib/otzi/pubkeys.json
+# No chown: written by root, the files are root:otzi (setgid dir) as a restore run as
+# root would leave them without ownership handling, so the restore assertions below
+# prove restore gives them to the otzi user (the archive itself carries no owner).
 chmod 600 /var/lib/otzi/share.json
 chmod 660 /var/lib/otzi/identity.json
 chmod 644 /var/lib/otzi/pubkeys.json
@@ -230,6 +295,16 @@ test -f /var/lib/otzi/share.json       || { echo "FAIL: share.json not restored"
 test -f /var/lib/otzi/identity.json    || { echo "FAIL: identity.json not restored";        exit 1; }
 test -f /var/lib/otzi/pubkeys.json     || { echo "FAIL: pubkeys.json not restored";         exit 1; }
 
+# Owners: restore ran as root; the daemon (User=otzi) must own what it reads in
+# /var/lib/otzi, and the config in /etc/otzi stays root:otzi.
+[ "$(stat -c %U /var/lib/otzi/share.json)" = "otzi" ]    || { echo "FAIL: share.json owner is $(stat -c %U /var/lib/otzi/share.json), want otzi"; exit 1; }
+[ "$(stat -c %G /var/lib/otzi/share.json)" = "otzi" ]    || { echo "FAIL: share.json group is $(stat -c %G /var/lib/otzi/share.json), want otzi"; exit 1; }
+[ "$(stat -c %U /var/lib/otzi/identity.json)" = "otzi" ] || { echo "FAIL: identity.json owner";    exit 1; }
+[ "$(stat -c %U /var/lib/otzi/pubkeys.json)" = "otzi" ]  || { echo "FAIL: pubkeys.json owner";     exit 1; }
+[ "$(stat -c %U:%G /etc/otzi/daemon.toml)" = "root:otzi" ] || { echo "FAIL: daemon.toml owner";    exit 1; }
+# ...and the proof that matters: the daemon user can read the restored share.
+runuser -u otzi -- head -c 1 /var/lib/otzi/share.json >/dev/null || { echo "FAIL: user otzi cannot read share.json"; exit 1; }
+
 # Per-file modes (mirrors restore.ts FIXED_FILE_MODES + dynamic table).
 stat -c "%a" /etc/otzi/daemon.toml         | grep -q "^640$" || { echo "FAIL: daemon.toml mode";       exit 1; }
 stat -c "%a" /var/lib/otzi/share.json      | grep -q "^600$" || { echo "FAIL: share.json mode";        exit 1; }
@@ -241,7 +316,29 @@ stat -c "%a" /var/lib/otzi/pubkeys.json    | grep -q "^644$" || { echo "FAIL: pu
 grep -q "id = \"testnode-a\"" /etc/otzi/daemon.toml || {
   echo "FAIL: restored daemon.toml does not match the original"; exit 1;
 }
-echo "OK: restored layout + modes match expected"
+echo "OK: restored layout + owners + modes match expected"
+'
+
+echo ">> verifying an upgrade after the restore leaves the restored node alone"
+# The restore branch answered "yes" to restore-from-backup and postinst took the
+# answer back; reinstalling the package (what an upgrade runs) must not restore
+# again, rewrite daemon.toml or touch the share.
+docker exec "$CONTAINER" bash -euo pipefail -c '
+export DEBIAN_FRONTEND=noninteractive
+CONFIG_SUM=$(sha256sum /etc/otzi/daemon.toml    | cut -d" " -f1)
+SHARE_SUM=$(sha256sum  /var/lib/otzi/share.json | cut -d" " -f1)
+UPGRADE_OUT=$(apt-get install -y --reinstall /tmp/otzi-headless.deb 2>&1) || {
+  echo "FAIL: reinstalling over the restored node exited non-zero:"; echo "$UPGRADE_OUT"; exit 1;
+}
+if printf "%s\n" "$UPGRADE_OUT" | grep -q "attempting restore from"; then
+  echo "FAIL: the upgrade tried to restore from backup again"; echo "$UPGRADE_OUT"; exit 1
+fi
+[ "$(sha256sum /etc/otzi/daemon.toml    | cut -d" " -f1)" = "$CONFIG_SUM" ] || { echo "FAIL: upgrade changed daemon.toml"; exit 1; }
+[ "$(sha256sum /var/lib/otzi/share.json | cut -d" " -f1)" = "$SHARE_SUM"  ] || { echo "FAIL: upgrade changed share.json"; exit 1; }
+[ "$(stat -c %U:%G /var/lib/otzi/share.json)" = "otzi:otzi" ] || { echo "FAIL: upgrade changed the owner of share.json"; exit 1; }
+ANSWER=$(printf "get otzi-headless/restore-from-backup\n" | debconf-communicate otzi-headless)
+[ "$ANSWER" = "0 false" ] || { echo "FAIL: restore-from-backup is \"$ANSWER\" after the upgrade, want \"0 false\""; exit 1; }
+echo "OK: upgrade after restore kept daemon.toml and share.json, and restore-from-backup stays false"
 '
 
 echo ">> verifying backup password wiped from debconf cache"
@@ -264,5 +361,138 @@ fi
 echo "OK: backup password wiped from debconf cache"
 '
 
+# ─────────────────────────────────────────────────────────────────────────
+# Third pass: relay-transport installs.
+#
+# Each variant purges the package (postrm wipes /etc/otzi, /var/lib/otzi and the
+# debconf answers), preseeds relay answers and installs again. The rendered
+# daemon.toml must carry no [[peers]], must parse (`otzi daemon` gets as far as
+# the missing OTZI_SHARE_PASSWORD, as in the first pass), and the relay unit must
+# stay disabled. The relay leader also writes [bootstrap] parties. A bad ring size
+# or a relay URL that is not ws:// or wss:// is left out with a warning.
+# ─────────────────────────────────────────────────────────────────────────
+
+# install_relay_variant <role> <parties-answer> <relay-url>: purge, preseed, install.
+install_relay_variant() {
+  docker exec -i "$CONTAINER" bash -s -- "$1" "$2" "$3" <<'INSIDE'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+ROLE="$1"; PARTIES="$2"; RELAY_URL="$3"
+
+apt-get purge -y otzi-headless >/dev/null
+rm -rf /etc/otzi /var/lib/otzi
+
+debconf-set-selections <<EOF
+otzi-headless otzi-headless/role select $ROLE
+otzi-headless otzi-headless/operators string
+otzi-headless otzi-headless/network select signet
+otzi-headless otzi-headless/esplora-url string
+otzi-headless otzi-headless/transport select relay
+otzi-headless otzi-headless/relay-url string $RELAY_URL
+otzi-headless otzi-headless/parties string $PARTIES
+otzi-headless otzi-headless/bootstrap-bind string 0.0.0.0:7090
+otzi-headless otzi-headless/bootstrap-leader-url string http://leader.example:7090
+otzi-headless otzi-headless/node-id string relay-$ROLE
+EOF
+
+apt-get install -y /tmp/otzi-headless.deb 2>&1 | tee /tmp/relay-install.log
+INSIDE
+}
+
+# daemon_toml_parses <label> <expected-error-regex>: `otzi daemon` against the
+# rendered config must fail with exactly that error. With no password in the
+# environment a config that parses fails on OTZI_SHARE_PASSWORD; one the parser
+# refuses fails with its ConfigError first.
+daemon_toml_parses() {
+  local out rc
+  set +e
+  out=$(docker exec "$CONTAINER" /usr/bin/otzi daemon /etc/otzi/daemon.toml 2>&1)
+  rc=$?
+  set -e
+  if [ $rc -eq 0 ] || ! printf '%s\n' "$out" | grep -Eq "$2"; then
+    echo "FAIL: $1: wanted /$2/ from otzi daemon, got (exit $rc):" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+}
+
+echo ">> relay variant: leader of a ring of 3"
+install_relay_variant leader 3 wss://relay.example
+docker exec "$CONTAINER" bash -euo pipefail -c '
+grep -qx "kind = \"relay\""                   /etc/otzi/daemon.toml
+grep -qx "url = \"wss://relay.example\""       /etc/otzi/daemon.toml
+grep -qx "role = \"leader\""                   /etc/otzi/daemon.toml
+grep -qx "bind = \"0.0.0.0:7090\""             /etc/otzi/daemon.toml
+grep -qx "parties = 3"                          /etc/otzi/daemon.toml || { echo "FAIL: relay leader lacks parties = 3"; exit 1; }
+! grep -qxF "[[peers]]"                          /etc/otzi/daemon.toml || { echo "FAIL: relay config carries [[peers]]"; exit 1; }
+! grep -q "advertised_endpoint"                /etc/otzi/daemon.toml || { echo "FAIL: relay config carries advertised_endpoint"; exit 1; }
+test -f /etc/otzi/relay.env                    || { echo "FAIL: relay.env missing"; exit 1; }
+[ -z "$(find /etc/systemd/system -name otzi-relay.service 2>/dev/null)" ] || { echo "FAIL: otzi-relay.service is enabled"; exit 1; }
+test -f /lib/systemd/system/otzi-relay.service || { echo "FAIL: relay unit missing"; exit 1; }
+'
+daemon_toml_parses "relay leader" "OTZI_SHARE_PASSWORD"
+# The closing message explains the relay coordinator.
+docker exec "$CONTAINER" grep -q "Relay coordinator" /tmp/relay-install.log || { echo "FAIL: no relay coordinator note in the install output"; exit 1; }
+docker exec "$CONTAINER" grep -q "systemctl enable --now otzi-relay" /tmp/relay-install.log || { echo "FAIL: install output does not say how to start the relay"; exit 1; }
+docker exec "$CONTAINER" grep -qF "(this node: wss://relay.example)" /tmp/relay-install.log || { echo "FAIL: install output does not name this node's relay URL"; exit 1; }
+echo "OK: relay leader renders parties = 3, no [[peers]], and parses"
+
+echo ">> relay variant: an upper-case scheme is accepted and written lowercased"
+install_relay_variant leader 3 WSS://Relay.Example
+docker exec "$CONTAINER" bash -euo pipefail -c '
+grep -qx "url = \"wss://Relay.Example\"" /etc/otzi/daemon.toml || { echo "FAIL: WSS://Relay.Example not written as wss://Relay.Example"; exit 1; }
+! grep -q "WARNING.*relay URL" /tmp/relay-install.log || { echo "FAIL: an upper-case scheme was warned about"; exit 1; }
+'
+daemon_toml_parses "relay leader, upper-case scheme" "OTZI_SHARE_PASSWORD"
+echo "OK: the relay URL scheme is matched in any case and written lowercased"
+
+echo ">> relay variant: leaf (a stale parties answer must not be written)"
+install_relay_variant leaf 7 wss://relay.example
+docker exec "$CONTAINER" bash -euo pipefail -c '
+grep -qx "kind = \"relay\""                   /etc/otzi/daemon.toml
+grep -qx "role = \"leaf\""                     /etc/otzi/daemon.toml
+grep -qx "leader_url = \"http://leader.example:7090\"" /etc/otzi/daemon.toml
+! grep -q "^parties"                           /etc/otzi/daemon.toml || { echo "FAIL: relay leaf carries parties"; exit 1; }
+! grep -qxF "[[peers]]"                          /etc/otzi/daemon.toml || { echo "FAIL: relay config carries [[peers]]"; exit 1; }
+[ -z "$(find /etc/systemd/system -name otzi-relay.service 2>/dev/null)" ] || { echo "FAIL: otzi-relay.service is enabled"; exit 1; }
+'
+daemon_toml_parses "relay leaf" "OTZI_SHARE_PASSWORD"
+echo "OK: relay leaf renders no parties, no [[peers]], and parses"
+
+echo ">> relay variant: leader with a bad ring size"
+# Each of these is warned about and left out; the parser then names the key.
+for BAD in 1 256 abc 3.5; do
+  install_relay_variant leader "$BAD" ws://relay.example:9000
+  docker exec "$CONTAINER" grep -q "WARNING.*ignoring ring size '$BAD'" /tmp/relay-install.log \
+    || { echo "FAIL: no warning for parties '$BAD'" >&2; exit 1; }
+  docker exec "$CONTAINER" bash -euo pipefail -c '! grep -q "^parties" /etc/otzi/daemon.toml' \
+    || { echo "FAIL: parties '$BAD' was written" >&2; exit 1; }
+  daemon_toml_parses "relay leader, parties '$BAD'" "bootstrap.parties.*required"
+done
+# A blank answer gets its own wording.
+install_relay_variant leader "" ws://relay.example:9000
+docker exec "$CONTAINER" grep -q "WARNING.*no ring size given" /tmp/relay-install.log \
+  || { echo "FAIL: no warning for a blank ring size" >&2; exit 1; }
+docker exec "$CONTAINER" bash -euo pipefail -c '! grep -q "^parties" /etc/otzi/daemon.toml' \
+  || { echo "FAIL: a blank ring size was written" >&2; exit 1; }
+daemon_toml_parses "relay leader, blank parties" "bootstrap.parties.*required"
+echo "OK: a bad ring size is warned about and left out"
+
+echo ">> relay variant: leader with a relay URL the daemon cannot dial"
+# Only ws:// and wss:// are written. Anything else is warned about and left out, the parser
+# names transport.url, and the closing message does not print an empty "(this node: )".
+for BADURL in "" relay.example http://relay.example; do
+  install_relay_variant leader 3 "$BADURL"
+  docker exec "$CONTAINER" grep -Eq "WARNING.*(no relay URL given|ignoring relay URL '$BADURL')" /tmp/relay-install.log \
+    || { echo "FAIL: no warning for relay URL '$BADURL'" >&2; exit 1; }
+  docker exec "$CONTAINER" bash -euo pipefail -c '! grep -q "^url = " /etc/otzi/daemon.toml' \
+    || { echo "FAIL: relay URL '$BADURL' was written" >&2; exit 1; }
+  if docker exec "$CONTAINER" grep -qF "(this node: )" /tmp/relay-install.log; then
+    echo "FAIL: the closing message prints an empty relay URL for '$BADURL'" >&2; exit 1
+  fi
+  daemon_toml_parses "relay leader, url '$BADURL'" "transport.url.*required"
+done
+echo "OK: a relay URL without ws:// or wss:// is warned about and left out"
+
 echo ""
-echo "✓ all checks passed (fresh install + restore round-trip)"
+echo "✓ all checks passed (fresh install + restore round-trip + relay variants)"

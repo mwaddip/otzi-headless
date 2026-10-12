@@ -7,7 +7,7 @@ on chain.
 
 The ceremonies are **pull-based**. Each node produces its blobs locally and stores
 them; a node that needs round-N inputs pulls them from their producers. There are
-no periodic state broadcasts, no barriers and no heartbeats. Four small control
+no periodic state broadcasts, no barriers and no ceremony heartbeats. Four small control
 messages announce and close ceremonies; everything else is blobs.
 
 ---
@@ -107,7 +107,9 @@ inconsistent setup fail loudly. Once a vault exists, no DKG can touch it.
    loaded, no file at the share path), `network` equals its configured network,
    `parties` equals its ring size, `2 ≤ threshold ≤ parties`, and its gate
    approves the DKG spec. The announcing node applies the no-vault rule before it
-   announces (the `dkg` op returns `409`).
+   announces (the `dkg` op returns `409`), and checks before its gate that every
+   other node is connected to it (otherwise a retryable `503`, nothing
+   announced).
 2. **Round 1.** Each node generates its round-1 package and stores it as
    `dkg-r1`, then pulls `dkg-r1` from the other N−1 nodes. Each package must
    carry exactly `threshold` commitments.
@@ -180,6 +182,7 @@ builds the proposal and broadcasts the result.
  ────────────────                              ────────────
  validate the request           ─ 400
  analyse proposal, own key      ─ 400
+ signers connected, < 32 led    ─ 503
  own gate                       ─ 403
  announce-sign {signers, proposal} ──────────► sender is the pinned leader
                                                ceremonyId new · signers valid
@@ -203,20 +206,27 @@ builds the proposal and broadcasts the result.
    proposal shape and the 255-input limit. A violation is a `400`.
 2. **Analyse the proposal** against the public key package in its own share and
    its own network. A rejection is a `400` and nothing is announced.
-3. **Build the signing spec** from that analysis and evaluate its own gate. A
+3. **Check the ring, before the gate.** Every other signer must be connected to
+   this node right now (`Transport.isConnected`), and this node must lead fewer
+   than 32 signing requests (each counts from this check, through its gate,
+   until it returns: the participants' cap per leader). Otherwise it answers a
+   retryable `503` and nothing is announced; no gate approval is consumed. The
+   check is a snapshot: a signer that drops right after it misses the announce,
+   and the ceremony fails at its deadline.
+4. **Build the signing spec** from that analysis and evaluate its own gate. A
    reject is a `403` and nothing is announced.
-4. **Announce.** Broadcast `announce-sign {ceremonyId, signers, proposal}`.
+5. **Announce.** Broadcast `announce-sign {ceremonyId, signers, proposal}`.
    Sighashes are not sent.
-5. **Sign.** Run `sign-r1` and `sign-r2`: produce its own blob, pull the other
+6. **Sign.** Run `sign-r1` and `sign-r2`: produce its own blob, pull the other
    signers' blobs.
-6. **Aggregate** per input with the full public key package, so a cheating signer
+7. **Aggregate** per input with the full public key package, so a cheating signer
    is named. Check each signature against the vault output key.
-7. **Finalize.** `finalizeSend` places the signatures as key-path witnesses
+8. **Finalize.** `finalizeSend` places the signatures as key-path witnesses
    (verifying each under BIP340 again) and yields the signed transaction and its
    txid.
-8. **Sign off.** Broadcast `signoff-done {ceremonyId, signaturesHex}` and return
+9. **Sign off.** Broadcast `signoff-done {ceremonyId, signaturesHex}` and return
    `{ceremonyId, txid, signedTxHex, signaturesHex}` to the caller.
-9. **On any failure after the announce**, broadcast `signoff-aborted` and return
+10. **On any failure after the announce**, broadcast `signoff-aborted` and return
    `500`.
 
 ### Participant
@@ -230,6 +240,10 @@ unless all of these hold:
   contains only ring members, and has at least as many entries as the share's
   threshold;
 - the proposal has at most 255 inputs;
+- the leader has fewer than 32 signing ceremonies live on this node (a
+  ceremony is live until its sign-off, abort or deadline, or until it is
+  rejected; one waiting on a slow gate counts), so a compromised ring member
+  cannot make every participant hold ceremonies without bound;
 - the proposal passes the same analysis against this node's own key package and
   network;
 - this node's gate approves the spec built from that analysis.
@@ -269,8 +283,10 @@ A participant stays live until the leader's sign-off or its signing deadline.
 |---|---|---|
 | Request shape: unknown fields, `ceremonyId` pattern, `signers` rules, proposal shape, at most 255 inputs | Daemon API (leader) | `400`, nothing announced |
 | Proposal analysis against the node's **own** key and network | Leader before the announce; every participant on the announce | Leader `400`; participant silent drop |
+| Every other party connected (`Transport.isConnected`); for signing, fewer than 32 requests led by this node | Leader before its gate (both ceremonies) | `503`, nothing announced, no approval consumed; retry |
 | Gate on a spec built from that analysis | Leader before the announce; every participant on the announce | Leader `403`; participant silent drop |
 | Announce comes from the pinned leader; `ceremonyId` is new | Participant | Dropped, logged |
+| The leader has fewer than 32 live signing ceremonies on this node | Participant | Dropped, logged (warn); the 33rd is accepted once one settles |
 | `signers` valid: contains self and leader, unique, ring members, at least the threshold | Participant | Dropped, logged |
 | DKG announce: no vault, matching network, `parties` = ring size, `2 ≤ threshold ≤ parties`, gate | Each node | Dropped; the `dkg` op returns `409` when the receiving node holds a vault |
 | Sender binding on every pulled blob | Every node, both ceremonies | Ceremony aborts, reason names the sender |

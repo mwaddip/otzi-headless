@@ -398,6 +398,10 @@
   - **Post:** Registers handler to serve pull requests from peers. Returns unsubscribe function.
   - **Throws:** `Error` if handler already registered.
 
+- `isConnected(partyId: PartyId): boolean` (Transport interface)
+  - **Post:** `true` for self. For a peer, `true` while it has a `PeerConnection` that has not closed: `dial` / `acceptInbound` return one only after the Noise-KK handshake completed, so an open WebSocket still handshaking (or a dial in backoff) is not connected. `false` for an unknown partyId and after `stop()`.
+  - **Throws:** Never.
+
 **Invariants:**
 - Role: lower partyId dials, higher partyId listens (asymmetric).
 - Initiator side redials on disconnect with exponential backoff: 1s, 2s, 4s, 8s, capped at 10s.
@@ -417,7 +421,7 @@
 - Wire/byte format: WebSocket per peer pair, Noise-KK + AES-GCM encrypted, JSON app messages.
 
 **Notes / gotchas:**
-- Reconnect is initiator-only (asymmetric); responder is passive. Operator restart required for relay reconnect.
+- Reconnect is initiator-only (asymmetric); responder is passive. (The relay transport redials the relay on its own: see `relay-transport.ts`, Reconnect.)
 - Broadcast is fan-out with independent encryption per peer (not a single encrypt shared to all).
 - Pull timeout returning null is not an error; caller is responsible for retry logic.
 - Server bind is "host:port" (no default 0.0.0.0); explicit host required.
@@ -475,23 +479,23 @@
 **Purpose:** Tiny dumb relay router; per-ring connection roster, peer-joined/peer-left notifications, frame forwarding by partyId.
 
 **Public surface:**
-- `RelayServerOptions` — Configuration with listen address ("host:port" required) and optional logger.
+- `RelayServerOptions` — Configuration with listen address ("host:port" required; an IPv6 host is written in brackets, `[::1]:7100`), optional `heartbeatMs` (default 20 000) and optional logger.
 
 - `RelayServer` — Immutable relay state machine; owns per-ring rosters and WebSocket server. Internally serialized; concurrent peer joins/frames handled safely.
 
 - `constructor(options: RelayServerOptions)`
   - **Pre:** `options.listen` is valid "host:port".
-  - **Post:** Initializes relay state (rings map). Does not start listening yet.
-  - **Throws:** `Error` if bind format is invalid.
+  - **Post:** Initializes relay state (rings map). Does not start listening yet. A bracketed IPv6 host is stored without its brackets (`[::1]:7100` binds host `::1`, and `address()` reports `::1`), as `src/config/parse.ts` reads a bracketed bind host; `listen` and DNS never see the brackets.
+  - **Throws:** `Error` if bind format is invalid (including an empty host, `[]`, or brackets that are not one pair around the whole host: `[::1:7100`, `::1]:7100`, `[[::1]]:7100`), or `heartbeatMs` is not a finite number ≥ 1.
 
 - `start(): Promise<void>`
   - **Pre:** Relay not already started.
-  - **Post:** Creates HTTP server + WebSocketServer, binds to listen address, registers connection handler.
-  - **Throws:** `Error` if bind fails.
+  - **Post:** Creates HTTP server + WebSocketServer, binds to listen address, registers connection handler, starts the heartbeat. If `stop()` runs while the bind is still in progress, `start()` closes the listener it just opened and resolves with no heartbeat: nothing keeps running.
+  - **Throws:** the bind error (`EADDRINUSE`, `EACCES`, …) as the rejection of `start()`, never as an uncaught `'error'` event. A failed bind leaves the instance as if `start()` had not run: `address()` is `null` and a later `start()` binds normally. Once listening, a server-level error is logged at warn level (`RelayServer: server error`) and does not stop the relay.
 
 - `stop(): Promise<void>`
   - **Pre:** Relay started or already stopped (idempotent).
-  - **Post:** Closes all peer WebSockets, clears ring map, shuts down servers.
+  - **Post:** Stops the heartbeat and clears the ring map, then: terminates every WebSocket client that is not registered (it never sent a `hello`, so it has nothing to flush — with an external HTTP server, `ws` would otherwise wait for it forever); closes every registered one (a close frame, as before); closes the `WebSocketServer` (no new upgrades). Registered clients get `STOP_GRACE_MS` (2 000 ms) to finish the close handshake; any WebSocket still open after it is terminated, with one warn line `RelayServer: terminating connections that did not close within the grace period` (`{ connections, graceMs }`). Then the HTTP listener is closed (after the WebSockets, so a `stop()` during the bind still lets `start()` see its listener and close it) and every HTTP connection that never upgraded (a bare TCP connection, an unanswered plain HTTP request; the relay answers none) is destroyed (`closeAllConnections`); `stop()` resolves once the listener has closed, logging `RelayServer: stopped`. No client can hold it: it resolves within the grace plus the time to tear sockets down.
 
 - `address(): { host: string; port: number } | null`
   - **Pre:** Relay is started.
@@ -508,7 +512,8 @@
 - Relay sees only opaque hex payloads; never validates or decrypts (Noise KK at peer layer provides auth).
 - **No L4 source-IP filter.** Multiplexing is by `partyId` from the client `hello`, not by remote address; any host that can reach the relay can attempt to claim a partyId. Cryptographic auth (Noise-KK + P-256 pubkey book at the peer layer) is the only gate on relay'd traffic. This is the deliberate counterpart to peer-mesh's `verifyClient` allowlist — the relay path trades the L4 pre-filter for routability through NAT / shared infrastructure.
 - WebSocket errors and closes both trigger cleanup.
-- Graceful shutdown closes all peer sockets; no forced close.
+- **Heartbeat.** Every `heartbeatMs` (default 20 s) the relay pings every connection, registered or not. A connection that has not answered the previous ping is terminated instead. Its close then frees its partyId slot and sends `peer-left` to the ring, as any close does. A dead client is gone within two intervals (20–40 s by default), so a reconnecting node is not refused its own slot for long.
+- Shutdown closes registered peer sockets gracefully (a close frame) and forces only what cannot or did not close: unregistered clients at once, registered ones that did not finish the close handshake after the 2 s grace, and connections that never upgraded.
 
 **Cross-component contracts:**
 - Depends on: Node.js http, WebSocket (ws library), relay wire format.
@@ -529,23 +534,23 @@
 **Public surface:**
 - `RelayTransportPeer` — Immutable peer descriptor with partyId and 65-byte publicKey.
 
-- `RelayTransportOptions` — Configuration with self identity, relay URL, ringId, peers, optional WebSocket constructor, pull timeout, logger.
+- `RelayTransportOptions` — Configuration with self identity, relay URL, ringId, peers, optional WebSocket constructor, pull timeout, `reconnect?: { initialMs?, maxMs? }` (relay reconnect backoff, default 1000 / 30000 ms), `liveness?: { connectMs?, ackMs?, pingIntervalMs?, pongMs? }` (defaults 10 000 / 10 000 / 20 000 / 10 000 ms), logger. The daemon passes neither `reconnect` nor `liveness`.
 
 - `RelayTransport` (implements Transport) — Transport layer over shared relay; single WebSocket to relay, per-peer Noise-KK sessions. Internally serialized; broadcast and pull are concurrent-safe.
 
 - `constructor(options: RelayTransportOptions)`
   - **Pre:** `options.self.partyId` not in peer list. ringId is non-empty string (derived from pubkey book).
   - **Post:** Initializes transport state (peer states with status, pending pulls). Does not connect to relay yet. `peers` = every ring member, self included, ascending (the `Transport` contract in [core.md](core.md)): `options.peers` plus `options.self.partyId`.
-  - **Throws:** `Error` if self is in peer list.
+  - **Throws:** `Error` if self is in peer list, or a `reconnect` / `liveness` value is not a finite number ≥ 1, or `reconnect.maxMs` < `reconnect.initialMs`.
 
 - `start(): Promise<void>`
-  - **Pre:** Transport not already started.
-  - **Post:** Connects to relay WebSocket. Registers message handler. Sends hello with ringId and partyId. Relay responds with ack + roster; triggers handshakes for all peers in roster (initiators send hs1, responders wait for hs1).
-  - **Throws:** `Error` if relay connection fails.
+  - **Pre:** none; a second call is a no-op.
+  - **Post:** Makes the first connection attempt: opens the relay WebSocket and sends hello with ringId and partyId. Resolves once the hello is written **or the attempt has failed** — a relay that is down or unreachable does not fail `start()` (an upgrade that never completes fails after `connectMs`, 10 s); the failure is logged at warn and the next attempt scheduled (see Reconnect). Relay responds with ack + roster; triggers handshakes for all peers in roster (initiators send hs1, responders wait for hs1). Logs `relay-transport: started` unless `stop()` cut the attempt short.
+  - **Throws:** `SyntaxError` (from `ws`) only when the relay URL is malformed — no attempt is made. Never for an unreachable relay.
 
 - `stop(): Promise<void>`
   - **Pre:** Transport started or already stopped (idempotent).
-  - **Post:** Rejects pending pulls, closes relay WebSocket, clears peer states.
+  - **Post:** Cancels any pending reconnect, clears the socket's ping, pong and ack timers at once (not on the close event, which a graceful close may report up to 30 s later), rejects pending pulls, closes the relay WebSocket (aborting an attempt still connecting, whose `start()` then resolves), clears peer states. No connection attempt follows.
 
 - `broadcast(msg: Uint8Array): Promise<void>`
   - **Post:** Encrypts msg independently for each connected peer; sends via relay frames. Silently skips offline peers. Logs warn if individual sends fail.
@@ -555,13 +560,17 @@
 
 - `pull(key: BlobKey): Promise<Uint8Array | null>`
   - **Pre:** key.from is in peer list.
-  - **Post:** If peer is not connected, returns null (an initiator first starts a fresh handshake to an online peer that is disconnected, or whose handshake is older than 10 s). Otherwise sends pull-req, waits up to `pullTimeoutMs` (default 30s), returns blob, or null when the request cannot be sent, the peer's session ends (record failure, re-handshake, `peer-left`, relay close) or the timeout passes — all transient.
+  - **Post:** If peer is not connected, returns null (an initiator first starts a fresh handshake to an online peer that is disconnected, or whose handshake is older than 10 s; inside the restart window described under Re-handshake, it starts when the window ends). Otherwise sends pull-req, waits up to `pullTimeoutMs` (default 30s), returns blob, or null when the request cannot be sent, the peer's session ends (record failure, re-handshake, `peer-left`, relay close) or the timeout passes — all transient.
   - **Throws:** `Error` if key.from is not in peer list. Pending pulls reject when the transport stops.
 
 - `servePulls(handler: (from: PartyId, key: BlobKey) => Uint8Array | null): Unsubscribe`
   - **Pre:** handler not already registered.
   - **Post:** Registers pull server.
   - **Throws:** `Error` if handler already registered.
+
+- `isConnected(partyId: PartyId): boolean` (Transport interface)
+  - **Post:** `true` for self. For a peer, `true` while its status is `connected` with a session (the Noise-KK handshake over the relay completed and no session end has happened since). `false` for `disconnected`, `waiting-for-hs1` and `waiting-for-hs2`, for every peer while the relay socket is down (a drop marks them all `disconnected`), for an unknown partyId and after `stop()`. It has no side effect: unlike a send or pull, it never starts a handshake.
+  - **Throws:** Never.
 
 **Invariants:**
 - Role: lower partyId is initiator (sends hs1 when peer appears), higher is responder (waits for hs1).
@@ -571,14 +580,27 @@
 - A `pull-resp` resolves a pending pull only when it comes from the peer the pull was sent to; a response from any other peer is ignored.
 - Per-peer send chain serializes every frame to that peer — hs1, hs2 and seal-then-send of records — so frames reach the relay in counter order. A responder enqueues hs2 in the same synchronous step that makes the session usable, so no record overtakes it. A record queued under a session that has since been replaced is dropped, not sent.
 - Handshake: initiator sends message1 (raw 65-byte ephemeral, not encrypted), responder replies with message2 (also raw), then both derive AES-GCM session.
-- Peer roster discovered via relay's ack + peer-joined/peer-left events. Initiators trigger handshake on roster update (a join restarts any handshake in flight).
-- Relay reconnect is NOT implemented; operator restart on relay drop.
+- Peer roster discovered via relay's ack + peer-joined/peer-left events. Initiators trigger handshake on roster update (a join restarts any handshake in flight), within the restart window described under Re-handshake.
+- **Reconnect.** A relay socket ends when it fails to open (including an upgrade still incomplete after `connectMs`), drops (`close` or `error`; one drop schedules one attempt), gets no ack within `ackMs` of the hello, misses a pong (see Liveness), or the relay answers hello with an `error` before the ack (a refused hello, e.g. a connection the relay has not yet seen drop still holds this partyId). The client terminates the last three at once, with no close handshake. Unless `stop()` was called:
+  - every peer goes offline: `disconnected`, session and initiator state cleared, pending pulls resolve null, incoming frames still queued from the old socket discarded;
+  - a warn names the reason, the attempt number and the next delay (`delayMs`);
+  - the next attempt runs after `min(maxMs, initialMs·2^k)` plus up to 10 % random jitter, where k counts failed attempts since the last ack (defaults 1000 / 30000 ms: 1 s, 2 s, 4 s … 30 s);
+  - the relay's ack to a hello resets k to 0, and the roster logic (ack, `peer-joined`) restarts the handshakes (a peer's first handshake at once; a restart less than a second after that peer's last one waits for the end of that window);
+  - retries continue until `stop()`. Only events and messages from the current socket count.
+- **Liveness.** Each relay socket has its own ping, pong and ack timers; they are cleared on that socket's close, on a drop, and on `stop()`.
+  - From `open`, the client pings the relay every `pingIntervalMs` (20 s). A ping whose pong has not arrived within `pongMs` (10 s) drops the socket ("relay did not answer a ping"). No new ping goes out while one is unanswered.
+  - From the hello, the relay must ack within `ackMs` (10 s). Otherwise the socket is dropped ("relay did not acknowledge hello") as a failed attempt, so k is not reset.
+  - The upgrade (TCP connect plus HTTP 101) must complete within `connectMs` (10 s, the ws `handshakeTimeout`).
+  - A dead path is noticed within about 30 s on the client (20 s to the next ping, 10 s for its pong) and 20–40 s on the relay (its heartbeat, see `server.ts`).
+- While disconnected from the relay, broadcasts skip every peer and pulls return null, and `isConnected` is `false` for every peer. A ceremony is therefore not started meanwhile: the leader answers 503 before its gate when a party is not connected (Ruling P10; [daemon.md](daemon.md), `leader.ts`). For a ceremony already running the nulls are transient: its pulls retry until its deadline, so an outage during it that ends before the deadline only delays it.
 - Broadcast is fan-out with independent encryption per peer.
 - Pull timeout returning null is transient; BlobPuller's retry handles retries.
 - **Re-handshake.** A peer whose session breaks is re-keyed by a fresh handshake, always started by the initiator:
-  - An initiator whose record open fails (or whose seal-then-send fails) drops the session and sends a new hs1 at once; it also starts one on the next send or pull to an online peer that is disconnected or whose handshake is older than 10 s, and on a re-handshake request.
-  - A responder accepts a 65-byte handshake frame from the peer in any state: when a frame fails to open under the current session and has the handshake shape, it is a fresh hs1 and the responder answers it with hs2 and a new session. A responder whose record open fails on any other frame, or that receives a record while it has no session, drops it and sends a **re-handshake request** — a frame with an empty payload — to the initiator.
-  - While waiting for hs2, an initiator drops frames that do not have the handshake shape (records the peer sent under the old session).
+  - An initiator whose record open fails (or whose seal-then-send fails) replaces the session with a new handshake; it also starts one on the next send or pull to an online peer that is disconnected or whose handshake is older than 10 s, on the roster (ack, `peer-joined`), and on a re-handshake request. All of these go through the one rate-limited start below: the new hs1 goes out at once when the last start for that peer was over a second ago, else when that window ends (the old session stays until then; its frames that fail to open are dropped, logged once per pending restart).
+  - A responder accepts a 65-byte handshake frame from the peer in any state: when a frame fails to open under the current session and has the handshake shape, it is a fresh hs1 and the responder answers it with hs2 and a new session. A responder whose record open fails on any other frame, or that receives a record while it has no session, drops it and sends a **re-handshake request** — a frame with an empty payload — to the initiator. A responder whose own handshake fails (an hs1 that does not process, e.g. not a point on the curve) ends its session to `waiting-for-hs1` and sends the same request, so the initiator does not keep a session or an hs2 wait the responder no longer shares. (Only while a relay socket is up and is the one the hs1 arrived on: a relay close that lands while the responder computes, or before it starts, leaves the peer `disconnected` and silent, and the reconnect re-handshakes.)
+  - **A request restarts the handshake from any state**, `waiting-for-hs2` included: the responder discarded our hs1, so waiting for its hs2 cannot succeed.
+  - **Rate limit, with deferral.** Every initiator handshake start, whatever triggers it (roster, record failure, seal-then-send failure, stale handshake, re-handshake request, the next send or pull), goes through one per-peer limiter: at most one start per peer per `REHANDSHAKE_MIN_INTERVAL_MS` (1000 ms), counted from the last start of any kind (`lastRestartAt`). A peer's first handshake is immediate. A trigger inside the window is **deferred, not dropped** (nobody retries it: the responder sends a request once, and an idle initiator has nothing else to notice the split): one per-peer timer starts the handshake when the window ends, and further triggers merge into it (at most one pending timer per peer; debug log `handshake restart deferred (rate limit)` when it is armed). The timer is cleared by `stop()`, a relay drop, `peer-left`, and any start that happens first (that start answers the deferred triggers); it does nothing for a peer that is no longer online. When it fires it normally starts the handshake. The one exception is a timer armed only by re-handshake requests: it skips the start if the peer is `connected` under a session other than the one held when the latest request arrived (a handshake that completed since has answered it, so a request that crossed a restart in flight costs no second handshake). A deferred record-failure, stale, roster or send/pull start always runs unless a start already happened since. Result: a pair whose handshakes keep failing (say, mismatched keys, with a peer sending continuously) restarts at most once per second per peer, however much traffic arrives. A clock that steps back does not hold starts off.
+  - While waiting for hs2, an initiator drops frames that do not have the handshake shape (records the peer sent under the old session) but runs the stale check on them (`maybeStartHandshake`): a handshake older than 10 s restarts, a fresher one is left alone.
   - Every session end (record failure, re-handshake, `peer-left`, relay close) resolves the peer's pending pulls with null.
 
 **Cross-component contracts:**
@@ -589,10 +611,10 @@
 **Notes / gotchas:**
 - Role is symmetric (lower dials, higher listens) but implemented via relay routing. Initiator sends hs1 as frame(to=partyId, payload=hs1); responder receives incoming(from=partyId, payload=hs1).
 - Per-peer `processing` flag is CRITICAL: without it, concurrent incoming frames could race the handshake state machine.
-- The re-handshake request is unauthenticated (it carries nothing); whoever can inject relay frames can force re-handshakes, which is no more than the relay can do by dropping frames.
+- The re-handshake request is unauthenticated (it carries nothing); whoever can inject relay frames can force re-handshakes, which is no more than the relay can do by dropping frames. The initiator's restart limiter caps every restart at one per peer per second, so a frame injector (empty frames, or frames that fail to open) can force at most that many handshakes, which is no worse than the relay dropping frames (the frames themselves are still dispatched and dropped one by one).
 - Broadcast and pull are independent per-peer; one peer's failure doesn't affect others.
 
-**Reconnect behavior (operator-facing):** No automatic reconnect. If the relay WebSocket drops mid-session, `handleRelayClose()` sets all peers to disconnected and clears sessions; subsequent broadcasts silently no-op (offline peers are skipped) and pulls return null. The daemon does NOT re-dial. Operators recover via `systemctl restart otzi`. Acceptable for short-lived federations; production federations that need stability should use peer-mesh transport, which has initiator-side exponential-backoff reconnect built in.
+**Reconnect behavior (operator-facing):** Automatic; no operator restart. A relay that is down when the daemon starts, restarts, or drops the connection is redialled with backoff (1 s, 2 s, 4 s … capped at 30 s, plus up to 10 % jitter), each failed attempt logged at warn with its next delay. An unreachable relay costs at most 10 s per attempt (connect timeout), so the daemon starts promptly and stays up meanwhile (no crash-loop under systemd). Silent failures are caught by keepalives on both sides. The client pings every 20 s and drops a relay that does not pong within 10 s; the relay pings every 20 s and evicts a client that missed the previous ping. A TLS reverse proxy in front of the relay therefore sees traffic at least every 20 s, and any proxy idle timeout above that keeps the connection open. No ceremony starts during the outage: a `dkg` or `sign` request gets a retryable 503 (`signer <id> is not connected` / `party <id> is not connected`) until every party has reconnected and re-handshaked, and nothing is announced or approved meanwhile. A ceremony already running when the outage begins sees null pulls, keeps retrying, and completes after the reconnect if that comes before its deadline; otherwise it times out as usual.
 
 ---
 

@@ -5,10 +5,12 @@
 - Linux (tested: Debian 12+, Ubuntu 24.04+).
 - `nodejs` ≥ 22. On Ubuntu 24.04, the default `nodejs` package is too old —
   install [nodesource's 22.x](https://github.com/nodesource/distributions) first.
-- systemd (the .deb installs a unit file at `/lib/systemd/system/otzi.service`).
+- systemd (the .deb installs the unit files `/lib/systemd/system/otzi.service` and
+  `otzi-relay.service`; the second is installed disabled and is needed only for the
+  relay transport, see [Relay coordinator](#relay-coordinator)).
 - One open port per node for peer-mesh (default `8800`); leader nodes also
   open the bootstrap-server port temporarily (default `7090`) during initial
-  pubkey exchange. The operator API is local-only over a UDS at
+  pubkey exchange, reachable only by the members (see step 3 of the walkthrough). The operator API is local-only over a UDS at
   `/var/run/otzi/otzi.sock` — no operator-facing port is exposed.
 - Outbound HTTPS from the host where you run `otzi btc *` to the Esplora API
   (mempool.space for the configured network, or your `esplora_url`). The daemon
@@ -32,7 +34,8 @@ follow up with `sudo apt -f install` to resolve.)
    ```
    debconf will prompt for:
    - **Restore from a backup?** — `Yes` skips every other prompt and restores the
-     node from an archive (see § Backup + recovery).
+     node from an archive (see § Backup + recovery). Asked only while
+     `/etc/otzi/daemon.toml` does not exist, so not on an upgrade.
    - **Node role** (`leader` / `leaf`) — leader hosts bootstrap, leaves connect to it.
    - **Operator usernames** (space-separated) — each gets `usermod -aG otzi`.
    - **Bitcoin network** — `mainnet`, `testnet4` or `signet`. Every node in the
@@ -46,8 +49,22 @@ follow up with `sudo apt -f install` to resolve.)
        separated `host[:port]` list of every other node — on a leaf,
        the leader is auto-derived from the bootstrap leader URL, so
        you only list peers *other than* the leader).
-     - For `relay`: **Relay URL**.
+     - For `relay`: **Relay URL** (`ws://` or `wss://`, the scheme in any case,
+       written lowercased; the same on every node, see
+       [Relay coordinator](#relay-coordinator)). Any other answer, or none, is left
+       out of `daemon.toml` with a warning on stderr, and the daemon and `otzi setup`
+       then refuse the config with `config transport.url: required when
+       transport.kind = "relay"` until you add `url` under `[transport]`. A relay
+       config has no `[[peers]]`, so no peer list is asked.
    - **Bootstrap bind** (leader) or **leader URL** (leaf).
+   - **Number of nodes in the ring (including this one)** — asked only on a
+     leader under `relay`. An integer from 2 to 255; it becomes `[bootstrap]
+     parties`, which tells the leader how many registrations to admit
+     (`parties − 1`). Anything else is left out of `daemon.toml` with a warning
+     on stderr, and `otzi setup` (and the daemon) then refuse the config with
+     `config bootstrap.parties: required when transport.kind = "relay" and
+     bootstrap.role = "leader"` until you add the key under `[bootstrap]`.
+     Peer-mesh counts `[[peers]]` instead, and a leaf never takes the key.
    - **Node identifier** (defaults to `hostname -s`; local logging label only).
 
 2. **Log out / log back in** (or `newgrp otzi`) so your shell picks up
@@ -58,16 +75,84 @@ follow up with `sudo apt -f install` to resolve.)
    sudo -u otzi otzi setup /etc/otzi/daemon.toml
    ```
    (Or, as a member of the `otzi` group, just `otzi setup
-   /etc/otzi/daemon.toml`.) Records identity pubkeys + each peer's
-   reachable address in `/var/lib/otzi/pubkeys.json` and prints the
-   96-bit SHA-256 fingerprint of the pubkey book, formatted
-   `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx`. **Compare the fingerprint on every node
-   out of band before going further.** A mismatch means someone tampered with the
-   exchange: delete `/var/lib/otzi/pubkeys.json` on every node and redo setup.
+   /etc/otzi/daemon.toml`.) Records identity pubkeys (and, under peer-mesh, each
+   peer's reachable address) in `/var/lib/otzi/pubkeys.json` and prints a banner
+   like this one:
+   ```
+     otzi: setup complete — node-a
+     fingerprint: 3f2a-9c41-07be-d5e0-6a18-b2c7
+     this node: 1c9e04ab5d2f7a10
+     ring size: 3
+     party 0: 1c9e04ab5d2f7a10  node-a.example:8800
+     party 1: 7d20f3c58e1b9264  node-b.example:8800
+     party 2: e4b1a960c37d0f5e  node-c.example:8800
+     refused registrations: none
+   ```
+   A key id is the first 16 hex characters (64 bits) of SHA-256 over a node's
+   identity pubkey. A relay book has no endpoints, so its `party` lines end after
+   the key id. Two entries with the same key id get a `⚠ duplicate key id <id>`
+   line. Only the leader prints `refused registrations:`: how many registrations
+   it turned away, by reason (under relay: after the ring was full, duplicate,
+   with an endpoint; under peer-mesh: duplicate, not on the `[[peers]]`
+   allowlist). Before going further:
+   - **Compare the fingerprint on every node out of band.** A mismatch means
+     someone tampered with the exchange: delete `/var/lib/otzi/pubkeys.json` on
+     every node and redo setup.
+   - **Confirm every key id belongs to one of your nodes.** Note each node's
+     `this node:` id; every `party` line must show one of them. An unknown id means
+     someone else registered: delete `/var/lib/otzi/pubkeys.json` on every node and
+     redo setup. The fingerprint cannot catch this, because the extra key is in
+     every node's book.
+   - **Count the party lines.** There must be exactly one per node you set up,
+     and `ring size:` must be that number.
+
    partyIds are assigned deterministically by sorted-pubkey-bytes order — every
    node observes the same mapping.
 
-4. **Enable + start the daemon** on every node:
+   **Admission depends on the transport.** Every node must use the same one.
+   - **Peer-mesh:** the leader admits only the endpoints in its `[[peers]]`.
+   - **Relay:** nodes have no endpoints, so the leader admits the first
+     `parties − 1` registrations, where `[bootstrap] parties` on the leader is the
+     ring size including itself (see [config.md](config.md#bootstrap)). The
+     leader's `parties` must equal the number of nodes you set up: one too low
+     turns a member away with `bootstrap is full`, one too high leaves the leader
+     waiting until it times out.
+   - A member whose transport differs from the leader's fails with
+     `setup: the leader expects … registrations …; this node is configured for … — use the same transport on every node`.
+   - A member that fails with `setup: bootstrap is full` was beaten to its slot by
+     someone else, or the leader's `parties` is lower than the number of nodes; the
+     leader's `refused registrations:` line counts the registrations it turned away
+     after the ring was full. Likewise, if the leader finishes before all your members have
+     registered, someone else filled a slot; a member that arrives after that
+     fails with `register: POST failed: … (ECONNREFUSED); the leader is not
+     accepting registrations — …`. That message also appears when the leader has
+     not started yet, so first check whether the leader has finished, then compare
+     key ids. Either way, an unknown key id means: abort, delete
+     `/var/lib/otzi/pubkeys.json` on every node and redo setup.
+   - If the leader times out with `received 1 of 2 registrations` (or similar),
+     fewer members registered than it expected: check that every member ran
+     setup and, under relay, the leader's `parties`.
+
+   **Bootstrap port exposure.** While setup runs, the leader's bootstrap port
+   (default `7090`) must be reachable only by the members. This matters most
+   under relay, where admission is by count. Use one of:
+   - a VPN;
+   - a firewall rule that admits only the members' addresses;
+   - a loopback bind reached through SSH tunnels: `bind = "127.0.0.1:7090"` on the
+     leader, and on each member `ssh -N -L 7090:127.0.0.1:7090 <leader-host>` with
+     `leader_url = "http://127.0.0.1:7090"`.
+
+   The installer's bootstrap bind defaults to `0.0.0.0:7090`, which peer-mesh
+   needs reachable by the members. Under relay, prefer the VPN address or the
+   loopback-plus-tunnel bind above: a relay leader bound to every interface
+   (`0.0.0.0` or `::`) prints a warning that the port must be reachable only by
+   the members during setup.
+
+   The leader stops listening once every member has registered. Remove any
+   firewall opening you made for setup.
+
+4. **Enable + start the daemon** on every node (under `relay`, preferably with the
+   relay server already running: see [Relay coordinator](#relay-coordinator)):
    ```
    sudo systemctl enable --now otzi
    ```
@@ -112,16 +197,114 @@ follow up with `sudo apt -f install` to resolve.)
    ```
    otzi vault
    ```
-   The address and `<threshold>-of-<parties>` must be identical on all nodes.
+   The address and `<threshold>-of-<parties>` must be identical on all nodes,
+   and `<parties>` must be the number of nodes you set up (under relay, the
+   leader's `[bootstrap] parties`).
+   `otzi vault` asks the running daemon for the vault it loaded and compares
+   `vault-pubkey.json` with the answer; a file that differs is refused (see
+   [`cli.md`](./cli.md)).
    Fund the address, then `otzi btc balance` and `otzi btc send` (see
    [`cli.md`](./cli.md)).
 
 Logs: `journalctl -u otzi -f`.
 
+## Relay coordinator
+
+Under `[transport] kind = "relay"` the daemons do not dial each other: every node
+connects to one relay server, which routes opaque encrypted frames between them.
+Run that server on a **coordinator host**, once for the whole ring. The host can
+be one of the ring nodes or a separate machine. The `.deb` ships the server as
+`otzi-relay.service`, installed **disabled**: nothing starts it until you do. On
+a ring node the relay does not run as the daemon's `otzi` user: systemd gives it
+a transient user of its own (`DynamicUser=yes`) and hides every other process
+from it (`ProtectProc=invisible`), so a compromised relay cannot read the share,
+the identity key or the daemon's environment (see [Service sandbox](#service-sandbox)).
+
+1. **Install the package on the coordinator host.** On a ring node it is already
+   there. On a separate host the debconf prompts can take any answer: the relay
+   reads nothing from `daemon.toml`, and `otzi.service` stays disabled and, with
+   no share password file, does not start.
+
+2. **Check the listen address** in `/etc/otzi/relay.env` (`root:root`, mode `0644`,
+   no secret). The postinst creates it when it is missing, and no later install,
+   upgrade or reconfigure overwrites it:
+   ```
+   OTZI_RELAY_LISTEN=127.0.0.1:7100
+   ```
+   The unit runs `otzi relay --listen ${OTZI_RELAY_LISTEN}`. The host part is
+   required: the relay has no built-in default, so it never binds every interface
+   by accident (an IPv6 host goes in brackets, `[::1]:7100`). The loopback default
+   suits a TLS reverse proxy on the same host. Edit the file as root and restart
+   the unit to change it. A port below 1024 needs a drop-in granting
+   `AmbientCapabilities=CAP_NET_BIND_SERVICE` (`sudo systemctl edit otzi-relay`).
+
+3. **Put TLS in front of it.** The relay speaks plain WebSocket and has no login
+   of its own: the Noise-KK layer between the daemons authenticates and encrypts
+   everything the relay carries, so the relay sees only opaque frames and cannot
+   read or forge them. It can still be disrupted: any host that can reach the port
+   can claim a party slot in a ring until the squatter disconnects. So keep the
+   relay on loopback behind a TLS reverse proxy, or on a VPN, and use the proxy's
+   or the firewall's own allowlist when you can. The proxy must pass WebSocket
+   upgrades and keep an idle connection open for longer than the 20 s keepalive
+   ping that both the relay and the daemons send. With nginx:
+   ```nginx
+   server {
+       listen 443 ssl;
+       server_name relay.example;
+       ssl_certificate     /etc/letsencrypt/live/relay.example/fullchain.pem;
+       ssl_certificate_key /etc/letsencrypt/live/relay.example/privkey.pem;
+
+       location / {
+           proxy_pass http://127.0.0.1:7100;
+           proxy_http_version 1.1;
+           proxy_set_header Upgrade $http_upgrade;
+           proxy_set_header Connection "upgrade";
+           proxy_read_timeout 3600s;
+           proxy_send_timeout 3600s;
+       }
+   }
+   ```
+   (Caddy needs only `relay.example { reverse_proxy 127.0.0.1:7100 }`.)
+
+4. **Start the relay** on the coordinator host:
+   ```
+   sudo systemctl enable --now otzi-relay
+   journalctl -u otzi-relay -f
+   ```
+   It logs `RelayServer: listening {"host":"127.0.0.1","port":7100}` at start, then
+   one line per connect and disconnect. It restarts itself after a crash
+   (`Restart=on-failure`). Daemons that lose the relay redial it with a backoff of
+   1 s up to 30 s and re-handshake with their peers; a relay restart does not
+   need a daemon restart. While a node is disconnected no ceremony starts: a
+   `sign` or `dkg` request gets a retryable `503` (`signer <id> is not
+   connected`) before the leader's gate, so retry once the ring has reconnected.
+   A ceremony already in flight when the relay drops only waits: its pulls retry
+   and it completes after the reconnect if that comes before its deadline.
+
+5. **Point every node at it.** `[transport] url` in `/etc/otzi/daemon.toml` is the
+   `wss://` URL of the proxy, the same on all nodes (`url = "wss://relay.example"`;
+   plain `ws://` is for loopback or a VPN). The installer's **Relay URL** prompt
+   writes it. Change the file by hand if the URL changes, then restart the daemon.
+
+The `otzi setup`, `otzi generate` and `otzi vault` steps are the same for both
+transports. Two differences matter during setup:
+
+- The bootstrap exchange runs over the leader's HTTP bootstrap port, not through
+  the relay, and under relay the leader admits members **by count**. Keep that
+  port reachable only by the members until setup ends (see step 3 of the
+  walkthrough).
+- The daemons connect to the relay when they start, so it is best to start the
+  relay before step 4 of the walkthrough. The order is advisory, not required: a
+  daemon that comes up first logs a warning and redials the relay with a backoff of
+  1 s up to 30 s, and connects as soon as the relay is there.
+
 ## Operator API
 
-Default: UDS at `/var/run/otzi/otzi.sock` (mode 660, owned otzi:otzi).
+Default: UDS at `/var/run/otzi/otzi.sock` (mode 660, owned otzi:otzi; it and its
+directory exist only while the daemon runs).
 Anyone in the `otzi` group can connect via the CLI.
+The directory is sticky, so a group member cannot remove the daemon's socket. `otzi vault`
+and `otzi btc` trust what the daemon behind that socket says about the vault.
 
 To add a new operator after install:
 ```
@@ -142,17 +325,20 @@ sudo dpkg-reconfigure otzi-headless
 | `/usr/bin/otzi` | CLI wrapper | root:root 755 |
 | `/usr/lib/otzi/entrypoint.mjs` | esbuild bundle | root:root 644 |
 | `/lib/systemd/system/otzi.service` | systemd unit | root:root 644 |
+| `/lib/systemd/system/otzi-relay.service` | systemd unit of the relay server (installed disabled; see [Relay coordinator](#relay-coordinator)) | root:root 644 |
 | `/etc/otzi/` | config dir (setgid; only root writes, group otzi reads) | root:otzi 2750 |
 | `/etc/otzi/daemon.toml` | rendered config (preserved across upgrades; owner and mode re-applied on every configure) | root:otzi 640 |
 | `/etc/otzi/otzi.env` | share password for the unit (`OTZI_SHARE_PASSWORD=…`) | root:root 600 |
+| `/etc/otzi/relay.env` | listen address of `otzi-relay.service` (`OTZI_RELAY_LISTEN=127.0.0.1:7100`); created when missing, never overwritten | root:root 644 |
 | `/etc/otzi/address-book.otzi.json` | this node's address book (optional; owner and mode re-applied on every configure) | root:otzi 640 |
 | `/var/lib/otzi/` | data dir (setgid; group otzi can write) | root:otzi 2770 |
-| `/var/lib/otzi/identity.json` | ECDH identity | written 660 |
+| `/var/lib/otzi/identity.json` | ECDH identity | otzi:otzi 660 |
 | `/var/lib/otzi/pubkeys.json` | pubkey book from bootstrap | otzi:otzi 644 |
 | `/var/lib/otzi/share.json` | encrypted Ötzi v4 share | otzi:otzi 600 |
 | `/var/lib/otzi/share.json.pending` | DKG staging file; exists while a DKG runs, or after a DKG that failed once this node had confirmed | otzi:otzi 600 |
 | `/var/lib/otzi/vault-pubkey.json` | public vault metadata | otzi:otzi 644 |
-| `/var/run/otzi/otzi.sock` | UDS socket for operator CLI | otzi:otzi 660 |
+| `/var/run/otzi/` | runtime dir for the socket (setgid and sticky: a group member cannot unlink or rename the daemon's socket and bind a look-alike). Exists only while `otzi.service` runs: the unit's `RuntimeDirectory=` creates it at start and removes it at stop, and nothing else creates it (only root can create entries in `/run`), so there is no directory to plant a socket in while the daemon is down | otzi:otzi 3770, while the daemon runs |
+| `/var/run/otzi/otzi.sock` | UDS socket for operator CLI; while the daemon is down the CLI finds no socket and reports the daemon unreachable | otzi:otzi 660, while the daemon runs |
 
 ## Operations
 
@@ -165,6 +351,7 @@ captures them in journald. There is no daemon-level log file to manage.
 journalctl -u otzi -f             # live tail
 journalctl -u otzi --since today  # windowed
 journalctl -u otzi -p warning     # filter by priority
+journalctl -u otzi-relay -f       # the relay server, on the coordinator host
 ```
 
 ### Disk + retention
@@ -200,6 +387,49 @@ address the warning names, `sudo mv /var/lib/otzi/share.json.pending
 overwrites it. If the file is the loaded share itself (a second name left by a
 failed removal after the commit), the daemon removes it at startup and logs at
 info level.
+
+### Service sandbox
+
+The unit (`/lib/systemd/system/otzi.service`) runs the daemon as the `otzi` user
+with these restrictions, which also bind everything the daemon starts, such as an
+`exec` gate command:
+
+| Setting | Effect |
+|---|---|
+| `ProtectSystem=strict`, `ReadWritePaths=/var/lib/otzi` | The file system is read-only except `/var/lib/otzi` (and the unit's `/run/otzi`). |
+| `ProtectHome=true`, `PrivateTmp=true` | No `/home`, `/root` or `/run/user`; a private `/tmp`. |
+| `PrivateDevices=true` | A private `/dev` with only `null`, `zero`, `full`, `random`, `urandom`, `tty` and the pty devices: no block devices, USB or serial ports. |
+| `NoNewPrivileges=true`, `RestrictSUIDSGID=true` | No gaining privilege through setuid or setgid programs (`sudo`, `su`), and no creating setuid or setgid files. |
+| `ProtectKernelTunables=true`, `ProtectKernelModules=true`, `ProtectKernelLogs=true`, `ProtectControlGroups=true` | `/proc/sys`, `/sys` and the cgroup file system are read-only; no loading kernel modules; no kernel log. |
+| `ProtectClock=true`, `ProtectHostname=true` | The system clock, the hardware clock and the hostname cannot be changed. |
+| `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` | TCP/UDP, the operator socket and nothing else. Netlink is what glibc's name resolution (`getaddrinfo` with `AI_ADDRCONFIG`) uses to learn the host's address families. |
+| `RestrictNamespaces=true`, `RestrictRealtime=true`, `LockPersonality=true`, `SystemCallArchitectures=native` | No new namespaces, no realtime scheduling, no personality change, no non-native system calls. |
+
+Deliberately not set:
+
+- `MemoryDenyWriteExecute`: Node's V8 JIT needs writable and executable memory.
+- `SystemCallFilter`: an `exec` gate command runs inside this sandbox, and so does
+  whatever it starts. Its system calls are the operator's to choose.
+- An empty `CapabilityBoundingSet`: the daemon runs with no capabilities already;
+  the setting would only stop a drop-in from granting one, such as
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE` to listen on a port below 1024.
+
+`otzi-relay.service` carries the same restrictions, except that it has no
+`ReadWritePaths=` and no `RuntimeDirectory=`: the relay holds no key, reads no vault
+file and writes nothing, so its whole file system is read-only. It also runs as a
+**transient user**, not as `otzi`: `DynamicUser=yes` allocates a fresh uid and gid for
+each run, separate from the daemon's `otzi` uid, and `ProtectProc=invisible` hides
+every process it does not own. A coordinator that is also a ring node therefore
+keeps the share, the identity key and the daemon's environment out of the relay's
+reach. The relay's logs show that transient uid. It gets its listen address only
+through the environment: systemd reads `/etc/otzi/relay.env` as root before it
+switches users.
+
+`exec` gate commands therefore see no `/dev` beyond the basics and have no setuid
+helper to call; see [`gates.md`](./gates.md) § `exec`. To loosen any of this for
+one host, add a drop-in with `sudo systemctl edit otzi` (or `otzi-relay`) rather than
+editing the packaged unit, which an upgrade replaces. `systemd-analyze security
+otzi.service` shows the unit's exposure.
 
 ### Address book
 
@@ -253,6 +483,12 @@ The archive contains:
 
 (Inside the archive, paths are stored without the leading slash.)
 
+The share, identity and pubkey book must sit directly inside `/etc/otzi` or
+`/var/lib/otzi`, as the `.deb` configures them: `otzi backup` refuses a
+`daemon.toml` that puts one in a subdirectory or elsewhere, or names one file
+twice, because `otzi restore` would refuse that archive (see
+[`cli.md`](./cli.md) § Backup + restore).
+
 The password is auto-generated (32 chars from `[A-Za-z0-9]`, ~190 bits
 entropy) and printed once to stdout:
 
@@ -282,7 +518,18 @@ When installing the .deb on a new host, answer `Yes` to "Restore from a
 backup?". debconf prompts for the archive path and password; postinst
 pipes the password via stdin to `otzi restore --password-stdin`. If
 restore succeeds, the rest of the install prompts (network, role,
-peers, etc.) are skipped — config came from the backup.
+peers, etc.) are skipped — config came from the backup — and postinst sets
+the answer back to `No` and wipes the stored path and password, so later
+upgrades of the package leave the restored node alone.
+
+The question, and the restore, only happen while `/etc/otzi/daemon.toml` does
+not exist (a fresh install, or one where you moved it aside). On an installed
+node neither an upgrade nor `dpkg-reconfigure` asks it, and if the stored
+answer is still `Yes` (an earlier release left it so), postinst prints a
+warning on stderr, `skipping the restore from backup`, resets the answer and carries on with the
+normal upgrade. To restore onto an installed node, move `daemon.toml` and the
+other files restore lists aside first (see 2. below), then run
+`dpkg-reconfigure otzi-headless` or `otzi restore`.
 
 If restore fails (wrong password, corrupted archive, missing file),
 dpkg flags the package as half-installed. Retry via:
@@ -324,16 +571,24 @@ files it created and leaves everything else as it was.
 The CLI prompts for the password interactively. Use
 `--password-stdin` for scripted runs.
 
-Restore places each file at its canonical path with these modes:
+Restore places each file at its canonical path with these modes and owners:
 
-| Path | Mode |
-|---|---|
-| `/etc/otzi/daemon.toml` | 0640 |
-| `/etc/otzi/address-book.otzi.json` | 0640 |
-| share file (`[share].path`) | 0600 |
-| identity file | 0660 |
-| pubkey-book file | 0644 |
-| `/var/lib/otzi/vault-pubkey.json` | 0644 |
+| Path | Mode | Owner |
+|---|---|---|
+| `/etc/otzi/daemon.toml` | 0640 | root:otzi |
+| `/etc/otzi/address-book.otzi.json` | 0640 | root:otzi |
+| share file (`[share].path`) | 0600 | otzi:otzi |
+| identity file | 0660 | otzi:otzi |
+| pubkey-book file | 0644 | otzi:otzi |
+| `/var/lib/otzi/vault-pubkey.json` | 0644 | otzi:otzi |
+
+The owners are what restore sets when it runs as root (the debconf restore and
+`sudo otzi restore` both do) on a host with the `otzi` system user: it gives
+every file it places in `/var/lib/otzi` to `otzi:otzi`, because the daemon runs
+as `otzi` and could not read a root-owned `0600` share. Files in `/etc/otzi`
+keep the owner they are created with, `root:otzi` through the setgid
+directory. Run as another user, or on a host with no `otzi` user, restore
+changes no owner.
 
 The archive does not contain `/etc/otzi/otzi.env`. Recreate it with the share
 password, then start the daemon; it loads the restored share:
@@ -374,6 +629,12 @@ sudo apt remove otzi-headless    # keeps /etc/otzi/ and /var/lib/otzi/
 sudo apt purge otzi-headless     # ALSO removes the share + config + user
 ```
 
+`remove` and `purge` stop `otzi.service` and `otzi-relay.service` (an upgrade does not:
+a running daemon or relay keeps going until you restart it). They do not disable a unit
+you enabled yourself, so run `sudo systemctl disable otzi` (and, on the coordinator
+host, `otzi-relay`) first, or the enablement link stays behind. `purge` also removes
+`/etc/otzi/relay.env` with the rest of `/etc/otzi`.
+
 > **Warning:** `purge` deletes `/var/lib/otzi/share.json`. The vault is n-of-n:
 > losing any one share without a backup makes the funds unspendable. Run
 > `sudo otzi backup` on every node before purging if you might reinstall.
@@ -382,4 +643,13 @@ sudo apt purge otzi-headless     # ALSO removes the share + config + user
 
 `scripts/test-deb-container.sh` runs the install end-to-end inside an Ubuntu
 24.04 container with pre-seeded debconf answers, and verifies the rendered
-config + bundle invocation. Useful before tagging a release.
+config + bundle invocation. Besides the peer-mesh install and the backup/restore
+round-trip it runs relay variants: a relay leader (`parties` 3) and a relay leaf,
+each of which must render a `daemon.toml` without `[[peers]]` that parses, and leaders
+with a bad ring size or a relay URL that is not `ws://` or `wss://`, which must be
+warned about and left out. It also
+checks that `otzi-relay.service` is installed with its sandbox directives
+(`DynamicUser=yes`, `ProtectProc=invisible`, no `User=` or `Group=`), not
+enabled, that `/etc/otzi/relay.env` exists with the loopback default and
+survives a reconfigure, and that nothing creates `/run/otzi` before the daemon
+starts. It needs docker. Useful before tagging a release.

@@ -124,7 +124,7 @@
 **Cross-component contracts:**
 - Depends on: `toVaultKey`, `vaultPayment` (`src/otzi/lib`).
 - Written by: `config-merge.ts` (`loadAndValidate` at startup, path from its `vaultPubkeyPath` option), `vault-share.ts` (`createShareStager().commit()`, path from `ShareStagerOptions.vaultPubkeyPath`).
-- Consumed by: `otzi vault`, `otzi btc balance|send|sign` (read-only).
+- Consumed by: `otzi vault` (read-only; checked against the daemon's `vault-info`, since any member of the `otzi` group can rewrite the file), `otzi btc balance|send|sign` (read-only).
 
 ---
 
@@ -132,7 +132,7 @@
 **Purpose:** Daemon API request parsing and input rules (spec §6.1).
 
 **Public surface:**
-- `class RequestError extends Error { constructor(readonly status: 400 | 409, message: string) }`
+- `class RequestError extends Error { constructor(readonly status: 400 | 409 | 503, message: string) }` — the handler answers `status` with `{ error: message }`. 503 is the leader's retryable refusal before its gate (`leader.ts`): nothing was announced and no approval was consumed.
 - `const NO_VAULT_MESSAGE = 'no vault loaded — run otzi generate, then restart the daemon'` — the 409 text for every op that needs a loaded vault (`vault-info`, `sign`).
 - `interface LeaderSignRequest { ceremonyId: string; signers: PartyId[]; proposal: SendProposal }`
 
@@ -221,11 +221,12 @@
   - **`runDkg(req: { ceremonyId: string }): Promise<{ ceremonyId: string; address: string; internalKey: string; network: NetworkName }>`**
     1. `deps.vault` set → `RequestError(409, 'this node already holds a vault')`.
     2. `slots.ceremonyIdInUse(ceremonyId)` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`.
-    3. `slots.beginLocalDkg(ceremonyId)`; `null` → `RequestError(409, 'a DKG is already running on this node')`. From here on, `end()` runs in a `finally`.
-    4. `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`. Checked while the slot is held, so a DKG this node joined and committed meanwhile is seen.
-    5. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })` (`peerIds` = every `peersById` label in party order); non-approve → `GateRejection`.
-    6. `createStager()`; random 32-byte session ID from `rng`; start the ceremony deadline; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, stager, AbortSignal.any([slot.signal, deadline]))`.
-    7. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
+    3. Every other party (`peersById` keys, ascending) must be connected (`io.transport.isConnected`); the first that is not → `RequestError(503, 'party <id> is not connected; retry when the ring is connected')` (and a warn line `leader: <party|signer> <id> is not connected; refusing before the gate`). The gate is not asked, so no approval is consumed, and nothing is announced. Checked before the slot is taken, so the 503 leaves `ceremonyId` free: a retry with the same id is not refused as in use.
+    4. `slots.beginLocalDkg(ceremonyId)`; `null` → `RequestError(409, 'a DKG is already running on this node')`. From here on, `end()` runs in a `finally`.
+    5. `await vaultExists()` → `RequestError(409, 'this node already holds a vault')`. Checked while the slot is held, so a DKG this node joined and committed meanwhile is seen.
+    6. `threshold = parties = peersById.size`; gate on `buildDkgSpec({ ceremonyId, leader: node.id, role: 'leader' }, { threshold, parties, network, peerIds })` (`peerIds` = every `peersById` label in party order); non-approve → `GateRejection`.
+    7. `createStager()`; random 32-byte session ID from `rng`; start the ceremony deadline; broadcast `announce-dkg {ceremonyId, sessionIdHex, threshold, parties, network}`; `runDkgCeremony(io, spec, stager, AbortSignal.any([slot.signal, deadline]))`.
+    8. Returns `address` = `vaultPayment(toVaultKey(publicKeyPackage), network).address` and `internalKey` = untweaked group key (33-byte SEC1 hex).
     - **Throws:** `RequestError`, `GateRejection`, the deadline error above, or the `runDkgCeremony` error (which already broadcast `signoff-aborted`, unless its signal aborted it). A failure is logged at warn level, or at error level for a `DkgShareKeptError`: the 500 body's `error` then says the staged share was kept at `<share path>.pending` and to check the other nodes with `otzi vault`.
     - **Post:** From the announce on, success and failure both `scheduleClear` the ceremony with the DKG retention. The new vault is on disk but not loaded; signing on it needs a daemon restart.
 
@@ -233,15 +234,20 @@
     1. No vault → `RequestError(409, NO_VAULT_MESSAGE)`.
     2. `slots.ceremonyIdInUse(ceremonyId)` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. A reused id never reaches the gate: no policy rate-window approval is consumed and no exec / webhook approver is asked.
     3. `analysis = analyzeProposal(proposal, toVaultKey(vault.publicKeyPackage), network)`; a throw → `RequestError(400, <message>)`.
-    4. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)` (labels from `addressBook` when present; a rejected `addressBook()` means no labels and one warn line); non-approve → `GateRejection`.
-    5. `slots.beginLocalSigning(ceremonyId)` — the authoritative reservation (an id taken while the gate deliberated is caught here); `null` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. From here on, a `finally` clears the deadline timer, schedules the blob clear (signing retention) and then calls `end()` — the orchestrator's settle order (clear, then record), so the id never comes free before its blobs' clear is scheduled.
-    6. Start the ceremony deadline; `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal, deadline)` — this broadcasts `announce-sign`.
-    7. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` (`src/otzi/backend/bitcoin.ts`) → signed hex and txid.
-    8. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`. A failed `signoff-done` broadcast is logged at warn and the signed transaction is still returned (participants settle `timeout` at their deadline).
-    - **Failure in steps 6–7:** broadcast `signoff-aborted {ceremonyId, reason}` (`reason` = the error message — `ceremony deadline of <ms> ms passed` when the deadline aborted it — at most 1024 characters; the broadcast is best-effort) and rethrow (handler → 500).
+    4. Read the output labels (`addressBook` when present; a rejected `addressBook()` means no labels and one warn line).
+    5. Every signer other than this node (in `signers` order) must be connected (`io.transport.isConnected`); the first that is not → `RequestError(503, 'signer <id> is not connected; retry when the ring is connected')` (and a warn line `leader: <party|signer> <id> is not connected; refusing before the gate`).
+    6. When this node already leads `MAX_LIVE_SIGNINGS_PER_LEADER` (32, `src/orchestrator/orchestrator.ts`) live signings → `RequestError(503, 'this node already leads 32 live signing ceremonies; retry later')`. Otherwise this request takes one of them, in the same synchronous step as the check (concurrent requests cannot overshoot), and gives it back in a `finally` when `sign` returns or throws — after the slot's `end()`. A led signing therefore counts from here, through the gate and the ceremony, until the request settles: the participants' cap (`announce-sign` in [orchestrator.md](orchestrator.md)) counts this leader's ceremonies from the announce, and a leader past it would announce ceremonies its participants drop. Steps 5 and 6 come before the gate: a 503 consumes no approval and announces nothing.
+    7. Gate on `buildSigningSpec(analysis, { ceremonyId, leader: node.id, role: 'leader' }, network, labelFor)`; non-approve → `GateRejection`.
+    8. `slots.beginLocalSigning(ceremonyId)` — the authoritative reservation (an id taken while the gate deliberated is caught here); `null` → `RequestError(409, 'ceremony id <ceremonyId> is already in use on this node')`. From here on, a `finally` clears the deadline timer, schedules the blob clear (signing retention) and then calls `end()` — the orchestrator's settle order (clear, then record), so the id never comes free before its blobs' clear is scheduled.
+    9. Start the ceremony deadline; `leadSigning(io, { ceremonyId, signers, sighashes: analysis sighashes, keyPackage, publicKeyPackage, rng }, proposal, deadline)` — this broadcasts `announce-sign`.
+    10. `finalizeSend(proposal.tx, proposal.prevouts, signatures as { index, signature: hex }, vaultPayment(vaultKey, network).outputKey)` (`src/otzi/backend/bitcoin.ts`) → signed hex and txid.
+    11. Broadcast `signoff-done {ceremonyId, signaturesHex}`; return `{ ceremonyId, txid, signedTxHex, signaturesHex }`. A failed `signoff-done` broadcast is logged at warn and the signed transaction is still returned (participants settle `timeout` at their deadline).
+    - **Failure in steps 9–10:** broadcast `signoff-aborted {ceremonyId, reason}` (`reason` = the error message — `ceremony deadline of <ms> ms passed` when the deadline aborted it — at most 1024 characters; the broadcast is best-effort) and rethrow (handler → 500).
 
 **Invariants:**
-- Nothing is announced unless the leader's own analysis and gate passed (400 / 403 leave peers untouched) and this node holds the ceremony's slot (409 otherwise).
+- Nothing is announced unless the leader's own analysis and gate passed (400 / 403 leave peers untouched), every other party of the ceremony was connected when the leader checked (503 otherwise), and this node holds the ceremony's slot (409 otherwise).
+- The connectivity check is a snapshot taken before the gate. A peer that drops between the check and the announce misses the announce; nothing re-announces it, and the ceremony then fails at its deadline as before.
+- At most `MAX_LIVE_SIGNINGS_PER_LEADER` (32) signing requests are past step 6 at once on this node; the 33rd gets 503 without reaching the gate, and a place frees when one of them settles.
 - The leader never broadcasts the transaction; it returns it.
 - The leader's own gate is evaluated once per request.
 - Signoffs come only from the leader for signing; DKG aborts come from whichever node fails.
@@ -269,7 +275,8 @@
 
 - `class Daemon`
   - **`constructor(deps: DaemonDeps)`**
-    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { loadAddressBook, logger, secretEnv: [config.share.passwordEnv, ...triggerTokenEnvNames(config.triggers)] })` (`triggerTokenEnvNames` = the `auth_token_env` of every `http` trigger), and one info line `daemon: gate strategy <strategy>`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath, logger })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(addressBookPath, network)` (`addressBookPath` = `deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH`); the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file with `readAddressBook(addressBookPath, network, { missing: 'error' })` and returns its addresses, so it throws when the file does not exist (ENOENT) as well as when it is invalid — where the `addressBook` labelling read returns `[]` on ENOENT — and `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
+    - **Post:** Builds `BlobStore`, `BlobServer`, `BlobPuller`, one `CeremonyIo` (`pullOpts` = `deps.pullOpts`); the gate via `createGate(config.gate, { network, loadAddressBook, logger, secretEnv: [config.share.passwordEnv, ...triggerTokenEnvNames(config.triggers)] })` (`triggerTokenEnvNames` = the `auth_token_env` of every `http` trigger), and one info line `daemon: gate strategy <strategy>`; `Orchestrator` and `LeaderDispatcher` with the same `io`, `gate`, `node = { id: config.node.id, partyId: selfPartyId }`, `peersById`, `network = config.network.name`, `vault = state.share`, `vaultExists` (`true` when a share is loaded, otherwise `vaultFileExists(config.share.path)`), `createStager = () => createShareStager({ path: config.share.path, password: state.password, network, partyId: selfPartyId, vaultPubkeyPath, logger })`, `rng`, `ceremonyDeadlines = config.deadlines`, and `addressBook = () => readAddressBook(addressBookPath, network)` (`addressBookPath` = `deps.addressBookPath ?? DEFAULT_ADDRESS_BOOK_PATH`); the leader's `slots` is the orchestrator; trigger sources from `config.triggers`. `loadAddressBook` reads the same file with `readAddressBook(addressBookPath, network, { missing: 'error' })` and returns its addresses, so it throws when the file does not exist (ENOENT) as well as when it is invalid — where the `addressBook` labelling read returns `[]` on ENOENT — and `allowed_recipients = "address-book"` rejects every signing spec on a node without a book.
+    - **Throws:** `ConfigError` from `createGate` for invalid `[gate]` params, an `allowed_recipients` entry that is no address of `[network].name` included (the daemon does not start; see gate.md, `parsePolicyParams`).
     - **Invariant:** Does NOT start anything. The share password reaches only the share stager; it is never logged or returned, and an `exec` gate's command inherits neither its environment variable nor an HTTP trigger's token variable.
   - **`async start(): Promise<void>`** — starts the orchestrator and every trigger. Reentrant.
   - **`async stop(): Promise<void>`** — stops triggers, the orchestrator, and closes the blob server. Reentrant.
@@ -324,7 +331,7 @@
 - Stdout is never written (it carries CLI output).
 
 **Cross-component contracts:**
-- Used by: `entrypoint.ts` (`runDaemonCommand`; the CLI verbs keep `NOOP_LOGGER`).
+- Used by: `entrypoint.ts` (`runDaemonCommand` and `runRelayCommand`; the other CLI verbs keep `NOOP_LOGGER`).
 - `examples/fail2ban/otzi.conf` matches `WARN peer-allowlist: dropped connection from non-peer source {"ip":"<HOST>"…` at the start of the line (after journald's optional `<host> <ident>[<pid>]: ` prefix).
 
 ---
@@ -338,8 +345,8 @@
 
 - `buildTransportFromFiles(state, options): Promise<TransportBundle>`
   - **Pre:** `config.node.identityKeyFile` + `pubkeyBookFile` paths are set.
-  - **Post:** Loads identity + book from disk, runs `resolveSelfFromBook`, runs `validatePeersAgainstBook` for peer-mesh, derives ringId + peersById, returns bundle.
-  - **Throws:** `Error` on file read, JSON parse, identity-not-in-book, `[[peers]]`/book mismatch, missing paths, or share/book disagreement.
+  - **Post:** Loads identity + book from disk, runs `resolveSelfFromBook`, runs `validatePeersAgainstBook` for peer-mesh (after the endpoint check below), derives ringId + peersById, returns bundle.
+  - **Throws:** `Error` on file read, JSON parse, identity-not-in-book, `[[peers]]`/book mismatch, a peer-mesh book entry without an `advertisedEndpoint`, missing paths, or share/book disagreement.
 
 - `buildTransportFromMemory(state, identity, book, options): Promise<TransportBundle>`
   - **Pre:** Identity + book are pre-built (test path).
@@ -347,21 +354,26 @@
 
 - **Identity file format** (JSON): `{ pkcs8Hex: <hex>, publicKeyHex: <hex> }` — PKCS#8 DER, 130-char hex uncompressed P-256 public key.
 
-- **Pubkey book format:** produced by bootstrap (`runMasterBootstrap` / `runMemberRegister`), parsed by `parseBook`. Entries: `{ partyId, publicKeyHex (130-char), advertisedEndpoint (canonical host:port) }`.
+- **Pubkey book format:** produced by bootstrap (`runMasterBootstrap` / `runMemberRegister`), parsed by `parseBook`. Entries: `{ partyId, publicKeyHex (130-char), advertisedEndpoint? (canonical host:port) }`. `advertisedEndpoint` is optional in the file (a relay book has none); only peer-mesh reads it.
 
 - **`resolveSelfFromBook(identity, book)`** (internal)
   - **Post:** Returns the book entry whose `publicKeyHex` (case-insensitive) matches the loaded identity. When a share is loaded: `share.partyId === selfEntry.partyId` and `share.parties === book.entries.length`.
   - **Throws:** `Error` if no entry matches the identity (re-run `otzi setup` for a stale book); if `share.partyId` disagrees with the book; `Error('share is for <p> parties but the pubkey book has <n>')`.
 
+- **`requireBookEndpoint(entry)`** (internal, peer-mesh only)
+  - **Post:** Returns the entry's `advertisedEndpoint`.
+  - **Throws:** `Error('transport-factory: pubkey book entry for party <id> has no advertisedEndpoint; peer-mesh needs one for every peer')` when the entry has none. The peer-mesh branch applies it to every non-self book entry, in ascending `partyId` order, before `validatePeersAgainstBook`, so the first endpoint-less party is the one named. The self entry needs no endpoint: self listens on `config.transport.advertisedEndpoint`.
+
 - **`validatePeersAgainstBook(book, configPeers, selfPartyId)`** (internal, peer-mesh only)
+  - **Pre:** Every non-self book entry has an `advertisedEndpoint` (`requireBookEndpoint` throws otherwise).
   - **Post:** Returns when the set of non-self book `advertisedEndpoint` values equals the set of `[[peers]].endpoint` values. The book is authoritative for partyId + pubkey; `[[peers]]` is a typo check.
   - **Throws:** `Error` on any endpoint present on one side only.
 
-- **ringId derivation:** SHA-256 over all raw pubkeys concatenated in partyId order, hex-encoded. Identical on every peer.
+- **ringId derivation:** SHA-256 over all raw pubkeys concatenated in partyId order, hex-encoded. Identical on every peer. Endpoints are not an input, so a book with and without endpoints for the same keys gives the same ringId.
 
 - **Transport branching**
-  - **peer-mesh:** requires `config.transport.advertisedEndpoint`; runs `validatePeersAgainstBook`; builds `PeerMeshTransport` from the book (`endpoint: ws://${advertisedEndpoint}`).
-  - **relay:** requires `config.transport.url`; builds `RelayTransport` with partyId + pubkey per book entry. The relay routes by partyId; cryptographic auth alone gates relay traffic.
+  - **peer-mesh:** requires `config.transport.advertisedEndpoint`; requires an `advertisedEndpoint` on every non-self book entry (`requireBookEndpoint`); runs `validatePeersAgainstBook`; builds `PeerMeshTransport` from the book (`endpoint: ws://${advertisedEndpoint}`).
+  - **relay:** requires `config.transport.url`; builds `RelayTransport` with partyId + pubkey per book entry. Never reads a book endpoint, so a book without endpoints is accepted (and `[[peers]]` may be empty). The relay routes by partyId; cryptographic auth alone gates relay traffic.
 
 **Invariants:**
 - The private key is loaded once at startup and never leaves the daemon.
@@ -375,22 +387,23 @@
 - Used by: `entrypoint.ts` (`buildTransportFromFiles`); tests via `buildTransportFromMemory`.
 
 **Notes / gotchas:**
-- `book.advertisedEndpoint` is bare `host:port`; transport-factory prepends `ws://` for `PeerMeshTransport`.
+- `book.advertisedEndpoint` (when present) is bare `host:port`; transport-factory prepends `ws://` for `PeerMeshTransport`.
 - `peersById` reaches the `Daemon` via `DaemonDeps.peersById`; `peersById.size` is the ring size used for DKG `parties` and the default `signers`.
 
 ---
 
 ### `entrypoint.ts`
-**Purpose:** The `otzi` executable. Dispatches verbs, runs the daemon, prints operator banners, maps errors to exit codes.
+**Purpose:** The `otzi` executable. Dispatches verbs, runs the daemon and the relay server, prints operator banners, maps errors to exit codes.
 
 **Verbs:**
 
 | Verb | Behaviour |
 |---|---|
 | `otzi daemon <config>` | Run the daemon (`runDaemonCommand`). |
-| `otzi setup <config>` | Bootstrap pubkey exchange; prints the 96-bit fingerprint. |
+| `otzi relay --listen <host:port>` | Run the relay server for `[transport] kind = "relay"` rings (`runRelayCommand`); needs no config and no vault. |
+| `otzi setup <config>` | Bootstrap pubkey exchange (endpoint allowlist under peer-mesh, count under relay); prints the 96-bit fingerprint and the key ids of this node and every ring entry. |
 | `otzi generate [--config <path>] [--ceremony-id <id>]` | Daemon `dkg` op (`generate`); banner prints the vault address and the restart instruction. |
-| `otzi vault [--json]` | Address, network, threshold/parties; the full file (keys included) with `--json`. |
+| `otzi vault [--json] [--config <path>]` | Address, network, threshold/parties, checked against the daemon's loaded share (`vault`); the full file (keys included) with `--json`. |
 | `otzi btc balance [--unit sats\|btc\|mbtc\|ubtc] [--config <path>]` | Esplora balance: confirmed and unconfirmed. |
 | `otzi btc send <label\|address> <amount[unit]\|max> [--fee-rate N] [--config <path>]` | `btcSend`: prints the txid and explorer URL. |
 | `otzi btc sign <proposal.json> [--broadcast] [--config <path>]` | `btcSign`: prints the analysis summary, txid and signed hex; `--broadcast` posts it. |
@@ -401,8 +414,8 @@
 | `otzi book export [path]` | Write the book file (stdout without a path). |
 | `otzi backup` / `otzi restore <archive> [--password-stdin]` | Archive and restore node state. |
 
-- `--config` defaults to `/etc/otzi/daemon.toml`. Every `book` verb takes it too, to learn the network.
-- CLI verbs other than `daemon` keep `NOOP_LOGGER` and write machine output to stdout only; banners, summaries and errors go to stderr. Stdout per verb: `vault` the text or JSON; `btc balance` the two balance lines; `btc send` the txid, then the explorer URL; `btc sign` the txid, then the signed hex, then (with `--broadcast`) the explorer URL; `book list` one tab-separated line per entry; `book import` the line `added <a>, updated <u>, unchanged <n>, removed <r>`; `book export` the book file when no path is given. `generate`, `book add` and `book remove` print only to stderr, as does `book export <path>`.
+- `--config` defaults to `/etc/otzi/daemon.toml`. Every `book` verb takes it too, to learn the network, and `vault` to find the daemon.
+- CLI verbs other than `daemon` and `relay` keep `NOOP_LOGGER` and write machine output to stdout only; banners, summaries and errors go to stderr. Stdout per verb: `vault` the text or JSON; `btc balance` the two balance lines; `btc send` the txid, then the explorer URL; `btc sign` the txid, then the signed hex, then (with `--broadcast`) the explorer URL; `book list` one tab-separated line per entry; `book import` the line `added <a>, updated <u>, unchanged <n>, removed <r>`; `book export` the book file when no path is given. `generate`, `book add` and `book remove` print only to stderr, as does `book export <path>`.
 - `parseVerbArgs(args, { values?, booleans? }): { positional: string[]; flags: Map<string, string> }` — positionals and `--flags` in any order. A `values` flag takes the next argument (`flag '--x' needs a value` when it is missing or starts with `--`); a `booleans` flag takes none (so `btc sign --broadcast <file>` works); any other `--flag` is `unknown flag '--x'`, so a typo never falls back to a default.
 - `reportCliError(err, write?)` — the message on stderr. A `BroadcastFailedError` also prints a line naming the txid and saying the transaction is signed but not broadcast, then the signed transaction hex as the last line, so the operator can broadcast it by other means. The process exits 1 on any error.
 - `otzi generate` takes no positional argument; a positional (the pre-0.3 `otzi generate <config.toml>`) fails with a hint to use `--config`. Its banner (stderr) prints the ceremony ID, network, vault address, share path and `Restart every daemon to load its share before signing.`
@@ -412,12 +425,18 @@
 - **`runDaemonCommand`**
   - **Post:** `loadAndValidate(configPath, { logger })` → `buildTransportFromFiles` → `Daemon` → `start`; SIGINT/SIGTERM stop the daemon and the transport, then exit 0. The startup line names the mode: signing (vault loaded) or setup (no vault). In setup mode it states that signing requests are rejected until the DKG runs (`otzi generate`) and every daemon restarts to load its share. The ceremony pull backoff comes from `pullOpts` (`initialDelayMs` 100, `maxDelayMs` 2 000); orchestrator and leader replace its `deadlineMs` and `maxAttempts` with the ceremony deadlines. The stale-`.pending` warning and the `vault-pubkey.json` rewrite come from `loadAndValidate` (through the logger passed in); `runDaemonCommand` does not warn a second time.
 
+- **`runRelayCommand(args: string[]): Promise<void>`**
+  - **Pre:** `args` holds exactly `--listen <host:port>`. The host is required and there is no default: the verb never binds every interface by accident (the packaged default `127.0.0.1:7100` lives in `/etc/otzi/relay.env`, which the unit passes as `--listen`).
+  - **Post:** `parseVerbArgs(args, { values: ['listen'] })`, then a `RelayServer({ listen, logger: createConsoleLogger() })` is started (default heartbeat). Resolves once the relay is listening; the open listener keeps the process alive. The console logger's `RelayServer: listening {"host":…,"port":…}` line on stderr is the listen line (the real port when `--listen` names port 0), followed by one line per connect and disconnect. SIGINT/SIGTERM log `received <signal>, shutting down`, stop the server, then exit 0. The shutdown has a hard deadline of `RELAY_SHUTDOWN_DEADLINE_MS` (5 000 ms, above `RelayServer.stop()`'s 2 s grace): if `stop()` has not settled by then, the process logs `otzi relay: shutdown did not finish within 5 s; exiting` and exits 0 anyway (a signal-initiated stop always exits 0, well inside systemd's stop timeout); the deadline timer is cleared when `stop()` settles first. Their handlers are installed before the server starts, so a signal sent the moment the listen line appears (or during the bind) stops the relay the same way, never through the default signal action. Nothing is written to stdout.
+  - **Throws:** `unknown flag '--x'` for any other flag; `flag '--listen' needs a value`; `unexpected argument '<x>'` plus the usage for a positional; `otzi relay needs --listen <host:port>` plus the usage when `--listen` is absent; `RelayServer`'s `invalid listen '<x>' — expected 'host:port'` / `invalid port` for a malformed address; the bind error (e.g. `listen EADDRINUSE: address already in use …`) when the address cannot be bound. In every case the process exits 1 through `reportCliError`, and no signal handler is left behind: an argument or address error comes before they are installed, and a failed bind removes them.
+  - **Scope:** the relay serves plain WebSocket and has no TLS; anything beyond loopback or a VPN goes behind a TLS reverse proxy (`wss://`). It reads no daemon config, share, identity or pubkey book.
+
 **Invariants:**
-- The daemon is the only long-lived verb; every other verb talks to it over the daemon client (UDS by default) or works on local files.
-- TOML + share password are required by the daemon; absence fails at load time.
+- The daemon and the relay are the only long-lived verbs; every other verb talks to the daemon over the daemon client (UDS by default) or works on local files.
+- TOML + share password are required by the daemon; absence fails at load time. `otzi relay` needs neither.
 
 **Cross-component contracts:**
-- Depends on: `config-merge`, `transport-factory`, `Daemon`, `setup`, `src/cli/cmd/*`.
+- Depends on: `config-merge`, `transport-factory`, `Daemon`, `setup`, `src/cli/cmd/*`, `RelayServer` (`src/transport/relay/server.ts`; see [transport.md](transport.md)), `console-logger`.
 
 ---
 
@@ -433,16 +452,27 @@
 **Public surface:**
 - **`setupMaster(configPath, bind): Promise<void>`**
   - **Pre:** Config path + bind address (host:port) provided.
-  - **Post:** Loads config; loads/generates identity key; runs bootstrap master; writes pubkey book; prints the fingerprint banner.
-  - **Idempotent:** If the pubkey book already exists, re-prints the fingerprint without re-bootstrapping.
+  - **Post:** Loads config; picks the admission from `[transport] kind` (peer-mesh → `{ kind: 'endpoints', selfEndpoint: transport.advertised_endpoint, expectedPeers: [[peers]] }`; relay → `{ kind: 'count', parties: bootstrap.parties }`); loads/generates identity key; under relay, when `isWildcardBind(bind)`, prints one warning before listening (Ruling P16): `otzi: ⚠ the bootstrap bind <bind> listens on every interface, and under relay the leader admits the first <parties − 1> registrations: keep this port reachable only by the members during setup (a VPN, a firewall rule, or a loopback bind reached through an SSH tunnel)`; runs bootstrap master; writes pubkey book; prints the setup banner with the leader's refusal line (below). Peer-mesh admits by endpoint allowlist and gets no wildcard warning.
+  - **Throws:** peer-mesh without `transport.advertised_endpoint`; relay without `[bootstrap] parties` (`setup: relay mode needs [bootstrap] parties on the leader …` — the config parser already requires it on a relay leader, so only a config with no `[bootstrap]` reaches this).
+  - **Idempotent:** If the pubkey book already exists, re-prints the banner without re-bootstrapping.
   - **Identity:** Reused if file exists; generated if missing (mode 0660).
+
+- **`isWildcardBind(bind: string): boolean`** — `true` when the host of `host:port` (brackets stripped) is `0.0.0.0` or an all-zero IPv6 address (`::`, `0:0:0:0:0:0:0:0`, `::0`, …); `false` for every other host, loopback included.
 
 - **`setupMember(configPath, masterUrl): Promise<void>`**
   - **Pre:** Config path + master URL provided.
-  - **Post:** Loads config; loads/generates identity key; registers with master; writes pubkey book; prints the fingerprint banner.
-  - **Idempotent:** If the pubkey book already exists, re-prints the fingerprint.
+  - **Post:** Loads config; loads/generates identity key; registers with master (peer-mesh: with `transport.advertised_endpoint`, which must be set; relay: with no endpoint); writes pubkey book; prints the setup banner.
+  - **Idempotent:** If the pubkey book already exists, re-prints the banner.
 
-- **Fingerprint banner:** the 96-bit fingerprint `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` from `computeFingerprint`, with the instruction to compare it out of band with every other operator before any DKG.
+- **Setup banner** (`announceComplete`, both roles, both transports, and on the idempotent re-print):
+  - `fingerprint: xxxx-xxxx-xxxx-xxxx-xxxx-xxxx` from `computeFingerprint`;
+  - `this node: <keyId>` — this node's identity pubkey (`keyId` from `pubkey-book.ts`); on a re-print with no identity file, `this node: no identity key at <file>`;
+  - a warning right after that line when the daemon could not start with this book: `⚠ no identity key — the daemon cannot start; restore it from a backup, or delete pubkeys.json on every node and redo setup` (no identity file), or `⚠ this node's key is not in this book — the daemon will not start; delete pubkeys.json on every node and redo setup` (an identity whose pubkey matches no entry). A fresh setup never prints either, since the member and master checks guarantee the key is in the book; only a re-print can;
+  - `ring size: <N>` (the number of book entries), right before the party lines;
+  - one line per book entry in partyId order: `party <partyId>: <keyId>`, followed by two spaces and the entry's endpoint when it has one (peer-mesh);
+  - `⚠ duplicate key id <id>`, once per key id that two or more entries share (in partyId order of first appearance), right after the party lines;
+  - leader only, after a bootstrap it ran (not on a re-print), the registrations it refused (`MasterBootstrapResult.refused`): `refused registrations: none`, or under relay `refused registrations: <full> after the ring was full, <duplicate> duplicate, <endpointPresent> with an endpoint`, under peer-mesh `refused registrations: <duplicate> duplicate, <notAllowed> not on the [[peers]] allowlist`; under relay with `full > 0` also `⚠ <full> registration(s) arrived after the ring was full: if one of your nodes failed with "bootstrap is full", someone else took its place — abort and redo setup`;
+  - the instruction to compare the fingerprint out of band with every other operator before any DKG, `Confirm every key id above belongs to one of your nodes; an unknown id means someone else registered — delete pubkeys.json on every node and redo setup.`, and `Count the party lines: there must be exactly one per node you set up.`
 
 - **Validation:** `identity_key_file` and `pubkey_book_file` must be set in config; missing paths fail immediately.
 
@@ -454,6 +484,7 @@
 **Invariants:**
 - Setup is idempotent; re-running after abort is safe.
 - The fingerprint must match across all nodes (operators compare it); a mismatch means tampering — delete the books and redo setup.
+- Every key id in the banner must belong to one of the operators' own nodes, and there must be exactly one party line per node set up; an unknown or extra one means someone else registered (in relay mode anyone who reaches the bootstrap port can) — delete the books and redo setup. A key id is 64 bits, so grinding a key to match an operator's id is out of reach; a duplicate id warning still flags two entries an operator cannot tell apart.
 
 **Cross-component contracts:**
 - Depends on: Config loader, bootstrap runners (`runMasterBootstrap`, `runMemberRegister`), identity crypto, pubkey book serialization.
@@ -481,11 +512,11 @@
 - `interface VaultInfo { partyIds: number[]; threshold: number; parties: number; network: NetworkName; address: string; internalKey: string; outputKey: string }` — the `vault-info` response.
 - `class DaemonClient`
   - `static fromConfig(configPath): Promise<DaemonClient>` / `static fromParsed(cfg): DaemonClient` — prefers the `uds` trigger's `path`; falls back to the `http` trigger's `bind` (a `/`-path is a socket path).
-  - `request<T>(body: unknown): Promise<T>` — POSTs JSON; 200 → parsed body; non-200 → `DaemonClientError(status, message)`.
-  - `vaultInfo(): Promise<VaultInfo>` — `{ op: 'vault-info' }`.
+  - `request<T>(body: unknown, options?: RequestOptions): Promise<T>` — POSTs JSON; 200 → parsed body; non-200 → `DaemonClientError(status, message)`. `RequestOptions = { signal?: AbortSignal }`: aborting it cancels the request, closes its connection, and rejects with an `AbortError` (an already-aborted signal never connects).
+  - `vaultInfo(options?: RequestOptions): Promise<VaultInfo>` — `{ op: 'vault-info' }`.
   - **Throws:** `Error` when the config has neither trigger.
 
-**Cross-component contracts:** Used by every CLI verb that talks to the daemon (`generate`, `btc send`, `btc sign`). Commands take an injectable `{ request }` (`CliDeps.client`) for tests.
+**Cross-component contracts:** Used by every CLI verb that talks to the daemon (`generate`, `vault`, `btc send`, `btc sign`). Commands take an injectable `{ request }` (`CliDeps.client`) for tests; `vault` takes `{ vaultInfo }` (`VaultDeps.client`).
 
 ### `units.ts`
 **Purpose:** CLI amount parsing and formatting.
@@ -495,6 +526,25 @@
   - **Post:** `<number>[sats|btc|mbtc|ubtc]` (default sats) converted to integer sats without floating point.
   - **Throws:** On empty input, an unknown unit, a fractional sat, or a negative amount.
 - `formatSats(sats: bigint, unit?: BtcUnit): string` — decimal string in `unit` (default sats), trailing zeros trimmed; a negative amount (an unconfirmed balance can fall when a spend is in the mempool) is `-` plus the formatted magnitude.
+
+### `state-paths.ts`
+**Purpose:** The one rule for where a node's operator-configurable state files may live, shared by `otzi backup` and `otzi restore` (restore imports from `backup.ts`, so the rule cannot live in either without a cycle). The share, identity and pubkey-book paths come from `daemon.toml`; restore runs as root and writes them, so they are confined to the two directories the `.deb` creates, and backup refuses what restore would refuse rather than write an archive that cannot be restored.
+
+**Public surface:**
+- `CONFIG_DIR` = `'etc/otzi'`, `DATA_DIR` = `'var/lib/otzi'` (tar-relative, no leading slash): the config directory, and the data directory whose files belong to the user `otzi` (`restore.ts` chowns what it places there).
+- `STATE_DIRS` — `[CONFIG_DIR, DATA_DIR]`.
+- `FIXED_STATE_FILES` — `{ daemonConfig: 'etc/otzi/daemon.toml', addressBook: 'etc/otzi/address-book.otzi.json', vaultPubkey: 'var/lib/otzi/vault-pubkey.json' }` (`as const`): the tar paths of the files whose place `daemon.toml` does not choose. The one list: `backup.ts` packs these (its `DAEMON_CONFIG_TAR`, `ADDRESS_BOOK_TAR`, `VAULT_PUBKEY_TAR` are its members, and a test asserts that backup's `DEFAULT_*_PATH` strip to them), `restore.ts` keys its mode table (`FIXED_FILE_MODES`) by them, and both pass `FIXED_TAR_PATHS` as `resolveStatePaths`'s `fixed`. A fourth fixed file is added here.
+- `FIXED_TAR_PATHS: readonly string[]` — `Object.values(FIXED_STATE_FILES)`.
+- `resolveStatePaths(named: { key: string; path: string }[], fixed: readonly string[], refuse: (key: string, path: string, why: string) => Error): string[]`
+  - **Post:** returns, in order, the tar path of each named path: `path.posix.resolve(path)` without the leading slash, a direct child of `etc/otzi` or `var/lib/otzi`.
+  - **Throws** `refuse(key, path, why)` for the first named path that is (`why` is neutral text; each caller puts it in its own message):
+    - relative, or resolving outside both directories — `is outside /etc/otzi and /var/lib/otzi`;
+    - resolving below a subdirectory of them (`/var/lib/otzi/keys/share.json`) — `is not a direct child of /etc/otzi or /var/lib/otzi`;
+    - resolving to the tar path of an earlier named path or of one of `fixed` — `names a file another key also names`.
+
+**Invariants:** Pure (no file system access); `..` and `.` segments are resolved before the check, so `/var/lib/otzi/../../etc/x` is outside and `/var/lib/otzi/./share.json` is a direct child.
+
+**Cross-component contracts:** Used by `backup.ts` and `restore.ts` only.
 
 ---
 
@@ -506,48 +556,73 @@
 - `generate(opts: { configPath: string; ceremonyId?: string }, deps?: CliDeps): Promise<{ ceremonyId: string; address: string; network: NetworkName }>`
   - **Pre:** The daemon on this node is running and holds no vault; every other daemon in the ring is running and holds no vault.
   - **Post:** Sends `{ op: 'dkg', ceremonyId? }` through `deps.client` or `DaemonClient.fromConfig(configPath)`; returns the response's `ceremonyId`, `address`, `network`.
-  - **Throws:** `DaemonClientError` (409 when the node already holds a vault, 403 gate reject, 500 ceremony failure); `Error` when the reply lacks `ceremonyId`, `address` or `network`.
+  - **Throws:** `DaemonClientError` (409 when the node already holds a vault, 403 gate reject, 503 when a party is not connected, 500 ceremony failure); `Error` when the reply lacks `ceremonyId`, `address` or `network`.
   - **Banner (entrypoint):** ceremony ID, network, vault address, share path, and the instruction to restart every daemon to load the new share.
 
 ### `vault.ts`
-**Purpose:** `otzi vault [--json]` — print the vault metadata from `vault-pubkey.json`.
+**Purpose:** `otzi vault [--json] [--config <path>]` — print the vault metadata, checked against the daemon. `vault-pubkey.json` is written by the daemon but can be rewritten by any member of the `otzi` group (it is mode 0644 in a group-writable directory), so a file the CLI shows without asking would be a way to put a wrong funding address in front of an operator. The asking and comparing is `vault-check.ts`.
 
-- `vault(opts?: { vaultPath?: string; json?: boolean }): Promise<string>`
-  - **Post:** Reads `readVaultPubkeyFile(opts.vaultPath)`. Default output, three lines: `network:   <network>`, `address:   <address>`, `threshold: <threshold>-of-<parties>`. With `json`: the whole file as pretty JSON (keys and `vaultKey` included).
-  - **Throws:** `readVaultPubkeyFile` errors (missing file points at `otzi generate`).
+- `interface VaultDeps { client?: VaultInfoSource; warn?: (text: string) => void }` — `client` defaults to `DaemonClient.fromConfig(configPath)` (built inside `askDaemon`, so a config the client cannot be built from counts as unreachable), `warn` to stderr (`console.error`).
+- `vault(opts: { configPath: string; vaultPath?: string; json?: boolean }, deps?: VaultDeps): Promise<string>` — `vaultPath` defaults to `DEFAULT_VAULT_PUBKEY_PATH`.
+  - **Pre:** none; the daemon may be down.
+  - **Post:** `askDaemon` (10 s, see `vault-check.ts`) and acts on the answer:
+    1. **Daemon holds a vault.** When the file exists it is read and compared with the reply (`vaultMismatch`). Any difference, or a file that cannot be read or validated (`unusableFile`), throws one `Error` that names the file path and each differing field as `<field>: file <x>, daemon <y>`, says the file does not match the daemon's loaded share, and tells the operator that restarting the daemon rewrites it; nothing is returned, so nothing reaches stdout. On a match, or when the file does not exist, the daemon's values are returned: three lines `network:   <network>`, `address:   <address>`, `threshold: <threshold>-of-<parties>`, or with `json` pretty JSON in the file's key order (`network`, `address`, `internalKey`, `outputKey`, `threshold`, `parties`, then `vaultKey`). `vaultKey` comes from the file, which the daemon does not send: with a matching file the output is the file's bytes, and `warn` gets `the per-party values of vaultKey.verifyingShares come from <path> and are not checked against the daemon` (`json` only; the other `vaultKey` fields are checked, see `vault-check.ts`); with no file it is left out and `warn` gets a line saying so (`json` only).
+    2. **Daemon answers 409 (no vault loaded).** Without a file, throws `the daemon has no vault loaded — run 'otzi generate' …`. With a file (a DKG committed this node's share and the daemon has not restarted to load it; the recovery of a partly failed DKG reads the vault from such a node), the file is read (`readVaultPubkeyFile`, so an unreadable or invalid one still throws), `warn(NO_VAULT_NOTE)` = `the daemon has not loaded a vault — restart it to load the share; values not verified`, and the file's values are returned in the shape above (the file's bytes with `json`). Exit 0.
+    3. **Daemon unreachable** (the reasons in `vault-check.ts`: client not buildable, system error, no answer within 10 s, or a 401 / 403 refusal of the CLI itself — the note then reads `not verified against the daemon (401 unauthorized)`). `readVaultPubkeyFile(vaultPath)` is returned in the shape above, after `warn("not verified against the daemon (<reason>)")`. A missing or invalid file throws as `readVaultPubkeyFile` does (a missing one points at `otzi generate`).
+  - **Throws:** a `DaemonClientError` for any status but 409, 401 and 403 (400, 500, …), and the `Error` of a reply that is not JSON or not a vault-info: the daemon answered, so the file is not shown as if the daemon were down.
+  - **Invariants:** stdout carries only the returned text (the notes go to `warn`); a mismatch prints nothing there. The output shape is that of the file as before the cross-check; only `--json` without a file lacks `vaultKey`.
+
+### `vault-check.ts` (`src/cli/vault-check.ts`)
+**Purpose:** Asking the daemon for its vault and comparing it with `vault-pubkey.json`, for `otzi vault` and `otzi btc balance|send|sign`.
+
+**Public surface:**
+- `ASK_TIMEOUT_MS = 10_000`; `NO_VAULT_NOTE = 'the daemon has not loaded a vault — restart it to load the share; values not verified'`; `notVerifiedNote(reason) = 'not verified against the daemon (<reason>)'`.
+- `interface VaultInfoSource { vaultInfo(options?: RequestOptions): Promise<VaultInfo> }` — a `DaemonClient`, or `infoFromRequest(client)` over anything with `request(body, options?)` (the `CliDeps.client` shape; sends `{ op: 'vault-info' }`).
+- `type DaemonAnswer = { kind: 'vault'; info: VaultInfo } | { kind: 'no-vault' } | { kind: 'unreachable'; reason: string }`.
+- `askDaemon(getClient: () => VaultInfoSource | Promise<VaultInfoSource>, timeoutMs = ASK_TIMEOUT_MS): Promise<DaemonAnswer>`
+  - **Post:** `getClient()` throwing → `unreachable` (reason: the message through `displayText`). Otherwise `vaultInfo({ signal })` is raced against `timeoutMs`: no answer in time → the signal is aborted (so the request's socket closes and the process can exit) and the result is `unreachable` with reason `no answer within 10 s`; the failure of the aborted request is ignored, and the timer is cleared whatever happens. A `DaemonClientError` with status 409 → `no-vault`. A `DaemonClientError` with status 401 or 403 (an `http` trigger whose token the CLI does not send, or a `Host` it refuses: the daemon will not answer this CLI) → `unreachable` with reason `<status> <message>` (the message through `displayText`), so the verbs treat it like a daemon they cannot ask (Ruling P17). A system error (an `Error` with a string `code`: `ENOENT` no socket, `ECONNREFUSED`, `EACCES`, …) → `unreachable` with its message. A reply is checked to carry `network` (a known one), `address`, `internalKey`, `outputKey`, `threshold` and `parties` → `vault`.
+  - **Throws:** a `DaemonClientError` for any other status (400, 500, …), an `Error` for a reply that is not JSON (`daemon returned invalid JSON`) or not a vault-info (`daemon reply to 'vault-info' has no vault (…)`): the daemon answered, so nobody may treat it as down.
+- `vaultMismatch(path, file, info): Error | undefined` — compares `network`, `address`, `internalKey`, `outputKey`, `threshold`, `parties`, and for the `vaultKey` the CLI builds transactions from and prints with `--json`: `vaultKey.untweakedVerifyingKey` against `internalKey`, `vaultKey.minSigners` against `threshold`, the number of `vaultKey.verifyingShares` against `parties` (strict equality). The per-party values of `verifyingShares` cannot be checked (`vault-info` does not carry them). A difference gives one `Error` naming `path`, each differing field as `<field>: file <x>, daemon <y>` (file text through `displayText`), that the file does not match the daemon's loaded share, and that a restart rewrites it.
+- `unusableFile(path, err): Error` — the same shape for a file that exists but cannot be read or validated (`cannot be used: <reason>`).
+
+**Cross-component contracts:** Used by `vault.ts` and `btc.ts`. Depends on `DaemonClient` / `DaemonClientError` / `VaultInfo` (`daemon-client.ts`), `VaultPubkeyFile` (`vault-pubkey.ts`), `displayText` / `errorReason`.
 
 ### `btc.ts`
 **Purpose:** `otzi btc balance|send|sign` — chain access through Esplora, signing through the daemon.
 
 **Public surface:**
 - `const MAX_FEE_RATE = 10_000` — the highest fee rate (sat/vB) the CLI accepts, from `--fee-rate` or from Esplora.
-- `interface CliDeps { client?: { request<T>(body: unknown): Promise<T> }; summary?: (text: string) => void; warn?: (text: string) => void }` — `summary` receives the analysis summary before the daemon is asked to sign, `warn` non-fatal warnings; both default to stderr (`console.error`).
+- `interface CliDeps { client?: { request<T>(body: unknown, options?: RequestOptions): Promise<T> }; summary?: (text: string) => void; warn?: (text: string) => void }` — `summary` receives the analysis summary before the daemon is asked to sign, `warn` non-fatal warnings; both default to stderr (`console.error`).
 - `class BroadcastFailedError extends Error { constructor(message: string, readonly txid: string, readonly signedTxHex: string) }`
 
-- **Context (all three verbs):** `readVaultPubkeyFile(vaultPath)` and `loadDaemonConfig(configPath)`; `base = chainApiUrl({ network: vault.network, esploraUrl: config.network.esploraUrl })`. A config whose `[network].name` differs from the vault file's network is an `Error` naming both (it would query the wrong chain).
+- **Context (all three verbs):** `readVaultPubkeyFile(vaultPath)` (default `DEFAULT_VAULT_PUBKEY_PATH`) and `loadDaemonConfig(configPath)`; `base = chainApiUrl({ network: vault.network, esploraUrl: config.network.esploraUrl })`. A config whose `[network].name` differs from the vault file's network is an `Error` naming both (it would query the wrong chain).
 - **Esplora errors:** every Esplora call is wrapped as `Error('Esplora <base>: <reason>')`, where `<reason>` is the HTTP status and body for a non-2xx answer, or the connection error (`connect ECONNREFUSED …`) when Esplora is unreachable. The reason is untrusted text and is shown through `displayText` (control characters removed, line breaks as spaces).
 
-- `btcBalance(opts: { configPath: string; vaultPath?: string; unit?: BtcUnit }): Promise<string>`
-  - **Post:** `getBalance(base, vault.address)`; returns `"confirmed: X\nunconfirmed: Y"` formatted in `unit` (default sats).
+- **The file against the daemon (all three verbs).** `vault-pubkey.json` is rewritable by any member of the `otzi` group and supplies the address, the change key and the network, so each verb asks the daemon (`askDaemon` over `infoFromRequest(deps.client ?? DaemonClient.fromParsed(config))`, 10 s) before it uses the file:
+  - `btcSend` / `btcSign` **require** the daemon's loaded vault to match the file (`vaultMismatch`): a mismatch throws the mismatch error (path and each differing field; see `vault-check.ts`), a daemon without a vault throws `Error('the daemon has not loaded a vault — restart it to load the share')`, a daemon that cannot be reached (including no answer in 10 s, and a 401 / 403 refusal of the CLI: reason `<status> <message>`) throws `Error('cannot check <path> against the daemon: <reason>')`. All before Esplora is asked, anything is built, summarised or signed, so stdout stays empty. Any other daemon error (a status other than 409, 401 and 403, a reply that is not JSON) is thrown as it is.
+  - `btcBalance` **verifies when it can**: a mismatch throws the same error before Esplora is asked; a daemon that cannot be reached (a 401 / 403 included) leaves the balance with `deps.warn(notVerifiedNote(reason))`, a daemon without a vault with `deps.warn(NO_VAULT_NOTE)`.
+
+- `btcBalance(opts: { configPath: string; vaultPath?: string; unit?: BtcUnit }, deps?: CliDeps): Promise<string>`
+  - **Post:** the file against the daemon (above), then `getBalance(base, vault.address)`; returns `"confirmed: X\nunconfirmed: Y"` formatted in `unit` (default sats).
 
 - `btcSend(opts: { configPath: string; vaultPath?: string; bookPath?: string; to: string; amount: string; feeRate?: number }, deps?: CliDeps): Promise<{ txid: string; explorerUrl: string }>`
   1. Read `vault-pubkey.json` and the config (Esplora base: `esplora_url` or the `chainApiUrl` default).
   2. Resolve `to` with `resolveRecipient(await readAddressBook(bookPath, network), to, network)` (`bookPath` defaults to `DEFAULT_ADDRESS_BOOK_PATH`): a label of this node's book, or an address valid for the vault's network; anything else is `Error('unknown label or invalid address: <to>')`, and a label that is an address (on any supported network) but names a different address is refused (see [address-book.md](address-book.md) `resolveRecipient`). A book that cannot be read or validated is an error naming the book path; a missing book file is an empty book.
-  3. Local checks, before Esplora or the daemon is touched: `amount` is `'max'` (case-insensitive) or `parseBtcAmount(amount).sats`, and a sats amount below `MIN_SEND_SATS` (546) is `Error('amount <n> sats is below the minimum send of 546 sats')`; a given `feeRate` must be finite, greater than 0 and at most `MAX_FEE_RATE` (`Error('fee rate must be more than 0 and at most 10000 sat/vB (got <n>)')`); the daemon connection is built from the config (`deps.client` or `DaemonClient.fromParsed`).
+  3. Local checks, before Esplora or the daemon is touched: `amount` is `'max'` (case-insensitive) or `parseBtcAmount(amount).sats`, and a sats amount below `MIN_SEND_SATS` (546) is `Error('amount <n> sats is below the minimum send of 546 sats')`; a given `feeRate` must be finite, greater than 0 and at most `MAX_FEE_RATE` (`Error('fee rate must be more than 0 and at most 10000 sat/vB (got <n>)')`); the daemon connection is built from the config (`deps.client` or `DaemonClient.fromParsed`). Then the file is required to match the daemon's loaded vault (above): `vault-info` is the first daemon call of a send, before Esplora.
   4. `getUtxos`, keeping confirmed ones only; fee rate is `feeRate` or `getFeeRates(base).normal`. An Esplora `normal` rate that is not a finite number greater than 0 and at most `MAX_FEE_RATE` is `Error('Esplora <base> returned an unusable fee rate (<value> sat/vB; expected more than 0 and at most 10000); pass --fee-rate to choose one')`, before any daemon call.
   5. `buildSend({ utxos, vault: vaultKey, network, to, amount, feeRate })`. `InsufficientFundsError` becomes `Error('insufficient funds: <available> sats (<btc> BTC) confirmed, <needed> sats (<btc> BTC) needed at <rate> sat/vB')`, plus `; a further <n> sats (<btc> BTC) is unconfirmed and is not spent until it confirms` when unconfirmed coins exist.
   6. More than 255 prevouts → `Error('this send needs <k> inputs; at most 255 fit in one transaction — consolidate first')` before any daemon call.
   7. `analyzeProposal` on the built proposal gives the summary (format under `btcSign`, labels from the book read in step 2), written through `deps.summary` (default stderr) before the daemon is asked to sign. A send refused in steps 1–6 prints no summary.
-  8. Daemon `{ op: 'sign', proposal: { network, tx, prevouts } }`, then the reply check (below).
+  8. Daemon `{ op: 'sign', proposal: { network, tx, prevouts } }`, then the reply check (below). A 503 refusal (a signer not connected, or the leader's cap) is rethrown as `DaemonClientError(503, '<daemon message>\nNothing was announced or signed. This is temporary: run the same command again to retry.')` — the retry hint (`btcSign` too); any other daemon status is thrown as it is.
   9. `broadcastTx(base, signedTxHex)`; on failure throw `BroadcastFailedError('broadcast failed — Esplora <base>: <reason>', txid, signedTxHex)`. The txid Esplora answers only cross-checks the daemon's: when it differs, `deps.warn` gets `warning: Esplora <base> answered txid '<x>' for the broadcast, but the signed transaction is <txid>` and the send still succeeds.
   - **Reply check (`btcSend` and `btcSign`, before anything is broadcast or returned):** the reply must carry a string `txid` and hex `signedTxHex` (`Error("daemon reply to 'sign' has no signed transaction (txid, signedTxHex)")`), and `signedTxHex` must decode as a transaction (`the signed transaction in the daemon's reply cannot be decoded: …`) whose txid equals the reply's `txid` (`daemon reply is inconsistent: it names txid <a> but its signed transaction is <b>`), equals `analyzeProposal`'s txid for the proposal, and whose serialization without witnesses equals `proposal.tx` (`daemon signed a different transaction than the proposal (proposal <a>, signed <b>); not broadcasting it`), and every input must carry witness data (`the daemon's signed transaction has no signature for input <i>; not broadcasting it`). Anything else is thrown and nothing is broadcast; a txid alone proves nothing, because a segwit txid ignores witnesses.
   - **Post:** Returns the daemon's txid and `explorerTxUrl(base, txid)`.
   - **Throws:** recipient, amount, fee-rate, Esplora, `InsufficientFundsError` (as above), input-limit, daemon (`DaemonClientError`), reply-check and broadcast errors.
 
 - `btcSign(opts: { configPath: string; vaultPath?: string; bookPath?: string; proposalPath: string; broadcast: boolean }, deps?: CliDeps): Promise<{ txid: string; signedTxHex: string; summary: string; explorerUrl?: string }>`
-  - **Post:** Reads a `SendProposal` JSON file and checks it with `parseProposal` (so more than 255 prevouts is refused with the daemon's text); `analyzeProposal` against `vault-pubkey.json`'s `vaultKey` and network gives `summary`, which is written through `deps.summary` (default stderr) before the daemon is asked to sign and is also returned; the output labels come from `readAddressBook(bookPath, network)` (default `DEFAULT_ADDRESS_BOOK_PATH`) through `labelFor`, as the daemon labels its specs, and a book that cannot be read means no labels and one `deps.warn` line naming the book; daemon `{ op: 'sign', proposal }` and the reply check (see `btcSend`); broadcasts only when `broadcast` is true (`explorerUrl` then set; a failure throws `BroadcastFailedError`; a differing txid from Esplora is a warning).
+  - **Post:** Reads a `SendProposal` JSON file and checks it with `parseProposal` (so more than 255 prevouts is refused with the daemon's text); requires the file to match the daemon's loaded vault (above; after the proposal file is read, before the file's key analyses it); `analyzeProposal` against `vault-pubkey.json`'s `vaultKey` and network gives `summary`, which is written through `deps.summary` (default stderr) before the daemon is asked to sign and is also returned; the output labels come from `readAddressBook(bookPath, network)` (default `DEFAULT_ADDRESS_BOOK_PATH`) through `labelFor`, as the daemon labels its specs, and a book that cannot be read means no labels and one `deps.warn` line naming the book; daemon `{ op: 'sign', proposal }` and the reply check (see `btcSend`); broadcasts only when `broadcast` is true (`explorerUrl` then set; a failure throws `BroadcastFailedError`; a differing txid from Esplora is a warning).
   - **`summary`:** `network: <n>`, `inputs: <k>, <sats> sats (<btc> BTC)`, `outputs:` and one line per output (`<address>  <sats> sats (<btc> BTC)`, `  change` appended for a change output, then `  "<label>"` when the address is in the book, the label shown through `displayText`), `fee: <sats> sats (<btc> BTC), <rate> sat/vB`.
-  - **Throws:** file errors (`cannot read proposal file <path>: …`), `proposal file <path> is not valid JSON`, shape errors (`proposal file <path>: <parseProposal message>`), analysis errors (`proposal refused: <analyzeProposal message>`, before any daemon call), daemon errors, `BroadcastFailedError`.
+  - **Throws:** file errors (`cannot read proposal file <path>: …`), `proposal file <path> is not valid JSON`, shape errors (`proposal file <path>: <parseProposal message>`), analysis errors (`proposal refused: <analyzeProposal message>`, before the daemon is asked to sign), the vault-check errors above, daemon errors, `BroadcastFailedError`.
 
 **Invariants:**
 - The CLI is the only component that talks to the chain.
@@ -573,9 +648,10 @@
 
 **Public surface:**
 - `runBackup(opts?: BackupOptions): Promise<BackupResult>`
-  - **Pre:** `configPath` (default `/etc/otzi/daemon.toml`) exists and is readable; share file (`[share].path`, loose-parsed from daemon.toml), identity file (`[node].identity_key_file`) and pubkey-book file (`[node].pubkey_book_file`) exist. Optional files (`vault-pubkey.json`, the address book) are skipped if absent.
+  - **Pre:** `configPath` (default `/etc/otzi/daemon.toml`) exists and is readable; share file (`[share].path`, loose-parsed from daemon.toml), identity file (`[node].identity_key_file`) and pubkey-book file (`[node].pubkey_book_file`) exist. Each of those three paths is absolute and a direct child of `/etc/otzi` or `/var/lib/otzi`, no two name the same file, and none names `daemon.toml`, `vault-pubkey.json` or the address book (the rule restore applies: `state-paths.ts`). Optional files (`vault-pubkey.json`, the address book) are skipped if absent.
   - **Post:** Single archive written at `<outputDir>/otzi-backup-<safe-ISO>.otzi-backup` (default `outputDir` is `os.homedir()`); mode 0600; atomic via `.tmp` + rename. Returns `{ path, password, filesIncluded }`.
   - **Throws:**
+    - A share, identity or pubkey-book path that breaks the rule above → `Error('cannot back up: <key> = <path> <why>; otzi restore would refuse the archive')`, `<key>` one of `[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file`, `<why>` as in `state-paths.ts`. Checked right after daemon.toml is parsed, before any other file is looked at or anything is written (no staging directory, no archive); `<path>` goes through `displayText`.
     - Required file missing → `Error` with message ending in `". This looks like a fresh / pre-bootstrap install; nothing meaningful to back up yet."`.
     - daemon.toml unreadable (ENOENT) → propagates with the same canonical tail.
 
@@ -594,17 +670,17 @@
 
 **Invariants:**
 - Password is generated by `runBackup` (32 chars from `[A-Za-z0-9]`, ≈190 bits entropy); operators do not choose it.
-- Tar paths are RELATIVE (no leading slash) so restore can place each entry at the corresponding absolute path.
+- Tar paths are RELATIVE (no leading slash) so restore can place each entry at the corresponding absolute path. The three configurable ones are the resolved tar paths of `state-paths.ts` (so `/var/lib/otzi/./share.json` is archived as `var/lib/otzi/share.json`, the path restore resolves it to); the three fixed ones are `FIXED_STATE_FILES` of the same module.
 - `meta.json` is generated in-tar (version, createdAt, hostname, partyId); never copied from disk.
 - `runBackup` is pure-ish: filesystem I/O + crypto only, no logging, no `process.exit`, no banner.
 
 **Cross-component contracts:**
-- Depends on: `node:crypto` (PBKDF2-SHA256, AES-256-GCM, randomBytes), `tar` (gzip), `smol-toml` (loose parse for share/identity/pubkey paths), `DEFAULT_ADDRESS_BOOK_PATH` (`src/address-book/store.ts`).
+- Depends on: `node:crypto` (PBKDF2-SHA256, AES-256-GCM, randomBytes), `tar` (gzip), `smol-toml` (loose parse for share/identity/pubkey paths), `resolveStatePaths`, `FIXED_STATE_FILES` and `FIXED_TAR_PATHS` (`src/cli/state-paths.ts`), `DEFAULT_ADDRESS_BOOK_PATH` (`src/address-book/store.ts`).
 - Used by: `entrypoint.ts`.
 - Exports the wire-format constants `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_SALT_LEN`, `BACKUP_IV_LEN`, `BACKUP_TAG_LEN`, `BACKUP_HEADER_LEN`, `BACKUP_PBKDF2_ITERATIONS`, the default file paths and `stripLeadingSlash` — `restore.ts` consumes all of these.
 
 ### `restore.ts`
-**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, read its tar members in memory, validate every member and every target path, then create each file at its canonical absolute path with the mode the daemon expects. Usable as a CLI verb and as the engine the debconf postinst pipes the password into via stdin. Restore runs as root, so it writes only the vault's own files, only directly inside `/etc/otzi` and `/var/lib/otzi`, and never replaces or follows anything already there.
+**Purpose:** Reverse of `runBackup`. Decrypt a `.otzi-backup` archive, read its tar members in memory, validate every member and every target path, then create each file at its canonical absolute path with the mode the daemon expects. Usable as a CLI verb and as the engine the debconf postinst pipes the password into via stdin. Restore runs as root, so it writes only the vault's own files, only directly inside `/etc/otzi` and `/var/lib/otzi`, and never replaces or follows anything already there. When it runs as root and a system user `otzi` exists, it also gives the files it places in `/var/lib/otzi` to that user, so the daemon (`User=otzi`) can read the share.
 
 **Public surface:**
 - `runRestore(opts: RestoreOptions): Promise<RestoreResult>`
@@ -615,12 +691,13 @@
   - **Validation (after decryption, before anything is written; each failure throws and writes nothing):**
     1. Every tar member name is relative and has no `..` segment (`archive entry <name>: absolute path refused` / `… '..' refused`).
     2. Every member is a regular file, or a directory that is not a target path (skipped). A symlink, hardlink, character or block device or FIFO anywhere, and a directory at a target path, is refused (`archive entry <name>: <symlink|hardlink|character device|block device|FIFO|directory where a regular file is expected> refused`). A file named twice is refused.
-    3. The targets are the fixed tar paths `etc/otzi/daemon.toml` (required), `etc/otzi/address-book.otzi.json`, `var/lib/otzi/vault-pubkey.json`, plus the three paths the archived daemon.toml names (`[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file`, loose-parsed; the backup defaults when absent). Each of those three must be absolute and resolve (`path.posix.resolve`) to a direct child of `/etc/otzi` or `/var/lib/otzi`: a path elsewhere is refused with `daemon.toml in the archive: <key> = <path> is outside /etc/otzi and /var/lib/otzi; refused`, a path below a subdirectory of them (`/var/lib/otzi/keys/share.json`) with `… <key> = <path> is not a direct child of /etc/otzi or /var/lib/otzi; refused`; no two targets may be the same path. With every target directly inside an allowed directory there is no directory in between that a symlink could replace between the checks and the write.
+    3. The targets are the fixed tar paths `etc/otzi/daemon.toml` (required), `etc/otzi/address-book.otzi.json`, `var/lib/otzi/vault-pubkey.json`, plus the three paths the archived daemon.toml names (`[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file`, loose-parsed; the backup defaults when absent). Each of those three must be absolute and resolve (`path.posix.resolve`) to a direct child of `/etc/otzi` or `/var/lib/otzi` (the rule of `state-paths.ts`, which `otzi backup` applies too): a path elsewhere is refused with `daemon.toml in the archive: <key> = <path> is outside /etc/otzi and /var/lib/otzi; refused`, a path below a subdirectory of them (`/var/lib/otzi/keys/share.json`) with `… <key> = <path> is not a direct child of /etc/otzi or /var/lib/otzi; refused`; no two targets may be the same path. With every target directly inside an allowed directory there is no directory in between that a symlink could replace between the checks and the write.
     4. Every other member (and `meta.json`, read for the result) is not written: it is skipped and listed in `skippedEntries`.
     5. **No target exists** (`lstat`; a symlink, dangling or not, counts): otherwise `restore would replace existing files: <path>, …; move them aside and run restore again`, listing every one.
     - **Display:** every piece of archive-derived text in these refusals (entry names, the paths and parse errors of the archived daemon.toml, the target paths) is shown through `displayText` (`src/util/text.ts`): control characters are removed, so an archive cannot inject terminal escape sequences into the error.
-  - **Placement:** in archive order, each target is created with `open(path, 'wx', mode)` (fails if anything appeared there meanwhile; never follows a symlink at the final component), written, `chmod`'d to its mode and synced; the allowed directory is created when missing.
-  - **Post:** Every target in the archive exists at its canonical (or `rootOverride`-prefixed) absolute path with its mode (see "Restored file modes"). `meta.json` is read into the result but NEVER written to disk. Returns `{ restoredFiles: { path, mode }[], skippedEntries: string[], metaPartyId?, metaCreatedAt?, metaHostname? }`.
+  - **Placement:** in archive order, each target is created with `open(path, 'wx', mode)` (fails if anything appeared there meanwhile; never follows a symlink at the final component), given to the `otzi` user when ownership applies (below), written, `chmod`'d to its mode and synced; the allowed directory is created when missing.
+  - **Ownership:** applies only when the process runs as root (`process.getuid?.() === 0`) and the `otzi` lookup finds a user. `readOtziOwner(root, run)` does the lookup: `findOtziOwner` over `<root>/etc/passwd` (uid and primary gid of the user `otzi`) and `<root>/etc/group` (gid of the group `otzi`, which wins over the user's primary gid), a missing file counting as empty. When that finds no user **and `root` is `/`** (no `rootOverride`; the host is the system being restored into), the directory service is asked: `getent passwd otzi` and `getent group otzi` through `run` (`RestoreOptions.execFile`, `timeout` 10 s each), their output parsed by `findOtziOwner` as passwd and group text. A `getent` that exits non-zero (2: not found), is absent, times out or prints something `findOtziOwner` rejects counts as no user. Another `root` never asks `getent`. Then every file placed directly inside `/var/lib/otzi` (the share, identity and pubkey-book files when `daemon.toml` puts them there, and `vault-pubkey.json`) is `fchown`ed to that uid and gid on the handle `open` returned, before the handle is closed, so no file is ever left mis-owned by a crash after it was closed. Files placed in `/etc/otzi` (`daemon.toml`, the address book, and any of the three that `daemon.toml` puts there) keep the owner they were created with: root, group `otzi` through the setgid directory. A failing `fchown` is a placement failure (rollback below) whose error is `could not give <path> to otzi (<uid>:<gid>): <reason>` (`cause` = the original error; `<path>` and `<reason>` through `displayText`). Not root: nothing is chowned, the files belong to the invoking user, and there is no warning. Root with no `otzi` user (the lookup above found none): nothing is chowned and `warnings` gets one entry, saying that no system user `otzi` was found, that the restored files in `/var/lib/otzi` stay root-owned and the daemon (`User=otzi`) will not be able to read its share, and giving the command `chown otzi:otzi <the files placed in /var/lib/otzi>` to run once the user exists, every path shell-quoted (`shellQuote`, `src/util/text.ts`: single quotes, an embedded single quote as `'\''`, so a space or a quote in a path cannot split a word or run anything); the entrypoint prints it on stderr as `WARNING: …`. Directories restore creates are not chowned.
+  - **Post:** Every target in the archive exists at its canonical (or `rootOverride`-prefixed) absolute path with its mode and, where ownership applies, its owner (see "Restored file modes and owners"). `meta.json` is read into the result but NEVER written to disk. Returns `{ restoredFiles: { path, mode, owner? }[], skippedEntries: string[], warnings: string[], metaPartyId?, metaCreatedAt?, metaHostname? }`.
   - **Throws:**
     - Bad magic → `Error('not an otzi backup archive (magic mismatch)')`.
     - Existing daemon.toml → `Error('config already present at <path>; move it aside first')`.
@@ -633,14 +710,23 @@
   - `archivePath: string` — required positional CLI arg.
   - `password?: string` — explicit password (test path or `--password` flag; the flag leaks via `/proc/<pid>/cmdline`, docs steer operators to stdin).
   - `passwordStdin?: boolean` — read password from stdin until newline (postinst path).
-  - `rootOverride?: string` — chroot-style prefix for all extraction targets (test seam; default `/`). The allowed directories become `<rootOverride>/etc/otzi` and `<rootOverride>/var/lib/otzi`; the paths daemon.toml names are still checked as production paths.
+  - `rootOverride?: string` — chroot-style prefix for all extraction targets (test seam; default `/`). The allowed directories become `<rootOverride>/etc/otzi` and `<rootOverride>/var/lib/otzi`; the paths daemon.toml names are still checked as production paths. The default `otzi` lookup reads `<rootOverride>/etc/passwd` and `<rootOverride>/etc/group` and does not ask `getent`, so a test root without them never chowns.
   - `daemonStatusCheck?: () => Promise<boolean>` — override the `systemctl is-active otzi` probe (test seam).
+  - `execFile?: RunCommand` — runs the external commands, `systemctl is-active otzi` and `getent` (test seam; default `child_process.execFile`). `RunCommand = (file: string, args: readonly string[], options?: { timeout?: number }) => Promise<{ stdout: string }>`, rejecting on a non-zero exit, a timeout or a missing command.
   - `configExistsCheck?: () => Promise<boolean>` — override the daemon.toml-exists probe (test seam).
   - `stdinStream?: Readable` — alternate stream for the `passwordStdin` path (test seam).
+  - `isRoot?: boolean` — overrides `process.getuid?.() === 0` (test seam).
+  - `lookupOtziOwner?: () => Promise<OtziOwner | undefined>` — overrides the `readOtziOwner` lookup of the `otzi` user (test seam); `undefined` means there is no such user.
+  - `chownFile?: (handle: FileHandle, path: string, owner: OtziOwner) => Promise<void>` — overrides the `handle.chown(owner.uid, owner.gid)` call (test seam); called with the still-open handle.
+
+- `OtziOwner` — `{ uid: number; gid: number }`.
+- `readOtziOwner(root: string, run?: RunCommand): Promise<OtziOwner | undefined>` — the lookup described under **Ownership**; `run` defaults to `child_process.execFile`.
+- `findOtziOwner(passwd: string, group: string): OtziOwner | undefined` — pure parser of `passwd` / `group` file text: the uid of the user `otzi` and the gid of the group `otzi`, falling back to the user's primary gid; `undefined` when the user is missing or a field is not a non-negative integer.
 
 - `RestoreResult`
-  - `restoredFiles: { path: string; mode: number }[]`.
+  - `restoredFiles: { path: string; mode: number; owner?: OtziOwner }[]` — `owner` is present exactly for the files restore `fchown`ed.
   - `skippedEntries: string[]` — tar member names that are not part of a backup and were not written (the CLI prints one warning line per entry).
+  - `warnings: string[]` — what the operator must act on although the restore succeeded (only the root-without-an-`otzi`-user case above; the CLI prints each as `WARNING: <text>` on stderr). Empty otherwise.
   - `metaPartyId?: number`, `metaCreatedAt?: string`, `metaHostname?: string` — from in-archive `meta.json`; missing/malformed meta is non-fatal.
 
 **Invariants:**
@@ -648,12 +734,13 @@
 - Wrong-password and tampered-archive surface IDENTICALLY.
 - Members are parsed in memory (`tar` `Parser`); nothing from the archive is extracted to disk before validation, and nothing is ever written outside the target list.
 - Restore only creates files: it never replaces, truncates, deletes or writes through an existing file system entry. A throw mid-place removes only the files this call created.
+- Ownership never widens access: `fchown` happens on a file restore itself created with its final mode (the share is 0600), and only to the `otzi` user, whose daemon is the share's one legitimate reader. Restore never chowns a pre-existing entry, a directory, or anything in `/etc/otzi`.
 - `meta.json` and unknown members are never written to disk; unknown members are reported in `skippedEntries`.
 - Password resolution precedence: explicit `password` → `passwordStdin` → interactive readline prompt on stderr.
-- `runRestore` is pure-ish: filesystem I/O + crypto + `systemctl` exec only; a single `console.error` on rollback.
+- `runRestore` is pure-ish: filesystem I/O + crypto + `systemctl` and (real root only) `getent` exec; a single `console.error` on rollback.
 
 **Cross-component contracts:**
-- Depends on: `node:crypto`, `tar` (`Parser`), `smol-toml`, `node:child_process`, constants from `backup.ts`.
+- Depends on: `node:crypto`, `tar` (`Parser`), `smol-toml`, `node:child_process`, constants from `backup.ts`, `resolveStatePaths`, `DATA_DIR` and `FIXED_STATE_FILES` (`src/cli/state-paths.ts`), `displayText` / `errorReason` / `shellQuote` (`src/util/text.ts`).
 - Used by: `entrypoint.ts`, debconf postinst (via `--password-stdin`).
 
 ---
@@ -701,19 +788,21 @@ Constants exported by `backup.ts`: `BACKUP_MAGIC`, `BACKUP_MAGIC_LEN`, `BACKUP_S
 
 ---
 
-## Restored file modes (invariant)
+## Restored file modes and owners (invariant)
 
-`restore.ts` creates each file with these modes. They match what the `.deb` postinst sets up (chmod-only; ownership inherits from `/etc/otzi` and `/var/lib/otzi` setgid bits).
+`restore.ts` creates each file with these modes. They match what the `.deb` postinst sets up. The owner column is the result of a restore run as root on an install with a system user `otzi` (normal ownership: see `docs/install.md` § File layout); a file `restore` did not chown belongs to whoever created it, and gets group `otzi` from the setgid directory when root creates it.
 
-| Path | Mode |
-|---|---|
-| `/etc/otzi/daemon.toml` | 0640 |
-| `/etc/otzi/address-book.otzi.json` | 0640 |
-| share file (configurable path) | 0600 |
-| identity file | 0660 |
-| pubkey-book file | 0644 |
-| `/var/lib/otzi/vault-pubkey.json` | 0644 |
+| Path | Mode | Owner after restore as root |
+|---|---|---|
+| `/etc/otzi/daemon.toml` | 0640 | root:otzi (setgid dir) |
+| `/etc/otzi/address-book.otzi.json` | 0640 | root:otzi (setgid dir) |
+| share file (configurable path) | 0600 | otzi:otzi in `/var/lib/otzi` |
+| identity file | 0660 | otzi:otzi in `/var/lib/otzi` |
+| pubkey-book file | 0644 | otzi:otzi in `/var/lib/otzi` |
+| `/var/lib/otzi/vault-pubkey.json` | 0644 | otzi:otzi |
 
-Operator-configurable paths (share / identity / pubkeys per `[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file` in daemon.toml) are resolved at restore time by loose-parsing the archived daemon.toml, and must be direct children of `/etc/otzi` or `/var/lib/otzi` (no nested layouts). Unrecognized tar entries are not written; `otzi restore` prints `warning: skipped archive entry <name>: not part of an otzi backup` to stderr for each.
+A share, identity or pubkey-book file that `daemon.toml` puts directly in `/etc/otzi` stays root:otzi (mode as in the table). Without a user `otzi` (after `getent`, on the real root), or when not root, no file is chowned; as root without the user, `warnings` says so (see **Ownership** under `runRestore`).
+
+Operator-configurable paths (share / identity / pubkeys per `[share].path`, `[node].identity_key_file`, `[node].pubkey_book_file` in daemon.toml) are resolved at restore time by loose-parsing the archived daemon.toml, and must be direct children of `/etc/otzi` or `/var/lib/otzi` (no nested layouts); `otzi backup` refuses a daemon.toml that breaks this, so every archive it writes can be restored. Unrecognized tar entries are not written; `otzi restore` prints `warning: skipped archive entry <name>: not part of an otzi backup` to stderr for each.
 
 ---

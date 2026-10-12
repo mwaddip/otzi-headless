@@ -21,8 +21,24 @@
  *
  * Re-handshake: a broken session is replaced by a fresh handshake, always
  * started by the initiator — on its own record failure, on the next send or
- * pull, or on a re-handshake request (an empty frame) from the responder. A
- * responder accepts a fresh hs1 in any state.
+ * pull, or on a re-handshake request (an empty frame) from the responder,
+ * which a responder also sends when its own handshake fails. A request
+ * restarts the handshake from any state. Every initiator restart, whatever
+ * triggers it (the roster, a record failure, a stale handshake, a request),
+ * takes place at most once per `REHANDSHAKE_MIN_INTERVAL_MS` per peer: a
+ * trigger inside the window is deferred to its end, never dropped, so a pair
+ * that cannot agree retries once per window, not at the pace of its traffic.
+ * A responder accepts a fresh hs1 in any state.
+ *
+ * Reconnect: a relay socket that fails to open, drops, or has its hello
+ * refused ends every peer session and schedules the next attempt with
+ * exponential backoff (`reconnect`); the relay's ack to a hello resets it.
+ * `start()` resolves after the first attempt either way; `stop()` cancels.
+ *
+ * Liveness (`liveness`): the upgrade must complete within `connectMs`, the
+ * relay must ack our hello within `ackMs`, and an open socket pings the relay
+ * every `pingIntervalMs`, dropping it when a pong takes longer than `pongMs`.
+ * Each miss ends the socket as a failed attempt.
  */
 
 import { WebSocket } from 'ws';
@@ -69,6 +85,18 @@ export interface RelayTransportOptions {
   peers: ReadonlyArray<RelayTransportPeer>;
   wsCtor?: typeof WebSocket;
   pullTimeoutMs?: number;
+  /**
+   * Relay reconnect backoff: attempt k (from 0) waits min(maxMs, initialMs·2^k)
+   * plus up to 10 % jitter. Defaults 1000 / 30000 ms.
+   */
+  reconnect?: { initialMs?: number; maxMs?: number };
+  /**
+   * Relay socket liveness, in ms: `connectMs` bounds the TCP connect and the
+   * WebSocket upgrade (default 10 000); `ackMs` the wait from our hello to the
+   * relay's ack (10 000); an open socket pings the relay every `pingIntervalMs`
+   * (20 000) and drops it when a pong takes longer than `pongMs` (10 000).
+   */
+  liveness?: { connectMs?: number; ackMs?: number; pingIntervalMs?: number; pongMs?: number };
   logger?: Logger;
 }
 
@@ -86,6 +114,18 @@ interface PeerState {
   /** Initiator: when the current handshake started, and which one it is. */
   handshakeStartedAt: number;
   handshakeAttempt: number;
+  /** Initiator: when the handshake last (re)started, for any reason: the rate limit counts from it. */
+  lastRestartAt: number;
+  /**
+   * Initiator: the timer that starts the handshake at the end of the rate-limit window, for the
+   * triggers that arrived inside it (merged: at most one per peer). `deferredRequestOnly`: every
+   * one of them was a re-handshake request, and `deferredForSession` is the session held when the
+   * latest request arrived: a session that has replaced it by the time the timer fires has
+   * answered such requests. Any other trigger (record failure, ...) is not answered that way.
+   */
+  deferredRestart: NodeJS.Timeout | null;
+  deferredRequestOnly: boolean;
+  deferredForSession: RecordSession | null;
   /** Serialises every frame to this peer (handshake and records): the relay sees them in counter order. */
   sendChain: Promise<void>;
   /**
@@ -98,6 +138,13 @@ interface PeerState {
   processing: boolean;
 }
 
+/** One relay socket's timers. Cleared on that socket's close, on a drop, and on `stop()`. */
+interface SocketTimers {
+  ping: NodeJS.Timeout | null;
+  pong: NodeJS.Timeout | null;
+  ack: NodeJS.Timeout | null;
+}
+
 interface PendingPull {
   resolve: (blob: Uint8Array | null) => void;
   reject: (err: Error) => void;
@@ -107,8 +154,18 @@ interface PendingPull {
 }
 
 const DEFAULT_PULL_TIMEOUT_MS = 30_000;
+const DEFAULT_RECONNECT_INITIAL_MS = 1_000;
+const DEFAULT_RECONNECT_MAX_MS = 30_000;
+/** A reconnect delay grows by up to this fraction, so a ring that lost its relay does not redial in lockstep. */
+const RECONNECT_JITTER = 0.1;
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_ACK_TIMEOUT_MS = 10_000;
+const DEFAULT_PING_INTERVAL_MS = 20_000;
+const DEFAULT_PONG_TIMEOUT_MS = 10_000;
 /** An initiator handshake without hs2 for this long may be restarted. */
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+/** Re-handshake requests restart the handshake at most this often after a restart; a pair that cannot agree must not spin. */
+const REHANDSHAKE_MIN_INTERVAL_MS = 1_000;
 /** Handshake messages are raw uncompressed P-256 points. */
 const HANDSHAKE_FRAME_BYTES = 65;
 const EMPTY = new Uint8Array(0);
@@ -124,10 +181,25 @@ export class RelayTransport implements Transport {
   private readonly broadcastHandlers = new Set<(from: PartyId, msg: Uint8Array) => void>();
   private pullHandler: ((from: PartyId, key: BlobKey) => Uint8Array | null) | null = null;
   private readonly pendingPulls = new Map<string, PendingPull>();
+  /** The current relay socket, from its connection attempt until it drops or `stop()`. */
   private ws: WebSocket | null = null;
+  /** The relay acked this socket's hello. */
+  private registered = false;
   private readonly wsCtor: typeof WebSocket;
   private readonly log: Logger;
   private readonly pullTimeoutMs: number;
+  private readonly reconnectInitialMs: number;
+  private readonly reconnectMaxMs: number;
+  /** Failed attempts since the last ack: the exponent of the next delay. */
+  private reconnectAttempt = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private readonly connectTimeoutMs: number;
+  private readonly ackTimeoutMs: number;
+  private readonly pingIntervalMs: number;
+  private readonly pongTimeoutMs: number;
+  /** The current socket's timers. */
+  private timers: SocketTimers | null = null;
+  private started = false;
   private stopped = false;
 
   constructor(options: RelayTransportOptions) {
@@ -140,6 +212,17 @@ export class RelayTransport implements Transport {
     this.wsCtor = options.wsCtor ?? WebSocket;
     this.log = options.logger ?? NOOP_LOGGER;
     this.pullTimeoutMs = options.pullTimeoutMs ?? DEFAULT_PULL_TIMEOUT_MS;
+    this.reconnectInitialMs = durationMs(options.reconnect?.initialMs, DEFAULT_RECONNECT_INITIAL_MS, 'reconnect.initialMs');
+    this.reconnectMaxMs = durationMs(options.reconnect?.maxMs, DEFAULT_RECONNECT_MAX_MS, 'reconnect.maxMs');
+    if (this.reconnectMaxMs < this.reconnectInitialMs)
+      throw new Error(
+        `RelayTransport: reconnect.maxMs (${this.reconnectMaxMs}) is below reconnect.initialMs (${this.reconnectInitialMs})`,
+      );
+    const liveness = options.liveness ?? {};
+    this.connectTimeoutMs = durationMs(liveness.connectMs, DEFAULT_CONNECT_TIMEOUT_MS, 'liveness.connectMs');
+    this.ackTimeoutMs = durationMs(liveness.ackMs, DEFAULT_ACK_TIMEOUT_MS, 'liveness.ackMs');
+    this.pingIntervalMs = durationMs(liveness.pingIntervalMs, DEFAULT_PING_INTERVAL_MS, 'liveness.pingIntervalMs');
+    this.pongTimeoutMs = durationMs(liveness.pongMs, DEFAULT_PONG_TIMEOUT_MS, 'liveness.pongMs');
 
     for (const peer of options.peers) {
       if (peer.partyId === this.partyId)
@@ -154,6 +237,10 @@ export class RelayTransport implements Transport {
         online: false,
         handshakeStartedAt: 0,
         handshakeAttempt: 0,
+        lastRestartAt: 0,
+        deferredRestart: null,
+        deferredRequestOnly: false,
+        deferredForSession: null,
         sendChain: Promise.resolve(),
         pending: [],
         processing: false,
@@ -161,48 +248,31 @@ export class RelayTransport implements Transport {
     }
   }
 
+  /** Resolves after the first connection attempt, whether or not it reached the relay; later attempts follow the backoff. */
   async start(): Promise<void> {
-    if (this.ws) return;
-    const ws = new this.wsCtor(this.relayUrl, { maxPayload: MAX_FRAME_BYTES });
-    this.ws = ws;
-
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => {
-        ws.off('open', onOpen);
-        reject(err);
-      };
-      const onOpen = () => {
-        ws.off('error', onError);
-        resolve();
-      };
-      ws.once('error', onError);
-      ws.once('open', onOpen);
-    });
-
-    ws.on('message', (data) => {
-      void this.onRelayMessage(data);
-    });
-    ws.on('close', () => this.handleRelayClose());
-    ws.on('error', () => this.handleRelayClose());
-
-    await this.sendToRelay({
-      kind: 'hello',
-      ringId: this.ringId,
-      partyId: this.self.partyId,
-    });
-
-    this.log.info('relay-transport: started', { ringId: this.ringId, partyId: this.self.partyId });
+    if (this.started) return;
+    this.started = true;
+    await this.connect();
+    // A stop() during the first attempt ended it: nothing started.
+    if (!this.stopped) this.log.info('relay-transport: started', { ringId: this.ringId, partyId: this.self.partyId });
   }
 
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    // Now, not on the close event: a graceful close may take up to 30 s to report.
+    this.clearSocketTimers();
     for (const pending of this.pendingPulls.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('relay-transport: stopping'));
     }
     this.pendingPulls.clear();
     if (this.ws) {
+      // Open or still connecting: either way it closes, and its close event is ignored (stopped).
       const ws = this.ws;
       this.ws = null;
       try {
@@ -213,6 +283,7 @@ export class RelayTransport implements Transport {
     }
     for (const peer of this.peerStates.values()) {
       peer.online = false;
+      this.clearDeferredRestart(peer);
       this.endSession(peer, 'disconnected');
     }
     this.log.info('relay-transport: stopped');
@@ -287,11 +358,18 @@ export class RelayTransport implements Transport {
     };
   }
 
+  /** Self, or a peer whose handshake over the relay completed and whose session has not ended since. No side effect. */
+  isConnected(partyId: PartyId): boolean {
+    if (partyId === this.partyId) return true;
+    const peer = this.peerStates.get(partyId);
+    return peer !== undefined && peer.status === 'connected' && peer.session !== null;
+  }
+
   // ─────────────────────────────────────────────────────────────────────
   // Relay message dispatch
   // ─────────────────────────────────────────────────────────────────────
 
-  private async onRelayMessage(data: unknown): Promise<void> {
+  private async onRelayMessage(ws: WebSocket, data: unknown): Promise<void> {
     const text = typeof data === 'string' ? data : Buffer.from(data as ArrayBuffer).toString('utf8');
     const msg = parseServerMsg(text);
     if (!msg) {
@@ -312,17 +390,30 @@ export class RelayTransport implements Transport {
         await this.onIncoming(msg.from, fromHex(msg.payloadHex));
         return;
       case 'error':
+        if (!this.registered) {
+          // An error before the ack: the relay refused our hello (say, a connection it has
+          // not yet seen drop still holds our partyId). A failed attempt: drop it and retry.
+          this.dropSocket(ws, 'relay refused hello', { message: msg.message });
+          return;
+        }
         this.log.warn('relay-transport: relay error', { message: msg.message });
         return;
     }
   }
 
   private async onAck(roster: PartyId[]): Promise<void> {
+    if (this.timers?.ack) {
+      clearTimeout(this.timers.ack);
+      this.timers.ack = null;
+    }
+    this.registered = true;
+    this.reconnectAttempt = 0;
+    this.log.info('relay-transport: registered with the relay', { roster });
     for (const partyId of roster) {
       const peer = this.peerStates.get(partyId);
       if (!peer) continue;
       peer.online = true;
-      if (peer.role === 'initiator') void this.startInitiatorHandshake(peer);
+      if (peer.role === 'initiator') this.startInitiatorHandshake(peer);
       else peer.status = 'waiting-for-hs1';
     }
   }
@@ -332,7 +423,7 @@ export class RelayTransport implements Transport {
     if (!peer) return;
     peer.online = true;
     // A (re)joined peer holds no session: any handshake in flight went to its previous connection.
-    if (peer.role === 'initiator') void this.startInitiatorHandshake(peer, { restart: true });
+    if (peer.role === 'initiator') this.startInitiatorHandshake(peer, { restart: true });
     else this.endSession(peer, 'waiting-for-hs1');
   }
 
@@ -340,6 +431,7 @@ export class RelayTransport implements Transport {
     const peer = this.peerStates.get(partyId);
     if (!peer) return;
     peer.online = false;
+    this.clearDeferredRestart(peer);
     this.endSession(peer, 'disconnected');
     peer.pending.length = 0;
     this.log.info('relay-transport: peer left', { partyId });
@@ -398,14 +490,21 @@ export class RelayTransport implements Transport {
 
     // Initiator.
     if (peer.status === 'waiting-for-hs2') {
-      if (isHandshakeFrame(payload) && peer.initiatorState) await this.completeInitiatorHandshake(peer, payload);
-      // Anything else is a record the responder sealed under the old session: dropped.
+      if (isHandshakeFrame(payload)) {
+        if (peer.initiatorState) await this.completeInitiatorHandshake(peer, payload);
+        return;
+      }
+      // A record the responder sealed under the old session: it holds a session, so our hs1 may
+      // have been lost. The record is dropped; a handshake under way for too long restarts.
+      this.maybeStartHandshake(peer);
       return;
     }
     if (peer.status === 'connected' && peer.session) {
       if (await this.handleConnectedIncoming(peer, payload)) return;
-      this.log.warn('relay-transport: record auth failed; re-handshaking', { peerPartyId: peer.partyId });
-      void this.startInitiatorHandshake(peer, { restart: true });
+      // One warning per pending restart, not one per frame that fails while it waits for its window.
+      if (!peer.deferredRestart)
+        this.log.warn('relay-transport: record auth failed; re-handshaking', { peerPartyId: peer.partyId });
+      this.startInitiatorHandshake(peer, { restart: true });
       return;
     }
     // A record while this node holds no session: the responder still holds one.
@@ -421,16 +520,17 @@ export class RelayTransport implements Transport {
     if (peer.role !== 'initiator' || !peer.online) return;
     const stale =
       peer.status === 'waiting-for-hs2' && Date.now() - peer.handshakeStartedAt > HANDSHAKE_TIMEOUT_MS;
-    if (peer.status === 'disconnected' || stale) void this.startInitiatorHandshake(peer, { restart: true });
+    if (peer.status === 'disconnected' || stale) this.startInitiatorHandshake(peer, { restart: true });
   }
 
+  /**
+   * The responder discarded whatever it held, our hs1 included, so waiting for
+   * an hs2 cannot succeed: restart from any state (subject to the window, see
+   * `startInitiatorHandshake`).
+   */
   private onRehandshakeRequest(peer: PeerState): void {
-    if (peer.status === 'waiting-for-hs2') {
-      this.maybeStartHandshake(peer); // only when stale: a handshake is already under way
-      return;
-    }
-    this.log.info('relay-transport: re-handshake requested', { peerPartyId: peer.partyId });
-    void this.startInitiatorHandshake(peer, { restart: true });
+    this.log.debug('relay-transport: re-handshake requested', { peerPartyId: peer.partyId });
+    this.startInitiatorHandshake(peer, { restart: true, request: true });
   }
 
   /** Responder: ask the initiator for a fresh handshake (an empty frame). */
@@ -443,12 +543,81 @@ export class RelayTransport implements Transport {
     );
   }
 
-  private async startInitiatorHandshake(peer: PeerState, opts: { restart?: boolean } = {}): Promise<void> {
-    if (this.stopped || !this.ws || peer.role !== 'initiator') return;
+  /**
+   * Initiator: the only way a handshake starts, for every trigger (the roster, a record
+   * failure, a stale handshake, a re-handshake `request`, ...). Starts one with an online
+   * peer that has none, or with `restart` ends the current one and starts over.
+   *
+   * At most one start per peer per `REHANDSHAKE_MIN_INTERVAL_MS`, counted from the last one
+   * of any kind. A trigger inside the window is deferred, not dropped (nobody retries it: the
+   * responder sends a request once, and our own traffic may be idle): one timer per peer starts
+   * the handshake when the window ends, and further triggers merge into it. A peer's first
+   * handshake is immediate. So a pair whose handshakes keep failing (say, mismatched keys)
+   * restarts once per window however much traffic arrives, not at the pace of that traffic.
+   */
+  private startInitiatorHandshake(peer: PeerState, opts: { restart?: boolean; request?: boolean } = {}): void {
+    if (!this.canHandshake(peer)) return;
     if (peer.status !== 'disconnected' && !opts.restart) return;
+    const sinceLast = Date.now() - peer.lastRestartAt;
+    // A negative interval is a clock that stepped back: not a reason to hold anything off.
+    if (sinceLast >= 0 && sinceLast < REHANDSHAKE_MIN_INTERVAL_MS) {
+      this.deferStart(peer, REHANDSHAKE_MIN_INTERVAL_MS - sinceLast, opts.request === true);
+      return;
+    }
+    void this.beginInitiatorHandshake(peer);
+  }
+
+  /** Start `delayMs` from now unless something else starts one first; triggers share one timer. */
+  private deferStart(peer: PeerState, delayMs: number, request: boolean): void {
+    // The session a request is about: one that replaces it before the timer fires has answered it.
+    if (request) peer.deferredForSession = peer.session;
+    if (peer.deferredRestart) {
+      peer.deferredRequestOnly = peer.deferredRequestOnly && request;
+      return;
+    }
+    peer.deferredRequestOnly = request;
+    this.log.debug('relay-transport: handshake restart deferred (rate limit)', {
+      peerPartyId: peer.partyId,
+      delayMs,
+      request,
+    });
+    peer.deferredRestart = setTimeout(() => {
+      const requestOnly = peer.deferredRequestOnly;
+      const since = peer.deferredForSession;
+      peer.deferredRestart = null;
+      peer.deferredRequestOnly = false;
+      peer.deferredForSession = null;
+      if (!this.canHandshake(peer)) return;
+      if (requestOnly && peer.status === 'connected' && peer.session && peer.session !== since) {
+        this.log.debug('relay-transport: deferred re-handshake request already answered by a newer session', {
+          peerPartyId: peer.partyId,
+        });
+        return;
+      }
+      void this.beginInitiatorHandshake(peer);
+    }, delayMs);
+  }
+
+  private clearDeferredRestart(peer: PeerState): void {
+    if (peer.deferredRestart) clearTimeout(peer.deferredRestart);
+    peer.deferredRestart = null;
+    peer.deferredRequestOnly = false;
+    peer.deferredForSession = null;
+  }
+
+  /** The relay is up and this is an initiator's online peer. */
+  private canHandshake(peer: PeerState): boolean {
+    return !this.stopped && this.ws !== null && peer.role === 'initiator' && peer.online;
+  }
+
+  /** Begin a handshake now (the window has been checked): the old session ends and hs1 goes out. */
+  private async beginInitiatorHandshake(peer: PeerState): Promise<void> {
+    if (!this.canHandshake(peer)) return;
     // Synchronously: the old session ends (its pulls resolve null) and later triggers see a handshake under way.
+    // A start deferred until now is answered by this one (a later trigger will be deferred anew).
+    this.clearDeferredRestart(peer);
     this.endSession(peer, 'waiting-for-hs2');
-    peer.handshakeStartedAt = Date.now();
+    peer.handshakeStartedAt = peer.lastRestartAt = Date.now();
     const attempt = ++peer.handshakeAttempt;
     try {
       const { state, message1 } = await initiatorBegin(this.self.identity);
@@ -489,6 +658,9 @@ export class RelayTransport implements Transport {
   }
 
   private async completeResponderHandshake(peer: PeerState, message1: Uint8Array): Promise<void> {
+    // The relay socket the hs1 came in on. If it is gone when the answer is ready, the relay close
+    // already ended this peer's session: hs2 has nowhere to go and the initiator will start over.
+    const ws = this.ws;
     try {
       const { message2, secrets } = await responderRespond(
         this.self.identity,
@@ -496,6 +668,7 @@ export class RelayTransport implements Transport {
         peer.publicKey,
       );
       const session = await RecordSession.create(secrets);
+      if (!ws || this.ws !== ws) return;
       // One synchronous step: the old session ends, the new one is usable, and hs2
       // takes its place in the send chain ahead of every record sealed under it.
       this.endSession(peer, 'connected');
@@ -508,7 +681,11 @@ export class RelayTransport implements Transport {
         peerPartyId: peer.partyId,
         err: errMsg(err),
       });
+      if (!ws || this.ws !== ws) return; // the relay is gone (or was before): nothing to answer over
+      // The initiator waits for an hs2 that will not come (or holds a session we no longer have):
+      // ask it to start over, as for any other session we could not keep.
       this.endSession(peer, 'waiting-for-hs1');
+      this.requestRehandshake(peer);
     }
   }
 
@@ -526,7 +703,7 @@ export class RelayTransport implements Transport {
   private sessionBroken(peer: PeerState, reason: string): void {
     this.log.warn('relay-transport: session broken', { peerPartyId: peer.partyId, reason });
     if (peer.role === 'initiator') {
-      void this.startInitiatorHandshake(peer, { restart: true });
+      this.startInitiatorHandshake(peer, { restart: true });
     } else {
       this.endSession(peer, 'waiting-for-hs1');
       this.requestRehandshake(peer);
@@ -645,28 +822,155 @@ export class RelayTransport implements Transport {
 
   private sendToRelay(msg: RelayClientMsg): Promise<void> {
     const ws = this.ws;
-    if (!ws) return Promise.reject(new Error('relay-transport: not connected to the relay'));
+    if (!ws || ws.readyState !== WebSocket.OPEN)
+      return Promise.reject(new Error('relay-transport: not connected to the relay'));
     return new Promise<void>((resolve, reject) => {
       ws.send(encodeClientMsg(msg), (err) => (err ? reject(err) : resolve()));
     });
   }
 
-  private handleRelayClose(): void {
+  // ─────────────────────────────────────────────────────────────────────
+  // Relay connection lifecycle
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * One connection attempt: open a socket to the relay and send `hello`.
+   * Resolves once the hello is written or the attempt has failed. A failure,
+   * and any later drop, schedules the next attempt (`handleRelayClose`).
+   */
+  private async connect(): Promise<void> {
     if (this.stopped) return;
-    this.log.warn('relay-transport: relay connection closed');
+    // `handshakeTimeout` bounds the TCP connect and the HTTP 101 together.
+    const ws = new this.wsCtor(this.relayUrl, { maxPayload: MAX_FRAME_BYTES, handshakeTimeout: this.connectTimeoutMs });
+    const timers: SocketTimers = { ping: null, pong: null, ack: null };
+    this.ws = ws;
+    this.timers = timers;
+    this.registered = false;
+    let opened = false;
+    ws.once('open', () => {
+      opened = true;
+      if (this.ws === ws) this.startKeepalive(ws, timers);
+    });
+    ws.on('close', () => clearTimers(timers));
+    ws.on('pong', () => {
+      if (timers.pong) clearTimeout(timers.pong);
+      timers.pong = null;
+    });
+    ws.on('message', (data) => {
+      if (this.ws === ws) void this.onRelayMessage(ws, data);
+    });
+    // One drop can fire both `error` and `close`: the first one handles it.
+    ws.on('error', (err) =>
+      this.handleRelayClose(ws, opened ? 'relay connection failed' : 'relay connection attempt failed', {
+        err: errMsg(err),
+      }),
+    );
+    ws.on('close', (code) =>
+      this.handleRelayClose(ws, opened ? 'relay connection closed' : 'relay connection attempt failed', { code }),
+    );
+
+    await new Promise<void>((resolve) => {
+      ws.once('open', resolve);
+      ws.once('error', () => resolve());
+      ws.once('close', () => resolve());
+    });
+    if (!opened || this.ws !== ws) return; // failed (next attempt scheduled) or stopped
+
+    // No ack in time is a failed attempt: the backoff is not reset.
+    timers.ack = setTimeout(() => {
+      timers.ack = null;
+      this.dropSocket(ws, 'relay did not acknowledge hello', { ackMs: this.ackTimeoutMs });
+    }, this.ackTimeoutMs);
+    try {
+      await this.sendToRelay({ kind: 'hello', ringId: this.ringId, partyId: this.self.partyId });
+    } catch (err) {
+      this.dropSocket(ws, 'relay hello send failed', { err: errMsg(err) });
+    }
+  }
+
+  /** Ping the relay every `pingIntervalMs`; a ping unanswered after `pongMs` drops the socket. */
+  private startKeepalive(ws: WebSocket, timers: SocketTimers): void {
+    timers.ping = setInterval(() => {
+      if (this.ws !== ws || timers.pong) return; // an unanswered ping's own deadline decides
+      timers.pong = setTimeout(() => {
+        timers.pong = null;
+        this.dropSocket(ws, 'relay did not answer a ping', { pongMs: this.pongTimeoutMs });
+      }, this.pongTimeoutMs);
+      try {
+        ws.ping();
+      } catch {
+        /* not open any more: its close event drops it */
+      }
+    }, this.pingIntervalMs);
+  }
+
+  /** End this socket as a failed attempt, then kill it at once (no close handshake to wait for). */
+  private dropSocket(ws: WebSocket, reason: string, details: Record<string, unknown>): void {
+    this.handleRelayClose(ws, reason, details);
+    ws.terminate();
+  }
+
+  private clearSocketTimers(): void {
+    if (this.timers) clearTimers(this.timers);
+    this.timers = null;
+  }
+
+  /**
+   * The current relay socket failed to open, dropped, or had its hello refused:
+   * every peer goes offline (sessions end, pending pulls resolve null, queued
+   * frames from the old socket are discarded) and the next attempt is scheduled.
+   * Events from any other socket, and anything after `stop()`, are ignored.
+   */
+  private handleRelayClose(ws: WebSocket, reason: string, details: Record<string, unknown>): void {
+    if (this.stopped || this.ws !== ws) return;
+    this.ws = null;
+    this.registered = false;
+    this.clearSocketTimers();
     for (const peer of this.peerStates.values()) {
       peer.online = false;
+      peer.pending.length = 0;
+      this.clearDeferredRestart(peer);
       this.endSession(peer, 'disconnected');
     }
-    this.ws = null;
-    // Reconnection to the relay is not implemented in phase 3e — operator
-    // restarts the daemon. Phase 3f integration can add exponential backoff
-    // if real deployments want it.
+    this.scheduleReconnect(reason, details);
+  }
+
+  /** Attempt k (from 0) waits min(maxMs, initialMs·2^k) plus up to 10 % jitter. */
+  private scheduleReconnect(reason: string, details: Record<string, unknown>): void {
+    if (this.stopped || this.reconnectTimer) return;
+    const base = Math.min(this.reconnectMaxMs, this.reconnectInitialMs * 2 ** this.reconnectAttempt);
+    const delayMs = base + Math.floor(Math.random() * base * RECONNECT_JITTER);
+    this.reconnectAttempt += 1;
+    this.log.warn(`relay-transport: ${reason}; reconnecting`, {
+      ...details,
+      attempt: this.reconnectAttempt,
+      delayMs,
+    });
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect().catch((err) =>
+        this.log.error('relay-transport: reconnect failed to start', { err: errMsg(err) }),
+      );
+    }, delayMs);
   }
 }
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function clearTimers(t: SocketTimers): void {
+  if (t.ping) clearInterval(t.ping);
+  if (t.pong) clearTimeout(t.pong);
+  if (t.ack) clearTimeout(t.ack);
+  t.ping = t.pong = t.ack = null;
+}
+
+/** A configured duration, or the default: finite and at least 1 ms. */
+function durationMs(value: number | undefined, fallback: number, name: string): number {
+  const ms = value ?? fallback;
+  if (!Number.isFinite(ms) || ms < 1) throw new Error(`RelayTransport: ${name} must be a finite number of ms, at least 1 (got ${ms})`);
+  return ms;
 }
 
 /**

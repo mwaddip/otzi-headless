@@ -22,3 +22,14 @@ export function errorReason(err: unknown): string {
 export function displayText(text: string): string {
   return text.replace(/[\t\r\n]+/g, ' ').replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
 }
+
+/**
+ * `word` as one word of a POSIX shell command line: in single quotes, an
+ * embedded single quote written as `'\''`. Nothing inside single quotes is
+ * special to the shell, so a space, `$`, `;` or a quote in a path cannot split
+ * the word or run anything. Use it for every path put in a command the operator
+ * is told to run.
+ */
+export function shellQuote(word: string): string {
+  return `'${word.replace(/'/g, `'\\''`)}'`;
+}

@@ -14,9 +14,11 @@
  *
  * Cross-validation:
  *   - Self entry = the book entry whose publicKeyHex matches loaded identity.
- *   - For peer-mesh: every `[[peers]].endpoint` (canonical) must match a
- *     non-self book entry's `advertisedEndpoint` (canonical), and vice versa.
- *   - For relay: peer endpoint matching is skipped (relay routes by partyId).
+ *   - For peer-mesh: every non-self book entry must carry an
+ *     `advertisedEndpoint`, and every `[[peers]].endpoint` (canonical) must
+ *     match one of them (canonical), and vice versa.
+ *   - For relay: endpoint matching is skipped (relay routes by partyId); book
+ *     entries need no endpoint.
  *   - A loaded share must have the self entry's partyId and the book's party
  *     count (`assertShareMatchesBook`).
  */
@@ -147,6 +149,9 @@ async function buildFromState(args: BuildFromStateArgs): Promise<TransportBundle
         'buildTransport: transport.advertised_endpoint required when transport.kind = "peer-mesh"',
       );
     }
+    // A book from a relay setup carries no endpoints. Say so, naming the
+    // party, before comparing the book with `[[peers]]`.
+    for (const e of bookPeers) requireBookEndpoint(e);
     validatePeersAgainstBook(pubkeyBook, config.peers, selfPartyId);
 
     // peer-mesh expects ws:// URLs (PeerConnection.dial uses `new URL`).
@@ -155,7 +160,7 @@ async function buildFromState(args: BuildFromStateArgs): Promise<TransportBundle
     const peers = bookPeers.map((e) => ({
       partyId: e.partyId,
       publicKey: fromHex(e.publicKeyHex),
-      endpoint: `ws://${e.advertisedEndpoint}`,
+      endpoint: `ws://${requireBookEndpoint(e)}`,
     }));
     const transport = new PeerMeshTransport({
       self: { partyId: selfPartyId, identity },
@@ -256,6 +261,16 @@ function assertShareMatchesBook(
   }
 }
 
+/** peer-mesh dials every peer, so every non-self book entry must have an endpoint. */
+function requireBookEndpoint(e: PubkeyBookEntry): string {
+  if (e.advertisedEndpoint === undefined) {
+    throw new Error(
+      `transport-factory: pubkey book entry for party ${e.partyId} has no advertisedEndpoint; peer-mesh needs one for every peer`,
+    );
+  }
+  return e.advertisedEndpoint;
+}
+
 function validatePeersAgainstBook(
   book: PubkeyBook,
   configPeers: ReadonlyArray<{ endpoint: string }>,
@@ -264,7 +279,7 @@ function validatePeersAgainstBook(
   const bookEndpoints = new Set<string>();
   for (const e of book.entries) {
     if (e.partyId === selfPartyId) continue;
-    bookEndpoints.add(e.advertisedEndpoint);
+    bookEndpoints.add(requireBookEndpoint(e));
   }
   const configEndpoints = new Set<string>();
   for (const p of configPeers) {

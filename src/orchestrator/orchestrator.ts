@@ -88,6 +88,15 @@ const SETTLE_LEVEL: Record<OutcomeStatus, LogLevel> = {
 
 const DEFAULT_WAIT_MS = 60_000;
 
+/**
+ * Most signing ceremonies one remote leader may hold live on this node at once
+ * (facts/orchestrator.md, `announce-sign`). Each live tracker holds a timer, an
+ * abort controller and a pull loop — for an `exec` or `webhook` gate until the
+ * operator decides — so a compromised ring member must not be able to open
+ * them without bound.
+ */
+export const MAX_LIVE_SIGNINGS_PER_LEADER = 32;
+
 export class Orchestrator {
   private readonly deps: OrchestratorDeps;
   private readonly log: Logger;
@@ -363,6 +372,14 @@ export class Orchestrator {
     if (proposal.prevouts.length > MAX_INPUTS) {
       return drop('warn', `proposal has ${proposal.prevouts.length} inputs, at most ${MAX_INPUTS}`);
     }
+    // Checked and opened without an await in between, so concurrent announces cannot overshoot.
+    const live = this.liveSigningsOf(from);
+    if (live >= MAX_LIVE_SIGNINGS_PER_LEADER) {
+      return drop(
+        'warn',
+        `party ${from} already leads ${live} live signing ceremonies here, at most ${MAX_LIVE_SIGNINGS_PER_LEADER}`,
+      );
+    }
 
     const t = this.open(ceremonyId, 'signing', from);
     let analysis: ProposalAnalysis;
@@ -519,6 +536,16 @@ export class Orchestrator {
     if (this.localDkg || this.joinedDkg) return true;
     for (const t of this.trackers.values()) if (t.kind === 'dkg') return true;
     return false;
+  }
+
+  /**
+   * Signing ceremonies `leader` has live on this node. Only trackers count:
+   * the ceremonies this node leads itself are local slots, never trackers.
+   */
+  private liveSigningsOf(leader: PartyId): number {
+    let n = 0;
+    for (const t of this.trackers.values()) if (t.kind === 'signing' && t.leader === leader && !t.settled) n++;
+    return n;
   }
 
   /** A live tracker, an outcome within retention, or a local slot holds `ceremonyId`. */

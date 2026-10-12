@@ -9,15 +9,21 @@ set -e
 # will run `otzi restore`; on success the rest of the config flow is skipped,
 # on failure postinst exits non-zero (operator can `dpkg-reconfigure` to retry
 # or decline restore).
-db_input high otzi-headless/restore-from-backup || true
-db_go || true
-db_get otzi-headless/restore-from-backup || true
-if [ "$RET" = "true" ]; then
-  db_input critical otzi-headless/backup-path || true
-  db_input critical otzi-headless/backup-password || true
+#
+# Only while there is no /etc/otzi/daemon.toml: restore refuses to run over an
+# existing config, so on an installed node (an upgrade, or a reconfigure) the
+# question is not asked. To restore on such a node, move daemon.toml aside first.
+if [ ! -e /etc/otzi/daemon.toml ] && [ ! -L /etc/otzi/daemon.toml ]; then
+  db_input high otzi-headless/restore-from-backup || true
   db_go || true
-  # Skip the rest of the prompts — postinst short-circuits on restore success.
-  exit 0
+  db_get otzi-headless/restore-from-backup || true
+  if [ "$RET" = "true" ]; then
+    db_input critical otzi-headless/backup-path || true
+    db_input critical otzi-headless/backup-password || true
+    db_go || true
+    # Skip the rest of the prompts — postinst short-circuits on restore success.
+    exit 0
+  fi
 fi
 
 db_get otzi-headless/node-id || true
@@ -58,6 +64,10 @@ db_get otzi-headless/role || true
 ROLE="$RET"
 if [ "$ROLE" = "leader" ]; then
   db_input medium otzi-headless/bootstrap-bind || true
+  # A relay config has no [[peers]] to count, so the relay leader states the ring size.
+  if [ "$TRANSPORT" = "relay" ]; then
+    db_input high otzi-headless/parties || true
+  fi
 else
   db_input high otzi-headless/bootstrap-leader-url || true
 fi

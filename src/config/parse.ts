@@ -21,6 +21,7 @@ import {
   PeerEntry,
   ShareConfig,
   TransportConfig,
+  TransportKind,
   TRANSPORT_KINDS,
   TriggerEntry,
   TRIGGER_KINDS,
@@ -220,7 +221,13 @@ function parsePeer(raw: unknown, i: number): PeerEntry {
   }
 }
 
-function parsePeers(raw: unknown): PeerEntry[] {
+function parsePeers(raw: unknown, kind: TransportKind): PeerEntry[] {
+  if (kind === 'relay') {
+    // The relay needs no peer list: the pubkey book alone names the ring. Entries
+    // that are present are still validated, though nothing reads them.
+    if (raw === undefined) return [];
+    return asArray(raw, 'peers').map((p, i) => parsePeer(p, i));
+  }
   if (raw === undefined)
     throw new ConfigError('peers', 'missing required array (at least one peer)');
   const arr = asArray(raw, 'peers');
@@ -329,15 +336,52 @@ function parseTriggers(raw: unknown): TriggerEntry[] {
   return arr.map((t, i) => parseTrigger(t, i));
 }
 
-function parseBootstrap(raw: unknown): BootstrapConfig | undefined {
+const MIN_BOOTSTRAP_PARTIES = 2;
+const MAX_BOOTSTRAP_PARTIES = 255;
+
+function parseParties(v: unknown): number {
+  const n = asInteger(v, 'bootstrap.parties');
+  if (n < MIN_BOOTSTRAP_PARTIES || n > MAX_BOOTSTRAP_PARTIES)
+    throw new ConfigError(
+      'bootstrap.parties',
+      `must be an integer from ${MIN_BOOTSTRAP_PARTIES} to ${MAX_BOOTSTRAP_PARTIES} (got ${n})`,
+    );
+  return n;
+}
+
+/**
+ * `kind` is the parsed `[transport].kind`. A relay leader names the ring size in
+ * `parties` (there is no `[[peers]]` list to count); a peer-mesh leader counts
+ * `[[peers]]`, and a leaf never takes the key.
+ */
+function parseBootstrap(raw: unknown, kind: TransportKind): BootstrapConfig | undefined {
   if (raw === undefined) return undefined;
   const o = asObject(raw, 'bootstrap');
   const role = asEnum(o.role, 'bootstrap.role', BOOTSTRAP_ROLES);
-  rejectUnknownKeys(o, 'bootstrap', ['role', role === 'leader' ? 'bind' : 'leader_url']);
+  // Checked before the unknown-key rule so a peer-mesh operator learns why the key is refused.
+  if (role === 'leader' && kind !== 'relay' && 'parties' in o)
+    throw new ConfigError(
+      'bootstrap.parties',
+      'only used with transport.kind = "relay"; peer-mesh counts [[peers]]',
+    );
+  rejectUnknownKeys(
+    o,
+    'bootstrap',
+    role === 'leader' ? (kind === 'relay' ? ['role', 'bind', 'parties'] : ['role', 'bind']) : ['role', 'leader_url'],
+  );
   if (role === 'leader') {
     if (o.bind === undefined)
       throw new ConfigError('bootstrap.bind', 'required when bootstrap.role = "leader"');
-    return { role, bind: asString(o.bind, 'bootstrap.bind') };
+    const leader: BootstrapConfig = { role, bind: asString(o.bind, 'bootstrap.bind') };
+    if (kind === 'relay') {
+      if (o.parties === undefined)
+        throw new ConfigError(
+          'bootstrap.parties',
+          'required when transport.kind = "relay" and bootstrap.role = "leader"',
+        );
+      leader.parties = parseParties(o.parties);
+    }
+    return leader;
   }
   if (o.leader_url === undefined)
     throw new ConfigError('bootstrap.leader_url', 'required when bootstrap.role = "leaf"');
@@ -364,13 +408,15 @@ function validateCoherence(cfg: DaemonConfig): void {
 export function parseDaemonConfig(raw: unknown): DaemonConfig {
   const o = asObject(raw, '<root>');
   rejectUnknownKeys(o, '', ['share', 'node', 'network', 'transport', 'peers', 'gate', 'deadlines', 'triggers', 'bootstrap']);
-  const bootstrap = parseBootstrap(o.bootstrap);
+  // `[[peers]]` and `[bootstrap]` depend on the transport kind, so it is parsed first.
+  const transport = parseTransport(o.transport);
+  const bootstrap = parseBootstrap(o.bootstrap, transport.kind);
   const cfg: DaemonConfig = {
     share: parseShare(o.share),
     node: parseNode(o.node),
     network: parseNetwork(o.network),
-    transport: parseTransport(o.transport),
-    peers: parsePeers(o.peers),
+    transport,
+    peers: parsePeers(o.peers, transport.kind),
     gate: parseGate(o.gate),
     deadlines: parseDeadlines(o.deadlines),
     triggers: parseTriggers(o.triggers),

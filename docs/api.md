@@ -72,13 +72,16 @@ a fresh one.
 | `403` | `{ "error": "forbidden host" }` | HTTP trigger: the `Host` header is not a loopback name with the listener's port. |
 | `405` | `{ "error": "method not allowed" }` | Non-POST method. |
 | `409` | `{ "error": "<detail>" }` | `vault-info` / `sign`: no vault is loaded (`no vault loaded — run otzi generate, then restart the daemon`). `dkg`: this node already holds a vault, or a DKG is already running on this node. `dkg` / `sign`: the `ceremonyId` is already in use on this node — by a live ceremony, or by one that ended here within its retention period (5 min signing, 15 min DKG). Nothing was announced to peers. |
+| `503` | `{ "error": "<detail>" }` | Retryable: the leader did not start the ceremony. `dkg` / `sign`: another node of the ceremony is not connected to this one right now (`party <id> is not connected; retry when the ring is connected` / `signer <id> is not connected; …`). `sign`: this node already leads 32 signing requests (awaiting its gate or running; `this node already leads 32 live signing ceremonies; retry later`). Checked before the gate, so no gate approval was consumed, and nothing was announced to peers: send the same request again (the same `ceremonyId` is fine). |
 | `500` | `{ "error": "<detail>", "ceremonyId": "…" }` | Ceremony failure after the announce: a peer dropped or rejected, the ceremony deadline passed (`ceremony deadline of <ms> ms passed`, from `[deadlines]`), a blob failed sender binding, a signature failed verification. Check the daemon logs; the cause names the offending party where one is known. |
 
 ## `op: "vault-info"`
 
 Read-only vault metadata for operator backends and tooling: the vault address and
-keys, the network, the threshold and the ring's party IDs. `otzi vault` does not
-call it; it reads `vault-pubkey.json`.
+keys, the network, the threshold and the ring's party IDs. `otzi vault` and
+`otzi btc balance|send|sign` call it and compare the answer with
+`vault-pubkey.json`, which other members of the `otzi` group can rewrite (see
+[`cli.md`](./cli.md)); they give up on a daemon that does not answer within 10 s.
 
 Request:
 
@@ -151,6 +154,11 @@ Preconditions and failures:
 - `409` (`a DKG is already running on this node`) while the node leads or takes
   part in another DKG, or (`ceremony id <id> is already in use on this node`)
   for an ID used here within the last 15 minutes; nothing is announced.
+- `503` (`party <id> is not connected; retry when the ring is connected`) when
+  another node is not connected to the receiving node (it is down, or its
+  transport is still reconnecting); checked before the gate, nothing is
+  announced. Retry once every node is up. A node that drops after this check
+  misses the announce, and the ceremony fails at its deadline (`500`).
 - `403` when the receiving node's gate does not approve the DKG spec.
 - `500` when the ceremony fails or times out (`[deadlines].dkg_ms`). A node
   deletes its staged `<share path>.pending` file only if it had not yet
@@ -238,6 +246,27 @@ A `ceremonyId` already in use on the leader — by a live ceremony, or by one
 that ended there within its blob retention period (5 min after a signing
 ceremony, 15 min after a DKG) — is a `409` before analysis and the gate, so it
 consumes no gate approval.
+
+### Before the gate: a connected ring, and at most 32 led signings
+
+After analysis and before its gate, the leader answers `503` and announces
+nothing when:
+
+- a signer other than itself is not connected to it right now
+  (`signer <id> is not connected; retry when the ring is connected`) — the
+  node is down, or its transport is still reconnecting after a relay or network
+  outage; an announce it cannot hear would only hang until the deadline;
+- it already leads 32 signing requests (`this node already leads 32 live
+  signing ceremonies; retry later`). A request counts from this check until
+  it returns, including while it waits for this node's gate. Participants drop
+  the 33rd live ceremony of one leader, so a leader past that cap would announce
+  ceremonies that cannot complete.
+
+Both are retryable: no gate approval was consumed (a policy rate window is
+untouched, no exec or webhook approver was asked), so the same request can
+simply be sent again. `otzi btc send` and `otzi btc sign` say so on stderr. The
+connectivity check is a snapshot: a signer that drops between the check and the
+announce misses the announce, and that ceremony fails at its deadline (`500`).
 
 ### Gate
 

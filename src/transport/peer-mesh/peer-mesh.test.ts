@@ -272,6 +272,39 @@ describe('PeerMeshTransport — lifecycle', () => {
       await transport.stop();
     }
   }, 10_000);
+
+  it('isConnected: self always; a peer only once its handshake completed, not on an open socket; nobody after stop()', async () => {
+    nodes = await buildRing(2);
+    const [a, b] = [nodes[0]!.transport, nodes[1]!.transport];
+    expect(b.isConnected(1)).toBe(true);
+    expect(b.isConnected(0)).toBe(false);
+    expect(b.isConnected(9)).toBe(false);
+
+    // An open WebSocket from the peer's address that never sends hs1 is not a session.
+    await b.start();
+    const { WebSocket } = await import('ws');
+    const raw = new WebSocket(`ws://127.0.0.1:${nodes[1]!.port}`);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        raw.once('open', () => resolve());
+        raw.once('error', reject);
+      });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(b.isConnected(0)).toBe(false);
+    } finally {
+      raw.terminate();
+    }
+
+    await a.start();
+    await waitForRing(nodes);
+    expect(a.isConnected(1)).toBe(true);
+    expect(b.isConnected(0)).toBe(true);
+
+    await a.stop();
+    expect(a.isConnected(1)).toBe(false);
+    expect(a.isConnected(0)).toBe(true);
+    await vi.waitFor(() => expect(b.isConnected(0)).toBe(false), { timeout: 5_000, interval: 20 });
+  }, 15_000);
 });
 
 // ─────────────────────────────────────────────────────────────────────────

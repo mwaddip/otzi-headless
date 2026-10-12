@@ -12,10 +12,10 @@ import { isCeremonyId, isProposalShape, MAX_INPUTS } from '../core/messages';
 import type { PartyId } from '../core/types';
 import type { SendProposal } from '../otzi/lib/vault-types';
 
-/** A request the daemon refuses with a client status; the handler answers `{ error: message }`. */
+/** A request the daemon refuses: a client status, or a retryable 503 (nothing announced); the handler answers `{ error: message }`. */
 export class RequestError extends Error {
   constructor(
-    readonly status: 400 | 409,
+    readonly status: 400 | 409 | 503,
     message: string,
   ) {
     super(message);

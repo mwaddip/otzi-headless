@@ -140,7 +140,7 @@ max_ceremonies_per_hour = 10
 |---|---|
 | `max_sats_per_tx` | `spec.amount` ≤ cap. |
 | `max_sats_per_24h` | Sum of `amount` over this node's approvals in the last 24 h, plus this spec, ≤ cap. Recorded at approval; held in memory. |
-| `allowed_recipients` | An array of addresses, or the string `"address-book"`. Every non-change output address must be in the set. With `"address-book"`, the book is read at each evaluation; a missing or invalid book rejects. |
+| `allowed_recipients` | An array of addresses, or the string `"address-book"`. Every non-change output address must be in the set. Every array entry must be a valid address of `[network].name`, or the daemon refuses to start (see below). With `"address-book"`, the book is read at each evaluation; a missing or invalid book rejects. |
 | `max_fee_sats` | `spec.fee` ≤ cap. Stops a fee-burn proposal that passes the amount and recipient rules. |
 | `max_fee_rate` | `spec.feeRate` ≤ cap (sat/vB). |
 | `max_ceremonies_per_hour` | Signing approvals by this node in the last hour < cap. |
@@ -148,6 +148,20 @@ max_ceremonies_per_hour = 10
 
 Caps are non-negative safe integers (TOML integer or decimal string);
 `max_fee_rate` may be fractional. Unknown keys are rejected.
+
+**Recipient addresses are checked at startup.** Each entry of an
+`allowed_recipients` array must be a valid address for the network in
+`[network].name` (`mainnet`, or `testnet4` / `signet`, which share one address
+format). Anything else raises a `ConfigError` at `gate.allowed_recipients[<i>]`
+that quotes the entry and names the network: a typo, a testnet address on
+mainnet, a regtest address, a script in hex. Without the check the entry would
+never match and the rule would silently reject every payment to that recipient.
+Base58 addresses (`1…`, `3…`, `m…`, `n…`, `2…`) are case-sensitive and kept as
+written. An all-uppercase bech32 address (what a QR code carries) is accepted
+and stored in lowercase, because the analysis reports bech32 outputs in
+lowercase and the gate compares exact strings. A bech32 address in mixed case is
+invalid under BIP 173 and refused. `"address-book"` is not checked at startup;
+the book validates every entry each time it is read.
 
 **Rejected keys.** Each raises a `ConfigError` at startup:
 
@@ -236,6 +250,23 @@ env         = { OTZI_GATE_PENDING_DIR = "/var/lib/otzi/gate/pending", OTZI_GATE_
 The script creates the directories on its first run, owned by `otzi` with group
 `otzi` and mode 0770, so operators in the `otzi` group can write decision files
 there.
+
+**Sandbox.** On a packaged install the command runs inside the daemon's systemd
+sandbox (see [`install.md`](./install.md) § Service sandbox), as the `otzi` user:
+
+- the file system is read-only except `/var/lib/otzi` (and a private `/tmp`);
+- `/dev` is a private one with only `null`, `zero`, `full`, `random`, `urandom`,
+  `tty` and the pty devices: no block devices, USB or serial ports;
+- `NoNewPrivileges=true`: `sudo`, `su` and other setuid helpers cannot raise
+  privilege, and the command cannot create setuid or setgid files;
+- it cannot change the clock, the hostname or kernel settings, and it can open
+  IPv4, IPv6, Unix and netlink sockets only.
+
+An approver that needs more (a hardware token on a USB or serial device, a
+directory outside `/var/lib/otzi`) needs a drop-in (`sudo systemctl edit otzi`,
+for example `PrivateDevices=false` or `ReadWritePaths=/srv/approvals`). That
+loosens the whole daemon, not only the command; an approver that runs elsewhere
+and is reached through the `webhook` strategy avoids it.
 
 ### `webhook` — POST spec to an HTTP endpoint
 

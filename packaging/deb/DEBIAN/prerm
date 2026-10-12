@@ -2,9 +2,15 @@
 set -e
 
 case "$1" in
-  remove|upgrade|deconfigure)
+  remove|deconfigure)
     if [ -d /run/systemd/system ]; then
-      deb-systemd-helper stop otzi.service >/dev/null 2>&1 || true
+      # Stop the daemon and the relay server before their files go away. Not on
+      # "upgrade": nothing restarts them afterwards, so an upgrade leaves them
+      # running (they pick up the new code at the next restart). "stop" is not an
+      # action of deb-systemd-helper, which would silently do nothing; that is
+      # deb-systemd-invoke's. A unit that is not loaded makes systemctl fail, which
+      # must not abort the removal.
+      deb-systemd-invoke stop otzi.service otzi-relay.service >/dev/null 2>&1 || true
     fi
     ;;
 esac

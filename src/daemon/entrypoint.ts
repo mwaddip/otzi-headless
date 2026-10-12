@@ -3,8 +3,9 @@
  *
  *   otzi daemon <config.toml>                   — run the daemon
  *   otzi setup <config.toml>                    — run bootstrap (reads [bootstrap].role from config)
+ *   otzi relay --listen <host:port>             — run the relay server (transport = "relay" deployments)
  *   otzi generate [--config <path>] [...]       — run the DKG through the local daemon
- *   otzi vault [--json]                         — print vault metadata
+ *   otzi vault [--json] [--config <path>]       — print vault metadata, checked against the daemon
  *   otzi btc balance [--unit ...]               — vault balance from Esplora
  *   otzi btc send <addr|label> <amount>[unit]|max — build, sign and broadcast a vault transfer
  *   otzi btc sign <proposal.json> [--broadcast] — sign a caller-built proposal
@@ -14,6 +15,8 @@
  *
  * The `daemon` subcommand loads config + share + identity + pubkey book and
  * starts the transport + Daemon. SIGINT/SIGTERM trigger graceful shutdown.
+ * The `relay` subcommand is the other long-lived verb: it needs no config and
+ * no vault, only the address to listen on, and stops the same way.
  * If the configured share file is missing, the daemon comes up in setup
  * mode (signing rejected; DKG works) — the operator runs `otzi generate` on
  * one node, then restarts every daemon to load its new share.
@@ -28,6 +31,7 @@
 import { BroadcastFailedError } from '../cli/cmd/btc';
 import type { BtcUnit } from '../cli/units';
 import { loadDaemonConfig } from '../config/load';
+import { RelayServer } from '../transport/relay/server';
 import { loadAndValidate } from './config-merge';
 import { createConsoleLogger } from './console-logger';
 import { Daemon } from './daemon';
@@ -45,6 +49,9 @@ export async function main(argv: readonly string[]): Promise<void> {
       return;
     case 'setup':
       await runSetupCommand(rest);
+      return;
+    case 'relay':
+      await runRelayCommand(rest);
       return;
     case 'generate':
       await runGenerateCommand(rest);
@@ -74,8 +81,9 @@ function usage(): string {
     'usage:',
     '  otzi daemon <path/to/daemon.toml>',
     '  otzi setup <path/to/daemon.toml>',
+    '  otzi relay --listen <host:port>',
     '  otzi generate [--config <path>] [--ceremony-id <id>]',
-    '  otzi vault [--json]',
+    '  otzi vault [--json] [--config <path>]',
     '  otzi btc balance [--unit sats|btc|mbtc|ubtc] [--config <path>]',
     '  otzi btc send <address|label> <amount>[unit]|max [--fee-rate <sat/vB>] [--config <path>]',
     '  otzi btc sign <proposal.json> [--broadcast] [--config <path>]',
@@ -185,6 +193,57 @@ async function runSetupCommand(args: string[]): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `otzi relay`
+// ─────────────────────────────────────────────────────────────────────────
+
+/** A signal-initiated `otzi relay` shutdown exits by then at the latest (facts/daemon.md, `runRelayCommand`). */
+export const RELAY_SHUTDOWN_DEADLINE_MS = 5_000;
+
+/**
+ * Run the relay server (`RelayServer`) until SIGINT or SIGTERM. Needs no daemon
+ * config and no vault. There is no default address: the host is required, so a
+ * relay never binds to every interface by accident. Logs through the console
+ * logger (stderr); stdout stays empty.
+ */
+export async function runRelayCommand(args: string[]): Promise<void> {
+  const { positional, flags } = parseVerbArgs(args, { values: ['listen'] });
+  noPositional(positional);
+  const listen = flags.get('listen');
+  if (listen === undefined) throw new Error(`otzi relay needs --listen <host:port>\n${usage()}`);
+
+  const server = new RelayServer({ listen, logger: createConsoleLogger() });
+
+  const shutdown = async (signal: string) => {
+    console.error(`received ${signal}, shutting down`);
+    // `stop()` gives clients a 2 s grace; whatever still holds it, the process exits in time.
+    const deadline = setTimeout(() => {
+      console.error(`otzi relay: shutdown did not finish within ${RELAY_SHUTDOWN_DEADLINE_MS / 1000} s; exiting`);
+      process.exit(0);
+    }, RELAY_SHUTDOWN_DEADLINE_MS);
+    try {
+      await server.stop();
+    } finally {
+      clearTimeout(deadline);
+      process.exit(0);
+    }
+  };
+  // Installed before the bind: `start()` writes the listen line, the relay's ready signal, and a
+  // signal sent the moment it appears must reach these handlers, not the default action.
+  const onSigint = () => void shutdown('SIGINT');
+  const onSigterm = () => void shutdown('SIGTERM');
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
+  try {
+    await server.start();
+  } catch (err) {
+    // Nothing is listening and the caller exits 1: leave no handler behind.
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
+    throw err;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Arguments and errors
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -268,14 +327,14 @@ async function runGenerateCommand(args: string[]): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// `otzi vault [--json]`
+// `otzi vault [--json] [--config <path>]`
 // ─────────────────────────────────────────────────────────────────────────
 
 async function runVaultCommand(args: string[]): Promise<void> {
-  const { positional, flags } = parseVerbArgs(args, { booleans: ['json'] });
+  const { positional, flags } = parseVerbArgs(args, { values: ['config'], booleans: ['json'] });
   noPositional(positional);
   const { vault } = await import('../cli/cmd/vault');
-  console.log(await vault({ json: flags.has('json') }));
+  console.log(await vault({ configPath: flags.get('config') ?? DEFAULT_DAEMON_CONFIG_PATH, json: flags.has('json') }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -459,9 +518,13 @@ async function runRestoreCommand(args: string[]): Promise<void> {
   for (const entry of result.skippedEntries) {
     console.error(`warning: skipped archive entry ${displayText(entry)}: not part of an otzi backup`);
   }
+  for (const warning of result.warnings) {
+    console.error(`WARNING: ${warning}`);
+  }
   console.log('Restored files:');
   for (const f of result.restoredFiles) {
-    console.log(`  ${f.path} (mode 0${f.mode.toString(8).padStart(3, '0')})`);
+    const mode = `mode 0${f.mode.toString(8).padStart(3, '0')}`;
+    console.log(`  ${f.path} (${mode}${f.owner ? ', owner otzi:otzi' : ''})`);
   }
   console.log('Next steps:');
   console.log('  1. Create /etc/otzi/otzi.env with the share password (the archive does not contain it):');

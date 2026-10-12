@@ -7,7 +7,10 @@ set -e
 if [ -d /run/systemd/system ]; then
   case "$1" in
     purge|remove)
-      deb-systemd-helper purge otzi.service >/dev/null 2>&1 || true
+      # otzi-relay.service gets the same cleanup as the daemon unit.
+      for OTZI_UNIT in otzi.service otzi-relay.service; do
+        deb-systemd-helper purge "$OTZI_UNIT" >/dev/null 2>&1 || true
+      done
       systemctl daemon-reload >/dev/null 2>&1 || true
       ;;
   esac

@@ -91,7 +91,7 @@ Four properties shape everything else:
 
 1. **Pull-based blob exchange.** Each peer produces ceremony blobs locally
    and stores them. For each round, peers pull missing inputs from
-   producers reactively. No 500 ms state ticks, no barriers, no heartbeats.
+   producers reactively. No 500 ms state ticks, no barriers, no ceremony heartbeats.
 2. **Signing is leader-driven, DKG is symmetric.** A signing trigger
    (UDS / HTTP / cron) fires on exactly one node; that node analyses the
    proposal, evaluates its gate, announces once, drives both rounds, aggregates
@@ -176,6 +176,13 @@ Notes on the prompts:
   leader URL above. So leaves only list peers other than the leader.
 - **"Esplora URL"** is the chain API the `otzi btc *` verbs use. Blank selects
   the mempool.space default for the network. The daemon never reads it.
+- **Relay transport.** With `relay` the table changes: there is no reachable
+  address and no peer list; every node asks for the **Relay URL**, and the
+  bootstrap leader also asks **Number of nodes in the ring** (2 to 255, itself
+  included). One host runs the relay server (`otzi-relay.service`, installed
+  disabled, under a transient systemd user of its own, so it can share a ring
+  node without reaching the daemon's files) behind a TLS proxy; see
+  [`docs/install.md`](docs/install.md#relay-coordinator).
 
 postinst auto-adds every operator listed at the debconf prompt to the
 `otzi` group (so they can connect to the UDS at
@@ -206,6 +213,13 @@ formatted `xxxx-xxxx-xxxx-xxxx-xxxx-xxxx`. **Compare the fingerprint across all
 three nodes out of band** (voice call, signed message). If any node shows a
 different value, someone tampered with the exchange — delete
 `/var/lib/otzi/pubkeys.json` everywhere and start over.
+
+The banner also lists key ids (16 hex characters each): this node's
+(`this node: <id>`), the ring size, and one `party <partyId>: <id>` line per
+ring member. **Confirm every listed key id is one of your three nodes', and
+that there are exactly three party lines.** An unknown id means someone else registered —
+delete `/var/lib/otzi/pubkeys.json` everywhere and start over. Keep the
+bootstrap port reachable only by the three nodes while setup runs.
 
 The pubkey book records each peer's partyId (assigned deterministically by
 sorted-pubkey-bytes order, identical on every node) and reachable address.
@@ -320,9 +334,10 @@ daemon UDS are reserved for tests + debugging.
 | Verb | Purpose |
 |---|---|
 | `otzi daemon <config>` | Run the daemon (long-lived; usually started by systemd). |
+| `otzi relay --listen <host:port>` | Run the relay server for relay-transport rings (long-lived; behind a TLS reverse proxy). |
 | `otzi setup <config>` | Bootstrap pubkey exchange. Reads `[bootstrap].role`. Prints the 96-bit fingerprint. |
 | `otzi generate` | Run the run-once DKG through the local daemon; prints the vault address. |
-| `otzi vault [--json]` | Print the vault address, network and threshold/parties (keys with `--json`). |
+| `otzi vault [--json] [--config <path>]` | Print the vault address, network and threshold/parties (keys with `--json`), checked against the daemon's loaded share. |
 | `otzi btc balance [--unit ...]` | Confirmed and unconfirmed vault balance from Esplora (units: `sats` `btc` `mbtc` `ubtc`). |
 | `otzi btc send <label\|address> <amount[unit]\|max> [--fee-rate N]` | Build, sign and broadcast a send. |
 | `otzi btc sign <proposal.json> [--broadcast]` | Sign a caller-built `SendProposal`; prints the analysis, txid and signed hex. |

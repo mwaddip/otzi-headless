@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { displayText, errorReason } from './text';
+import { execFileSync } from 'node:child_process';
+import { displayText, errorReason, shellQuote } from './text';
 
 describe('displayText', () => {
   it('leaves ordinary text, including non-ASCII, as it is', () => {
@@ -44,5 +45,27 @@ describe('errorReason', () => {
     expect(errorReason(viaCode)).toBe('ENOTFOUND');
     expect(errorReason(new Error('fetch failed'))).toBe('fetch failed');
     expect(errorReason(new Error('other', { cause: new Error('hidden') }))).toBe('other');
+  });
+});
+
+describe('shellQuote', () => {
+  it('wraps a word in single quotes', () => {
+    expect(shellQuote('/var/lib/otzi/share.json')).toBe("'/var/lib/otzi/share.json'");
+    expect(shellQuote('')).toBe("''");
+  });
+
+  it('closes, escapes and reopens the quotes around an embedded single quote', () => {
+    expect(shellQuote("it's")).toBe("'it'\\''s'");
+  });
+
+  it.each([
+    ['a path with a space', '/tmp/my dir/share.json'],
+    ['a path with a single quote', "/tmp/it's/share.json"],
+    ['a path with both', "/tmp/it's a dir/sha're.json"],
+    ['shell metacharacters', '/tmp/$(touch pwned);`id`|&<>*?[x]\\"#~!/f'],
+    ['leading dashes', '--no-dereference'],
+  ])('reads back as the one word it was given by a real shell: %s', (_name, word) => {
+    const out = execFileSync('sh', ['-c', `printf '%s\\0' ${shellQuote(word)} ${shellQuote('x y')}`], { encoding: 'utf8' });
+    expect(out.split('\0').slice(0, 2)).toEqual([word, 'x y']);
   });
 });

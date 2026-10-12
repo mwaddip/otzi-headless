@@ -32,7 +32,7 @@ kind                 = "peer-mesh"                       # "peer-mesh" | "relay"
 advertised_endpoint  = "node-a.example:8800"             # required for peer-mesh; canonical host[:port]
 # url                = "ws://relay.example:9000"         # required iff kind = "relay"
 
-[[peers]]
+[[peers]]                                                # required for peer-mesh; optional under relay (not used)
 endpoint = "node-b.example:8800"                         # required; canonical host[:port]
 
 [gate]
@@ -108,19 +108,24 @@ signet.
 
 | Key | Type | Notes |
 |---|---|---|
-| `kind` | `"peer-mesh"` \| `"relay"` | See `CLAUDE.md` § Transport. `peer-mesh` = direct WebSocket between daemons. `relay` = the headless relay server (`src/transport/relay/server.ts`) routes opaque encrypted frames. |
+| `kind` | `"peer-mesh"` \| `"relay"` | See `CLAUDE.md` § Transport. `peer-mesh` = direct WebSocket between daemons. `relay` = the headless relay server (`src/transport/relay/server.ts`, run with `otzi relay --listen <host:port>`) routes opaque encrypted frames. |
 | `advertised_endpoint` | string | Required when `kind="peer-mesh"`. This node's reachable `host[:port]` (canonical form post-parse; see § Canonical endpoint form). Peers will dial here. Wildcards (`0.0.0.0`, `::`) rejected. |
-| `url` | string | Required when `kind="relay"`. `ws://` URL of the relay (e.g. `ws://relay.example:9000`). |
+| `url` | string | Required when `kind="relay"`. WebSocket URL of the relay: `ws://` on loopback or a VPN (e.g. `ws://relay.example:9000`), or `wss://` through a TLS reverse proxy in front of the relay. The daemon redials a relay that is down or drops the connection (backoff 1 s … 30 s). Both the daemon and the relay send a keepalive ping every 20 s, so a proxy idle timeout above 20 s keeps the connection open. |
 
 The parser rejects a `listen` field with an error pointing at
 `advertised_endpoint`.
 
-## `[[peers]]` (required — at least one)
+## `[[peers]]` (peer-mesh: required, at least one; relay: optional)
 
 One entry per *other* node in the ring (this node is implied by `[node]`).
 Order does not matter — partyIds are derived from the pubkey book, not
 peer-array index. `[[peers]]` is a local sanity-check against the
 authoritative book; bidirectional endpoint match is enforced at startup.
+
+Under `transport.kind = "relay"` the section may be left out, and a relay config
+normally is: the relay routes by `partyId` and the pubkey book names the ring, so
+there is no peer list to check. If you do list peers under relay, each entry is
+validated as below but nothing uses it.
 
 | Key | Type | Notes |
 |---|---|---|
@@ -165,7 +170,7 @@ rule is active iff its key is set, and every active rule must pass.
 |---|---|---|---|
 | `max_sats_per_tx` | integer \| decimal string | Signing | `spec.amount` ≤ cap. `amount` is the sum of non-change outputs, so change back to the vault never counts. |
 | `max_sats_per_24h` | integer \| decimal string | Signing | Sum of `amount` over this node's approvals in the last 24 h, plus this spec, ≤ cap. Recorded at approval; held in memory. |
-| `allowed_recipients` | string[] \| `"address-book"` | Signing | Every non-change output address must be in the set. With `"address-book"`, the set is this node's address book, read at each evaluation; a missing or invalid book rejects. |
+| `allowed_recipients` | string[] \| `"address-book"` | Signing | Every non-change output address must be in the set. Each array entry must be a valid address of `[network].name` (checked at startup). With `"address-book"`, the set is this node's address book, read at each evaluation; a missing or invalid book rejects. |
 | `max_fee_sats` | integer \| decimal string | Signing | `spec.fee` ≤ cap. |
 | `max_fee_rate` | number \| decimal string | Signing | `spec.feeRate` ≤ cap, in sat/vB. May be fractional. |
 | `max_ceremonies_per_hour` | integer ≥ 1 | Signing | Signing approvals by this node in the last hour < cap. |
@@ -192,6 +197,13 @@ Details:
   `allowed_recipients = "address-book"`, a missing book file, an invalid book
   file or any other failed read rejects every signing spec, even one whose
   outputs are all change.
+- **`allowed_recipients` entries are validated.** Each array entry must be a
+  valid address for `[network].name`; a typo, an address of another network
+  (`bc1…` on `testnet4`, `tb1…` on `mainnet`) or a script in hex is a
+  `ConfigError` at `gate.allowed_recipients[<i>]` that quotes the entry and
+  names the network, and the daemon does not start. Base58 addresses are kept as
+  written; an all-uppercase bech32 address is stored in lowercase, which is how
+  the analysis reports outputs; mixed-case bech32 is refused (BIP 173).
 - The address book is `/etc/otzi/address-book.otzi.json`. Editing it changes the
   allowlist without a daemon restart, which is why it is root-owned (`0640`).
 - Signing rules never apply to a DKG spec, and `dkg_leader_allowlist` never
@@ -297,9 +309,15 @@ path = "/var/run/otzi/otzi.sock"
 ```
 
 Permission model: filesystem ACL on the socket file gates access. The
-deb's postinst sets `/var/run/otzi/` to `chmod 2770 root:otzi` (setgid),
-so the socket lands at `chmod 660 root:otzi`. Any user in the `otzi`
-group can connect; nobody else.
+packaged unit's `RuntimeDirectory=` creates `/var/run/otzi/` as `3770 otzi:otzi`
+(setgid and sticky) when the daemon starts and removes it when it stops, so the
+socket lands owned by `otzi:otzi` and group-writable. Nothing creates the
+directory while the daemon is down; the CLI then finds no socket and reports the
+daemon unreachable. Any user in the `otzi`
+group can connect; nobody else. The sticky bit keeps a group member from
+unlinking or renaming the daemon's socket and binding a look-alike, which the
+CLI would trust (`otzi vault` and `otzi btc` check what they print against the
+daemon behind this socket).
 
 ### `kind = "http"` (loopback only)
 
@@ -348,14 +366,52 @@ config.
 | `role` | `'leader'` \| `'leaf'` | yes | Leader hosts the registration server; leaves POST to it. |
 | `bind` | string | leader-only | `host:port` for the leader's bootstrap HTTP listener. |
 | `leader_url` | string | leaf-only | Full URL of the leader's bootstrap endpoint. |
+| `parties` | integer, 2 to 255 | relay leader only | Ring size, this node included. A relay config has no `[[peers]]` to count, so the leader states the size; under peer-mesh the size is the number of `[[peers]]` plus this node, and `parties` is refused. A leaf never takes it. |
 
-Example (leader):
+The parser applies the `parties` rules to every config it reads, `otzi setup`
+and daemon start alike. A relay leader whose `[bootstrap]` lacks `parties` fails
+with:
+
+```
+config bootstrap.parties: required when transport.kind = "relay" and bootstrap.role = "leader"
+```
+
+Leaving the section in place after setup is fine as long as it stays valid.
+
+Example (peer-mesh leader):
 
 ```toml
 [bootstrap]
 role = "leader"
 bind = "0.0.0.0:7090"
 ```
+
+Example (relay leader, a ring of 3, bound to its VPN address so only the
+members reach it):
+
+```toml
+[bootstrap]
+role = "leader"
+bind = "10.8.0.1:7090"
+parties = 3
+```
+
+Or bound to loopback, with each member reaching it through an SSH tunnel
+(`ssh -N -L 7090:127.0.0.1:7090 <leader-host>`, and `leader_url =
+"http://127.0.0.1:7090"` on the member):
+
+```toml
+[bootstrap]
+role = "leader"
+bind = "127.0.0.1:7090"
+parties = 3
+```
+
+Under relay the leader admits the first `parties − 1` registrations, so its
+bootstrap port must be reachable only by the members during setup. `otzi setup`
+warns when a relay leader's `bind` is every interface (`0.0.0.0` or `::`). The
+peer-mesh leader admits only its `[[peers]]` endpoints, and `0.0.0.0` is fine
+there.
 
 Example (leaf):
 
@@ -371,6 +427,10 @@ Parse-time checks:
 
 - `transport.advertised_endpoint` required when `transport.kind = "peer-mesh"`.
 - `transport.url` required when `transport.kind = "relay"`.
+- `[[peers]]` has at least one entry when `transport.kind = "peer-mesh"`; under
+  `"relay"` it may be absent or empty.
+- `[bootstrap] parties` (integer, 2 to 255) is required on a leader when
+  `transport.kind = "relay"`, and refused under `"peer-mesh"` and on a leaf.
 - Endpoint canonicalization (see § Canonical endpoint form) on
   `transport.advertised_endpoint` and every `[[peers]].endpoint`.
 

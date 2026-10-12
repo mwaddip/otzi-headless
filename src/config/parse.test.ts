@@ -435,6 +435,151 @@ describe('[bootstrap] parsing', () => {
   });
 });
 
+describe('relay transport — [[peers]] optional, [bootstrap] parties', () => {
+  /** MINIMAL_TOML on a relay transport, with no `[[peers]]` at all. */
+  const RELAY_NO_PEERS = `
+[share]
+path = "/etc/otzi/share.json"
+password_env = "OTZI_SHARE_PASSWORD"
+
+[node]
+id = "node-a"
+
+[network]
+name = "testnet4"
+
+[transport]
+kind = "relay"
+url = "ws://relay.example:9000"
+
+[gate]
+strategy = "auto"
+`;
+  const RELAY_WITH_PEERS = RELAY_NO_PEERS.replace(
+    '[gate]',
+    '[[peers]]\nendpoint = "Node-B.example.com"\n\n[[peers]]\nendpoint = "127.0.0.1:8802"\n\n[gate]',
+  );
+  const LEADER = '\n[bootstrap]\nrole = "leader"\nbind = "0.0.0.0:7090"\n';
+
+  function configError(toml: string): ConfigError {
+    try {
+      parseDaemonConfigToml(toml);
+    } catch (e) {
+      expect(e).toBeInstanceOf(ConfigError);
+      return e as ConfigError;
+    }
+    throw new Error('expected parseDaemonConfigToml to throw a ConfigError');
+  }
+
+  it('relay config without [[peers]] parses with peers = []', () => {
+    const cfg = parseDaemonConfigToml(RELAY_NO_PEERS);
+    expect(cfg.transport).toEqual({ kind: 'relay', url: 'ws://relay.example:9000' });
+    expect(cfg.peers).toEqual([]);
+    expect(cfg.bootstrap).toBeUndefined();
+  });
+
+  it('relay config with an empty peers array parses with peers = []', () => {
+    const cfg = parseDaemonConfigToml(`peers = []\n${RELAY_NO_PEERS}`);
+    expect(cfg.peers).toEqual([]);
+  });
+
+  it('relay config with [[peers]] still parses them', () => {
+    const cfg = parseDaemonConfigToml(RELAY_WITH_PEERS);
+    expect(cfg.peers).toEqual([
+      { endpoint: 'node-b.example.com:8800' },
+      { endpoint: '127.0.0.1:8802' },
+    ]);
+    // Entries that are present are validated as ever, even though relay does not use them.
+    const err = configError(RELAY_WITH_PEERS.replace('endpoint = "127.0.0.1:8802"', 'endpoint = "127.0.0.1:8802"\nid = "x"'));
+    expect(err.path).toBe('peers[1].id');
+    expect(err.message).toMatch(/no longer supported/);
+  });
+
+  it('peer-mesh still requires at least one peer', () => {
+    const missing = configError(MINIMAL_TOML.replace(/\[\[peers\]\][\s\S]*?(?=\n\[gate\])/g, ''));
+    expect(missing.path).toBe('peers');
+    expect(missing.message).toBe('config peers: missing required array (at least one peer)');
+    const empty = configError(`peers = []\n${MINIMAL_TOML.replace(/\[\[peers\]\][\s\S]*?(?=\n\[gate\])/g, '')}`);
+    expect(empty.path).toBe('peers');
+    expect(empty.message).toBe('config peers: must contain at least one peer');
+  });
+
+  it('relay leader requires bootstrap.parties', () => {
+    const err = configError(RELAY_NO_PEERS + LEADER);
+    expect(err.path).toBe('bootstrap.parties');
+    expect(err.message).toBe(
+      'config bootstrap.parties: required when transport.kind = "relay" and bootstrap.role = "leader"',
+    );
+  });
+
+  it('relay leader with bootstrap.parties parses it, at both ends of the range', () => {
+    for (const n of [2, 3, 255]) {
+      const cfg = parseDaemonConfigToml(RELAY_NO_PEERS + LEADER + `parties = ${n}\n`);
+      expect(cfg.bootstrap).toEqual({ role: 'leader', bind: '0.0.0.0:7090', parties: n });
+    }
+  });
+
+  it('relay leader with bootstrap.parties parses with [[peers]] present too', () => {
+    const cfg = parseDaemonConfigToml(RELAY_WITH_PEERS + LEADER + 'parties = 3\n');
+    expect(cfg.bootstrap?.parties).toBe(3);
+    expect(cfg.peers).toHaveLength(2);
+  });
+
+  it('relay leaf needs no bootstrap.parties', () => {
+    const cfg = parseDaemonConfigToml(
+      RELAY_NO_PEERS + '\n[bootstrap]\nrole = "leaf"\nleader_url = "http://leader-host:7090"\n',
+    );
+    expect(cfg.bootstrap).toEqual({ role: 'leaf', leaderUrl: 'http://leader-host:7090' });
+  });
+
+  it.each<[string, string]>([
+    ['1', '1'],
+    ['0', '0'],
+    ['-3', '-3'],
+    ['256', '256'],
+    ['2.5', '2.5'],
+    ['"3"', '"3"'],
+    ['true', 'true'],
+  ])('bootstrap.parties must be an integer from 2 to 255 (rejects %s)', (_label, value) => {
+    const err = configError(RELAY_NO_PEERS + LEADER + `parties = ${value}\n`);
+    expect(err.path).toBe('bootstrap.parties');
+  });
+
+  it('bootstrap.parties out of range names the limits and the value', () => {
+    expect(configError(RELAY_NO_PEERS + LEADER + 'parties = 1\n').message).toBe(
+      'config bootstrap.parties: must be an integer from 2 to 255 (got 1)',
+    );
+    expect(configError(RELAY_NO_PEERS + LEADER + 'parties = 256\n').message).toBe(
+      'config bootstrap.parties: must be an integer from 2 to 255 (got 256)',
+    );
+  });
+
+  it('bootstrap.parties is rejected under peer-mesh', () => {
+    const err = configError(MINIMAL_TOML + LEADER + 'parties = 3\n');
+    expect(err.path).toBe('bootstrap.parties');
+    expect(err.message).toBe(
+      'config bootstrap.parties: only used with transport.kind = "relay"; peer-mesh counts [[peers]]',
+    );
+    // The specific message wins over the range check.
+    expect(configError(MINIMAL_TOML + LEADER + 'parties = 1\n').message).toMatch(/only used with transport\.kind = "relay"/);
+  });
+
+  it('bootstrap.parties is rejected on a leaf', () => {
+    const leaf = '\n[bootstrap]\nrole = "leaf"\nleader_url = "http://leader-host:7090"\nparties = 3\n';
+    for (const base of [RELAY_NO_PEERS, MINIMAL_TOML]) {
+      const err = configError(base + leaf);
+      expect(err.path).toBe('bootstrap.parties');
+      expect(err.message).toMatch(/unknown key \(expected one of role, leader_url\)/);
+    }
+  });
+
+  it('keeps rejecting unknown [bootstrap] keys under relay', () => {
+    const err = configError(RELAY_NO_PEERS + LEADER + 'parties = 3\nextra = 1\n');
+    expect(err.path).toBe('bootstrap.extra');
+    expect(err.message).toMatch(/unknown key \(expected one of role, bind, parties\)/);
+  });
+});
+
 describe('http trigger loopback enforcement', () => {
   it('accepts 127.0.0.1', () => {
     const cfg = parseDaemonConfigToml(

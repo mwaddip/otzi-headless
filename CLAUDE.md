@@ -27,7 +27,7 @@ The daemon runs pull-based instead:
 - Each peer holds produced blobs in memory during a ceremony and clears them a fixed retention period after the ceremony ends on that node (5 min signing, 15 min DKG), so lagging peers can still pull until then.
 - For round N, each peer requests missing inputs from their producers.
 - When a peer has all inputs, it computes and stores the output.
-- No 500ms state ticks, no barrier synchronization, no heartbeat.
+- No 500ms state ticks, no barrier synchronization, no ceremony heartbeat.
 
 ### Role asymmetry — signing vs DKG
 
@@ -42,7 +42,7 @@ The daemon runs pull-based instead:
 
 **Participants** (non-leader signers) run their own analysis and gate on the announce, produce `sign-r1`, pull `sign-r1` from co-signers, produce `sign-r2`, and stop — they do NOT aggregate. A participant settles on signoff receipt (common case) or on the ceremony deadline (safety net for a crashed leader / dropped signoff).
 
-This leader is trigger-assigned — a static role for the ceremony, not an elected coordination primitive. No leader election, no heartbeat, no barrier. The forbidden shape is the Ötzi UI's *leader-as-synchronization-primitive*, not "someone is in charge".
+This leader is trigger-assigned — a static role for the ceremony, not an elected coordination primitive. No leader election, no ceremony heartbeat, no barrier. The forbidden shape is the Ötzi UI's *leader-as-synchronization-primitive*, not "someone is in charge".
 
 **DKG is symmetric.** The node whose trigger fires generates the 32-byte session ID and announces; it has no other role. Every party computes its own key share; no party ever holds another party's share. All N nodes then FROST-sign a verification message computed from their own view of the result, each aggregates and verifies that signature, stages its share file, and completes only after every other node has confirmed its own verification.
 
@@ -72,7 +72,7 @@ Default is `auto` everywhere. The gate is opt-in per node, not required infrastr
 
 Config-selectable:
 1. **Peer mesh** — direct WebSocket connections between daemons. Fits permanent federations with stable identities.
-2. **Relay** — the headless relay server (`src/transport/relay/server.ts`), a dumb router of opaque encrypted frames. Simpler, but requires a coordinator online. otzi-headless never joins an Ötzi relay session.
+2. **Relay** — the headless relay server (`src/transport/relay/server.ts`), a dumb router of opaque encrypted frames. Simpler, but requires a coordinator online. Operators run it with `otzi relay --listen <host:port>` on the coordinator host, behind a TLS reverse proxy (`wss://`), shipped as `otzi-relay.service`. otzi-headless never joins an Ötzi relay session.
 
 Both share the same E2E encrypted wire format (Noise-KK over ECDH P-256, AES-256-GCM records).
 
